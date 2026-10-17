@@ -107,7 +107,7 @@ fn message(issuer: &PublicKey, generation: u64, key: &PublicKey) -> Vec<u8> {
 /// Check that [`issuer`](Self::issuer) is the issuer you expect before
 /// trusting notes with it.
 ///
-/// An issuer serves its set at `GET /v1/keys` in the reference server.
+/// The reference server serves a mint's set at `GET /v1/mints/{mint}/keys`.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(try_from = "RawKeySet", into = "RawKeySet")]
 pub struct KeySet {
