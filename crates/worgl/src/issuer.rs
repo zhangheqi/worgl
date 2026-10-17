@@ -13,21 +13,24 @@
 //! the value destroyed by rotations. They satisfy
 //! `outstanding = minted − destroyed` at all times.
 
-use std::collections::{HashMap, VecDeque};
+use std::collections::{BTreeMap, HashMap, VecDeque};
 
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
 use crate::codec::{DecodeError, Reader, Writer};
 use crate::error::{ApplyError, Error, SetupError};
-use crate::keys::{IssuerKey, PublicKey};
+use crate::keys::{IssuerKey, PublicKey, Signature};
 use crate::ledger::{Ledger, LedgerConfig, Serial, Status};
+use crate::mint::{MintAuthorization, MintRequest, VerifiedMint};
 use crate::note::{Note, NoteError, read_key};
 use crate::policy::Policy;
 use crate::transfer::{TransferId, TransferRequest, VerifiedTransfer, Verifier};
 
 const SNAPSHOT_MAGIC: &[u8; 8] = b"WORGLSNP";
-const SNAPSHOT_VERSION: u16 = 1;
+/// Version 2 added each mint authority's last mint; version 1 snapshots
+/// still restore, with none.
+const SNAPSHOT_VERSION: u16 = 2;
 
 /// A note created by a mint or transfer.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
@@ -79,6 +82,14 @@ pub enum Event {
     },
     /// The first layer was dropped and a new last layer created.
     Rotate(RotationReport),
+    /// New money was minted into the mint layer at a mint authority's
+    /// signed request.
+    AuthorizedMint {
+        /// Who asked, with their signature.
+        authorization: MintAuthorization,
+        /// The note created.
+        issued: Issued,
+    },
 }
 
 impl Event {
@@ -107,6 +118,16 @@ impl Event {
                     .u32(r.destroyed_notes)
                     .u128(r.destroyed_value);
             }
+            Event::AuthorizedMint {
+                authorization,
+                issued,
+            } => {
+                w.u8(5)
+                    .bytes(authorization.authority.as_bytes())
+                    .u64(authorization.sequence)
+                    .bytes(&authorization.signature.to_bytes());
+                write_issued(&mut w, issued);
+            }
         }
         w.finish()
     }
@@ -133,6 +154,14 @@ impl Event {
                 destroyed_notes: r.u32()?,
                 destroyed_value: r.u128()?,
             }),
+            5 => Event::AuthorizedMint {
+                authorization: MintAuthorization {
+                    authority: read_key(&mut r)?,
+                    sequence: r.u64()?,
+                    signature: Signature::from_bytes(&r.array()?),
+                },
+                issued: read_issued(&mut r)?,
+            },
             _ => return Err(DecodeError::Invalid("event type")),
         };
         r.finish()?;
@@ -168,10 +197,11 @@ fn read_list<T>(
     (0..count).map(|_| item(r)).collect()
 }
 
-/// The outcome of [`Issuer::plan_transfer`].
+/// The outcome of [`Issuer::plan_transfer`] and
+/// [`Issuer::plan_authorized_mint`].
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Plan {
-    /// A fresh transfer: make the event durable if needed, then
+    /// A fresh request: make the event durable if needed, then
     /// [`apply`](Issuer::apply) it and hand out [`notes`](Issuer::notes).
     Apply(Event),
     /// The identical request was already applied; these are the notes it
@@ -284,6 +314,8 @@ pub struct Issuer {
     minted: u128,
     destroyed: u128,
     receipts: Receipts,
+    /// Each mint authority's last accepted request and the note it created.
+    authorities: BTreeMap<PublicKey, (MintAuthorization, Issued)>,
 }
 
 impl Issuer {
@@ -301,6 +333,7 @@ impl Issuer {
             minted: 0,
             destroyed: 0,
             receipts: Receipts::default(),
+            authorities: BTreeMap::new(),
         })
     }
 
@@ -393,6 +426,61 @@ impl Issuer {
         }))
     }
 
+    /// The last sequence number accepted from a mint authority, if any.
+    pub fn mint_sequence(&self, authority: &PublicKey) -> Option<u64> {
+        self.authorities
+            .get(authority)
+            .map(|(authorization, _)| authorization.sequence)
+    }
+
+    /// Plans a verified mint request. Its sequence number must be above the
+    /// authority's last, except that the authority's last request replays the
+    /// note it created.
+    ///
+    /// The amount and the authority are checked against this issuer's policy
+    /// again, which is cheap, in case the request was verified under a
+    /// different one.
+    pub fn plan_authorized_mint(&self, mint: &VerifiedMint) -> Result<Plan, Error> {
+        if mint.issuer != self.public {
+            return Err(Error::MintUnauthorized);
+        }
+        self.policy.check_mint(mint.amount)?;
+        let MintAuthorization {
+            authority,
+            sequence,
+            ..
+        } = mint.authorization;
+        if !self.policy.mint_authorities.contains(&authority) {
+            return Err(Error::UnknownAuthority(authority));
+        }
+        if let Some((last, issued)) = self.authorities.get(&authority) {
+            if sequence == last.sequence
+                && mint.amount == issued.amount
+                && mint.holder == issued.holder
+            {
+                return Ok(Plan::Replay(self.sign_all(std::slice::from_ref(issued))));
+            }
+            if sequence <= last.sequence {
+                return Err(Error::StaleMint {
+                    sequence,
+                    last: last.sequence,
+                });
+            }
+        }
+        let position = self.mint_position();
+        let serial = self
+            .next_serial(position, 0)
+            .ok_or(Error::LayerFull { position })?;
+        Ok(Plan::Apply(Event::AuthorizedMint {
+            authorization: mint.authorization,
+            issued: Issued {
+                serial,
+                amount: mint.amount,
+                holder: mint.holder,
+            },
+        }))
+    }
+
     /// Plans a verified transfer against the ledger: every input must be
     /// live and outside the last layer, and the layer one past the furthest
     /// input must have room for every output.
@@ -471,6 +559,10 @@ impl Issuer {
             Event::Mint(issued) => self.apply_mint(issued)?,
             Event::Transfer { id, spent, issued } => self.apply_transfer(*id, spent, issued)?,
             Event::Rotate(report) => self.apply_rotate(report)?,
+            Event::AuthorizedMint {
+                authorization,
+                issued,
+            } => self.apply_authorized_mint(authorization, issued)?,
         }
         self.sequence += 1;
         Ok(())
@@ -482,7 +574,9 @@ impl Issuer {
     /// yields byte-identical notes.
     pub fn notes(&self, event: &Event) -> Vec<Note> {
         match event {
-            Event::Mint(issued) => self.sign_all(std::slice::from_ref(issued)),
+            Event::Mint(issued) | Event::AuthorizedMint { issued, .. } => {
+                self.sign_all(std::slice::from_ref(issued))
+            }
             Event::Transfer { issued, .. } => self.sign_all(issued),
             Event::Rotate(_) => Vec::new(),
         }
@@ -507,6 +601,20 @@ impl Issuer {
         }
     }
 
+    /// Verifies and carries out a signed mint request in memory. Resending
+    /// the authority's last request returns the same note.
+    pub fn authorized_mint(&mut self, request: &MintRequest) -> Result<Note, Error> {
+        let verified = self.verifier().verify_mint(request)?;
+        let mut notes = match self.plan_authorized_mint(&verified)? {
+            Plan::Replay(notes) => notes,
+            Plan::Apply(event) => {
+                self.apply(&event).expect("a freshly planned event applies");
+                self.notes(&event)
+            }
+        };
+        Ok(notes.remove(0))
+    }
+
     /// Rotates in memory.
     pub fn rotate(&mut self) -> RotationReport {
         let event = self.plan_rotate();
@@ -522,7 +630,8 @@ impl Issuer {
     /// Layout, big-endian: the magic `WORGLSNP`, a `u16` format version, the
     /// issuer public key, the event sequence number, the ledger (see
     /// [`Ledger::to_bytes`]), the live value of each layer as `u128`, value
-    /// minted and destroyed as `u128`, the remembered transfer receipts, and
+    /// minted and destroyed as `u128`, the remembered transfer receipts, each
+    /// mint authority's last request and note (sorted by authority key), and
     /// finally the SHA-256 of everything before it.
     pub fn snapshot(&self) -> Vec<u8> {
         let mut w = Writer::default();
@@ -542,6 +651,13 @@ impl Issuer {
             for i in issued {
                 write_issued(&mut w, i);
             }
+        }
+        w.u32(self.authorities.len() as u32);
+        for (authorization, issued) in self.authorities.values() {
+            w.bytes(authorization.authority.as_bytes())
+                .u64(authorization.sequence)
+                .bytes(&authorization.signature.to_bytes());
+            write_issued(&mut w, issued);
         }
         let mut bytes = w.finish();
         let checksum: [u8; 32] = Sha256::digest(&bytes).into();
@@ -565,7 +681,8 @@ impl Issuer {
         if &r.array::<8>()? != SNAPSHOT_MAGIC {
             return Err(DecodeError::Invalid("snapshot magic").into());
         }
-        if r.u16()? != SNAPSHOT_VERSION {
+        let version = r.u16()?;
+        if !(1..=SNAPSHOT_VERSION).contains(&version) {
             return Err(DecodeError::Invalid("snapshot version").into());
         }
         if read_key(&mut r)? != key.public_key() {
@@ -588,6 +705,24 @@ impl Issuer {
             }
             receipts.order.push_back(id);
         }
+        let mut authorities = BTreeMap::new();
+        if version >= 2 {
+            let count = r.u32()?;
+            for _ in 0..count {
+                let authorization = MintAuthorization {
+                    authority: read_key(&mut r)?,
+                    sequence: r.u64()?,
+                    signature: Signature::from_bytes(&r.array()?),
+                };
+                let issued = read_issued(&mut r)?;
+                if authorities
+                    .insert(authorization.authority, (authorization, issued))
+                    .is_some()
+                {
+                    return Err(DecodeError::Invalid("duplicate mint authority").into());
+                }
+            }
+        }
         r.finish()?;
         receipts.shrink_to(policy.receipt_capacity as usize);
         Ok(Self {
@@ -600,6 +735,7 @@ impl Issuer {
             minted,
             destroyed,
             receipts,
+            authorities,
         })
     }
 
@@ -621,6 +757,25 @@ impl Issuer {
         let position = self.check_issued(std::slice::from_ref(issued))?;
         self.allocate(position, issued);
         self.minted += u128::from(issued.amount);
+        Ok(())
+    }
+
+    fn apply_authorized_mint(
+        &mut self,
+        authorization: &MintAuthorization,
+        issued: &Issued,
+    ) -> Result<(), ApplyError> {
+        if let Some((last, _)) = self.authorities.get(&authorization.authority)
+            && authorization.sequence <= last.sequence
+        {
+            return Err(ApplyError(format!(
+                "mint sequence {} is not above {}",
+                authorization.sequence, last.sequence
+            )));
+        }
+        self.apply_mint(issued)?;
+        self.authorities
+            .insert(authorization.authority, (*authorization, *issued));
         Ok(())
     }
 
@@ -730,7 +885,7 @@ impl Issuer {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::keys::HolderKey;
+    use crate::keys::{HolderKey, MintKey};
     use crate::transfer::Output;
 
     fn issuer(layers: u32, policy: Policy) -> Issuer {
@@ -965,6 +1120,143 @@ mod tests {
         };
         assert!(i.apply(&forged).is_err(), "value must balance");
         assert_eq!(i.snapshot(), before);
+
+        let (mut i, authority) = minting_issuer();
+        i.authorized_mint(&mint_request(&i, &authority, 5, 8))
+            .unwrap();
+        let before = i.snapshot();
+        let Plan::Apply(stale) = i
+            .plan_authorized_mint(
+                &i.verifier()
+                    .verify_mint(&mint_request(&i, &authority, 6, 8))
+                    .unwrap(),
+            )
+            .unwrap()
+        else {
+            panic!("fresh mint")
+        };
+        let Event::AuthorizedMint {
+            mut authorization,
+            issued,
+        } = stale
+        else {
+            unreachable!()
+        };
+        authorization.sequence = 5;
+        let stale = Event::AuthorizedMint {
+            authorization,
+            issued,
+        };
+        assert!(i.apply(&stale).is_err(), "sequence numbers must rise");
+        assert_eq!(i.snapshot(), before);
+    }
+
+    fn minting_issuer() -> (Issuer, MintKey) {
+        let authority = MintKey::generate();
+        let policy = Policy {
+            mint_authorities: vec![authority.public_key()],
+            ..Policy::cash_like()
+        };
+        (issuer(3, policy), authority)
+    }
+
+    fn mint_request(
+        issuer: &Issuer,
+        authority: &MintKey,
+        sequence: u64,
+        amount: u64,
+    ) -> MintRequest {
+        let holder = HolderKey::generate().public_key();
+        MintRequest::sign(authority, issuer.public_key(), sequence, amount, holder)
+    }
+
+    #[test]
+    fn authorized_mints_need_rising_sequence_numbers() {
+        let (mut i, authority) = minting_issuer();
+        assert_eq!(i.mint_sequence(&authority.public_key()), None);
+        let first = mint_request(&i, &authority, 1, 8);
+        let note = i.authorized_mint(&first).unwrap();
+        assert_eq!(note.amount(), 8);
+        assert_eq!(note.holder(), &first.holder);
+        assert!(matches!(
+            i.status(&note),
+            Ok(NoteStatus::Live { position: 1, .. })
+        ));
+        assert_eq!(i.mint_sequence(&authority.public_key()), Some(1));
+
+        // Resending the request returns the same note and mints nothing.
+        assert_eq!(i.authorized_mint(&first), Ok(note));
+        assert_eq!(i.supply().minted, 8);
+
+        // A different request under a used number is refused.
+        for sequence in [0, 1] {
+            assert_eq!(
+                i.authorized_mint(&mint_request(&i, &authority, sequence, 8)),
+                Err(Error::StaleMint { sequence, last: 1 })
+            );
+        }
+        // Numbers may skip, but never go back.
+        i.authorized_mint(&mint_request(&i, &authority, 7, 4))
+            .unwrap();
+        assert_eq!(
+            i.authorized_mint(&first),
+            Err(Error::StaleMint {
+                sequence: 1,
+                last: 7
+            })
+        );
+        assert_eq!(i.supply().minted, 12);
+    }
+
+    #[test]
+    fn authorities_answer_to_the_current_policy_and_keep_their_numbers() {
+        let (mut i, authority) = minting_issuer();
+        let request = mint_request(&i, &authority, 3, 8);
+        let note = i.authorized_mint(&request).unwrap();
+
+        // Restored under a policy that drops the authority, it cannot mint.
+        let policy = i.policy().clone();
+        let snapshot = i.snapshot();
+        let mut without = Issuer::restore(i.key.clone(), &snapshot, Policy::cash_like()).unwrap();
+        assert_eq!(
+            without.authorized_mint(&mint_request(&without, &authority, 4, 8)),
+            Err(Error::UnknownAuthority(authority.public_key()))
+        );
+        // A request verified under the old policy is checked again.
+        let verified = i
+            .verifier()
+            .verify_mint(&mint_request(&i, &authority, 4, 8))
+            .unwrap();
+        assert_eq!(
+            without.plan_authorized_mint(&verified),
+            Err(Error::UnknownAuthority(authority.public_key()))
+        );
+
+        // Listed again, the authority's old requests stay spent.
+        let mut again = Issuer::restore(i.key.clone(), &snapshot, policy).unwrap();
+        assert_eq!(again.mint_sequence(&authority.public_key()), Some(3));
+        assert_eq!(again.authorized_mint(&request), Ok(note));
+        assert!(matches!(
+            again.authorized_mint(&mint_request(&again, &authority, 2, 8)),
+            Err(Error::StaleMint { .. })
+        ));
+        assert_eq!(again.snapshot(), snapshot);
+    }
+
+    #[test]
+    fn version_1_snapshots_restore_with_no_authorities() {
+        let mut i = issuer(4, Policy::cash_like());
+        let key = HolderKey::generate();
+        i.mint(8, key.public_key()).unwrap();
+        // Version 1 ended with the receipts: drop the empty authority list.
+        let mut body = i.snapshot();
+        body.truncate(body.len() - 32);
+        assert_eq!(body.split_off(body.len() - 4), [0; 4]);
+        body[8..10].copy_from_slice(&1u16.to_be_bytes());
+        let checksum: [u8; 32] = Sha256::digest(&body).into();
+        body.extend_from_slice(&checksum);
+        let restored = Issuer::restore(i.key.clone(), &body, Policy::cash_like()).unwrap();
+        assert_eq!(restored.snapshot(), i.snapshot());
     }
 
     #[test]
@@ -1018,7 +1310,20 @@ mod tests {
         else {
             panic!("fresh transfer")
         };
-        for event in [mint, transfer, i.plan_rotate()] {
+        let authority = MintKey::generate();
+        let authorized = Event::AuthorizedMint {
+            authorization: MintAuthorization {
+                authority: authority.public_key(),
+                sequence: 9,
+                signature: authority.sign(b"anything"),
+            },
+            issued: Issued {
+                serial: Serial::new(2, 1),
+                amount: 4,
+                holder: key.public_key(),
+            },
+        };
+        for event in [mint, transfer, i.plan_rotate(), authorized] {
             assert_eq!(Event::from_bytes(&event.to_bytes()), Ok(event.clone()));
             let json = serde_json::to_string(&event).unwrap();
             assert_eq!(serde_json::from_str::<Event>(&json).unwrap(), event);

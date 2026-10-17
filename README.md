@@ -134,6 +134,15 @@ by default) by the hash of their signed message. If a response is lost, the
 client resends the identical request and gets the identical notes back, since
 Ed25519 signatures are deterministic.
 
+**Minting takes a mint authority's signature.** The policy lists the public
+keys allowed to mint (`mint_authorities`). Each mint request is signed by one
+of them and carries a sequence number, and the issuer accepts only a number
+above that authority's last, so a copied request cannot mint twice, while
+resending the last request returns the same note. Each such mint is journaled
+with its signature, so the journal shows who authorized every unit of supply.
+The server mints no other way: the admin token only rotates. The library's
+`Issuer::mint` remains for code that embeds the issuer directly.
+
 **The issuer is an event-sourced state machine.** Every change is an `Event`
 that the issuer plans without side effects, the store writes and flushes to a
 journal, and only then the issuer applies. Applying is deterministic and
@@ -198,10 +207,12 @@ cargo build --release
 ./target/release/worgl-server serve --state ./issuer --listen 127.0.0.1:8080 --rotate-every 86400
 ```
 
-`init` writes the issuer key and a random 64-character admin token (both
-mode 0600), the policy as `policy.json` and an empty ledger. The server
-refuses to start with an admin token shorter than 32 characters. Edit `policy.json` to change the rules;
-missing fields take their cash-like defaults:
+`init` writes the issuer key, a random 64-character admin token and a mint
+authority key `mint.key` (all mode 0600), the policy as `policy.json` with the
+mint key listed in `mint_authorities`, and an empty ledger. The server never
+reads `mint.key`; move it to wherever you mint from. The server refuses to
+start with an admin token shorter than 32 characters. Edit `policy.json` to
+change the rules; missing fields take their cash-like defaults:
 
 ```json
 { "max_inputs": 16, "denominations": "any" }
@@ -213,14 +224,24 @@ missing fields take their cash-like defaults:
 | GET | `/v1/info` | | layers, supply, policy |
 | POST | `/v1/verify` | `{"note"}` | serial, amount, state, position, hops left |
 | POST | `/v1/transfer` | `{"inputs": [{"note", "signature"}], "outputs": [{"amount", "holder"}]}` | `{"notes"}` |
-| POST | `/v1/admin/mint` | `{"amount", "holder"}` | `{"note"}` |
+| POST | `/v1/mint` | `{"authority", "sequence", "amount", "holder", "signature"}` | `{"note"}` |
 | POST | `/v1/admin/rotate` | | what was destroyed |
+
+To mint, sign a request with the mint key and post it. The issuer key is the
+one `init` printed and `/v1/info` reports:
+
+```sh
+./target/release/worgl-server sign-mint --key ./issuer/mint.key --issuer <issuer key> \
+    --sequence 1 --amount 8 --holder <holder public key> \
+  | curl -sd @- -H 'content-type: application/json' http://127.0.0.1:8080/v1/mint
+```
 
 Admin routes need `Authorization: Bearer <token>`. Errors carry a stable code,
 such as `{"error": "spent", "message": "note 3:17 is already spent"}`; the
 codes are listed in [`ApiError::code`](crates/worgl-server/src/lib.rs). The
-request types are the library's own (`TransferRequest`, `Note`, `PublicKey`),
-so a Rust client signs with the library and posts the JSON it serializes to.
+request types are the library's own (`TransferRequest`, `MintRequest`, `Note`,
+`PublicKey`), so a Rust client signs with the library and posts the JSON it
+serializes to.
 
 The server is one process; a lock file stops a second one from opening the
 same state. It speaks plain HTTP: put it behind a reverse proxy for TLS and
@@ -231,8 +252,8 @@ rate limiting.
 - **The issuer sees lineage.** Inherent to the design; see above.
 - **Sequential serials** let anyone who sees two notes of one generation tell
   which was issued first.
-- **No backing.** Minting is an admin call; there is no deposit or redemption
-  into other money.
+- **No backing.** A mint authority decides what to mint; there is no deposit
+  or redemption into other money.
 - **One issuer key** with no key rotation, and no replication or failover.
 - **No client CLI.** Holders use the library, or any HTTP client plus Ed25519.
 

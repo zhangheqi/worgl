@@ -1,5 +1,6 @@
 use thiserror::Error;
 
+use crate::keys::PublicKey;
 use crate::ledger::{ConfigError, Serial};
 use crate::note::NoteError;
 use crate::policy::PolicyError;
@@ -9,8 +10,11 @@ use crate::policy::PolicyError;
 /// [`Policy`](Error::Policy), [`Note`](Error::Note),
 /// [`DuplicateInput`](Error::DuplicateInput) and
 /// [`WrongKey`](Error::WrongKey) mean the request itself is malformed;
-/// [`Unauthorized`](Error::Unauthorized) means a signature is missing or
-/// wrong; the rest are refusals by the ledger that depend on its state.
+/// [`Unauthorized`](Error::Unauthorized),
+/// [`UnknownAuthority`](Error::UnknownAuthority) and
+/// [`MintUnauthorized`](Error::MintUnauthorized) mean a signature is
+/// missing or wrong; the rest are refusals that depend on the issuer's
+/// state.
 #[derive(Debug, Clone, PartialEq, Eq, Error)]
 #[non_exhaustive]
 pub enum Error {
@@ -58,6 +62,21 @@ pub enum Error {
     LayerFull {
         /// Position of the full layer.
         position: u32,
+    },
+    /// A mint request names a key the policy does not list as a mint authority.
+    #[error("key {0} is not a mint authority of this issuer")]
+    UnknownAuthority(PublicKey),
+    /// A mint request's signature does not verify.
+    #[error("the mint authority's signature does not verify")]
+    MintUnauthorized,
+    /// A mint request reuses a sequence number, or goes below one, that its
+    /// authority already used.
+    #[error("mint sequence {sequence} is not above {last}, the authority's last")]
+    StaleMint {
+        /// The request's sequence number.
+        sequence: u64,
+        /// The last sequence number accepted from the authority.
+        last: u64,
     },
 }
 

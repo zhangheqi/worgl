@@ -3,7 +3,8 @@
 //! The ledger only knows bits and layers. Everything here is a choice an
 //! operator can make differently without touching stored state: which amounts
 //! may exist, how many notes a transfer may consume and create, where new
-//! money lands and how many recent transfers can be safely retried.
+//! money lands, who may ask for it to be minted and how many recent transfers
+//! can be safely retried.
 //!
 //! The default, [`Policy::cash_like`], is chosen for privacy. A transfer that
 //! consumes several notes tells the issuer those notes had one owner, the
@@ -18,6 +19,7 @@
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
+use crate::keys::PublicKey;
 use crate::ledger::LedgerConfig;
 
 /// Which amounts a note may carry.
@@ -126,6 +128,11 @@ pub struct Policy {
     /// notes back. 0 turns this off. Each entry costs about
     /// `40 + 52 × outputs` bytes.
     pub receipt_capacity: u32,
+    /// Keys whose signed [`MintRequest`](crate::MintRequest)s the issuer
+    /// accepts. Empty, the default, accepts none. Removing a key stops it
+    /// minting; the issuer keeps its sequence number, so adding it back
+    /// cannot replay its old requests.
+    pub mint_authorities: Vec<PublicKey>,
 }
 
 impl Policy {
@@ -137,6 +144,7 @@ impl Policy {
             max_outputs: 16,
             denominations: Denominations::PowersOfTwo,
             receipt_capacity: 65_536,
+            mint_authorities: Vec::new(),
         }
     }
 

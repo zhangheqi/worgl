@@ -35,6 +35,7 @@ use thiserror::Error;
 use crate::error::{ApplyError, Error, SetupError};
 use crate::issuer::{Event, Issuer, Plan, RotationReport};
 use crate::keys::{IssuerKey, PublicKey};
+use crate::mint::VerifiedMint;
 use crate::note::Note;
 use crate::policy::Policy;
 use crate::transfer::VerifiedTransfer;
@@ -400,6 +401,20 @@ impl PersistentIssuer {
         let event = self.issuer.plan_mint(amount, holder)?;
         self.commit(&event)?;
         Ok(self.issuer.notes(&event).remove(0))
+    }
+
+    /// Mints at a verified mint authority's request once the mint is on disk.
+    /// Resending the authority's last request returns the same note and
+    /// writes nothing.
+    pub fn authorized_mint(&mut self, mint: &VerifiedMint) -> Result<Note, CommitError> {
+        let mut notes = match self.issuer.plan_authorized_mint(mint)? {
+            Plan::Replay(notes) => notes,
+            Plan::Apply(event) => {
+                self.commit(&event)?;
+                self.issuer.notes(&event)
+            }
+        };
+        Ok(notes.remove(0))
     }
 
     /// Carries out a verified transfer once it is on disk. A resent request

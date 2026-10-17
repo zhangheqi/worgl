@@ -4,7 +4,8 @@
 //! a fresh [`HolderKey`] and hands out only its [`PublicKey`]; the note they
 //! receive names that key, and spending the note needs a signature from it.
 //! A holder key is meant to be used for exactly one note, so nothing at the
-//! issuer ties two notes to the same holder.
+//! issuer ties two notes to the same holder. A [`MintKey`] belongs to a mint
+//! authority, whose signature the issuer requires before it mints.
 //!
 //! Keys and signatures travel as lowercase hex in human-readable formats such
 //! as JSON, and as raw bytes in binary ones.
@@ -197,6 +198,12 @@ macro_rules! secret_key {
 secret_key!(
     /// The issuer's signing key. Every note carries a signature from it.
     IssuerKey
+);
+
+secret_key!(
+    /// A mint authority's key. An issuer mints on request only for the keys
+    /// its policy lists; see [`mint`](crate::mint).
+    MintKey
 );
 
 secret_key!(
