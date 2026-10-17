@@ -1,5 +1,7 @@
 //! End-to-end tests of the HTTP API, in process, against a real store on disk.
 
+use std::sync::atomic::{AtomicU64, Ordering};
+
 use axum::Router;
 use axum::body::Body;
 use axum::http::{Method, Request, StatusCode, header};
@@ -7,8 +9,8 @@ use http_body_util::BodyExt;
 use serde_json::{Value, json};
 use tower::ServiceExt;
 use worgl::{
-    BurnRequest, HolderKey, Issuer, IssuerKey, LedgerConfig, Note, Output, PersistentIssuer,
-    Policy, TransferRequest,
+    BurnRequest, HolderKey, Issuer, IssuerKey, LedgerConfig, MintKey, MintRequest, Note, Output,
+    PersistentIssuer, Policy, PublicKey, TransferRequest,
 };
 use worgl_server::{AppState, Info, RotationSchedule, router};
 
@@ -17,6 +19,9 @@ const TOKEN: &str = "test-admin-token-0123456789abcdef";
 struct Server {
     app: Router,
     state: AppState,
+    issuer: PublicKey,
+    authority: MintKey,
+    sequence: AtomicU64,
     _dir: tempfile::TempDir,
 }
 
@@ -27,14 +32,40 @@ impl Server {
             layers: 4,
             layer_size: 1024,
         };
-        let issuer = Issuer::new(IssuerKey::generate(), ledger, Policy::cash_like()).unwrap();
+        let authority = MintKey::generate();
+        let policy = Policy {
+            mint_authorities: vec![authority.public_key()],
+            ..Policy::cash_like()
+        };
+        let issuer = Issuer::new(IssuerKey::generate(), ledger, policy).unwrap();
+        let public = *issuer.public_key();
         let issuer = PersistentIssuer::create(dir.path(), issuer).unwrap();
         let state = AppState::new(issuer, TOKEN, 1000).unwrap();
         Self {
             app: router(state.clone()),
             state,
+            issuer: public,
+            authority,
+            sequence: AtomicU64::new(0),
             _dir: dir,
         }
+    }
+
+    /// A mint request signed with the next sequence number.
+    fn mint_request(&self, amount: u64, holder: &HolderKey) -> MintRequest {
+        let sequence = self.sequence.fetch_add(1, Ordering::Relaxed) + 1;
+        MintRequest::sign(
+            &self.authority,
+            &self.issuer,
+            sequence,
+            amount,
+            holder.public_key(),
+        )
+    }
+
+    async fn post_mint(&self, request: &MintRequest) -> (StatusCode, Value) {
+        let body = serde_json::to_value(request).unwrap();
+        self.call(Method::POST, "/v1/mint", None, body).await
     }
 
     async fn call(
@@ -66,10 +97,7 @@ impl Server {
     }
 
     async fn mint(&self, amount: u64, holder: &HolderKey) -> Note {
-        let body = json!({"amount": amount, "holder": holder.public_key()});
-        let (status, answer) = self
-            .call(Method::POST, "/v1/admin/mint", Some(TOKEN), body)
-            .await;
+        let (status, answer) = self.post_mint(&self.mint_request(amount, holder)).await;
         assert_eq!(status, StatusCode::OK, "{answer}");
         serde_json::from_value(answer["note"].clone()).unwrap()
     }
@@ -112,18 +140,69 @@ fn short_admin_tokens_are_refused() {
 #[tokio::test]
 async fn admin_routes_need_the_token() {
     let server = Server::new();
-    let body = json!({"amount": 8, "holder": HolderKey::generate().public_key()});
     for token in [None, Some("wrong")] {
         let (status, answer) = server
-            .call(Method::POST, "/v1/admin/mint", token, body.clone())
+            .call(Method::POST, "/v1/admin/rotate", token, Value::Null)
             .await;
         assert_eq!(status, StatusCode::UNAUTHORIZED);
         assert_eq!(answer["error"], "admin_unauthorized");
     }
+    // The admin token cannot mint: there is no admin mint route.
+    let body = json!({"amount": 8, "holder": HolderKey::generate().public_key()});
     let (status, _) = server
-        .call(Method::POST, "/v1/admin/rotate", None, Value::Null)
+        .call(Method::POST, "/v1/admin/mint", Some(TOKEN), body)
         .await;
-    assert_eq!(status, StatusCode::UNAUTHORIZED);
+    assert_eq!(status, StatusCode::NOT_FOUND);
+}
+
+#[tokio::test]
+async fn minting_needs_a_listed_authority_and_fresh_numbers() {
+    let server = Server::new();
+    let alice = HolderKey::generate();
+    let request = server.mint_request(8, &alice);
+    let (code, answer) = server.post_mint(&request).await;
+    assert_eq!(code, StatusCode::OK, "{answer}");
+    let note: Note = serde_json::from_value(answer["note"].clone()).unwrap();
+    assert_eq!(note.holder(), &alice.public_key());
+    assert_eq!(server.verify(&note).await["state"], "live");
+
+    // A resent request gets the same note back; a copied one under a used
+    // number mints nothing.
+    let (code, again) = server.post_mint(&request).await;
+    assert_eq!(code, StatusCode::OK);
+    assert_eq!(again, answer);
+    let used = MintRequest::sign(
+        &server.authority,
+        &server.issuer,
+        request.sequence,
+        16,
+        alice.public_key(),
+    );
+    let (code, answer) = server.post_mint(&used).await;
+    assert_eq!(code, StatusCode::CONFLICT);
+    assert_eq!(answer["error"], "stale_mint");
+
+    // Only listed keys can mint, and only with a good signature.
+    let stranger = MintKey::generate();
+    let foreign = MintRequest::sign(&stranger, &server.issuer, 1, 8, alice.public_key());
+    let (code, answer) = server.post_mint(&foreign).await;
+    assert_eq!(code, StatusCode::FORBIDDEN);
+    assert_eq!(answer["error"], "unknown_authority");
+    let mut forged = server.mint_request(8, &alice);
+    forged.amount = 1024;
+    let (code, answer) = server.post_mint(&forged).await;
+    assert_eq!(code, StatusCode::FORBIDDEN);
+    assert_eq!(answer["error"], "unauthorized");
+
+    let (_, answer) = server
+        .call(Method::GET, "/v1/info", None, Value::Null)
+        .await;
+    let info: Info = serde_json::from_value(answer).unwrap();
+    assert_eq!(info.supply.minted, 8);
+    assert_eq!(
+        info.policy.mint_authorities,
+        [server.authority.public_key()]
+    );
 }
 
 #[tokio::test]
@@ -182,10 +261,7 @@ async fn bad_requests_get_stable_error_codes() {
     assert_eq!(answer["error"], "malformed");
 
     // 3 is not a power of two under the default policy.
-    let body = json!({"amount": 3, "holder": alice.public_key()});
-    let (code, answer) = server
-        .call(Method::POST, "/v1/admin/mint", Some(TOKEN), body)
-        .await;
+    let (code, answer) = server.post_mint(&server.mint_request(3, &alice)).await;
     assert_eq!(code, StatusCode::BAD_REQUEST);
     assert_eq!(answer["error"], "policy");
 
@@ -266,23 +342,11 @@ async fn post(app: Router, path: &'static str, body: Value) -> (StatusCode, Valu
 async fn concurrent_requests_all_land_and_never_double_spend() {
     let server = Server::new();
     let keys: Vec<HolderKey> = (0..64).map(|_| HolderKey::generate()).collect();
-    let mints: Vec<_> = keys
-        .iter()
-        .map(|key| {
-            let body = json!({"amount": 8, "holder": key.public_key()});
-            tokio::spawn(post(server.app.clone(), "/v1/admin/mint", body))
-        })
-        .collect();
+    // An authority sends one mint at a time, so the notes are minted in turn.
     let mut notes = Vec::new();
-    for mint in mints {
-        let (code, answer) = mint.await.unwrap();
-        assert_eq!(code, StatusCode::OK, "{answer}");
-        notes.push(serde_json::from_value::<Note>(answer["note"].clone()).unwrap());
+    for key in &keys {
+        notes.push(server.mint(8, key).await);
     }
-    let mut serials: Vec<_> = notes.iter().map(Note::serial).collect();
-    serials.sort_unstable();
-    serials.dedup();
-    assert_eq!(serials.len(), 64);
 
     // Each note is paid to two different keys at once: one payment wins.
     let mut races = Vec::new();

@@ -27,7 +27,7 @@
 //! This is weaker than blind-signature e-cash, where the issuer cannot link a
 //! note to the one it replaced, and stronger than any account system. Blind
 //! signatures are incompatible with the design: the issuer must choose each
-//! note's serial, because the serial is the note's bit position.
+//! note's serial, because the serial names the note's bit.
 //!
 //! # Layout
 //!
@@ -67,7 +67,9 @@ mod hex_serde;
 pub mod issuer;
 pub mod keys;
 pub mod ledger;
+pub mod mint;
 pub mod note;
+mod permutation;
 pub mod policy;
 pub mod store;
 pub mod transfer;
@@ -75,8 +77,9 @@ pub mod transfer;
 pub use codec::DecodeError;
 pub use error::{ApplyError, Error, SetupError};
 pub use issuer::{Event, Issuer, NoteStatus, Plan, RotationReport, Supply};
-pub use keys::{HolderKey, IssuerKey, PublicKey, Signature};
+pub use keys::{HolderKey, IssuerKey, MintKey, PublicKey, Signature};
 pub use ledger::{Ledger, LedgerConfig, Serial};
+pub use mint::{MintAuthorization, MintRequest, VerifiedMint};
 pub use note::{Note, NoteError};
 pub use policy::{Denominations, Policy, PolicyError};
 pub use store::{Batch, CommitError, FileStore, PersistentIssuer, StoreError};

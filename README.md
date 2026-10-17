@@ -49,15 +49,16 @@ batching transfers blurs this.
 This is weaker than blind-signature e-cash (Chaum, Cashu, GNU Taler), where
 the issuer cannot link a note to the one it replaced, and stronger than any
 account system. Blind signatures do not fit this design: the issuer must
-choose each note's serial, because the serial is the note's bit position.
+choose each note's serial, because the serial names the note's bit.
 
 ## Efficiency
 
 - **Storage:** one bit per note. Four layers of 2²⁰ bits take 512 KiB and
   hold over four million notes in flight.
 - **Status reads and writes:** O(1). A serial maps straight to its bit: the
-  layer's slot is `generation mod layers` and its position is
-  `generation − oldest generation`.
+  layer's slot is `generation mod layers`, its position is
+  `generation − oldest generation`, and the bit is the index run back through
+  a ten-round keyed permutation, about 0.65 µs in a release build.
 - **Rotation:** one word write per 64 bits the dropped layer used.
 - **Per transfer:** two signature checks per input (issuer and holder) and one
   signature per output.
@@ -73,7 +74,7 @@ choose each note's serial, because the serial is the note's bit position.
 |---|---|
 | Centralized, no wallets | One [`Issuer`](crates/worgl/src/issuer.rs). It keeps no accounts and stores no notes; holders keep their own notes. |
 | Asymmetric crypto issues notes | Ed25519 via `ed25519-dalek`, strict verification ([`keys.rs`](crates/worgl/src/keys.rs)). |
-| Serial numbers | [`Serial`](crates/worgl/src/ledger.rs) is `generation:index`. |
+| Serial numbers | [`Serial`](crates/worgl/src/ledger.rs) is `generation:index`; the index is a keyed permutation of the note's bit ([`permutation.rs`](crates/worgl/src/permutation.rs)). |
 | Bit array of valid notes | [`Ledger`](crates/worgl/src/ledger.rs): one flat array, slot-major, `u64` words. |
 | Transfer invalidates and reissues | [`Issuer::plan_transfer`](crates/worgl/src/issuer.rs) and `apply`. |
 | Last-used index | Each layer counts the bits it has handed out; issuing sets the next one. |
@@ -88,6 +89,15 @@ can be changed.
 **Serials carry a generation that is never reused.** When a dropped layer's
 slot is reused, an old note's serial names a generation that no longer exists,
 so it can never match the fresh bit that sits where its bit used to be.
+
+**Serial indexes are scrambled.** A layer hands out its bits in order, but a
+note's index is its bit under a keyed permutation that differs in every
+generation and is derived from the issuer key. A serial therefore does not
+say whether a note was issued before or after another, and the outputs of
+one split do not carry consecutive indexes. The generation still tells which
+layer, and so roughly which rotation period, a note was issued in. An issuer
+restored from a snapshot written before this change keeps using bits as
+indexes, because its notes already carry them.
 
 **Notes are 149 signed bytes.** Version, issuer key, serial, amount, holder
 key and the issuer's signature. In text they are unpadded URL-safe base64. The
@@ -154,6 +164,15 @@ bound and the guarantee.
 by default) by the hash of their signed message. If a response is lost, the
 client resends the identical request and gets the identical notes back, since
 Ed25519 signatures are deterministic.
+
+**Minting takes a mint authority's signature.** The policy lists the public
+keys allowed to mint (`mint_authorities`). Each mint request is signed by one
+of them and carries a sequence number, and the issuer accepts only a number
+above that authority's last, so a copied request cannot mint twice, while
+resending the last request returns the same note. Each such mint is journaled
+with its signature, so the journal shows who authorized every unit of supply.
+The server mints no other way: the admin token only rotates. The library's
+`Issuer::mint` remains for code that embeds the issuer directly.
 
 **The issuer is an event-sourced state machine.** Every change is an `Event`
 that the issuer plans without side effects, the store writes and flushes to a
@@ -224,10 +243,12 @@ cargo build --release
 ./target/release/worgl-server serve --state ./issuer --listen 127.0.0.1:8080 --rotate-every 86400
 ```
 
-`init` writes the issuer key and a random 64-character admin token (both
-mode 0600), the policy as `policy.json` and an empty ledger. The server
-refuses to start with an admin token shorter than 32 characters. Edit `policy.json` to change the rules;
-missing fields take their cash-like defaults:
+`init` writes the issuer key, a random 64-character admin token and a mint
+authority key `mint.key` (all mode 0600), the policy as `policy.json` with the
+mint key listed in `mint_authorities`, and an empty ledger. The server never
+reads `mint.key`; move it to wherever you mint from. The server refuses to
+start with an admin token shorter than 32 characters. Edit `policy.json` to
+change the rules; missing fields take their cash-like defaults:
 
 ```json
 { "max_inputs": 16, "denominations": "any" }
@@ -240,15 +261,24 @@ missing fields take their cash-like defaults:
 | POST | `/v1/verify` | `{"note"}` | serial, amount, state, position, hops left |
 | POST | `/v1/transfer` | `{"inputs": [{"note", "signature"}], "outputs": [{"amount", "holder"}]}` | `{"notes"}` |
 | POST | `/v1/burn` | `{"inputs": [{"note", "signature"}]}` | `{"value"}` burned |
-| POST | `/v1/admin/mint` | `{"amount", "holder"}` | `{"note"}` |
+| POST | `/v1/mint` | `{"authority", "sequence", "amount", "holder", "signature"}` | `{"note"}` |
 | POST | `/v1/admin/rotate` | | what was destroyed |
+
+To mint, sign a request with the mint key and post it. The issuer key is the
+one `init` printed and `/v1/info` reports:
+
+```sh
+./target/release/worgl-server sign-mint --key ./issuer/mint.key --issuer <issuer key> \
+    --sequence 1 --amount 8 --holder <holder public key> \
+  | curl -sd @- -H 'content-type: application/json' http://127.0.0.1:8080/v1/mint
+```
 
 Admin routes need `Authorization: Bearer <token>`. Errors carry a stable code,
 such as `{"error": "spent", "message": "note 3:17 is already spent"}`; the
 codes are listed in [`ApiError::code`](crates/worgl-server/src/lib.rs). The
-request types are the library's own (`TransferRequest`, `BurnRequest`, `Note`,
-`PublicKey`), so a Rust client signs with the library and posts the JSON it
-serializes to.
+request types are the library's own (`TransferRequest`, `BurnRequest`,
+`MintRequest`, `Note`, `PublicKey`), so a Rust client signs with the library
+and posts the JSON it serializes to.
 
 The server is one process; a lock file stops a second one from opening the
 same state. It speaks plain HTTP: put it behind a reverse proxy for TLS and
@@ -257,10 +287,8 @@ rate limiting.
 ## Not covered yet
 
 - **The issuer sees lineage.** Inherent to the design; see above.
-- **Sequential serials** let anyone who sees two notes of one generation tell
-  which was issued first.
-- **No backing.** Minting is an admin call; there is no deposit or redemption
-  into other money.
+- **No backing.** A mint authority decides what to mint; there is no deposit
+  or redemption into other money.
 - **One issuer key** with no key rotation, and no replication or failover.
 - **No client CLI.** Holders use the library, or any HTTP client plus Ed25519.
 

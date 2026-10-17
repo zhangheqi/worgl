@@ -45,6 +45,7 @@ use thiserror::Error;
 use crate::error::{ApplyError, Error, SetupError};
 use crate::issuer::{Event, Issuer, Plan, RotationReport};
 use crate::keys::{IssuerKey, PublicKey};
+use crate::mint::VerifiedMint;
 use crate::note::Note;
 use crate::policy::Policy;
 use crate::transfer::{VerifiedBurn, VerifiedTransfer};
@@ -489,6 +490,20 @@ impl PersistentIssuer {
         Ok(self.issuer.notes(&event).remove(0))
     }
 
+    /// Mints at a verified mint authority's request once the mint is on disk.
+    /// Resending the authority's last request returns the same note and
+    /// writes nothing.
+    pub fn authorized_mint(&mut self, mint: &VerifiedMint) -> Result<Note, CommitError> {
+        let mut notes = match self.issuer.plan_authorized_mint(mint)? {
+            Plan::Replay(notes) => notes,
+            Plan::Apply(event) => {
+                self.commit(&event)?;
+                self.issuer.notes(&event)
+            }
+        };
+        Ok(notes.remove(0))
+    }
+
     /// Carries out a verified transfer once it is on disk. A resent request
     /// that was already applied returns the same notes and writes nothing.
     pub fn transfer(&mut self, transfer: &VerifiedTransfer) -> Result<Vec<Note>, CommitError> {
@@ -580,6 +595,17 @@ impl Batch<'_> {
         Ok(self.stage(event).remove(0))
     }
 
+    /// Mints at a verified mint authority's request. Resending the
+    /// authority's last request returns the same note and adds nothing to
+    /// the batch.
+    pub fn authorized_mint(&mut self, mint: &VerifiedMint) -> Result<Note, Error> {
+        let mut notes = match self.owner.issuer.plan_authorized_mint(mint)? {
+            Plan::Replay(notes) => notes,
+            Plan::Apply(event) => self.stage(event),
+        };
+        Ok(notes.remove(0))
+    }
+
     /// Carries out a verified transfer. A resent request that was already
     /// applied returns the same notes and adds nothing to the batch.
     pub fn transfer(&mut self, transfer: &VerifiedTransfer) -> Result<Vec<Note>, Error> {
@@ -659,8 +685,9 @@ impl Drop for Batch<'_> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::keys::HolderKey;
+    use crate::keys::{HolderKey, MintKey};
     use crate::ledger::LedgerConfig;
+    use crate::mint::MintRequest;
     use crate::transfer::{BurnRequest, Output, TransferRequest};
 
     const LEDGER: LedgerConfig = LedgerConfig {
@@ -908,6 +935,37 @@ mod tests {
         drop(p);
         let p = PersistentIssuer::open(dir.path(), key, Policy::cash_like()).unwrap();
         assert_eq!(p.issuer().snapshot(), expected);
+    }
+
+    #[test]
+    fn a_mint_resent_in_the_same_batch_mints_once() {
+        let dir = tempfile::tempdir().unwrap();
+        let key = IssuerKey::generate();
+        let authority = MintKey::generate();
+        let policy = Policy {
+            mint_authorities: vec![authority.public_key()],
+            ..Policy::cash_like()
+        };
+        let issuer = Issuer::new(key.clone(), LEDGER, policy.clone()).unwrap();
+        let mut p = PersistentIssuer::create(dir.path(), issuer).unwrap();
+        let holder = HolderKey::generate().public_key();
+        let request = MintRequest::sign(&authority, p.public_key(), 1, 8, holder);
+        let verified = p.issuer().verifier().verify_mint(&request).unwrap();
+
+        let mut batch = p.batch().unwrap();
+        let note = batch.authorized_mint(&verified).unwrap();
+        assert_eq!(batch.authorized_mint(&verified).unwrap(), note);
+        assert_eq!(batch.len(), 1);
+        batch.commit().unwrap();
+
+        let expected = p.issuer().snapshot();
+        drop(p);
+        let p = PersistentIssuer::open(dir.path(), key, policy).unwrap();
+        assert_eq!(p.issuer().snapshot(), expected);
+        assert!(matches!(
+            p.issuer().status(&note),
+            Ok(crate::NoteStatus::Live { .. })
+        ));
     }
 
     #[test]

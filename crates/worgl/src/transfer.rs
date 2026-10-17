@@ -250,6 +250,11 @@ impl Verifier {
         &self.issuer
     }
 
+    /// The policy it checks against.
+    pub fn policy(&self) -> &Policy {
+        &self.policy
+    }
+
     /// Checks the request's shape against the policy, every input note's
     /// issuer signature, that no note appears twice and every holder
     /// signature. Cheap checks run first.
