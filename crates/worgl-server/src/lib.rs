@@ -16,6 +16,7 @@
 //! | GET    | `/v1/info`          |                                    | [`Info`]               |
 //! | POST   | `/v1/verify`        | `{"note": …}`                      | [`Verified`]           |
 //! | POST   | `/v1/transfer`      | [`TransferRequest`]                | `{"notes": [...]}`     |
+//! | POST   | `/v1/burn`          | [`BurnRequest`]                    | `{"value": …}`         |
 //! | POST   | `/v1/admin/mint`    | `{"amount": …, "holder": …}`       | `{"note": …}`          |
 //! | POST   | `/v1/admin/rotate`  |                                    | [`RotationReport`]     |
 //!
@@ -23,7 +24,7 @@
 //! status code and `{"error": code, "message": text}`, where `code` is one
 //! of the stable strings listed on [`ApiError::code`].
 
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, RwLock};
 
 use axum::extract::rejection::JsonRejection;
 use axum::extract::{DefaultBodyLimit, State};
@@ -35,8 +36,8 @@ use serde::{Deserialize, Serialize};
 use subtle::ConstantTimeEq;
 use worgl::issuer::LayerSummary;
 use worgl::{
-    CommitError, Error, Note, NoteStatus, PersistentIssuer, Policy, PublicKey, RotationReport,
-    Serial, Supply, TransferRequest, Verifier,
+    BurnRequest, CommitError, Error, Note, NoteStatus, PersistentIssuer, Policy, PublicKey,
+    RotationReport, Serial, Supply, TransferRequest, Verifier,
 };
 
 /// Largest request body accepted, in bytes.
@@ -66,6 +67,19 @@ pub struct AppState {
     inner: Arc<Mutex<Inner>>,
     verifier: Verifier,
     admin_token: Arc<str>,
+    schedule: Arc<RwLock<Option<RotationSchedule>>>,
+}
+
+/// When the issuer rotates on its own, as reported by `GET /v1/info`.
+///
+/// Clients use it to tell when a frozen note can move again and when a note
+/// must be refreshed before its layer is dropped.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RotationSchedule {
+    /// Seconds between rotations.
+    pub period_secs: u64,
+    /// Unix time, in seconds, of the next scheduled rotation.
+    pub next_at: u64,
 }
 
 struct Inner {
@@ -120,7 +134,20 @@ impl AppState {
                 compact_at: compact_every,
             })),
             admin_token: admin_token.into(),
+            schedule: Arc::new(RwLock::new(None)),
         })
+    }
+
+    /// Records the rotation schedule that `GET /v1/info` reports. The
+    /// scheduler calls this whenever it picks its next boundary; `None` means
+    /// rotation happens only through the admin API.
+    pub fn set_rotation_schedule(&self, schedule: Option<RotationSchedule>) {
+        // The lock guards a plain value, so a poisoned one still holds a usable schedule.
+        *self.schedule.write().unwrap_or_else(|e| e.into_inner()) = schedule;
+    }
+
+    fn rotation_schedule(&self) -> Option<RotationSchedule> {
+        *self.schedule.read().unwrap_or_else(|e| e.into_inner())
     }
 
     /// Runs `f` on the blocking pool with the issuer locked.
@@ -175,6 +202,7 @@ pub fn router(state: AppState) -> Router {
         .route("/v1/info", get(info))
         .route("/v1/verify", post(verify))
         .route("/v1/transfer", post(transfer))
+        .route("/v1/burn", post(burn))
         .route("/v1/admin/mint", post(mint))
         .route("/v1/admin/rotate", post(rotate))
         .layer(DefaultBodyLimit::max(BODY_LIMIT))
@@ -196,11 +224,16 @@ pub struct Info {
     pub supply: Supply,
     /// The rules in force.
     pub policy: Policy,
+    /// The rotation schedule, or `null` when rotation happens only through
+    /// the admin API.
+    #[serde(default)]
+    pub rotation: Option<RotationSchedule>,
 }
 
 async fn info(State(state): State<AppState>) -> Result<Json<Info>, ApiError> {
+    let rotation = state.rotation_schedule();
     state
-        .locked(|inner| {
+        .locked(move |inner| {
             let issuer = inner.issuer.issuer();
             Ok(Json(Info {
                 issuer: *issuer.public_key(),
@@ -209,6 +242,7 @@ async fn info(State(state): State<AppState>) -> Result<Json<Info>, ApiError> {
                 layers: issuer.layers(),
                 supply: issuer.supply(),
                 policy: issuer.policy().clone(),
+                rotation,
             }))
         })
         .await
@@ -273,6 +307,32 @@ async fn transfer(
         })
         .await?;
     Ok(Json(NotesBody { notes }))
+}
+
+/// Answer of `POST /v1/burn`: the value destroyed. A resent burn answers
+/// with the same value and destroys nothing more.
+#[derive(Serialize, Deserialize)]
+struct BurnedBody {
+    value: u128,
+}
+
+async fn burn(
+    State(state): State<AppState>,
+    body: Result<Json<BurnRequest>, JsonRejection>,
+) -> Result<Json<BurnedBody>, ApiError> {
+    let Json(request) = body?;
+    let verifier = state.verifier.clone();
+    let verified = tokio::task::spawn_blocking(move || verifier.verify_burn(&request))
+        .await
+        .map_err(|_| ApiError::internal("verification panicked"))??;
+    let value = state
+        .locked(move |inner| {
+            let value = inner.issuer.burn(&verified)?;
+            inner.after_write();
+            Ok(value)
+        })
+        .await?;
+    Ok(Json(BurnedBody { value }))
 }
 
 #[derive(Deserialize)]
