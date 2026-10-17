@@ -19,7 +19,7 @@ It is a primitive for autonomous systems that pay each other in credits,
 quotas or any other unit, rather than a cash product. Identity checks and
 regulation are out of scope.
 
-The workspace has three crates:
+The workspace has four crates:
 
 - [`worgl`](crates/worgl): the library. Ledger, note format, transfer
   protocol, policy, issuer state machine and crash-safe storage.
@@ -28,6 +28,8 @@ The workspace has three crates:
 - [`worgl-sdk`](crates/worgl-sdk): the holder's side. A note store that
   requests, pays, receives and refreshes notes while keeping the privacy
   rules, with no networking of its own.
+- [`worgl-client`](crates/worgl-client): talks to the server. Typed calls
+  for every route, and a purse that runs a holder over HTTP and saves it.
 
 > **Status:** 0.1. The design and code have not had an independent security
 > review. Do not use it to hold anything you cannot afford to lose.
@@ -291,6 +293,27 @@ the notes about to die to the holder itself, each at a random moment before
 the rotation. The store saves to JSON with its secret keys, so encrypt it at
 rest: the notes are bearer.
 
+`worgl-client` runs it against a server. A `Purse` wraps a holder, a
+`Client` and a `Store`: it reads mint info by itself, submits each transfer
+at its time, retries what fails on the way (a resent transfer gets the same
+answer), and saves after every change, before handing out anything that
+depends on it.
+
+```rust
+let client = Client::new("https://mint.example.com")?;
+let alice = Purse::open(client.clone(), "alice.json")?;
+let bob = Purse::open(client, "bob.json")?;
+
+let request = bob.request(&mint, 5).await?;                 // Bob → Alice
+let payment = alice.pay(&request, Spacing::default()).await?; // Alice → Bob
+bob.receive(&request, &payment).await?;                     // checks, submits, keeps
+alice.settle(Spacing::default()).await?;                    // later: her change
+```
+
+When the payer submits instead (`Purse::submit`), it hands the notes from the
+answers to the payee, who checks their signatures and keeps them with
+`Purse::accept`.
+
 ## Running the server
 
 ```sh
@@ -379,8 +402,8 @@ behind a reverse proxy for TLS and rate limiting.
   or redemption into other money.
 - **One copy of each mint**, with no replication or failover. The issuer key
   itself never rotates: a new one is a new mint.
-- **No HTTP client or CLI.** `worgl-sdk` makes and records transfers but
-  does not send them; submit them with any HTTP client.
+- **No CLI or TypeScript SDK yet.** Rust applications use `worgl-client`;
+  others call the HTTP API directly.
 
 ## Development
 

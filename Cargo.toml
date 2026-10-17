@@ -1,6 +1,6 @@
 [workspace]
 resolver = "3"
-members = ["crates/worgl", "crates/worgl-sdk", "crates/worgl-server"]
+members = ["crates/worgl", "crates/worgl-client", "crates/worgl-sdk", "crates/worgl-server"]
 
 [workspace.package]
 version = "0.1.0"
@@ -12,6 +12,8 @@ authors = ["The Worgl contributors"]
 
 [workspace.dependencies]
 worgl = { path = "crates/worgl", version = "0.1.0" }
+worgl-sdk = { path = "crates/worgl-sdk", version = "0.1.0" }
+worgl-server = { path = "crates/worgl-server" }
 
 anyhow = "1"
 axum = "0.8"
@@ -22,6 +24,7 @@ getrandom = "0.4"
 hex = "0.4"
 http-body-util = "0.1"
 proptest = "1"
+reqwest = { version = "0.13", default-features = false, features = ["http2", "json", "rustls"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 sha2 = "0.11"
