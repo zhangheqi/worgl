@@ -19,12 +19,15 @@ It is a primitive for autonomous systems that pay each other in credits,
 quotas or any other unit, rather than a cash product. Identity checks and
 regulation are out of scope.
 
-The workspace has two crates:
+The workspace has three crates:
 
 - [`worgl`](crates/worgl): the library. Ledger, note format, transfer
   protocol, policy, issuer state machine and crash-safe storage.
 - [`worgl-server`](crates/worgl-server): an HTTP server built on it that
   hosts many issuers, called mints, side by side.
+- [`worgl-sdk`](crates/worgl-sdk): the holder's side. A note store that
+  requests, pays, receives and refreshes notes while keeping the privacy
+  rules, with no networking of its own.
 
 > **Status:** 0.1. The design and code have not had an independent security
 > review. Do not use it to hold anything you cannot afford to lose.
@@ -258,6 +261,35 @@ event before applying it. To keep signature checks out of a lock, verify with
 split, pay, freeze in the last layer, rotate, replay refused, idle money
 expiring and refreshed money living on.
 
+## Holding and paying
+
+The library lets a holder do anything the protocol allows, including things
+that leak who owns what. `worgl-sdk` does the right thing by default: a fresh
+key for every note it expects, one note per transfer with change back to
+fresh keys, the transfers of one payment and the refreshes before a rotation
+spread out at random moments, and outputs in random order.
+
+A payment takes one round trip between the two holders:
+
+1. The payee calls `Holder::request` and sends the `PaymentRequest`: the
+   amount as notes, each to a fresh key of its own.
+2. The payer calls `Holder::pay` and sends back the `Payment`: signed
+   transfers, each spending one of its notes, with a time to submit each.
+   It prefers one note that covers everything; otherwise it spends several,
+   largest first.
+3. The payee checks it with `PaymentRequest::check`, submits each transfer
+   to the mint at its time, and takes the new notes in with
+   `Holder::absorb`. The payer records the same answers with
+   `Holder::settle`, which takes in its change. A payer that never saw the
+   answer resends its outgoing transfers and gets the same notes back.
+
+A `MintView`, read from the mint's info, tells the store which notes can
+move now, which are frozen until the next rotation and which die at it, and
+follows the rotation schedule without asking again. `Holder::refresh` pays
+the notes about to die to the holder itself, each at a random moment before
+the rotation. The store saves to JSON with its secret keys, so encrypt it at
+rest: the notes are bearer.
+
 ## Running the server
 
 ```sh
@@ -346,7 +378,8 @@ behind a reverse proxy for TLS and rate limiting.
   or redemption into other money.
 - **One copy of each mint**, with no replication or failover. The issuer key
   itself never rotates: a new one is a new mint.
-- **No client CLI.** Holders use the library, or any HTTP client plus Ed25519.
+- **No HTTP client or CLI.** `worgl-sdk` makes and records transfers but
+  does not send them; submit them with any HTTP client.
 
 ## Development
 

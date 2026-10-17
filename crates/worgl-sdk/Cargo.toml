@@ -1,0 +1,25 @@
+[package]
+name = "worgl-sdk"
+description = "The holder's side of Worgl: a note store that pays, receives and refreshes notes while keeping the privacy rules"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+keywords = ["ecash", "token", "wallet", "sdk"]
+categories = ["cryptography"]
+
+[dependencies]
+getrandom.workspace = true
+hex.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+worgl.workspace = true
+
+[dev-dependencies]
+proptest.workspace = true
+
+[lints]
+workspace = true
