@@ -13,7 +13,7 @@ use tracing_subscriber::EnvFilter;
 use worgl::{
     Issuer, IssuerKey, LedgerConfig, MintKey, MintRequest, PersistentIssuer, Policy, PublicKey,
 };
-use worgl_server::{AppState, router};
+use worgl_server::{AppState, RotationSchedule, router};
 
 const KEY_FILE: &str = "issuer.key";
 const TOKEN_FILE: &str = "admin.token";
@@ -256,6 +256,10 @@ async fn rotate_on_schedule(app: AppState, period: u64, marker: PathBuf) {
     loop {
         let now = unix_now();
         let next = last.saturating_add(period);
+        app.set_rotation_schedule(Some(RotationSchedule {
+            period_secs: period,
+            next_at: next,
+        }));
         if now < next {
             // Sleeping is on the monotonic clock; check the wall clock again on waking.
             tokio::time::sleep(Duration::from_secs(next - now)).await;
