@@ -212,6 +212,19 @@ impl Policy {
         Ok(())
     }
 
+    /// Checks a burn of `inputs` notes: at least one, and no more than a
+    /// transfer may spend, so a burn reveals no more co-ownership than a
+    /// transfer would.
+    pub fn check_burn(&self, inputs: usize) -> Result<(), PolicyError> {
+        if inputs == 0 || inputs > usize::from(self.max_inputs) {
+            return Err(PolicyError::Inputs {
+                count: inputs,
+                max: self.max_inputs,
+            });
+        }
+        Ok(())
+    }
+
     fn check_amount(&self, amount: u64) -> Result<(), PolicyError> {
         if amount == 0 {
             return Err(PolicyError::ZeroAmount);
@@ -246,8 +259,8 @@ pub enum PolicyError {
     /// An explicit denomination list is empty, contains zero or is not strictly ascending.
     #[error("denominations must be a non-empty, strictly ascending list without zero")]
     Denominations,
-    /// The transfer has no inputs or too many.
-    #[error("a transfer takes 1 to {max} input notes, not {count}")]
+    /// The transfer or burn has no inputs or too many.
+    #[error("a transfer or burn takes 1 to {max} input notes, not {count}")]
     Inputs {
         /// Inputs given.
         count: usize,

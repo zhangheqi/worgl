@@ -17,6 +17,15 @@
 //!
 //! The SHA-256 of the message is the request's [`TransferId`]. The issuer
 //! uses it to recognise a resent request and answer it with the same notes.
+//!
+//! A [`BurnRequest`] destroys notes on purpose, for a service that consumes
+//! the tokens it is paid. Its holders sign a message under a different
+//! domain, so a burn signature never passes as a transfer's or the reverse:
+//!
+//! ```text
+//! b"worgl/burn/v1" ‖ issuer key (32)
+//!   ‖ input count (u32) ‖ for each input:  generation (u64) ‖ index (u32)
+//! ```
 
 use std::fmt;
 use std::str::FromStr;
@@ -33,6 +42,7 @@ use crate::note::Note;
 use crate::policy::Policy;
 
 const DOMAIN: &[u8] = b"worgl/transfer/v1";
+const BURN_DOMAIN: &[u8] = b"worgl/burn/v1";
 
 /// A note to be created by a transfer.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
@@ -67,26 +77,7 @@ impl TransferRequest {
     ///
     /// Fails with [`Error::WrongKey`] if a key is not the one its note names.
     pub fn sign(inputs: &[(Note, &HolderKey)], outputs: Vec<Output>) -> Result<Self, Error> {
-        for (input, (note, key)) in inputs.iter().enumerate() {
-            if note.holder() != &key.public_key() {
-                return Err(Error::WrongKey { input });
-            }
-        }
-        let Some((first, _)) = inputs.first() else {
-            return Ok(Self {
-                inputs: Vec::new(),
-                outputs,
-            });
-        };
-        let serials: Vec<Serial> = inputs.iter().map(|(note, _)| note.serial()).collect();
-        let message = message(first.issuer(), &serials, &outputs);
-        let inputs = inputs
-            .iter()
-            .map(|(note, key)| Spend {
-                note: *note,
-                signature: key.sign(&message),
-            })
-            .collect();
+        let inputs = sign_inputs(inputs, |issuer, serials| message(issuer, serials, &outputs))?;
         Ok(Self { inputs, outputs })
     }
 
@@ -98,15 +89,75 @@ impl TransferRequest {
 
     /// The request's identity, as computed by the issuer that `issuer` names.
     pub fn id(&self, issuer: &PublicKey) -> TransferId {
-        TransferId::of(&message(issuer, &self.serials(), &self.outputs))
+        TransferId::of(&message(issuer, &serials(&self.inputs), &self.outputs))
+    }
+}
+
+/// A signed request to destroy `inputs`, issuing nothing in their place.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct BurnRequest {
+    /// The notes being destroyed, each with its holder's signature.
+    pub inputs: Vec<Spend>,
+}
+
+impl BurnRequest {
+    /// Builds and signs a burn. Each input note comes with the holder key it
+    /// is bound to.
+    ///
+    /// Fails with [`Error::WrongKey`] if a key is not the one its note names.
+    pub fn sign(inputs: &[(Note, &HolderKey)]) -> Result<Self, Error> {
+        let inputs = sign_inputs(inputs, burn_message)?;
+        Ok(Self { inputs })
     }
 
-    fn serials(&self) -> Vec<Serial> {
-        self.inputs
-            .iter()
-            .map(|spend| spend.note.serial())
-            .collect()
+    /// Signs a one-note burn, the only kind [`Policy::cash_like`] allows.
+    pub fn single(note: Note, key: &HolderKey) -> Result<Self, Error> {
+        Self::sign(&[(note, key)])
     }
+
+    /// The request's identity, as computed by the issuer that `issuer` names.
+    pub fn id(&self, issuer: &PublicKey) -> TransferId {
+        TransferId::of(&burn_message(issuer, &serials(&self.inputs)))
+    }
+}
+
+fn burn_message(issuer: &PublicKey, serials: &[Serial]) -> Vec<u8> {
+    let mut w = Writer::with_capacity(BURN_DOMAIN.len() + 36 + serials.len() * 12);
+    w.bytes(BURN_DOMAIN).bytes(issuer.as_bytes());
+    w.u32(serials.len() as u32);
+    for serial in serials {
+        w.u64(serial.generation).u32(serial.index);
+    }
+    w.finish()
+}
+
+/// Checks each key is the one its note names, then signs the message that
+/// `message` builds from the first note's issuer and every input's serial.
+fn sign_inputs(
+    inputs: &[(Note, &HolderKey)],
+    message: impl FnOnce(&PublicKey, &[Serial]) -> Vec<u8>,
+) -> Result<Vec<Spend>, Error> {
+    for (input, (note, key)) in inputs.iter().enumerate() {
+        if note.holder() != &key.public_key() {
+            return Err(Error::WrongKey { input });
+        }
+    }
+    let Some((first, _)) = inputs.first() else {
+        return Ok(Vec::new());
+    };
+    let serials: Vec<Serial> = inputs.iter().map(|(note, _)| note.serial()).collect();
+    let message = message(first.issuer(), &serials);
+    Ok(inputs
+        .iter()
+        .map(|(note, key)| Spend {
+            note: *note,
+            signature: key.sign(&message),
+        })
+        .collect())
+}
+
+fn serials(inputs: &[Spend]) -> Vec<Serial> {
+    inputs.iter().map(|spend| spend.note.serial()).collect()
 }
 
 fn message(issuer: &PublicKey, serials: &[Serial], outputs: &[Output]) -> Vec<u8> {
@@ -123,8 +174,8 @@ fn message(issuer: &PublicKey, serials: &[Serial], outputs: &[Output]) -> Vec<u8
     w.finish()
 }
 
-/// SHA-256 of a transfer's signed message. Two requests with the same id
-/// spend the same notes into the same outputs.
+/// SHA-256 of a transfer's or burn's signed message. Two requests with the
+/// same id spend the same notes into the same outputs.
 #[derive(Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub struct TransferId([u8; 32]);
 
@@ -211,31 +262,47 @@ impl Verifier {
         let inputs: Vec<u64> = request.inputs.iter().map(|s| s.note.amount()).collect();
         let outputs: Vec<u64> = request.outputs.iter().map(|o| o.amount).collect();
         self.policy.check_transfer(&inputs, &outputs)?;
-
-        let serials = request.serials();
-        let mut sorted = serials.clone();
-        sorted.sort_unstable();
-        if let Some(pair) = sorted.windows(2).find(|pair| pair[0] == pair[1]) {
-            return Err(Error::DuplicateInput(pair[0]));
-        }
-        for (input, spend) in request.inputs.iter().enumerate() {
-            spend
-                .note
-                .verify(&self.issuer)
-                .map_err(|error| Error::Note { input, error })?;
-        }
-        let message = message(&self.issuer, &serials, &request.outputs);
-        for (input, spend) in request.inputs.iter().enumerate() {
-            if !spend.note.holder().verify(&message, &spend.signature) {
-                return Err(Error::Unauthorized { input });
-            }
-        }
+        let message = message(&self.issuer, &serials(&request.inputs), &request.outputs);
+        self.check_inputs(&request.inputs, &message)?;
         Ok(VerifiedTransfer {
             issuer: self.issuer,
             id: TransferId::of(&message),
             inputs: request.inputs.iter().map(|spend| spend.note).collect(),
             outputs: request.outputs.clone(),
         })
+    }
+
+    /// Checks a burn the same way: input count against the policy, every
+    /// note's issuer signature, no note twice and every holder signature.
+    pub fn verify_burn(&self, request: &BurnRequest) -> Result<VerifiedBurn, Error> {
+        self.policy.check_burn(request.inputs.len())?;
+        let message = burn_message(&self.issuer, &serials(&request.inputs));
+        self.check_inputs(&request.inputs, &message)?;
+        Ok(VerifiedBurn {
+            issuer: self.issuer,
+            id: TransferId::of(&message),
+            inputs: request.inputs.iter().map(|spend| spend.note).collect(),
+        })
+    }
+
+    fn check_inputs(&self, inputs: &[Spend], message: &[u8]) -> Result<(), Error> {
+        let mut sorted = serials(inputs);
+        sorted.sort_unstable();
+        if let Some(pair) = sorted.windows(2).find(|pair| pair[0] == pair[1]) {
+            return Err(Error::DuplicateInput(pair[0]));
+        }
+        for (input, spend) in inputs.iter().enumerate() {
+            spend
+                .note
+                .verify(&self.issuer)
+                .map_err(|error| Error::Note { input, error })?;
+        }
+        for (input, spend) in inputs.iter().enumerate() {
+            if !spend.note.holder().verify(message, &spend.signature) {
+                return Err(Error::Unauthorized { input });
+            }
+        }
+        Ok(())
     }
 }
 
@@ -266,6 +333,38 @@ impl VerifiedTransfer {
     /// The requested outputs.
     pub fn outputs(&self) -> &[Output] {
         &self.outputs
+    }
+}
+
+/// A burn request whose signatures and shape have been checked.
+///
+/// Only [`Verifier::verify_burn`] creates one. Whether its inputs are still
+/// live is decided later, against the ledger, by
+/// [`Issuer::plan_burn`](crate::Issuer::plan_burn).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct VerifiedBurn {
+    pub(crate) issuer: PublicKey,
+    pub(crate) id: TransferId,
+    pub(crate) inputs: Vec<Note>,
+}
+
+impl VerifiedBurn {
+    /// The burn's identity.
+    pub fn id(&self) -> TransferId {
+        self.id
+    }
+
+    /// The notes to destroy.
+    pub fn inputs(&self) -> &[Note] {
+        &self.inputs
+    }
+
+    /// Their total value.
+    pub fn value(&self) -> u128 {
+        self.inputs
+            .iter()
+            .map(|note| u128::from(note.amount()))
+            .sum()
     }
 }
 
@@ -381,6 +480,67 @@ mod tests {
         let (note, key) = cash.note(0, 4);
         let odd = TransferRequest::sign(&[(note, &key)], vec![pay(3), pay(1)]).unwrap();
         assert!(matches!(cash.verifier.verify(&odd), Err(Error::Policy(_))));
+    }
+
+    #[test]
+    fn a_signed_burn_verifies_and_cannot_pass_as_a_transfer() {
+        let f = Fixture::new(Policy::cash_like());
+        let (note, key) = f.note(0, 8);
+        let burn = BurnRequest::single(note, &key).unwrap();
+        let verified = f.verifier.verify_burn(&burn).unwrap();
+        assert_eq!(verified.inputs(), &[note]);
+        assert_eq!(verified.value(), 8);
+        assert_eq!(verified.id(), burn.id(&f.issuer.public_key()));
+
+        // A transfer with no outputs is refused, and a burn's signature does
+        // not sign one either.
+        let transfer = TransferRequest {
+            inputs: burn.inputs.clone(),
+            outputs: Vec::new(),
+        };
+        assert!(matches!(
+            f.verifier.verify(&transfer),
+            Err(Error::Policy(_))
+        ));
+        let mut transfer = TransferRequest::single(note, &key, pay(8)).unwrap();
+        transfer.inputs[0].signature = burn.inputs[0].signature;
+        assert_eq!(
+            f.verifier.verify(&transfer),
+            Err(Error::Unauthorized { input: 0 })
+        );
+    }
+
+    #[test]
+    fn burns_follow_the_input_limit_and_need_every_holder() {
+        let cash = Fixture::new(Policy::cash_like());
+        let (a, ka) = cash.note(0, 4);
+        let (b, kb) = cash.note(1, 4);
+        let two = BurnRequest::sign(&[(a, &ka), (b, &kb)]).unwrap();
+        assert!(matches!(
+            cash.verifier.verify_burn(&two),
+            Err(Error::Policy(_))
+        ));
+        let none = BurnRequest { inputs: Vec::new() };
+        assert!(matches!(
+            cash.verifier.verify_burn(&none),
+            Err(Error::Policy(_))
+        ));
+
+        let flex = Fixture::new(Policy::flexible());
+        let (a, ka) = flex.note(0, 4);
+        let (b, kb) = flex.note(1, 4);
+        let twice = BurnRequest::sign(&[(a, &ka), (a, &ka)]).unwrap();
+        assert_eq!(
+            flex.verifier.verify_burn(&twice),
+            Err(Error::DuplicateInput(a.serial()))
+        );
+        let mut two = BurnRequest::sign(&[(a, &ka), (b, &kb)]).unwrap();
+        assert!(flex.verifier.verify_burn(&two).is_ok());
+        two.inputs[1].signature = two.inputs[0].signature;
+        assert_eq!(
+            flex.verifier.verify_burn(&two),
+            Err(Error::Unauthorized { input: 1 })
+        );
     }
 
     #[test]

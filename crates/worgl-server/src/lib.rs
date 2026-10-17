@@ -16,6 +16,7 @@
 //! | GET    | `/v1/info`          |                                    | [`Info`]               |
 //! | POST   | `/v1/verify`        | `{"note": …}`                      | [`Verified`]           |
 //! | POST   | `/v1/transfer`      | [`TransferRequest`]                | `{"notes": [...]}`     |
+//! | POST   | `/v1/burn`          | [`BurnRequest`]                    | `{"value": …}`         |
 //! | POST   | `/v1/mint`          | [`MintRequest`]                    | `{"note": …}`          |
 //! | POST   | `/v1/admin/rotate`  |                                    | [`RotationReport`]     |
 //!
@@ -37,8 +38,8 @@ use serde::{Deserialize, Serialize};
 use subtle::ConstantTimeEq;
 use worgl::issuer::LayerSummary;
 use worgl::{
-    CommitError, Error, MintRequest, Note, NoteStatus, PersistentIssuer, Policy, PublicKey,
-    RotationReport, Serial, Supply, TransferRequest, Verifier,
+    BurnRequest, CommitError, Error, MintRequest, Note, NoteStatus, PersistentIssuer, Policy,
+    PublicKey, RotationReport, Serial, Supply, TransferRequest, Verifier,
 };
 
 /// Largest request body accepted, in bytes.
@@ -203,6 +204,7 @@ pub fn router(state: AppState) -> Router {
         .route("/v1/info", get(info))
         .route("/v1/verify", post(verify))
         .route("/v1/transfer", post(transfer))
+        .route("/v1/burn", post(burn))
         .route("/v1/mint", post(mint))
         .route("/v1/admin/rotate", post(rotate))
         .layer(DefaultBodyLimit::max(BODY_LIMIT))
@@ -307,6 +309,32 @@ async fn transfer(
         })
         .await?;
     Ok(Json(NotesBody { notes }))
+}
+
+/// Answer of `POST /v1/burn`: the value destroyed. A resent burn answers
+/// with the same value and destroys nothing more.
+#[derive(Serialize, Deserialize)]
+struct BurnedBody {
+    value: u128,
+}
+
+async fn burn(
+    State(state): State<AppState>,
+    body: Result<Json<BurnRequest>, JsonRejection>,
+) -> Result<Json<BurnedBody>, ApiError> {
+    let Json(request) = body?;
+    let verifier = state.verifier.clone();
+    let verified = tokio::task::spawn_blocking(move || verifier.verify_burn(&request))
+        .await
+        .map_err(|_| ApiError::internal("verification panicked"))??;
+    let value = state
+        .locked(move |inner| {
+            let value = inner.issuer.burn(&verified)?;
+            inner.after_write();
+            Ok(value)
+        })
+        .await?;
+    Ok(Json(BurnedBody { value }))
 }
 
 #[derive(Serialize, Deserialize)]
