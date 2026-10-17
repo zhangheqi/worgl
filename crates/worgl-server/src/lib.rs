@@ -1,9 +1,12 @@
 //! An HTTP issuer for the [`worgl`] crate.
 //!
 //! The server holds one [`PersistentIssuer`] behind a mutex. Signature checks
-//! run before the lock is taken; inside it, each request plans an event,
-//! appends it to the journal, flushes it to disk and only then applies it and
-//! answers. All work that can block runs on Tokio's blocking pool.
+//! run first, on Tokio's blocking pool. Changes then queue for a single
+//! committer thread, which takes everything waiting (up to [`MAX_BATCH`]
+//! requests), carries it out as one [`Batch`](worgl::Batch), flushes it to
+//! disk once and only then answers. Under load a flush is shared by many
+//! requests; with one request at a time it behaves as before. Reads take the
+//! mutex on the blocking pool and never see a change before it is on disk.
 //!
 //! # API
 //!
@@ -27,6 +30,7 @@
 //! of the stable strings listed on [`ApiError::code`].
 
 use std::sync::{Arc, Mutex, RwLock};
+use std::thread;
 
 use axum::extract::rejection::JsonRejection;
 use axum::extract::{DefaultBodyLimit, State};
@@ -36,10 +40,12 @@ use axum::routing::{get, post};
 use axum::{Json, Router};
 use serde::{Deserialize, Serialize};
 use subtle::ConstantTimeEq;
+use tokio::sync::{mpsc, oneshot};
 use worgl::issuer::LayerSummary;
 use worgl::{
     BurnRequest, CommitError, Error, MintRequest, Note, NoteStatus, PersistentIssuer, Policy,
-    PublicKey, RotationReport, Serial, Supply, TransferRequest, Verifier,
+    PublicKey, RotationReport, Serial, Supply, TransferRequest, VerifiedBurn, VerifiedMint,
+    VerifiedTransfer, Verifier,
 };
 
 /// Largest request body accepted, in bytes.
@@ -47,6 +53,12 @@ pub const BODY_LIMIT: usize = 64 * 1024;
 
 /// Shortest admin token accepted, in bytes.
 pub const MIN_ADMIN_TOKEN_LEN: usize = 32;
+
+/// Most changes the committer carries out with one flush.
+pub const MAX_BATCH: usize = 256;
+
+/// Changes that may wait for the committer before senders have to wait too.
+const QUEUE: usize = 4096;
 
 /// The admin token is shorter than [`MIN_ADMIN_TOKEN_LEN`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -67,6 +79,7 @@ impl std::error::Error for WeakAdminToken {}
 #[derive(Clone)]
 pub struct AppState {
     inner: Arc<Mutex<Inner>>,
+    changes: mpsc::Sender<Job>,
     verifier: Verifier,
     admin_token: Arc<str>,
     schedule: Arc<RwLock<Option<RotationSchedule>>>,
@@ -84,6 +97,26 @@ pub struct RotationSchedule {
     pub next_at: u64,
 }
 
+/// A change for the committer to make.
+enum Change {
+    Mint(VerifiedMint),
+    Transfer(VerifiedTransfer),
+    Burn(VerifiedBurn),
+    Rotate,
+}
+
+/// What a change produced.
+enum Done {
+    Notes(Vec<Note>),
+    Burned(u128),
+    Rotated(RotationReport),
+}
+
+struct Job {
+    change: Change,
+    reply: oneshot::Sender<Result<Done, ApiError>>,
+}
+
 struct Inner {
     issuer: PersistentIssuer,
     compact_every: u64,
@@ -92,6 +125,52 @@ struct Inner {
 }
 
 impl Inner {
+    /// Carries out `changes` as one batch with one flush. A change the issuer
+    /// refuses gets its error; if the flush fails, every other change gets a
+    /// storage error.
+    fn commit(&mut self, changes: Vec<Change>) -> Vec<Result<Done, ApiError>> {
+        let mut batch = match self.issuer.batch() {
+            Ok(batch) => batch,
+            Err(error) => {
+                let error = ApiError::from(CommitError::Io(error));
+                return changes.iter().map(|_| Err(error.clone())).collect();
+            }
+        };
+        let mut rotated = false;
+        let results: Vec<_> = changes
+            .into_iter()
+            .map(|change| match change {
+                Change::Mint(mint) => batch
+                    .authorized_mint(&mint)
+                    .map(|note| Done::Notes(vec![note]))
+                    .map_err(ApiError::from),
+                Change::Transfer(transfer) => batch
+                    .transfer(&transfer)
+                    .map(Done::Notes)
+                    .map_err(ApiError::from),
+                Change::Burn(burn) => batch.burn(&burn).map(Done::Burned).map_err(ApiError::from),
+                Change::Rotate => {
+                    rotated = true;
+                    Ok(Done::Rotated(batch.rotate()))
+                }
+            })
+            .collect();
+        if let Err(error) = batch.commit() {
+            tracing::error!("the issuer refuses changes until it is restarted");
+            let error = ApiError::from(CommitError::Io(error));
+            return results
+                .into_iter()
+                .map(|result| result.and(Err(error.clone())))
+                .collect();
+        }
+        if rotated {
+            self.compact();
+        } else {
+            self.after_write();
+        }
+        results
+    }
+
     /// Writes a snapshot once enough events have been journaled.
     fn after_write(&mut self) {
         if self.issuer.journal_len() >= self.compact_at {
@@ -128,13 +207,22 @@ impl AppState {
             return Err(WeakAdminToken);
         }
         let compact_every = compact_every.max(1);
+        let verifier = issuer.issuer().verifier();
+        let inner = Arc::new(Mutex::new(Inner {
+            issuer,
+            compact_every,
+            compact_at: compact_every,
+        }));
+        let (changes, queue) = mpsc::channel(QUEUE);
+        let committer = inner.clone();
+        thread::Builder::new()
+            .name("worgl-committer".into())
+            .spawn(move || run_committer(&committer, queue))
+            .expect("spawning the committer thread");
         Ok(Self {
-            verifier: issuer.issuer().verifier(),
-            inner: Arc::new(Mutex::new(Inner {
-                issuer,
-                compact_every,
-                compact_at: compact_every,
-            })),
+            verifier,
+            inner,
+            changes,
             admin_token: admin_token.into(),
             schedule: Arc::new(RwLock::new(None)),
         })
@@ -150,6 +238,17 @@ impl AppState {
 
     fn rotation_schedule(&self) -> Option<RotationSchedule> {
         *self.schedule.read().unwrap_or_else(|e| e.into_inner())
+    }
+
+    /// Queues a change for the committer and waits until it is on disk.
+    async fn submit(&self, change: Change) -> Result<Done, ApiError> {
+        let (reply, done) = oneshot::channel();
+        self.changes
+            .send(Job { change, reply })
+            .await
+            .map_err(|_| ApiError::internal("the committer has stopped"))?;
+        done.await
+            .map_err(|_| ApiError::internal("the committer dropped a request"))?
     }
 
     /// Runs `f` on the blocking pool with the issuer locked.
@@ -171,12 +270,10 @@ impl AppState {
 
     /// Rotates and writes a fresh snapshot.
     pub async fn rotate(&self) -> Result<RotationReport, ApiError> {
-        self.locked(|inner| {
-            let report = inner.issuer.rotate().map_err(ApiError::from)?;
-            inner.compact();
-            Ok(report)
-        })
-        .await
+        match self.submit(Change::Rotate).await? {
+            Done::Rotated(report) => Ok(report),
+            _ => unreachable!("a rotation reports a rotation"),
+        }
     }
 
     fn check_admin(&self, headers: &HeaderMap) -> Result<(), ApiError> {
@@ -193,6 +290,33 @@ impl AppState {
                 "admin_unauthorized",
                 "missing or wrong admin token",
             ))
+        }
+    }
+}
+
+/// Takes every change waiting, up to [`MAX_BATCH`], commits them together and
+/// answers each. Returns once every [`AppState`] is gone.
+fn run_committer(inner: &Mutex<Inner>, mut queue: mpsc::Receiver<Job>) {
+    while let Some(first) = queue.blocking_recv() {
+        let mut jobs = vec![first];
+        while jobs.len() < MAX_BATCH {
+            match queue.try_recv() {
+                Ok(job) => jobs.push(job),
+                Err(_) => break,
+            }
+        }
+        let (changes, replies): (Vec<_>, Vec<_>) =
+            jobs.into_iter().map(|job| (job.change, job.reply)).unzip();
+        let results = match inner.lock() {
+            Ok(mut inner) => inner.commit(changes),
+            Err(_) => {
+                let error = ApiError::internal("issuer state is poisoned by an earlier panic");
+                changes.iter().map(|_| Err(error.clone())).collect()
+            }
+        };
+        for (reply, result) in replies.into_iter().zip(results) {
+            // The client may have gone away; the change stands regardless.
+            let _ = reply.send(result);
         }
     }
 }
@@ -301,14 +425,10 @@ async fn transfer(
     let verified = tokio::task::spawn_blocking(move || verifier.verify(&request))
         .await
         .map_err(|_| ApiError::internal("verification panicked"))??;
-    let notes = state
-        .locked(move |inner| {
-            let notes = inner.issuer.transfer(&verified)?;
-            inner.after_write();
-            Ok(notes)
-        })
-        .await?;
-    Ok(Json(NotesBody { notes }))
+    match state.submit(Change::Transfer(verified)).await? {
+        Done::Notes(notes) => Ok(Json(NotesBody { notes })),
+        _ => unreachable!("a transfer creates notes"),
+    }
 }
 
 /// Answer of `POST /v1/burn`: the value destroyed. A resent burn answers
@@ -327,14 +447,10 @@ async fn burn(
     let verified = tokio::task::spawn_blocking(move || verifier.verify_burn(&request))
         .await
         .map_err(|_| ApiError::internal("verification panicked"))??;
-    let value = state
-        .locked(move |inner| {
-            let value = inner.issuer.burn(&verified)?;
-            inner.after_write();
-            Ok(value)
-        })
-        .await?;
-    Ok(Json(BurnedBody { value }))
+    match state.submit(Change::Burn(verified)).await? {
+        Done::Burned(value) => Ok(Json(BurnedBody { value })),
+        _ => unreachable!("a burn reports its value"),
+    }
 }
 
 #[derive(Serialize, Deserialize)]
@@ -352,13 +468,10 @@ async fn mint(
     let verified = tokio::task::spawn_blocking(move || verifier.verify_mint(&checked))
         .await
         .map_err(|_| ApiError::internal("verification panicked"))??;
-    let note = state
-        .locked(move |inner| {
-            let note = inner.issuer.authorized_mint(&verified)?;
-            inner.after_write();
-            Ok(note)
-        })
-        .await?;
+    let note = match state.submit(Change::Mint(verified)).await? {
+        Done::Notes(mut notes) => notes.remove(0),
+        _ => unreachable!("a mint creates a note"),
+    };
     tracing::info!(
         authority = %request.authority,
         sequence = request.sequence,
@@ -379,7 +492,7 @@ async fn rotate(
 }
 
 /// An error answer: a status code and a stable machine-readable code.
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct ApiError {
     status: StatusCode,
     code: &'static str,
