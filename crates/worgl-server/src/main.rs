@@ -1,4 +1,5 @@
-//! `worgl-server`: create an issuer's state directory, then serve it over HTTP.
+//! `worgl-server`: create an issuer's state directory, serve it over HTTP, and
+//! sign mint requests.
 
 use std::fs::{self, OpenOptions};
 use std::io::Write;
@@ -9,11 +10,14 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use anyhow::{Context, Result, bail};
 use clap::{Parser, Subcommand};
 use tracing_subscriber::EnvFilter;
-use worgl::{Issuer, IssuerKey, LedgerConfig, PersistentIssuer, Policy};
+use worgl::{
+    Issuer, IssuerKey, LedgerConfig, MintKey, MintRequest, PersistentIssuer, Policy, PublicKey,
+};
 use worgl_server::{AppState, RotationSchedule, router};
 
 const KEY_FILE: &str = "issuer.key";
 const TOKEN_FILE: &str = "admin.token";
+const MINT_KEY_FILE: &str = "mint.key";
 const POLICY_FILE: &str = "policy.json";
 const SCHEDULE_FILE: &str = "last_rotation";
 
@@ -26,7 +30,8 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Command {
-    /// Create a new issuer: a key, an admin token and an empty ledger.
+    /// Create a new issuer: a key, an admin token, a mint authority key and
+    /// an empty ledger.
     Init {
         /// State directory to create.
         #[arg(long, env = "WORGL_STATE")]
@@ -38,9 +43,28 @@ enum Command {
         #[arg(long, default_value_t = 1 << 20)]
         layer_size: u32,
         /// Policy as a JSON file, copied into the state directory. Missing
-        /// fields take their cash-like defaults.
+        /// fields take their cash-like defaults. If it lists no
+        /// `mint_authorities`, a mint authority key is created and listed.
         #[arg(long)]
         policy: Option<PathBuf>,
+    },
+    /// Sign a mint request and print it as JSON, ready to POST to /v1/mint.
+    SignMint {
+        /// File holding the mint authority's secret key, as `init` writes it.
+        #[arg(long)]
+        key: PathBuf,
+        /// The issuer's public key, as /v1/info reports it.
+        #[arg(long)]
+        issuer: PublicKey,
+        /// Above every sequence number this key has signed for this issuer.
+        #[arg(long)]
+        sequence: u64,
+        /// Value of the note.
+        #[arg(long)]
+        amount: u64,
+        /// The public key the note is bound to.
+        #[arg(long)]
+        holder: PublicKey,
     },
     /// Serve an issuer over HTTP.
     Serve {
@@ -81,6 +105,18 @@ async fn main() -> Result<()> {
             };
             init(&state, LedgerConfig { layers, layer_size }, policy)
         }
+        Command::SignMint {
+            key,
+            issuer,
+            sequence,
+            amount,
+            holder,
+        } => {
+            let key = MintKey::from_secret_bytes(&read_key(&key)?);
+            let request = MintRequest::sign(&key, &issuer, sequence, amount, holder);
+            println!("{}", serde_json::to_string_pretty(&request)?);
+            Ok(())
+        }
         Command::Serve {
             state,
             listen,
@@ -99,9 +135,13 @@ fn load_policy(path: &Path) -> Result<Policy> {
     serde_json::from_str(&text).with_context(|| format!("parsing policy {}", path.display()))
 }
 
-fn init(state: &Path, ledger: LedgerConfig, policy: Policy) -> Result<()> {
+fn init(state: &Path, ledger: LedgerConfig, mut policy: Policy) -> Result<()> {
     if state.join(KEY_FILE).exists() {
         bail!("{} already holds an issuer", state.display());
+    }
+    let mint_key = policy.mint_authorities.is_empty().then(MintKey::generate);
+    if let Some(mint_key) = &mint_key {
+        policy.mint_authorities.push(mint_key.public_key());
     }
     let key = IssuerKey::generate();
     let issuer = Issuer::new(key.clone(), ledger, policy.clone())?;
@@ -114,10 +154,22 @@ fn init(state: &Path, ledger: LedgerConfig, policy: Policy) -> Result<()> {
     getrandom::fill(&mut token).map_err(|e| anyhow::anyhow!("system RNG failed: {e}"))?;
     write_secret(&state.join(KEY_FILE), &hex::encode(key.to_secret_bytes()))?;
     write_secret(&state.join(TOKEN_FILE), &hex::encode(token))?;
+    if let Some(mint_key) = &mint_key {
+        write_secret(
+            &state.join(MINT_KEY_FILE),
+            &hex::encode(mint_key.to_secret_bytes()),
+        )?;
+    }
     PersistentIssuer::create(state, issuer)?;
     println!("issuer key  {}", key.public_key());
     println!("admin token {}", state.join(TOKEN_FILE).display());
     println!("policy      {}", state.join(POLICY_FILE).display());
+    if mint_key.is_some() {
+        println!(
+            "mint key    {} (the server does not need it; keep it where you mint from)",
+            state.join(MINT_KEY_FILE).display()
+        );
+    }
     Ok(())
 }
 
@@ -139,6 +191,14 @@ fn read_secret(path: &Path) -> Result<String> {
     Ok(text.trim().to_owned())
 }
 
+/// Reads a 32-byte secret key written as hex by `init`.
+fn read_key(path: &Path) -> Result<[u8; 32]> {
+    let mut secret = [0u8; 32];
+    hex::decode_to_slice(read_secret(path)?, &mut secret)
+        .with_context(|| format!("{} must hold 64 hex digits", path.display()))?;
+    Ok(secret)
+}
+
 async fn serve(
     state: &Path,
     listen: SocketAddr,
@@ -146,10 +206,7 @@ async fn serve(
     policy: Policy,
     compact_every: u64,
 ) -> Result<()> {
-    let mut secret = [0u8; 32];
-    hex::decode_to_slice(read_secret(&state.join(KEY_FILE))?, &mut secret)
-        .context("issuer.key must hold 64 hex digits")?;
-    let key = IssuerKey::from_secret_bytes(&secret);
+    let key = IssuerKey::from_secret_bytes(&read_key(&state.join(KEY_FILE))?);
     let token = read_secret(&state.join(TOKEN_FILE))?;
     let issuer = PersistentIssuer::open(state, key, policy)
         .with_context(|| format!("opening {}", state.display()))?;

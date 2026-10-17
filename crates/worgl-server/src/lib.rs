@@ -17,10 +17,12 @@
 //! | POST   | `/v1/verify`        | `{"note": …}`                      | [`Verified`]           |
 //! | POST   | `/v1/transfer`      | [`TransferRequest`]                | `{"notes": [...]}`     |
 //! | POST   | `/v1/burn`          | [`BurnRequest`]                    | `{"value": …}`         |
-//! | POST   | `/v1/admin/mint`    | `{"amount": …, "holder": …}`       | `{"note": …}`          |
+//! | POST   | `/v1/mint`          | [`MintRequest`]                    | `{"note": …}`          |
 //! | POST   | `/v1/admin/rotate`  |                                    | [`RotationReport`]     |
 //!
-//! Admin routes need `Authorization: Bearer <token>`. Errors answer with a
+//! A mint request needs a signature from a key the policy lists in
+//! `mint_authorities`; the admin token cannot mint. Admin routes need
+//! `Authorization: Bearer <token>`. Errors answer with a
 //! status code and `{"error": code, "message": text}`, where `code` is one
 //! of the stable strings listed on [`ApiError::code`].
 
@@ -36,8 +38,8 @@ use serde::{Deserialize, Serialize};
 use subtle::ConstantTimeEq;
 use worgl::issuer::LayerSummary;
 use worgl::{
-    BurnRequest, CommitError, Error, Note, NoteStatus, PersistentIssuer, Policy, PublicKey,
-    RotationReport, Serial, Supply, TransferRequest, Verifier,
+    BurnRequest, CommitError, Error, MintRequest, Note, NoteStatus, PersistentIssuer, Policy,
+    PublicKey, RotationReport, Serial, Supply, TransferRequest, Verifier,
 };
 
 /// Largest request body accepted, in bytes.
@@ -203,7 +205,7 @@ pub fn router(state: AppState) -> Router {
         .route("/v1/verify", post(verify))
         .route("/v1/transfer", post(transfer))
         .route("/v1/burn", post(burn))
-        .route("/v1/admin/mint", post(mint))
+        .route("/v1/mint", post(mint))
         .route("/v1/admin/rotate", post(rotate))
         .layer(DefaultBodyLimit::max(BODY_LIMIT))
         .with_state(state)
@@ -335,12 +337,6 @@ async fn burn(
     Ok(Json(BurnedBody { value }))
 }
 
-#[derive(Deserialize)]
-struct MintBody {
-    amount: u64,
-    holder: PublicKey,
-}
-
 #[derive(Serialize, Deserialize)]
 struct NoteBody {
     note: Note,
@@ -348,18 +344,27 @@ struct NoteBody {
 
 async fn mint(
     State(state): State<AppState>,
-    headers: HeaderMap,
-    body: Result<Json<MintBody>, JsonRejection>,
+    body: Result<Json<MintRequest>, JsonRejection>,
 ) -> Result<Json<NoteBody>, ApiError> {
-    state.check_admin(&headers)?;
-    let Json(MintBody { amount, holder }) = body?;
+    let Json(request) = body?;
+    let verifier = state.verifier.clone();
+    let checked = request.clone();
+    let verified = tokio::task::spawn_blocking(move || verifier.verify_mint(&checked))
+        .await
+        .map_err(|_| ApiError::internal("verification panicked"))??;
     let note = state
         .locked(move |inner| {
-            let note = inner.issuer.mint(amount, holder)?;
+            let note = inner.issuer.authorized_mint(&verified)?;
             inner.after_write();
             Ok(note)
         })
         .await?;
+    tracing::info!(
+        authority = %request.authority,
+        sequence = request.sequence,
+        amount = request.amount,
+        "mint request answered"
+    );
     Ok(Json(NoteBody { note }))
 }
 
@@ -407,8 +412,10 @@ impl ApiError {
     }
 
     /// One of: `malformed`, `policy`, `invalid_note`, `duplicate_input`,
-    /// `unauthorized` (a holder signature), `admin_unauthorized`, `spent`,
-    /// `expired`, `unissued`, `frozen`, `layer_full`, `storage`, `internal`.
+    /// `unauthorized` (a holder's or mint authority's signature),
+    /// `unknown_authority`, `admin_unauthorized`, `spent`, `expired`,
+    /// `unissued`, `frozen`, `stale_mint`, `layer_full`, `storage`,
+    /// `internal`.
     pub fn code(&self) -> &'static str {
         self.code
     }
@@ -420,9 +427,11 @@ impl From<Error> for ApiError {
             Error::Policy(_) => (StatusCode::BAD_REQUEST, "policy"),
             Error::Note { .. } => (StatusCode::BAD_REQUEST, "invalid_note"),
             Error::DuplicateInput(_) => (StatusCode::BAD_REQUEST, "duplicate_input"),
-            Error::WrongKey { .. } | Error::Unauthorized { .. } => {
+            Error::WrongKey { .. } | Error::Unauthorized { .. } | Error::MintUnauthorized => {
                 (StatusCode::FORBIDDEN, "unauthorized")
             }
+            Error::UnknownAuthority(_) => (StatusCode::FORBIDDEN, "unknown_authority"),
+            Error::StaleMint { .. } => (StatusCode::CONFLICT, "stale_mint"),
             Error::Spent(_) => (StatusCode::CONFLICT, "spent"),
             Error::Expired(_) => (StatusCode::CONFLICT, "expired"),
             Error::Unissued(_) => (StatusCode::CONFLICT, "unissued"),
