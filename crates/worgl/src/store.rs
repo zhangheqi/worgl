@@ -37,7 +37,7 @@ use crate::issuer::{Event, Issuer, Plan, RotationReport};
 use crate::keys::{IssuerKey, PublicKey};
 use crate::note::Note;
 use crate::policy::Policy;
-use crate::transfer::VerifiedTransfer;
+use crate::transfer::{VerifiedBurn, VerifiedTransfer};
 
 const SNAPSHOT: &str = "snapshot.bin";
 const SNAPSHOT_TMP: &str = "snapshot.bin.tmp";
@@ -412,6 +412,15 @@ impl PersistentIssuer {
                 Ok(self.issuer.notes(&event))
             }
         }
+    }
+
+    /// Carries out a verified burn once it is on disk and returns the value
+    /// destroyed. A resent burn that was already applied writes nothing.
+    pub fn burn(&mut self, burn: &VerifiedBurn) -> Result<u128, CommitError> {
+        if let Plan::Apply(event) = self.issuer.plan_burn(burn)? {
+            self.commit(&event)?;
+        }
+        Ok(burn.value())
     }
 
     /// Rotates once the rotation is on disk.
