@@ -49,15 +49,16 @@ batching transfers blurs this.
 This is weaker than blind-signature e-cash (Chaum, Cashu, GNU Taler), where
 the issuer cannot link a note to the one it replaced, and stronger than any
 account system. Blind signatures do not fit this design: the issuer must
-choose each note's serial, because the serial is the note's bit position.
+choose each note's serial, because the serial names the note's bit.
 
 ## Efficiency
 
 - **Storage:** one bit per note. Four layers of 2²⁰ bits take 512 KiB and
   hold over four million notes in flight.
 - **Status reads and writes:** O(1). A serial maps straight to its bit: the
-  layer's slot is `generation mod layers` and its position is
-  `generation − oldest generation`.
+  layer's slot is `generation mod layers`, its position is
+  `generation − oldest generation`, and the bit is the index run back through
+  a ten-round keyed permutation, about 0.65 µs in a release build.
 - **Rotation:** one word write per 64 bits the dropped layer used.
 - **Per transfer:** two signature checks per input (issuer and holder) and one
   signature per output.
@@ -68,7 +69,7 @@ choose each note's serial, because the serial is the note's bit position.
 |---|---|
 | Centralized, no wallets | One [`Issuer`](crates/worgl/src/issuer.rs). It keeps no accounts and stores no notes; holders keep their own notes. |
 | Asymmetric crypto issues notes | Ed25519 via `ed25519-dalek`, strict verification ([`keys.rs`](crates/worgl/src/keys.rs)). |
-| Serial numbers | [`Serial`](crates/worgl/src/ledger.rs) is `generation:index`. |
+| Serial numbers | [`Serial`](crates/worgl/src/ledger.rs) is `generation:index`; the index is a keyed permutation of the note's bit ([`permutation.rs`](crates/worgl/src/permutation.rs)). |
 | Bit array of valid notes | [`Ledger`](crates/worgl/src/ledger.rs): one flat array, slot-major, `u64` words. |
 | Transfer invalidates and reissues | [`Issuer::plan_transfer`](crates/worgl/src/issuer.rs) and `apply`. |
 | Last-used index | Each layer counts the bits it has handed out; issuing sets the next one. |
@@ -83,6 +84,15 @@ can be changed.
 **Serials carry a generation that is never reused.** When a dropped layer's
 slot is reused, an old note's serial names a generation that no longer exists,
 so it can never match the fresh bit that sits where its bit used to be.
+
+**Serial indexes are scrambled.** A layer hands out its bits in order, but a
+note's index is its bit under a keyed permutation that differs in every
+generation and is derived from the issuer key. A serial therefore does not
+say whether a note was issued before or after another, and the outputs of
+one split do not carry consecutive indexes. The generation still tells which
+layer, and so roughly which rotation period, a note was issued in. An issuer
+restored from a snapshot written before this change keeps using bits as
+indexes, because its notes already carry them.
 
 **Notes are 149 signed bytes.** Version, issuer key, serial, amount, holder
 key and the issuer's signature. In text they are unpadded URL-safe base64. The
@@ -250,8 +260,6 @@ rate limiting.
 ## Not covered yet
 
 - **The issuer sees lineage.** Inherent to the design; see above.
-- **Sequential serials** let anyone who sees two notes of one generation tell
-  which was issued first.
 - **No backing.** Minting is an admin call; there is no deposit or redemption
   into other money.
 - **One issuer key** with no key rotation, and no replication or failover.

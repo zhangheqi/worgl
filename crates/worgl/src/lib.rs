@@ -27,7 +27,7 @@
 //! This is weaker than blind-signature e-cash, where the issuer cannot link a
 //! note to the one it replaced, and stronger than any account system. Blind
 //! signatures are incompatible with the design: the issuer must choose each
-//! note's serial, because the serial is the note's bit position.
+//! note's serial, because the serial names the note's bit.
 //!
 //! # Layout
 //!
@@ -68,6 +68,7 @@ pub mod issuer;
 pub mod keys;
 pub mod ledger;
 pub mod note;
+mod permutation;
 pub mod policy;
 pub mod store;
 pub mod transfer;
