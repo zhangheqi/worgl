@@ -23,7 +23,8 @@ The workspace has two crates:
 
 - [`worgl`](crates/worgl): the library. Ledger, note format, transfer
   protocol, policy, issuer state machine and crash-safe storage.
-- [`worgl-server`](crates/worgl-server): an HTTP issuer built on it.
+- [`worgl-server`](crates/worgl-server): an HTTP server built on it that
+  hosts many issuers, called mints, side by side.
 
 > **Status:** 0.1. The design and code have not had an independent security
 > review. Do not use it to hold anything you cannot afford to lose.
@@ -111,11 +112,11 @@ with the issuer key and signs that generation's notes with it. The key's
 secret is erased once its generation is dropped. A leaked generation key
 therefore forges notes for at most as many rotations as there are layers, and
 a leak exposes no key made after it. The certificates of the live generations
-are published at `/v1/keys`, so anyone who knows the issuer key can check a
-note offline. The issuer checks notes against its own keys only, so a leaked
-issuer key cannot get a forged note past it; it could certify a false key
-that fools someone checking offline, though, so a leaked issuer key still
-means moving to a new issuer. Issuers from before this change keep their
+are published at `/v1/mints/<issuer key>/keys`, so anyone who knows the issuer
+key can check a note offline. The issuer checks notes against its own keys
+only, so a leaked issuer key cannot get a forged note past it; it could
+certify a false key that fools someone checking offline, though, so a leaked
+issuer key still means moving to a new issuer. Issuers from before this change keep their
 generations signed by the issuer key until those are dropped.
 
 **Each note is bound to a one-time key.** To be paid, the receiver makes a
@@ -185,7 +186,7 @@ of them and carries a sequence number, and the issuer accepts only a number
 above that authority's last, so a copied request cannot mint twice, while
 resending the last request returns the same note. Each such mint is journaled
 with its signature, so the journal shows who authorized every unit of supply.
-The server mints no other way: the admin token only rotates. The library's
+The server mints no other way: no token can mint. The library's
 `Issuer::mint` remains for code that embeds the issuer directly.
 
 **The issuer is an event-sourced state machine.** Every change is an `Event`
@@ -200,12 +201,12 @@ destroyed by rotations and burned, so
 `outstanding = minted − destroyed − burned` can be audited at any time.
 
 **Rotation is an admin call or a schedule** aligned to multiples of the
-period since the Unix epoch, so restarts do not shift it. When a schedule is
-set, `/v1/info` reports its period and the time of the next rotation, so
-clients know when frozen notes thaw and when idle ones must be refreshed. The server records
-the last scheduled boundary, so a wall clock that steps backwards cannot
-rotate twice in one period. Boundaries missed while the server is down are
-not made up.
+period since the Unix epoch, so restarts do not shift it. Each mint has its
+own period, and its `info` reports the period and the time of the next
+rotation, so clients know when frozen notes thaw and when idle ones must be
+refreshed. The server records the last scheduled boundary, so a wall clock
+that steps backwards cannot rotate twice in one period. Boundaries missed
+while the server is down, or while the mint is paused, are not made up.
 
 **Storage fails loudly.** The journal is tied to its issuer's key, every
 record is checksummed, and a damaged record is only dropped when nothing
@@ -261,60 +262,90 @@ expiring and refreshed money living on.
 
 ```sh
 cargo build --release
-./target/release/worgl-server init  --state ./issuer --layers 4 --layer-size 1048576
-./target/release/worgl-server serve --state ./issuer --listen 127.0.0.1:8080 --rotate-every 86400
+./target/release/worgl-server init        --state ./server
+./target/release/worgl-server create-mint --state ./server --layers 4 --layer-size 1048576 --rotate-every 86400
+./target/release/worgl-server serve       --state ./server --listen 127.0.0.1:8080
 ```
 
-`init` writes the issuer key, a random 64-character admin token and a mint
-authority key `mint.key` (all mode 0600), the policy as `policy.json` with the
-mint key listed in `mint_authorities`, and an empty ledger with a generation
-key for each layer in `keys.bin` (mode 0600). The server never
-reads `mint.key`; move it to wherever you mint from. The server refuses to
-start with an admin token shorter than 32 characters. Edit `policy.json` to
-change the rules; missing fields take their cash-like defaults:
+One server hosts any number of mints. Each mint is one issuer, with its own
+key, ledger, policy, rotation period and directory under `mints/`, named by
+its issuer key. A note names its issuer, so the holder routes take no mint in
+their path and find it from the note.
+
+`init` writes a random 64-character operator token, which creates and lists
+mints. `create-mint` writes the mint's issuer key, its own admin token, which
+rotates and pauses that mint only, and a mint authority key `mint.key` (all
+mode 0600), the policy as `policy.json` with the mint key listed in
+`mint_authorities`, its period in `mint.json`, and an empty ledger with a
+generation key for each layer in `keys.bin` (mode 0600). It prints the mint's
+issuer key. The server never reads `mint.key`; move it to wherever you mint
+from. Edit `policy.json` and restart to change the rules; missing fields take
+their cash-like defaults:
 
 ```json
 { "max_inputs": 16, "denominations": "any" }
 ```
 
-| Method | Path | Body | Answer |
-|---|---|---|---|
-| GET | `/healthz` | | `ok` |
-| GET | `/v1/info` | | layers, supply, policy, rotation schedule |
-| GET | `/v1/keys` | | the live generations' keys and their certificates |
-| POST | `/v1/verify` | `{"note"}` | serial, amount, state, position, hops left |
-| POST | `/v1/transfer` | `{"inputs": [{"note", "signature"}], "outputs": [{"amount", "holder"}]}` | `{"notes"}` |
-| POST | `/v1/burn` | `{"inputs": [{"note", "signature"}]}` | `{"value"}` burned |
-| POST | `/v1/mint` | `{"authority", "sequence", "amount", "holder", "signature"}` | `{"note"}` |
-| POST | `/v1/admin/rotate` | | what was destroyed, and the new generation's key |
+A running server takes new mints through `POST /v1/admin/mints` instead, with
+a body like `{"ledger": {"layers": 4, "layer_size": 1048576}, "policy":
+{"mint_authorities": ["<public key>"]}, "rotate_every": 86400}`. Its policy
+must list a mint authority, since the server never holds one, and the answer
+carries the new mint's issuer key and admin token. A mint is built in a hidden
+directory and renamed into place when complete, so a crash never leaves one
+half made. The server refuses to start if any mint fails to open, or if a
+token is shorter than 32 characters.
 
-To mint, sign a request with the mint key and post it. The issuer key is the
-one `init` printed and `/v1/info` reports:
+| Method | Path | Token | Body | Answer |
+|---|---|---|---|---|
+| GET | `/healthz` | | | `ok` |
+| POST | `/v1/verify` | | `{"note"}` | serial, amount, state, position, hops left |
+| POST | `/v1/transfer` | | `{"inputs": [{"note", "signature"}], "outputs": [{"amount", "holder"}]}` | `{"notes"}` |
+| POST | `/v1/burn` | | `{"inputs": [{"note", "signature"}]}` | `{"value"}` burned |
+| GET | `/v1/mints/{mint}/info` | | | layers, supply, policy, rotation schedule, paused |
+| GET | `/v1/mints/{mint}/keys` | | | the live generations' keys and their certificates |
+| POST | `/v1/mints/{mint}/mint` | | `{"authority", "sequence", "amount", "holder", "signature"}` | `{"note"}` |
+| POST | `/v1/mints/{mint}/rotate` | mint | | what was destroyed, and the new generation's key |
+| POST | `/v1/mints/{mint}/pause` | mint | | `{"paused": true}` |
+| POST | `/v1/mints/{mint}/resume` | mint | | `{"paused": false}` |
+| GET | `/v1/admin/mints` | operator | | `{"mints"}` |
+| POST | `/v1/admin/mints` | operator | `{"ledger", "policy", "rotate_every"}` | `{"mint", "token"}` |
+
+To mint, sign a request with the mint key and post it to the mint `create-mint`
+printed:
 
 ```sh
-./target/release/worgl-server sign-mint --key ./issuer/mint.key --issuer <issuer key> \
+./target/release/worgl-server sign-mint --key ./server/mints/<mint>/mint.key --issuer <mint> \
     --sequence 1 --amount 8 --holder <holder public key> \
-  | curl -sd @- -H 'content-type: application/json' http://127.0.0.1:8080/v1/mint
+  | curl -sd @- -H 'content-type: application/json' http://127.0.0.1:8080/v1/mints/<mint>/mint
 ```
 
-Admin routes need `Authorization: Bearer <token>`. Errors carry a stable code,
-such as `{"error": "spent", "message": "note 3:17 is already spent"}`; the
-codes are listed in [`ApiError::code`](crates/worgl-server/src/lib.rs). The
-request types are the library's own (`TransferRequest`, `BurnRequest`,
-`MintRequest`, `Note`, `PublicKey`), so a Rust client signs with the library
-and posts the JSON it serializes to.
+**Pausing stops a mint without costing anyone a note.** A paused mint refuses
+transfers, burns, mints and rotations, scheduled or requested, and still
+verifies notes, so nothing moves and nothing expires until it resumes. Its
+`info` shows the pause to everyone, and the pause survives restarts. It is
+for incidents such as a leaked key or an attack on one mint; the others carry
+on.
 
-The server is one process; a lock file stops a second one from opening the
-same state. It speaks plain HTTP: put it behind a reverse proxy for TLS and
-rate limiting.
+Routes with a token need `Authorization: Bearer <token>`. Errors carry a
+stable code, such as `{"error": "spent", "message": "note 3:17 is already
+spent"}`; the codes are listed in
+[`ApiError::code`](crates/worgl-server/src/lib.rs). The request types are the
+library's own (`TransferRequest`, `BurnRequest`, `MintRequest`, `Note`,
+`PublicKey`), so a Rust client signs with the library and posts the JSON it
+serializes to.
+
+The server is one process. Each mint commits on its own, so a busy mint does
+not slow the others, and an idle one holds no thread. A lock file per mint
+stops a second process from opening it. The server speaks plain HTTP: put it
+behind a reverse proxy for TLS and rate limiting.
 
 ## Not covered yet
 
 - **The issuer sees lineage.** Inherent to the design; see above.
 - **No backing.** A mint authority decides what to mint; there is no deposit
   or redemption into other money.
-- **One server per issuer**, with no replication or failover. The issuer key
-  itself never rotates: a new one is a new issuer.
+- **One copy of each mint**, with no replication or failover. The issuer key
+  itself never rotates: a new one is a new mint.
 - **No client CLI.** Holders use the library, or any HTTP client plus Ed25519.
 
 ## Development

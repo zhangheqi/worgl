@@ -1,93 +1,91 @@
-//! An HTTP issuer for the [`worgl`] crate.
+//! An HTTP server hosting many mints, built on the [`worgl`] crate.
 //!
-//! The server holds one [`PersistentIssuer`] behind a mutex. Signature checks
-//! run first, on Tokio's blocking pool. Changes then queue for a single
-//! committer thread, which takes everything waiting (up to [`MAX_BATCH`]
-//! requests), carries it out as one [`Batch`](worgl::Batch), flushes it to
-//! disk once and only then answers. Under load a flush is shared by many
-//! requests; with one request at a time it behaves as before. Reads take the
-//! mutex on the blocking pool and never see a change before it is on disk.
+//! Each mint is one issuer: its own key, ledger, policy and rotation clock,
+//! in its own directory (see [`mints`] for the layout). Holder routes take
+//! no mint in their path: a note names its issuer, so `/v1/verify`,
+//! `/v1/transfer` and `/v1/burn` go to the mint whose key signed the note,
+//! or the first input note.
+//!
+//! Signature checks run first, on Tokio's blocking pool. Changes then queue
+//! for the mint's committer, which takes everything waiting (up to
+//! [`MAX_BATCH`] requests), carries it out as one [`Batch`](worgl::Batch),
+//! flushes it to disk once and only then answers. Under load a flush is
+//! shared by many requests; with one request at a time it behaves as one
+//! flush each. Reads never see a change before it is on disk. Mints share
+//! nothing but the process, and an idle mint holds no thread.
 //!
 //! # API
 //!
 //! All bodies are JSON. Keys and signatures are hex, notes are unpadded
-//! URL-safe base64.
+//! URL-safe base64. `{mint}` is a mint's issuer key.
 //!
-//! | method | path                | body                               | answer                 |
-//! |--------|---------------------|------------------------------------|------------------------|
-//! | GET    | `/healthz`          |                                    | `ok`                   |
-//! | GET    | `/v1/info`          |                                    | [`Info`]               |
-//! | GET    | `/v1/keys`          |                                    | [`KeySet`]             |
-//! | POST   | `/v1/verify`        | `{"note": …}`                      | [`Verified`]           |
-//! | POST   | `/v1/transfer`      | [`TransferRequest`]                | `{"notes": [...]}`     |
-//! | POST   | `/v1/burn`          | [`BurnRequest`]                    | `{"value": …}`         |
-//! | POST   | `/v1/mint`          | [`MintRequest`]                    | `{"note": …}`          |
-//! | POST   | `/v1/admin/rotate`  |                                    | [`RotationReport`]     |
+//! | method | path                       | token    | body                  | answer                 |
+//! |--------|----------------------------|----------|-----------------------|------------------------|
+//! | GET    | `/healthz`                 |          |                       | `ok`                   |
+//! | POST   | `/v1/verify`               |          | `{"note": …}`         | [`Verified`]           |
+//! | POST   | `/v1/transfer`             |          | [`TransferRequest`]   | `{"notes": [...]}`     |
+//! | POST   | `/v1/burn`                 |          | [`BurnRequest`]       | `{"value": …}`         |
+//! | GET    | `/v1/mints/{mint}/info`    |          |                       | [`Info`]               |
+//! | GET    | `/v1/mints/{mint}/keys`    |          |                       | [`KeySet`]             |
+//! | POST   | `/v1/mints/{mint}/mint`    |          | [`MintRequest`]       | `{"note": …}`          |
+//! | POST   | `/v1/mints/{mint}/rotate`  | mint     |                       | [`RotationReport`]     |
+//! | POST   | `/v1/mints/{mint}/pause`   | mint     |                       | `{"paused": true}`     |
+//! | POST   | `/v1/mints/{mint}/resume`  | mint     |                       | `{"paused": false}`    |
+//! | GET    | `/v1/admin/mints`          | operator |                       | `{"mints": [...]}`     |
+//! | POST   | `/v1/admin/mints`          | operator | [`MintSpec`]          | [`CreatedMint`]        |
 //!
-//! A mint request needs a signature from a key the policy lists in
-//! `mint_authorities`; the admin token cannot mint. Admin routes need
-//! `Authorization: Bearer <token>`. Errors answer with a
-//! status code and `{"error": code, "message": text}`, where `code` is one
-//! of the stable strings listed on [`ApiError::code`].
+//! A mint request needs a signature from a key the mint's policy lists in
+//! `mint_authorities`; no token can mint. Routes with a token need
+//! `Authorization: Bearer <token>`: a mint's routes take that mint's own
+//! admin token, and `/v1/admin` routes the server's operator token. A paused mint refuses transfers, burns, mints
+//! and rotations, scheduled or not, so no note expires while its holder
+//! cannot refresh it; it still verifies notes. Errors answer with a status
+//! code and `{"error": code, "message": text}`, where `code` is one of the
+//! stable strings listed on [`ApiError::code`].
 
-use std::sync::{Arc, Mutex, RwLock};
-use std::thread;
+pub mod files;
+pub mod mints;
 
+use std::path::{Path, PathBuf};
+use std::sync::{Arc, RwLock};
+
+use anyhow::bail;
 use axum::extract::rejection::JsonRejection;
-use axum::extract::{DefaultBodyLimit, State};
+use axum::extract::{DefaultBodyLimit, Path as UrlPath, State};
 use axum::http::{HeaderMap, StatusCode, header};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
 use axum::{Json, Router};
 use serde::{Deserialize, Serialize};
 use subtle::ConstantTimeEq;
-use tokio::sync::{mpsc, oneshot};
 use worgl::issuer::LayerSummary;
 use worgl::{
-    BurnRequest, CommitError, Error, KeySet, MintRequest, Note, NoteError, NoteStatus,
-    PersistentIssuer, Policy, PublicKey, RotationReport, Serial, Supply, TransferRequest,
-    VerifiedBurn, VerifiedMint, VerifiedTransfer, Verifier,
+    BurnRequest, CommitError, Error, KeySet, MintRequest, Note, NoteStatus, Policy, PublicKey,
+    RotationReport, Serial, Supply, TransferRequest,
 };
+
+pub use mints::{CreateError, CreatedMint, MintSpec, create_mint, init_state};
+use mints::{Mint, Registry};
 
 /// Largest request body accepted, in bytes.
 pub const BODY_LIMIT: usize = 64 * 1024;
 
-/// Shortest admin token accepted, in bytes.
+/// Shortest admin or operator token accepted, in bytes.
 pub const MIN_ADMIN_TOKEN_LEN: usize = 32;
 
-/// Most changes the committer carries out with one flush.
+/// Most changes a mint's committer carries out with one flush.
 pub const MAX_BATCH: usize = 256;
 
-/// Changes that may wait for the committer before senders have to wait too.
-const QUEUE: usize = 4096;
-
-/// The admin token is shorter than [`MIN_ADMIN_TOKEN_LEN`].
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct WeakAdminToken;
-
-impl std::fmt::Display for WeakAdminToken {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(
-            f,
-            "the admin token must be at least {MIN_ADMIN_TOKEN_LEN} bytes"
-        )
-    }
-}
-
-impl std::error::Error for WeakAdminToken {}
-
-/// Shared state of the HTTP handlers.
+/// Shared state of the HTTP handlers: every mint the server hosts.
 #[derive(Clone)]
 pub struct AppState {
-    inner: Arc<Mutex<Inner>>,
-    changes: mpsc::Sender<Job>,
-    /// Replaced after every rotation, which adds a generation key.
-    verifier: Arc<RwLock<Verifier>>,
-    admin_token: Arc<str>,
-    schedule: Arc<RwLock<Option<RotationSchedule>>>,
+    dir: Arc<Path>,
+    mints: Arc<RwLock<Registry>>,
+    operator_token: Arc<str>,
+    compact_every: u64,
 }
 
-/// When the issuer rotates on its own, as reported by `GET /v1/info`.
+/// When a mint rotates on its own, as reported by its `info`.
 ///
 /// Clients use it to tell when a frozen note can move again and when a note
 /// must be refreshed before its layer is dropped.
@@ -95,249 +93,122 @@ pub struct AppState {
 pub struct RotationSchedule {
     /// Seconds between rotations.
     pub period_secs: u64,
-    /// Unix time, in seconds, of the next scheduled rotation.
+    /// Unix time, in seconds, of the next scheduled rotation. A paused mint
+    /// skips it.
     pub next_at: u64,
 }
 
-/// A change for the committer to make.
-enum Change {
-    Mint(VerifiedMint),
-    Transfer(VerifiedTransfer),
-    Burn(VerifiedBurn),
-    Rotate,
-}
-
-/// What a change produced.
-enum Done {
-    Notes(Vec<Note>),
-    Burned(u128),
-    Rotated(RotationReport),
-}
-
-struct Job {
-    change: Change,
-    reply: oneshot::Sender<Result<Done, ApiError>>,
-}
-
-struct Inner {
-    issuer: PersistentIssuer,
-    verifier: Arc<RwLock<Verifier>>,
-    compact_every: u64,
-    /// Journal length at which the next snapshot is written.
-    compact_at: u64,
-}
-
-impl Inner {
-    /// Carries out `changes` as one batch with one flush. A change the issuer
-    /// refuses gets its error; if the flush fails, every other change gets a
-    /// storage error.
-    fn commit(&mut self, changes: Vec<Change>) -> Vec<Result<Done, ApiError>> {
-        let mut batch = match self.issuer.batch() {
-            Ok(batch) => batch,
-            Err(error) => {
-                let error = ApiError::from(CommitError::Io(error));
-                return changes.iter().map(|_| Err(error.clone())).collect();
-            }
-        };
-        let mut rotated = false;
-        let results: Vec<_> = changes
-            .into_iter()
-            .map(|change| match change {
-                Change::Mint(mint) => batch
-                    .authorized_mint(&mint)
-                    .map(|note| Done::Notes(vec![note]))
-                    .map_err(ApiError::from),
-                Change::Transfer(transfer) => batch
-                    .transfer(&transfer)
-                    .map(Done::Notes)
-                    .map_err(ApiError::from),
-                Change::Burn(burn) => batch.burn(&burn).map(Done::Burned).map_err(ApiError::from),
-                Change::Rotate => {
-                    let report = batch
-                        .rotate()
-                        .map_err(|e| ApiError::from(CommitError::Io(e)));
-                    rotated |= report.is_ok();
-                    report.map(Done::Rotated)
-                }
-            })
-            .collect();
-        if let Err(error) = batch.commit() {
-            tracing::error!("the issuer refuses changes until it is restarted");
-            let error = ApiError::from(CommitError::Io(error));
-            return results
-                .into_iter()
-                .map(|result| result.and(Err(error.clone())))
-                .collect();
-        }
-        if rotated {
-            // Before any answer goes out, since notes of the new generation
-            // only verify with its key.
-            let verifier = self.issuer.issuer().verifier();
-            *self.verifier.write().unwrap_or_else(|e| e.into_inner()) = verifier;
-            self.compact();
-        } else {
-            self.after_write();
-        }
-        results
-    }
-
-    /// Writes a snapshot once enough events have been journaled.
-    fn after_write(&mut self) {
-        if self.issuer.journal_len() >= self.compact_at {
-            self.compact();
-        }
-    }
-
-    fn compact(&mut self) {
-        match self.issuer.compact() {
-            Ok(()) => {
-                self.compact_at = self.compact_every;
-                tracing::debug!("wrote a fresh snapshot");
-            }
-            Err(error) => {
-                // The journal still holds every event, so nothing is lost.
-                // Try again after another batch rather than on every request.
-                self.compact_at = self.issuer.journal_len() + self.compact_every;
-                tracing::error!(%error, "snapshot failed; the journal keeps growing");
-            }
-        }
-    }
-}
-
 impl AppState {
-    /// Wraps an opened issuer. `compact_every` is how many journaled events
-    /// trigger a fresh snapshot; rotations always do. Refuses an admin token
-    /// shorter than [`MIN_ADMIN_TOKEN_LEN`].
-    pub fn new(
-        issuer: PersistentIssuer,
-        admin_token: &str,
-        compact_every: u64,
-    ) -> Result<Self, WeakAdminToken> {
-        if admin_token.len() < MIN_ADMIN_TOKEN_LEN {
-            return Err(WeakAdminToken);
+    /// Opens the server state in `dir`, made by [`init_state`], and every
+    /// mint in it, starting their committers and rotation clocks. Fails if
+    /// any mint does not open, rather than serve without it.
+    /// `compact_every` is how many journaled events trigger a fresh snapshot
+    /// of a mint; rotations always do. Must be called within a Tokio runtime.
+    pub fn open(dir: &Path, compact_every: u64) -> anyhow::Result<Self> {
+        if dir.join("issuer.key").exists() {
+            bail!(
+                "{} holds a single issuer from before mints; run `init` on a new directory \
+                 and move this one to its mints/<issuer key>/",
+                dir.display()
+            );
         }
-        let compact_every = compact_every.max(1);
-        let verifier = Arc::new(RwLock::new(issuer.issuer().verifier()));
-        let inner = Arc::new(Mutex::new(Inner {
-            issuer,
-            verifier: verifier.clone(),
-            compact_every,
-            compact_at: compact_every,
-        }));
-        let (changes, queue) = mpsc::channel(QUEUE);
-        let committer = inner.clone();
-        thread::Builder::new()
-            .name("worgl-committer".into())
-            .spawn(move || run_committer(&committer, queue))
-            .expect("spawning the committer thread");
+        let token_file = dir.join(mints::OPERATOR_TOKEN_FILE);
+        let operator_token = files::read_secret(&token_file)?;
+        if operator_token.len() < MIN_ADMIN_TOKEN_LEN {
+            bail!(
+                "{} must hold at least {MIN_ADMIN_TOKEN_LEN} characters",
+                token_file.display()
+            );
+        }
+        let mut registry = Registry::new();
+        for loaded in mints::load_all(dir)? {
+            let key = *loaded.key();
+            tracing::info!(mint = %key, "mint loaded");
+            registry.insert(key, Mint::start(loaded, compact_every));
+        }
         Ok(Self {
-            verifier,
-            inner,
-            changes,
-            admin_token: admin_token.into(),
-            schedule: Arc::new(RwLock::new(None)),
+            dir: dir.into(),
+            mints: Arc::new(RwLock::new(registry)),
+            operator_token: operator_token.into(),
+            compact_every,
         })
     }
 
-    /// Records the rotation schedule that `GET /v1/info` reports. The
-    /// scheduler calls this whenever it picks its next boundary; `None` means
-    /// rotation happens only through the admin API.
-    pub fn set_rotation_schedule(&self, schedule: Option<RotationSchedule>) {
-        // The lock guards a plain value, so a poisoned one still holds a usable schedule.
-        *self.schedule.write().unwrap_or_else(|e| e.into_inner()) = schedule;
+    /// The issuer keys of every mint, in order.
+    pub fn mints(&self) -> Vec<PublicKey> {
+        let mut keys: Vec<_> = self.registry().keys().copied().collect();
+        keys.sort_unstable();
+        keys
     }
 
-    fn rotation_schedule(&self) -> Option<RotationSchedule> {
-        *self.schedule.read().unwrap_or_else(|e| e.into_inner())
-    }
-
-    /// The verifier for the issuer's current generations.
-    fn verifier(&self) -> Verifier {
-        // The lock guards a plain value, so a poisoned one still holds a usable verifier.
-        self.verifier
-            .read()
-            .unwrap_or_else(|e| e.into_inner())
-            .clone()
-    }
-
-    /// Queues a change for the committer and waits until it is on disk.
-    async fn submit(&self, change: Change) -> Result<Done, ApiError> {
-        let (reply, done) = oneshot::channel();
-        self.changes
-            .send(Job { change, reply })
-            .await
-            .map_err(|_| ApiError::internal("the committer has stopped"))?;
-        done.await
-            .map_err(|_| ApiError::internal("the committer dropped a request"))?
-    }
-
-    /// Runs `f` on the blocking pool with the issuer locked.
-    async fn locked<T, F>(&self, f: F) -> Result<T, ApiError>
-    where
-        T: Send + 'static,
-        F: FnOnce(&mut Inner) -> Result<T, ApiError> + Send + 'static,
-    {
-        let inner = self.inner.clone();
-        tokio::task::spawn_blocking(move || {
-            let mut inner = inner
-                .lock()
-                .map_err(|_| ApiError::internal("issuer state is poisoned by an earlier panic"))?;
-            f(&mut inner)
+    /// Creates a mint and starts serving it.
+    pub async fn create_mint(&self, spec: MintSpec) -> Result<CreatedMint, ApiError> {
+        let dir = PathBuf::from(&*self.dir);
+        let (created, loaded) = tokio::task::spawn_blocking(move || {
+            let created = mints::create_mint(&dir, &spec)?;
+            let path = dir.join(mints::MINTS_DIR).join(created.mint.to_string());
+            let loaded = mints::load(&path).map_err(CreateError::Storage)?;
+            Ok::<_, CreateError>((created, loaded))
         })
         .await
-        .map_err(|_| ApiError::internal("request handler panicked"))?
+        .map_err(|_| ApiError::internal("creating a mint panicked"))??;
+        let mint = Mint::start(loaded, self.compact_every);
+        self.mints
+            .write()
+            .unwrap_or_else(|e| e.into_inner())
+            .insert(created.mint, mint);
+        tracing::info!(mint = %created.mint, "mint created");
+        Ok(created)
     }
 
-    /// Rotates and writes a fresh snapshot.
-    pub async fn rotate(&self) -> Result<RotationReport, ApiError> {
-        match self.submit(Change::Rotate).await? {
-            Done::Rotated(report) => Ok(report),
-            _ => unreachable!("a rotation reports a rotation"),
+    fn registry(&self) -> std::sync::RwLockReadGuard<'_, Registry> {
+        // Mints are only ever added, so a poisoned map is still a usable one.
+        self.mints.read().unwrap_or_else(|e| e.into_inner())
+    }
+
+    /// The mint with issuer key `key`.
+    fn mint(&self, key: &PublicKey) -> Result<Arc<Mint>, ApiError> {
+        self.registry().get(key).cloned().ok_or_else(|| {
+            ApiError::new(
+                StatusCode::NOT_FOUND,
+                "unknown_mint",
+                format!("no mint here has the issuer key {key}"),
+            )
+        })
+    }
+
+    /// The mint named in a route's path.
+    fn mint_at(&self, path: &str) -> Result<Arc<Mint>, ApiError> {
+        match path.parse::<PublicKey>() {
+            Ok(key) => self.mint(&key),
+            Err(_) => Err(ApiError::new(
+                StatusCode::NOT_FOUND,
+                "unknown_mint",
+                format!("{path} is not an issuer key"),
+            )),
         }
     }
 
-    fn check_admin(&self, headers: &HeaderMap) -> Result<(), ApiError> {
-        let given = headers
-            .get(header::AUTHORIZATION)
-            .and_then(|value| value.to_str().ok())
-            .and_then(|value| value.strip_prefix("Bearer "))
-            .unwrap_or_default();
-        if bool::from(given.as_bytes().ct_eq(self.admin_token.as_bytes())) {
-            Ok(())
-        } else {
-            Err(ApiError::new(
-                StatusCode::UNAUTHORIZED,
-                "admin_unauthorized",
-                "missing or wrong admin token",
-            ))
-        }
+    fn check_operator(&self, headers: &HeaderMap) -> Result<(), ApiError> {
+        check_bearer(headers, &self.operator_token, "operator")
     }
 }
 
-/// Takes every change waiting, up to [`MAX_BATCH`], commits them together and
-/// answers each. Returns once every [`AppState`] is gone.
-fn run_committer(inner: &Mutex<Inner>, mut queue: mpsc::Receiver<Job>) {
-    while let Some(first) = queue.blocking_recv() {
-        let mut jobs = vec![first];
-        while jobs.len() < MAX_BATCH {
-            match queue.try_recv() {
-                Ok(job) => jobs.push(job),
-                Err(_) => break,
-            }
-        }
-        let (changes, replies): (Vec<_>, Vec<_>) =
-            jobs.into_iter().map(|job| (job.change, job.reply)).unzip();
-        let results = match inner.lock() {
-            Ok(mut inner) => inner.commit(changes),
-            Err(_) => {
-                let error = ApiError::internal("issuer state is poisoned by an earlier panic");
-                changes.iter().map(|_| Err(error.clone())).collect()
-            }
-        };
-        for (reply, result) in replies.into_iter().zip(results) {
-            // The client may have gone away; the change stands regardless.
-            let _ = reply.send(result);
-        }
+/// Accepts the request only if it carries `Authorization: Bearer <token>`.
+fn check_bearer(headers: &HeaderMap, token: &str, which: &str) -> Result<(), ApiError> {
+    let given = headers
+        .get(header::AUTHORIZATION)
+        .and_then(|value| value.to_str().ok())
+        .and_then(|value| value.strip_prefix("Bearer "))
+        .unwrap_or_default();
+    if bool::from(given.as_bytes().ct_eq(token.as_bytes())) {
+        Ok(())
+    } else {
+        Err(ApiError::new(
+            StatusCode::UNAUTHORIZED,
+            "admin_unauthorized",
+            format!("missing or wrong {which} token"),
+        ))
     }
 }
 
@@ -345,23 +216,26 @@ fn run_committer(inner: &Mutex<Inner>, mut queue: mpsc::Receiver<Job>) {
 pub fn router(state: AppState) -> Router {
     Router::new()
         .route("/healthz", get(|| async { "ok" }))
-        .route("/v1/info", get(info))
-        .route("/v1/keys", get(keys))
         .route("/v1/verify", post(verify))
         .route("/v1/transfer", post(transfer))
         .route("/v1/burn", post(burn))
-        .route("/v1/mint", post(mint))
-        .route("/v1/admin/rotate", post(rotate))
+        .route("/v1/mints/{mint}/info", get(info))
+        .route("/v1/mints/{mint}/keys", get(keys))
+        .route("/v1/mints/{mint}/mint", post(mint))
+        .route("/v1/mints/{mint}/rotate", post(rotate))
+        .route("/v1/mints/{mint}/pause", post(pause))
+        .route("/v1/mints/{mint}/resume", post(resume))
+        .route("/v1/admin/mints", get(list_mints).post(new_mint))
         .layer(DefaultBodyLimit::max(BODY_LIMIT))
         .with_state(state)
 }
 
-/// Answer of `GET /v1/info`.
+/// Answer of `GET /v1/mints/{mint}/info`.
 #[derive(Debug, Serialize, Deserialize)]
 pub struct Info {
-    /// The issuer's public key.
+    /// The mint's issuer key.
     pub issuer: PublicKey,
-    /// Events applied since the issuer was created.
+    /// Events applied since the mint was created.
     pub sequence: u64,
     /// Position new money is minted into.
     pub mint_layer: u32,
@@ -371,33 +245,29 @@ pub struct Info {
     pub supply: Supply,
     /// The rules in force.
     pub policy: Policy,
-    /// The rotation schedule, or `null` when rotation happens only through
-    /// the admin API.
+    /// The rotation schedule, or `null` when the mint rotates only on
+    /// request.
     #[serde(default)]
     pub rotation: Option<RotationSchedule>,
+    /// Whether the mint is paused: it then refuses transfers, burns, mints
+    /// and rotations, so its notes neither move nor expire.
+    #[serde(default)]
+    pub paused: bool,
 }
 
-async fn info(State(state): State<AppState>) -> Result<Json<Info>, ApiError> {
-    let rotation = state.rotation_schedule();
-    state
-        .locked(move |inner| {
-            let issuer = inner.issuer.issuer();
-            Ok(Json(Info {
-                issuer: *issuer.public_key(),
-                sequence: issuer.sequence(),
-                mint_layer: issuer.mint_position(),
-                layers: issuer.layers(),
-                supply: issuer.supply(),
-                policy: issuer.policy().clone(),
-                rotation,
-            }))
-        })
-        .await
+async fn info(
+    State(state): State<AppState>,
+    UrlPath(mint): UrlPath<String>,
+) -> Result<Json<Info>, ApiError> {
+    Ok(Json(state.mint_at(&mint)?.info().await?))
 }
 
-/// The keys that sign the live generations, certified by the issuer key.
-async fn keys(State(state): State<AppState>) -> Json<KeySet> {
-    Json(state.verifier().keys().clone())
+/// The keys that sign the mint's live generations, certified by its issuer key.
+async fn keys(
+    State(state): State<AppState>,
+    UrlPath(mint): UrlPath<String>,
+) -> Result<Json<KeySet>, ApiError> {
+    Ok(Json(state.mint_at(&mint)?.keys()))
 }
 
 #[derive(Deserialize)]
@@ -422,26 +292,8 @@ async fn verify(
     body: Result<Json<VerifyBody>, JsonRejection>,
 ) -> Result<Json<Verified>, ApiError> {
     let Json(VerifyBody { note }) = body?;
-    // Check the signature before taking the lock; the lookup itself is O(1).
-    let verifier = state.verifier();
-    let keys = verifier.keys();
-    match note.verify(keys) {
-        Ok(()) => {}
-        // A dropped generation's key is erased; the lookup reports it expired.
-        Err(NoteError::UnknownGeneration(generation))
-            if note.issuer() == keys.issuer() && generation < keys.oldest() => {}
-        Err(error) => return Err(Error::Note { input: 0, error }.into()),
-    }
-    state
-        .locked(move |inner| {
-            let status = inner.issuer.issuer().serial_status(note.serial());
-            Ok(Json(Verified {
-                serial: note.serial(),
-                amount: note.amount(),
-                status,
-            }))
-        })
-        .await
+    let mint = state.mint(note.issuer())?;
+    Ok(Json(mint.verify(note).await?))
 }
 
 #[derive(Serialize, Deserialize)]
@@ -449,19 +301,26 @@ struct NotesBody {
     notes: Vec<Note>,
 }
 
+/// The mint that issued the first input. The issuer checks the others.
+fn first_input_mint(state: &AppState, inputs: &[worgl::Spend]) -> Result<Arc<Mint>, ApiError> {
+    let first = inputs.first().ok_or_else(|| {
+        ApiError::new(
+            StatusCode::BAD_REQUEST,
+            "malformed",
+            "the request spends no notes",
+        )
+    })?;
+    state.mint(first.note.issuer())
+}
+
 async fn transfer(
     State(state): State<AppState>,
     body: Result<Json<TransferRequest>, JsonRejection>,
 ) -> Result<Json<NotesBody>, ApiError> {
     let Json(request) = body?;
-    let verifier = state.verifier();
-    let verified = tokio::task::spawn_blocking(move || verifier.verify(&request))
-        .await
-        .map_err(|_| ApiError::internal("verification panicked"))??;
-    match state.submit(Change::Transfer(verified)).await? {
-        Done::Notes(notes) => Ok(Json(NotesBody { notes })),
-        _ => unreachable!("a transfer creates notes"),
-    }
+    let mint = first_input_mint(&state, &request.inputs)?;
+    let notes = mint.transfer(request).await?;
+    Ok(Json(NotesBody { notes }))
 }
 
 /// Answer of `POST /v1/burn`: the value destroyed. A resent burn answers
@@ -476,14 +335,9 @@ async fn burn(
     body: Result<Json<BurnRequest>, JsonRejection>,
 ) -> Result<Json<BurnedBody>, ApiError> {
     let Json(request) = body?;
-    let verifier = state.verifier();
-    let verified = tokio::task::spawn_blocking(move || verifier.verify_burn(&request))
-        .await
-        .map_err(|_| ApiError::internal("verification panicked"))??;
-    match state.submit(Change::Burn(verified)).await? {
-        Done::Burned(value) => Ok(Json(BurnedBody { value })),
-        _ => unreachable!("a burn reports its value"),
-    }
+    let mint = first_input_mint(&state, &request.inputs)?;
+    let value = mint.burn(request).await?;
+    Ok(Json(BurnedBody { value }))
 }
 
 #[derive(Serialize, Deserialize)]
@@ -493,22 +347,18 @@ struct NoteBody {
 
 async fn mint(
     State(state): State<AppState>,
+    UrlPath(mint): UrlPath<String>,
     body: Result<Json<MintRequest>, JsonRejection>,
 ) -> Result<Json<NoteBody>, ApiError> {
+    let mint = state.mint_at(&mint)?;
     let Json(request) = body?;
-    let verifier = state.verifier();
-    let checked = request.clone();
-    let verified = tokio::task::spawn_blocking(move || verifier.verify_mint(&checked))
-        .await
-        .map_err(|_| ApiError::internal("verification panicked"))??;
-    let note = match state.submit(Change::Mint(verified)).await? {
-        Done::Notes(mut notes) => notes.remove(0),
-        _ => unreachable!("a mint creates a note"),
-    };
+    let (authority, sequence, amount) = (request.authority, request.sequence, request.amount);
+    let note = mint.issue(request).await?;
     tracing::info!(
-        authority = %request.authority,
-        sequence = request.sequence,
-        amount = request.amount,
+        mint = %mint.key(),
+        %authority,
+        sequence,
+        amount,
         "mint request answered"
     );
     Ok(Json(NoteBody { note }))
@@ -516,12 +366,81 @@ async fn mint(
 
 async fn rotate(
     State(state): State<AppState>,
+    UrlPath(mint): UrlPath<String>,
     headers: HeaderMap,
 ) -> Result<Json<RotationReport>, ApiError> {
-    state.check_admin(&headers)?;
-    let report = state.rotate().await?;
-    tracing::info!(?report, "rotated by admin request");
+    let mint = state.mint_at(&mint)?;
+    check_bearer(&headers, mint.token(), "mint admin")?;
+    let report = mint.rotate().await?;
+    tracing::info!(mint = %mint.key(), ?report, "rotated by admin request");
     Ok(Json(report))
+}
+
+#[derive(Serialize, Deserialize)]
+struct PausedBody {
+    paused: bool,
+}
+
+async fn pause(
+    State(state): State<AppState>,
+    UrlPath(mint): UrlPath<String>,
+    headers: HeaderMap,
+) -> Result<Json<PausedBody>, ApiError> {
+    set_paused(&state, &mint, &headers, true).await
+}
+
+async fn resume(
+    State(state): State<AppState>,
+    UrlPath(mint): UrlPath<String>,
+    headers: HeaderMap,
+) -> Result<Json<PausedBody>, ApiError> {
+    set_paused(&state, &mint, &headers, false).await
+}
+
+async fn set_paused(
+    state: &AppState,
+    mint: &str,
+    headers: &HeaderMap,
+    paused: bool,
+) -> Result<Json<PausedBody>, ApiError> {
+    let mint = state.mint_at(mint)?;
+    check_bearer(headers, mint.token(), "mint admin")?;
+    mint.set_paused(paused).await?;
+    Ok(Json(PausedBody { paused }))
+}
+
+#[derive(Serialize, Deserialize)]
+struct MintsBody {
+    mints: Vec<PublicKey>,
+}
+
+async fn list_mints(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+) -> Result<Json<MintsBody>, ApiError> {
+    state.check_operator(&headers)?;
+    Ok(Json(MintsBody {
+        mints: state.mints(),
+    }))
+}
+
+/// Creates a mint. Its policy must list a mint authority, since the server
+/// never holds one and could not mint otherwise.
+async fn new_mint(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    body: Result<Json<MintSpec>, JsonRejection>,
+) -> Result<Json<CreatedMint>, ApiError> {
+    state.check_operator(&headers)?;
+    let Json(spec) = body?;
+    if spec.policy.mint_authorities.is_empty() {
+        return Err(ApiError::new(
+            StatusCode::BAD_REQUEST,
+            "malformed",
+            "the policy must list at least one mint authority",
+        ));
+    }
+    Ok(Json(state.create_mint(spec).await?))
 }
 
 /// An error answer: a status code and a stable machine-readable code.
@@ -552,6 +471,14 @@ impl ApiError {
         Self::new(StatusCode::INTERNAL_SERVER_ERROR, "internal", message)
     }
 
+    fn paused() -> Self {
+        Self::new(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "paused",
+            "the mint is paused; its notes keep their places until it resumes",
+        )
+    }
+
     /// The HTTP status.
     pub fn status(&self) -> StatusCode {
         self.status
@@ -559,9 +486,9 @@ impl ApiError {
 
     /// One of: `malformed`, `policy`, `invalid_note`, `duplicate_input`,
     /// `unauthorized` (a holder's or mint authority's signature),
-    /// `unknown_authority`, `admin_unauthorized`, `spent`, `expired`,
-    /// `unissued`, `frozen`, `stale_mint`, `layer_full`, `storage`,
-    /// `internal`.
+    /// `unknown_authority`, `admin_unauthorized` (a missing or wrong token),
+    /// `unknown_mint`, `paused`, `spent`, `expired`, `unissued`, `frozen`,
+    /// `stale_mint`, `layer_full`, `storage`, `internal`.
     pub fn code(&self) -> &'static str {
         self.code
     }
@@ -599,6 +526,22 @@ impl From<CommitError> for ApiError {
                     StatusCode::INTERNAL_SERVER_ERROR,
                     "storage",
                     "the issuer could not record the change; nothing was applied",
+                )
+            }
+        }
+    }
+}
+
+impl From<CreateError> for ApiError {
+    fn from(error: CreateError) -> Self {
+        match error {
+            CreateError::Invalid(reason) => Self::new(StatusCode::BAD_REQUEST, "malformed", reason),
+            CreateError::Storage(error) => {
+                tracing::error!(error = format!("{error:#}"), "creating a mint failed");
+                Self::new(
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    "storage",
+                    "the mint could not be written; nothing was created",
                 )
             }
         }
