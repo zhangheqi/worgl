@@ -5,13 +5,14 @@
 //! it wants to (see [`store`](crate::store)), and then the issuer *applies*
 //! it. Applying is deterministic and checks the event against the state, so
 //! replaying a journal of events onto the snapshot it started from rebuilds
-//! the exact same issuer. [`Issuer::mint`], [`Issuer::transfer`] and
-//! [`Issuer::rotate`] do all three steps for in-memory use.
+//! the exact same issuer. [`Issuer::mint`], [`Issuer::transfer`],
+//! [`Issuer::burn`] and [`Issuer::rotate`] do all three steps for in-memory
+//! use.
 //!
 //! Besides the ledger's bits, the issuer keeps a few counters that cost
-//! nothing per note: the live value in each layer, the value ever minted and
-//! the value destroyed by rotations. They satisfy
-//! `outstanding = minted − destroyed` at all times.
+//! nothing per note: the live value in each layer, the value ever minted, the
+//! value destroyed by rotations and the value burned on purpose. They satisfy
+//! `outstanding = minted − destroyed − burned` at all times.
 
 use std::collections::{HashMap, VecDeque};
 
@@ -24,10 +25,13 @@ use crate::keys::{IssuerKey, PublicKey};
 use crate::ledger::{Ledger, LedgerConfig, Serial, Status};
 use crate::note::{Note, NoteError, read_key};
 use crate::policy::Policy;
-use crate::transfer::{TransferId, TransferRequest, VerifiedTransfer, Verifier};
+use crate::transfer::{
+    BurnRequest, TransferId, TransferRequest, VerifiedBurn, VerifiedTransfer, Verifier,
+};
 
 const SNAPSHOT_MAGIC: &[u8; 8] = b"WORGLSNP";
-const SNAPSHOT_VERSION: u16 = 1;
+/// Version 2 added the burned value; version 1 snapshots still restore.
+const SNAPSHOT_VERSION: u16 = 2;
 
 /// A note created by a mint or transfer.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
@@ -79,6 +83,13 @@ pub enum Event {
     },
     /// The first layer was dropped and a new last layer created.
     Rotate(RotationReport),
+    /// Notes were destroyed on their holders' request, issuing nothing.
+    Burn {
+        /// Identity of the burn request.
+        id: TransferId,
+        /// The destroyed notes.
+        spent: Vec<Spent>,
+    },
 }
 
 impl Event {
@@ -91,10 +102,8 @@ impl Event {
                 write_issued(&mut w, issued);
             }
             Event::Transfer { id, spent, issued } => {
-                w.u8(2).bytes(&id.to_bytes()).u32(spent.len() as u32);
-                for s in spent {
-                    w.u64(s.serial.generation).u32(s.serial.index).u64(s.amount);
-                }
+                w.u8(2).bytes(&id.to_bytes());
+                write_spent(&mut w, spent);
                 w.u32(issued.len() as u32);
                 for i in issued {
                     write_issued(&mut w, i);
@@ -107,6 +116,10 @@ impl Event {
                     .u32(r.destroyed_notes)
                     .u128(r.destroyed_value);
             }
+            Event::Burn { id, spent } => {
+                w.u8(4).bytes(&id.to_bytes());
+                write_spent(&mut w, spent);
+            }
         }
         w.finish()
     }
@@ -118,12 +131,7 @@ impl Event {
             1 => Event::Mint(read_issued(&mut r)?),
             2 => {
                 let id = TransferId::from_bytes(r.array()?);
-                let spent = read_list(&mut r, 20, |r| {
-                    Ok(Spent {
-                        serial: Serial::new(r.u64()?, r.u32()?),
-                        amount: r.u64()?,
-                    })
-                })?;
+                let spent = read_spent(&mut r)?;
                 let issued = read_list(&mut r, 52, read_issued)?;
                 Event::Transfer { id, spent, issued }
             }
@@ -133,6 +141,10 @@ impl Event {
                 destroyed_notes: r.u32()?,
                 destroyed_value: r.u128()?,
             }),
+            4 => Event::Burn {
+                id: TransferId::from_bytes(r.array()?),
+                spent: read_spent(&mut r)?,
+            },
             _ => return Err(DecodeError::Invalid("event type")),
         };
         r.finish()?;
@@ -145,6 +157,32 @@ fn write_issued(w: &mut Writer, issued: &Issued) {
         .u32(issued.serial.index)
         .u64(issued.amount)
         .bytes(issued.holder.as_bytes());
+}
+
+fn spent(notes: &[Note]) -> Vec<Spent> {
+    notes
+        .iter()
+        .map(|note| Spent {
+            serial: note.serial(),
+            amount: note.amount(),
+        })
+        .collect()
+}
+
+fn write_spent(w: &mut Writer, spent: &[Spent]) {
+    w.u32(spent.len() as u32);
+    for s in spent {
+        w.u64(s.serial.generation).u32(s.serial.index).u64(s.amount);
+    }
+}
+
+fn read_spent(r: &mut Reader<'_>) -> Result<Vec<Spent>, DecodeError> {
+    read_list(r, 20, |r| {
+        Ok(Spent {
+            serial: Serial::new(r.u64()?, r.u32()?),
+            amount: r.u64()?,
+        })
+    })
 }
 
 fn read_issued(r: &mut Reader<'_>) -> Result<Issued, DecodeError> {
@@ -168,14 +206,15 @@ fn read_list<T>(
     (0..count).map(|_| item(r)).collect()
 }
 
-/// The outcome of [`Issuer::plan_transfer`].
+/// The outcome of [`Issuer::plan_transfer`] and [`Issuer::plan_burn`].
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Plan {
-    /// A fresh transfer: make the event durable if needed, then
+    /// A fresh request: make the event durable if needed, then
     /// [`apply`](Issuer::apply) it and hand out [`notes`](Issuer::notes).
     Apply(Event),
     /// The identical request was already applied; these are the notes it
-    /// produced, signed again. Nothing needs to be stored or applied.
+    /// produced, signed again, which is none for a burn. Nothing needs to be
+    /// stored or applied.
     Replay(Vec<Note>),
 }
 
@@ -210,7 +249,10 @@ pub struct Supply {
     pub minted: u128,
     /// Value destroyed by rotations.
     pub destroyed: u128,
-    /// Value held in live notes: `minted − destroyed`.
+    /// Value burned on its holders' request.
+    #[serde(default)]
+    pub burned: u128,
+    /// Value held in live notes: `minted − destroyed − burned`.
     pub outstanding: u128,
 }
 
@@ -256,13 +298,14 @@ impl Receipts {
         }
     }
 
-    /// Forgets transfers whose notes have expired.
+    /// Forgets transfers whose notes have expired. Burns issued nothing, so
+    /// they stay until newer requests push them out.
     fn prune(&mut self, oldest_generation: u64) {
         let issued = &mut self.issued;
         self.order.retain(|id| {
             let alive = issued[id]
                 .first()
-                .is_some_and(|i| i.serial.generation >= oldest_generation);
+                .is_none_or(|i| i.serial.generation >= oldest_generation);
             if !alive {
                 issued.remove(id);
             }
@@ -283,6 +326,7 @@ pub struct Issuer {
     value: Vec<u128>,
     minted: u128,
     destroyed: u128,
+    burned: u128,
     receipts: Receipts,
 }
 
@@ -300,6 +344,7 @@ impl Issuer {
             sequence: 0,
             minted: 0,
             destroyed: 0,
+            burned: 0,
             receipts: Receipts::default(),
         })
     }
@@ -334,6 +379,7 @@ impl Issuer {
         Supply {
             minted: self.minted,
             destroyed: self.destroyed,
+            burned: self.burned,
             outstanding: self.value.iter().sum(),
         }
     }
@@ -436,18 +482,38 @@ impl Issuer {
             })
             .collect::<Option<Vec<_>>>()
             .ok_or(Error::LayerFull { position })?;
-        let spent = transfer
-            .inputs
-            .iter()
-            .map(|note| Spent {
-                serial: note.serial(),
-                amount: note.amount(),
-            })
-            .collect();
         Ok(Plan::Apply(Event::Transfer {
             id: transfer.id,
-            spent,
+            spent: spent(&transfer.inputs),
             issued,
+        }))
+    }
+
+    /// Plans a verified burn against the ledger: every input must be live.
+    /// Notes frozen in the last layer can be burned, since nothing moves.
+    pub fn plan_burn(&self, burn: &VerifiedBurn) -> Result<Plan, Error> {
+        if burn.issuer != self.public {
+            return Err(Error::Note {
+                input: 0,
+                error: NoteError::WrongIssuer,
+            });
+        }
+        self.policy.check_burn(burn.inputs.len())?;
+        if self.receipts.issued.contains_key(&burn.id) {
+            return Ok(Plan::Replay(Vec::new()));
+        }
+        for note in &burn.inputs {
+            let serial = note.serial();
+            match self.ledger.status(serial) {
+                Status::Live { .. } => {}
+                Status::Spent => return Err(Error::Spent(serial)),
+                Status::Expired => return Err(Error::Expired(serial)),
+                Status::Unissued => return Err(Error::Unissued(serial)),
+            }
+        }
+        Ok(Plan::Apply(Event::Burn {
+            id: burn.id,
+            spent: spent(&burn.inputs),
         }))
     }
 
@@ -471,12 +537,13 @@ impl Issuer {
             Event::Mint(issued) => self.apply_mint(issued)?,
             Event::Transfer { id, spent, issued } => self.apply_transfer(*id, spent, issued)?,
             Event::Rotate(report) => self.apply_rotate(report)?,
+            Event::Burn { id, spent } => self.apply_burn(*id, spent)?,
         }
         self.sequence += 1;
         Ok(())
     }
 
-    /// The notes an event created, signed. Empty for a rotation.
+    /// The notes an event created, signed. Empty for a rotation or a burn.
     ///
     /// Ed25519 signatures are deterministic, so signing the same event again
     /// yields byte-identical notes.
@@ -484,7 +551,7 @@ impl Issuer {
         match event {
             Event::Mint(issued) => self.sign_all(std::slice::from_ref(issued)),
             Event::Transfer { issued, .. } => self.sign_all(issued),
-            Event::Rotate(_) => Vec::new(),
+            Event::Rotate(_) | Event::Burn { .. } => Vec::new(),
         }
     }
 
@@ -507,6 +574,17 @@ impl Issuer {
         }
     }
 
+    /// Verifies and carries out a burn in memory, returning the value
+    /// destroyed. A resent burn that was already applied returns the same
+    /// value and changes nothing.
+    pub fn burn(&mut self, request: &BurnRequest) -> Result<u128, Error> {
+        let verified = self.verifier().verify_burn(request)?;
+        if let Plan::Apply(event) = self.plan_burn(&verified)? {
+            self.apply(&event).expect("a freshly planned event applies");
+        }
+        Ok(verified.value())
+    }
+
     /// Rotates in memory.
     pub fn rotate(&mut self) -> RotationReport {
         let event = self.plan_rotate();
@@ -522,7 +600,7 @@ impl Issuer {
     /// Layout, big-endian: the magic `WORGLSNP`, a `u16` format version, the
     /// issuer public key, the event sequence number, the ledger (see
     /// [`Ledger::to_bytes`]), the live value of each layer as `u128`, value
-    /// minted and destroyed as `u128`, the remembered transfer receipts, and
+    /// minted, destroyed and burned as `u128`, the remembered receipts, and
     /// finally the SHA-256 of everything before it.
     pub fn snapshot(&self) -> Vec<u8> {
         let mut w = Writer::default();
@@ -534,7 +612,7 @@ impl Issuer {
         for value in &self.value {
             w.u128(*value);
         }
-        w.u128(self.minted).u128(self.destroyed);
+        w.u128(self.minted).u128(self.destroyed).u128(self.burned);
         w.u32(self.receipts.order.len() as u32);
         for id in &self.receipts.order {
             let issued = &self.receipts.issued[id];
@@ -565,7 +643,8 @@ impl Issuer {
         if &r.array::<8>()? != SNAPSHOT_MAGIC {
             return Err(DecodeError::Invalid("snapshot magic").into());
         }
-        if r.u16()? != SNAPSHOT_VERSION {
+        let version = r.u16()?;
+        if !(1..=SNAPSHOT_VERSION).contains(&version) {
             return Err(DecodeError::Invalid("snapshot version").into());
         }
         if read_key(&mut r)? != key.public_key() {
@@ -579,6 +658,7 @@ impl Issuer {
             .collect::<Result<Vec<_>, _>>()?;
         let minted = r.u128()?;
         let destroyed = r.u128()?;
+        let burned = if version >= 2 { r.u128()? } else { 0 };
         let mut receipts = Receipts::default();
         for _ in 0..r.u32()? {
             let id = TransferId::from_bytes(r.array()?);
@@ -599,6 +679,7 @@ impl Issuer {
             value,
             minted,
             destroyed,
+            burned,
             receipts,
         })
     }
@@ -636,6 +717,40 @@ impl Issuer {
                 "a transfer spends and issues at least one note".into(),
             ));
         }
+        self.check_spent(spent)?;
+        let total_in: u128 = spent.iter().map(|s| u128::from(s.amount)).sum();
+        let total_out: u128 = issued.iter().map(|i| u128::from(i.amount)).sum();
+        if total_in != total_out {
+            return Err(ApplyError(format!(
+                "spends {total_in} but issues {total_out}"
+            )));
+        }
+        let position = self.check_issued(issued)?;
+
+        self.spend(spent);
+        for i in issued {
+            self.allocate(position, i);
+        }
+        let capacity = self.policy.receipt_capacity as usize;
+        self.receipts.insert(capacity, id, issued.to_vec());
+        Ok(())
+    }
+
+    fn apply_burn(&mut self, id: TransferId, spent: &[Spent]) -> Result<(), ApplyError> {
+        if spent.is_empty() {
+            return Err(ApplyError("a burn spends at least one note".into()));
+        }
+        self.check_spent(spent)?;
+        self.spend(spent);
+        self.burned += spent.iter().map(|s| u128::from(s.amount)).sum::<u128>();
+        let capacity = self.policy.receipt_capacity as usize;
+        self.receipts.insert(capacity, id, Vec::new());
+        Ok(())
+    }
+
+    /// Checks that every spent note is live, appears once, and that its
+    /// layer holds at least the value spent from it.
+    fn check_spent(&self, spent: &[Spent]) -> Result<(), ApplyError> {
         let mut drained: Vec<(u32, u128)> = Vec::new();
         let mut serials = Vec::with_capacity(spent.len());
         for s in spent {
@@ -660,15 +775,11 @@ impl Issuer {
                 "layer {position} holds less value than is spent"
             )));
         }
-        let total_in: u128 = spent.iter().map(|s| u128::from(s.amount)).sum();
-        let total_out: u128 = issued.iter().map(|i| u128::from(i.amount)).sum();
-        if total_in != total_out {
-            return Err(ApplyError(format!(
-                "spends {total_in} but issues {total_out}"
-            )));
-        }
-        let position = self.check_issued(issued)?;
+        Ok(())
+    }
 
+    /// Clears the bits of notes [`check_spent`](Self::check_spent) accepted.
+    fn spend(&mut self, spent: &[Spent]) {
         for s in spent {
             let from = self
                 .ledger
@@ -676,12 +787,6 @@ impl Issuer {
                 .expect("checked live above");
             self.value[from as usize] -= u128::from(s.amount);
         }
-        for i in issued {
-            self.allocate(position, i);
-        }
-        let capacity = self.policy.receipt_capacity as usize;
-        self.receipts.insert(capacity, id, issued.to_vec());
-        Ok(())
     }
 
     fn apply_rotate(&mut self, report: &RotationReport) -> Result<(), ApplyError> {
@@ -834,6 +939,7 @@ mod tests {
             Supply {
                 minted: 6,
                 destroyed: 4,
+                burned: 0,
                 outstanding: 2
             }
         );
@@ -964,7 +1070,83 @@ mod tests {
             }],
         };
         assert!(i.apply(&forged).is_err(), "value must balance");
+        let empty = Event::Burn {
+            id: TransferId::from_bytes([1; 32]),
+            spent: Vec::new(),
+        };
+        assert!(i.apply(&empty).is_err(), "a burn spends something");
+        let unissued = Event::Burn {
+            id: TransferId::from_bytes([2; 32]),
+            spent: vec![Spent {
+                serial: Serial::new(issued.serial.generation, issued.serial.index + 1),
+                amount: 8,
+            }],
+        };
+        assert!(i.apply(&unissued).is_err(), "only live notes burn");
         assert_eq!(i.snapshot(), before);
+    }
+
+    #[test]
+    fn burning_destroys_value_even_in_the_last_layer() {
+        let mut i = issuer(4, Policy::cash_like());
+        let alice = HolderKey::generate();
+        let note = i.mint(8, alice.public_key()).unwrap();
+        let (frozen, bob) = pay(&mut i, note, &alice).unwrap();
+        assert!(matches!(
+            i.status(&frozen),
+            Ok(NoteStatus::Live { hops_left: 0, .. })
+        ));
+
+        let burn = BurnRequest::single(frozen, &bob).unwrap();
+        assert_eq!(i.burn(&burn), Ok(8));
+        assert_eq!(i.status(&frozen), Ok(NoteStatus::Spent));
+        assert_eq!(
+            i.supply(),
+            Supply {
+                minted: 8,
+                destroyed: 0,
+                burned: 8,
+                outstanding: 0,
+            }
+        );
+        assert_eq!(i.layers()[3].value, 0);
+
+        // A resent burn answers the same, even after rotations, and changes nothing.
+        i.rotate();
+        let sequence = i.sequence();
+        assert_eq!(i.burn(&burn), Ok(8));
+        assert_eq!(i.sequence(), sequence);
+
+        // A burned note cannot be spent, and a spent one cannot be burned.
+        let output = Output {
+            amount: 8,
+            holder: alice.public_key(),
+        };
+        let request = TransferRequest::single(frozen, &bob, output).unwrap();
+        assert_eq!(i.transfer(&request), Err(Error::Spent(frozen.serial())));
+        let carol = HolderKey::generate();
+        let note = i.mint(4, carol.public_key()).unwrap();
+        pay(&mut i, note, &carol).unwrap();
+        let late = BurnRequest::single(note, &carol).unwrap();
+        assert_eq!(i.burn(&late), Err(Error::Spent(note.serial())));
+    }
+
+    #[test]
+    fn version_1_snapshots_restore_with_nothing_burned() {
+        let mut i = issuer(4, Policy::cash_like());
+        i.mint(8, HolderKey::generate().public_key()).unwrap();
+        let v2 = i.snapshot();
+        // With no receipts the body ends in the burned value and a zero count.
+        let body = &v2[..v2.len() - 32];
+        let burned_at = body.len() - 4 - 16;
+        let mut v1 = [&body[..burned_at], &body[burned_at + 16..]].concat();
+        v1[8..10].copy_from_slice(&1u16.to_be_bytes());
+        let checksum: [u8; 32] = Sha256::digest(&v1).into();
+        v1.extend_from_slice(&checksum);
+
+        let restored = Issuer::restore(i.key.clone(), &v1, Policy::cash_like()).unwrap();
+        assert_eq!(restored.supply(), i.supply());
+        assert_eq!(restored.snapshot(), v2);
     }
 
     #[test]
@@ -1018,7 +1200,14 @@ mod tests {
         else {
             panic!("fresh transfer")
         };
-        for event in [mint, transfer, i.plan_rotate()] {
+        let burn = BurnRequest::single(note, &key).unwrap();
+        let Plan::Apply(burn) = i
+            .plan_burn(&i.verifier().verify_burn(&burn).unwrap())
+            .unwrap()
+        else {
+            panic!("fresh burn")
+        };
+        for event in [mint, transfer, burn, i.plan_rotate()] {
             assert_eq!(Event::from_bytes(&event.to_bytes()), Ok(event.clone()));
             let json = serde_json::to_string(&event).unwrap();
             assert_eq!(serde_json::from_str::<Event>(&json).unwrap(), event);

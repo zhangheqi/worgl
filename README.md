@@ -125,6 +125,14 @@ never gives an input extra hops.
 your own moves it one layer on. This is the "regular transfer" the design
 encourages and the way to save a note before its layer is dropped.
 
+**A holder can burn a note.** A `BurnRequest` destroys its input notes and
+issues nothing in their place, so money that is redeemed leaves circulation
+at once instead of waiting for its layer to be dropped. Burns follow the same
+input limit as transfers and work on a note frozen in the last layer. They
+are signed in their own domain, so a burn signature can never be replayed as
+a transfer or the other way round, and a resent burn is answered from its
+receipt without destroying anything more.
+
 **A full layer refuses until the next rotation.** Bits are not reused within a
 generation, so `layer_size` caps how many notes can land in one layer per
 rotation period.
@@ -139,8 +147,9 @@ that the issuer plans without side effects, the store writes and flushes to a
 journal, and only then the issuer applies. Applying is deterministic and
 checked, so a snapshot plus its journal rebuilds the exact same state, and a
 note is never handed out unless the event that created it is on disk. The
-issuer also keeps the live value of each layer and the value minted and
-destroyed, so `outstanding = minted − destroyed` can be audited at any time.
+issuer also keeps the live value of each layer and the value minted,
+destroyed by rotations and burned, so
+`outstanding = minted − destroyed − burned` can be audited at any time.
 
 **Rotation is an admin call or a schedule** aligned to multiples of the
 period since the Unix epoch, so restarts do not shift it. The server records
@@ -213,14 +222,16 @@ missing fields take their cash-like defaults:
 | GET | `/v1/info` | | layers, supply, policy |
 | POST | `/v1/verify` | `{"note"}` | serial, amount, state, position, hops left |
 | POST | `/v1/transfer` | `{"inputs": [{"note", "signature"}], "outputs": [{"amount", "holder"}]}` | `{"notes"}` |
+| POST | `/v1/burn` | `{"inputs": [{"note", "signature"}]}` | `{"value"}` burned |
 | POST | `/v1/admin/mint` | `{"amount", "holder"}` | `{"note"}` |
 | POST | `/v1/admin/rotate` | | what was destroyed |
 
 Admin routes need `Authorization: Bearer <token>`. Errors carry a stable code,
 such as `{"error": "spent", "message": "note 3:17 is already spent"}`; the
 codes are listed in [`ApiError::code`](crates/worgl-server/src/lib.rs). The
-request types are the library's own (`TransferRequest`, `Note`, `PublicKey`),
-so a Rust client signs with the library and posts the JSON it serializes to.
+request types are the library's own (`TransferRequest`, `BurnRequest`, `Note`,
+`PublicKey`), so a Rust client signs with the library and posts the JSON it
+serializes to.
 
 The server is one process; a lock file stops a second one from opening the
 same state. It speaks plain HTTP: put it behind a reverse proxy for TLS and
