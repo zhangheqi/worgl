@@ -1,0 +1,29 @@
+[package]
+name = "worgl"
+description = "Centralized, account-free e-cash: an issuer that tracks every note with one bit in a layered bitmap"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+readme = "../../README.md"
+keywords = ["ecash", "token", "bitmap", "ed25519", "ledger"]
+categories = ["cryptography", "data-structures"]
+
+[dependencies]
+base64.workspace = true
+ed25519-dalek.workspace = true
+getrandom.workspace = true
+hex.workspace = true
+serde.workspace = true
+sha2.workspace = true
+thiserror.workspace = true
+
+[dev-dependencies]
+proptest.workspace = true
+serde_json.workspace = true
+tempfile.workspace = true
+
+[lints]
+workspace = true
