@@ -143,7 +143,9 @@ issuer also keeps the live value of each layer and the value minted and
 destroyed, so `outstanding = minted − destroyed` can be audited at any time.
 
 **Rotation is an admin call or a schedule** aligned to multiples of the
-period since the Unix epoch, so restarts do not shift it. The server records
+period since the Unix epoch, so restarts do not shift it. When a schedule is
+set, `/v1/info` reports its period and the time of the next rotation, so
+clients know when frozen notes thaw and when idle ones must be refreshed. The server records
 the last scheduled boundary, so a wall clock that steps backwards cannot
 rotate twice in one period. Boundaries missed while the server is down are
 not made up.
@@ -210,7 +212,7 @@ missing fields take their cash-like defaults:
 | Method | Path | Body | Answer |
 |---|---|---|---|
 | GET | `/healthz` | | `ok` |
-| GET | `/v1/info` | | layers, supply, policy |
+| GET | `/v1/info` | | layers, supply, policy, rotation schedule |
 | POST | `/v1/verify` | `{"note"}` | serial, amount, state, position, hops left |
 | POST | `/v1/transfer` | `{"inputs": [{"note", "signature"}], "outputs": [{"amount", "holder"}]}` | `{"notes"}` |
 | POST | `/v1/admin/mint` | `{"amount", "holder"}` | `{"note"}` |
