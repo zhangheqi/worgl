@@ -6,8 +6,8 @@ use std::collections::{BTreeSet, VecDeque};
 use proptest::prelude::*;
 use worgl::ledger::Status;
 use worgl::{
-    Denominations, Error, Event, HolderKey, Issuer, IssuerKey, Ledger, LedgerConfig, Note, Output,
-    Plan, Policy, Serial, TransferRequest,
+    Denominations, Error, Event, GenerationKey, HolderKey, Issuer, IssuerKey, Ledger, LedgerConfig,
+    Note, Output, Plan, Policy, Serial, TransferRequest,
 };
 
 #[derive(Debug, Clone)]
@@ -245,6 +245,8 @@ fn run_history(
     let key = IssuerKey::from_secret_bytes(&[9; 32]);
     let mut issuer = Issuer::new(key.clone(), config, policy.clone()).unwrap();
     let genesis = issuer.snapshot();
+    // Every generation key ever used, to replay from the genesis snapshot.
+    let mut ring = issuer.key_ring().clone();
     let mut keys = Keys(0);
     let mut wallet: Vec<(Note, HolderKey)> = Vec::new();
     let mut spent: Vec<(Note, HolderKey)> = Vec::new();
@@ -352,7 +354,9 @@ fn run_history(
             }
             IssuerOp::Transfer { .. } | IssuerOp::Merge { .. } => {}
             IssuerOp::Rotate => {
-                let event = issuer.plan_rotate();
+                let next = GenerationKey::generate();
+                ring.insert(next.clone());
+                let event = issuer.plan_rotate(next);
                 commit(&mut issuer, event);
                 let oldest = issuer.ledger().oldest_generation();
                 wallet.retain(|(note, _)| note.serial().generation >= oldest);
@@ -385,7 +389,7 @@ fn run_history(
     }
 
     // Replaying the events onto the starting snapshot rebuilds the same state.
-    let mut replayed = Issuer::restore(key, &genesis, policy).unwrap();
+    let mut replayed = Issuer::restore(key, ring, &genesis, policy).unwrap();
     for event in &events {
         replayed.apply(event).unwrap();
         prop_assert_eq!(Event::from_bytes(&event.to_bytes()).unwrap(), event.clone());

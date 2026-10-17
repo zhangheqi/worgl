@@ -33,6 +33,8 @@
 //!
 //! - [`ledger`]: the layered bit array, independent of notes and crypto.
 //! - [`note`]: the signed note format.
+//! - [`keyset`]: the keys that sign each generation's notes, certified by
+//!   the issuer key.
 //! - [`transfer`]: what holders sign to move notes, and its verification.
 //! - [`policy`]: the rules an operator may change: denominations, inputs
 //!   and outputs per transfer, where new money lands.
@@ -66,6 +68,7 @@ mod error;
 mod hex_serde;
 pub mod issuer;
 pub mod keys;
+pub mod keyset;
 pub mod ledger;
 pub mod mint;
 pub mod note;
@@ -77,7 +80,8 @@ pub mod transfer;
 pub use codec::DecodeError;
 pub use error::{ApplyError, Error, SetupError};
 pub use issuer::{Event, Issuer, NoteStatus, Plan, RotationReport, Supply};
-pub use keys::{HolderKey, IssuerKey, MintKey, PublicKey, Signature};
+pub use keys::{GenerationKey, HolderKey, IssuerKey, MintKey, PublicKey, Signature};
+pub use keyset::{KeyCertificate, KeyRing, KeySet};
 pub use ledger::{Ledger, LedgerConfig, Serial};
 pub use mint::{MintAuthorization, MintRequest, VerifiedMint};
 pub use note::{Note, NoteError};

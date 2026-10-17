@@ -3,9 +3,17 @@
 //! A store is a directory holding
 //!
 //! - `snapshot.bin`, the issuer's state as of some event (see [`Issuer::snapshot`]),
-//! - `journal.bin`, every event applied since then, and
+//! - `journal.bin`, every event applied since then,
+//! - `keys.bin`, the secrets of the generation keys (see
+//!   [`KeyRing`]), readable by its owner only, and
 //! - `lock`, held for as long as a [`FileStore`] is open so that two
 //!   processes never write the same store.
+//!
+//! Only `keys.bin` is secret: snapshot and journal name public keys and
+//! certificates only. Back it up with the rest, since a store whose live
+//! generations lost their keys cannot sign their notes. A rotation writes the
+//! new key to `keys.bin` before journaling the rotation, and a compaction
+//! erases the keys of dropped generations from it.
 //!
 //! [`PersistentIssuer`] writes each event to the journal and flushes it to
 //! disk *before* applying it, so a note is never handed out unless the event
@@ -44,7 +52,8 @@ use thiserror::Error;
 
 use crate::error::{ApplyError, Error, SetupError};
 use crate::issuer::{Event, Issuer, Plan, RotationReport};
-use crate::keys::{IssuerKey, PublicKey};
+use crate::keys::{GenerationKey, IssuerKey, PublicKey};
+use crate::keyset::KeyRing;
 use crate::mint::VerifiedMint;
 use crate::note::Note;
 use crate::policy::Policy;
@@ -54,6 +63,8 @@ const SNAPSHOT: &str = "snapshot.bin";
 const SNAPSHOT_TMP: &str = "snapshot.bin.tmp";
 const JOURNAL: &str = "journal.bin";
 const JOURNAL_TMP: &str = "journal.bin.tmp";
+const KEYS: &str = "keys.bin";
+const KEYS_TMP: &str = "keys.bin.tmp";
 const LOCK: &str = "lock";
 const JOURNAL_MAGIC: &[u8; 8] = b"WORGLJNL";
 /// Version 2 groups events into records; version 1 held one event per record.
@@ -111,6 +122,8 @@ pub struct FileStore {
     journal_len: u64,
     /// Set when a failed append could not be rolled back.
     poisoned: bool,
+    /// What `keys.bin` holds.
+    keys: KeyRing,
     _lock: File,
 }
 
@@ -133,6 +146,8 @@ impl FileStore {
         journal.write_all(&journal_header(issuer.public_key()))?;
         journal.sync_all()?;
         sync_dir(&dir)?;
+        let keys = issuer.key_ring().clone();
+        write_keys(&dir, &keys)?;
         write_atomically(&dir, SNAPSHOT, SNAPSHOT_TMP, &issuer.snapshot())?;
         Ok(Self {
             dir,
@@ -140,12 +155,16 @@ impl FileStore {
             journal_bytes: HEADER_LEN,
             journal_len: 0,
             poisoned: false,
+            keys,
             _lock: lock,
         })
     }
 
-    /// Opens a store, restores the issuer from its snapshot and replays the
-    /// journal onto it.
+    /// Opens a store, restores the issuer from its snapshot and key ring and
+    /// replays the journal onto it.
+    ///
+    /// A store written before generation keys existed has no `keys.bin`; its
+    /// generations are signed by the issuer key until they are dropped.
     pub fn open(
         dir: impl AsRef<Path>,
         key: IssuerKey,
@@ -154,7 +173,17 @@ impl FileStore {
         let dir = dir.as_ref().to_path_buf();
         let lock = lock(&dir)?;
         let snapshot = fs::read(dir.join(SNAPSHOT))?;
-        let mut issuer = Issuer::restore(key, &snapshot, policy)?;
+        let ring = match fs::read(dir.join(KEYS)) {
+            Ok(mut bytes) => {
+                let ring = KeyRing::from_bytes(&bytes);
+                bytes.fill(0);
+                ring?
+            }
+            Err(error) if error.kind() == io::ErrorKind::NotFound => KeyRing::new(key.public_key()),
+            Err(error) => return Err(error.into()),
+        };
+        let mut keys = ring.clone();
+        let mut issuer = Issuer::restore(key, ring, &snapshot, policy)?;
 
         let mut journal = OpenOptions::new()
             .read(true)
@@ -199,6 +228,14 @@ impl FileStore {
             journal.set_len(intact as u64)?;
             journal.sync_all()?;
         }
+        // A rotation that was planned but never journaled leaves its key
+        // behind. The file may only lose it once no journaled event needs
+        // replaying, though; otherwise the next compaction removes it.
+        issuer.retire_keys();
+        if journal_len == 0 && issuer.key_ring().len() < keys.len() {
+            keys = issuer.key_ring().clone();
+            write_keys(&dir, &keys)?;
+        }
         Ok((
             Self {
                 dir,
@@ -206,6 +243,7 @@ impl FileStore {
                 journal_bytes: intact as u64,
                 journal_len,
                 poisoned: false,
+                keys,
                 _lock: lock,
             },
             issuer,
@@ -258,14 +296,31 @@ impl FileStore {
         Ok(())
     }
 
-    /// Replaces the snapshot with `issuer`'s state and empties the journal.
+    /// Replaces the snapshot with `issuer`'s state, empties the journal and
+    /// rewrites the key ring without the keys of dropped generations.
     pub fn compact(&mut self, issuer: &Issuer) -> io::Result<()> {
         write_atomically(&self.dir, SNAPSHOT, SNAPSHOT_TMP, &issuer.snapshot())?;
         self.journal.set_len(HEADER_LEN)?;
         // The records are gone from here on, whether or not the flush succeeds.
         self.journal_bytes = HEADER_LEN;
         self.journal_len = 0;
-        self.journal.sync_all()
+        self.journal.sync_all()?;
+        // Only now, since the old snapshot and journal named those keys.
+        let keys = issuer.key_ring().clone();
+        write_keys(&self.dir, &keys)?;
+        self.keys = keys;
+        Ok(())
+    }
+
+    /// Adds `ring`'s keys to `keys.bin` and flushes it to disk. Keys leave
+    /// the file only at [`compact`](Self::compact), since until then the
+    /// snapshot or journal may name them.
+    pub fn save_keys(&mut self, ring: &KeyRing) -> io::Result<()> {
+        let mut keys = self.keys.clone();
+        keys.extend(ring);
+        write_keys(&self.dir, &keys)?;
+        self.keys = keys;
+        Ok(())
     }
 
     /// Events in the journal since the last snapshot.
@@ -307,6 +362,28 @@ fn write_atomically(dir: &Path, name: &str, tmp: &str, bytes: &[u8]) -> io::Resu
     file.sync_all()?;
     drop(file);
     fs::rename(&tmp, dir.join(name))?;
+    sync_dir(dir)
+}
+
+/// Writes the key ring atomically, readable by its owner only.
+fn write_keys(dir: &Path, ring: &KeyRing) -> io::Result<()> {
+    let tmp = dir.join(KEYS_TMP);
+    let mut bytes = ring.to_bytes();
+    let written = (|| {
+        let mut options = OpenOptions::new();
+        options.write(true).create(true).truncate(true);
+        #[cfg(unix)]
+        std::os::unix::fs::OpenOptionsExt::mode(&mut options, 0o600);
+        let mut file = options.open(&tmp)?;
+        // The mode only applies to a new file; a stale one is tightened too.
+        #[cfg(unix)]
+        file.set_permissions(std::os::unix::fs::PermissionsExt::from_mode(0o600))?;
+        file.write_all(&bytes)?;
+        file.sync_all()
+    })();
+    bytes.fill(0);
+    written?;
+    fs::rename(&tmp, dir.join(KEYS))?;
     sync_dir(dir)
 }
 
@@ -525,9 +602,11 @@ impl PersistentIssuer {
         Ok(burn.value())
     }
 
-    /// Rotates once the rotation is on disk.
+    /// Rotates once the rotation is on disk, with a fresh generation key
+    /// that is saved before the rotation is journaled.
     pub fn rotate(&mut self) -> Result<RotationReport, CommitError> {
-        let event = self.issuer.plan_rotate();
+        self.check_in_step()?;
+        let event = self.plan_rotate()?;
         self.commit(&event)?;
         match event {
             Event::Rotate(report) => Ok(report),
@@ -544,6 +623,14 @@ impl PersistentIssuer {
     /// Events journaled since the last snapshot.
     pub fn journal_len(&self) -> u64 {
         self.store.journal_len()
+    }
+
+    /// Plans a rotation with a fresh key and saves the key ring with it.
+    fn plan_rotate(&mut self) -> io::Result<Event> {
+        let next = GenerationKey::try_generate().map_err(io::Error::other)?;
+        let event = self.issuer.plan_rotate(next);
+        self.store.save_keys(self.issuer.key_ring())?;
+        Ok(event)
     }
 
     fn commit(&mut self, event: &Event) -> io::Result<()> {
@@ -624,12 +711,13 @@ impl Batch<'_> {
         Ok(burn.value())
     }
 
-    /// Rotates.
-    pub fn rotate(&mut self) -> RotationReport {
-        let event = self.owner.issuer.plan_rotate();
+    /// Rotates, with a fresh generation key. The key is saved to the key
+    /// ring at once; if that fails, nothing is staged.
+    pub fn rotate(&mut self) -> io::Result<RotationReport> {
+        let event = self.owner.plan_rotate()?;
         self.stage(event.clone());
         match event {
-            Event::Rotate(report) => report,
+            Event::Rotate(report) => Ok(report),
             _ => unreachable!("plan_rotate plans a rotation"),
         }
     }
@@ -685,6 +773,7 @@ impl Drop for Batch<'_> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::issuer::NoteStatus;
     use crate::keys::{HolderKey, MintKey};
     use crate::ledger::LedgerConfig;
     use crate::mint::MintRequest;
@@ -726,6 +815,102 @@ mod tests {
         let p = PersistentIssuer::open(dir.path(), key, Policy::cash_like()).unwrap();
         assert_eq!(p.issuer().snapshot(), expected);
         assert_eq!(p.journal_len(), 0, "open compacts");
+    }
+
+    #[test]
+    fn rotations_keep_their_keys_on_disk_until_compaction() {
+        let dir = tempfile::tempdir().unwrap();
+        let (key, mut p) = fresh(dir.path());
+        let keys_at = |dir: &Path| KeyRing::from_bytes(&fs::read(dir.join(KEYS)).unwrap()).unwrap();
+        assert_eq!(keys_at(dir.path()).len(), 4);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mode = fs::metadata(dir.path().join(KEYS))
+                .unwrap()
+                .permissions()
+                .mode();
+            assert_eq!(mode & 0o777, 0o600);
+        }
+
+        // More rotations than layers: every generation the snapshot knew is
+        // dropped, but replaying from it needs every key since.
+        activity(&mut p);
+        for _ in 0..5 {
+            p.rotate().unwrap();
+        }
+        assert_eq!(p.issuer().key_ring().len(), 4);
+        assert_eq!(keys_at(dir.path()).len(), 10);
+        let expected = p.issuer().snapshot();
+        drop(p);
+        let p = PersistentIssuer::open(dir.path(), key.clone(), Policy::cash_like()).unwrap();
+        assert_eq!(p.issuer().snapshot(), expected);
+        // Opening compacted, which erased the dropped generations' keys.
+        assert_eq!(keys_at(dir.path()).len(), 4);
+        let live: Vec<_> = p
+            .issuer()
+            .keys()
+            .certificates()
+            .iter()
+            .map(|c| c.key)
+            .collect();
+        let ring = keys_at(dir.path());
+        assert!(live.iter().all(|key| ring.get(key).is_some()));
+    }
+
+    #[test]
+    fn a_rotation_that_never_reached_the_journal_leaves_no_key() {
+        let dir = tempfile::tempdir().unwrap();
+        let (key, mut p) = fresh(dir.path());
+        let expected = p.issuer().snapshot();
+        let mut batch = p.batch().unwrap();
+        batch.rotate().unwrap();
+        // Dropped uncommitted, as if the process died before the flush.
+        drop(batch);
+        drop(p);
+        let ring = KeyRing::from_bytes(&fs::read(dir.path().join(KEYS)).unwrap()).unwrap();
+        assert_eq!(ring.len(), 5);
+        let p = PersistentIssuer::open(dir.path(), key, Policy::cash_like()).unwrap();
+        assert_eq!(p.issuer().snapshot(), expected);
+        assert_eq!(p.issuer().key_ring().len(), 4);
+        let ring = KeyRing::from_bytes(&fs::read(dir.path().join(KEYS)).unwrap()).unwrap();
+        assert_eq!(ring.len(), 4);
+    }
+
+    #[test]
+    fn a_store_from_before_generation_keys_opens_and_starts_keeping_them() {
+        let dir = tempfile::tempdir().unwrap();
+        let key = IssuerKey::generate();
+        let mut issuer = Issuer::new(key.clone(), LEDGER, Policy::cash_like()).unwrap();
+        issuer.forget_generation_keys();
+        let alice = HolderKey::generate();
+        let note = issuer.mint(8, alice.public_key()).unwrap();
+        drop(FileStore::create(dir.path(), &issuer).unwrap());
+        fs::remove_file(dir.path().join(KEYS)).unwrap();
+
+        let mut p = PersistentIssuer::open(dir.path(), key.clone(), Policy::cash_like()).unwrap();
+        assert!(matches!(
+            p.issuer().status(&note),
+            Ok(NoteStatus::Live { .. })
+        ));
+        let report = p.rotate().unwrap();
+        let ring = KeyRing::from_bytes(&fs::read(dir.path().join(KEYS)).unwrap()).unwrap();
+        assert!(ring.get(&report.key.unwrap().key).is_some());
+        drop(p);
+        let p = PersistentIssuer::open(dir.path(), key, Policy::cash_like()).unwrap();
+        assert_eq!(p.issuer().keys().certificates(), &[report.key.unwrap()]);
+    }
+
+    #[test]
+    fn a_store_whose_keys_were_lost_does_not_open() {
+        let dir = tempfile::tempdir().unwrap();
+        let (key, p) = fresh(dir.path());
+        drop(p);
+        fs::remove_file(dir.path().join(KEYS)).unwrap();
+        assert!(matches!(
+            FileStore::open(dir.path(), key, Policy::cash_like()),
+            Err(StoreError::Setup(SetupError::MissingKey { generation: 0 }))
+        ));
     }
 
     #[test]
@@ -895,7 +1080,7 @@ mod tests {
 
         let mut batch = p.batch().unwrap();
         let paid = mint_and_pay(&mut batch);
-        let report = batch.rotate();
+        let report = batch.rotate().unwrap();
         assert_eq!(batch.len(), 3);
         let bytes = batch.bytes();
         batch.commit().unwrap();
@@ -1026,7 +1211,9 @@ mod tests {
         journal[8..10].copy_from_slice(&1u16.to_be_bytes());
         let alice = HolderKey::generate();
         let mint = issuer.plan_mint(8, alice.public_key()).unwrap();
-        for event in [mint, issuer.plan_rotate()] {
+        let rotate = issuer.plan_rotate(GenerationKey::generate());
+        write_keys(dir.path(), issuer.key_ring()).unwrap();
+        for event in [mint, rotate] {
             issuer.apply(&event).unwrap();
             let event = event.to_bytes();
             let mut record = ((8 + event.len()) as u32).to_be_bytes().to_vec();

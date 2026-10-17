@@ -10,12 +10,14 @@
 //! | 41..45   | serial index, big-endian `u32`                |
 //! | 45..53   | amount, big-endian `u64`, never zero          |
 //! | 53..85   | holder public key (one-time)                  |
-//! | 85..149  | issuer's Ed25519 signature                    |
+//! | 85..149  | Ed25519 signature                             |
 //!
-//! The signature covers `b"worgl/note/v1"` followed by bytes 0..85. The issuer
-//! stores no notes: the signature makes a note self-authenticating, and the
-//! issuer's bit array says whether it is still live. In text a note is the
-//! URL-safe, unpadded base64 of its bytes.
+//! The signature covers `b"worgl/note/v1"` followed by bytes 0..85, and is
+//! made by the key of the note's generation, which the issuer key certifies
+//! (see [`keyset`](crate::keyset)). The issuer stores no notes: the signature
+//! makes a note self-authenticating, and the issuer's bit array says whether
+//! it is still live. In text a note is the URL-safe, unpadded base64 of its
+//! bytes.
 
 use std::fmt;
 use std::str::FromStr;
@@ -25,7 +27,8 @@ use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use thiserror::Error;
 
 use crate::codec::{DecodeError, Reader, Writer};
-use crate::keys::{IssuerKey, PublicKey, Signature};
+use crate::keys::{PublicKey, Sign, Signature};
+use crate::keyset::KeySet;
 use crate::ledger::Serial;
 
 const VERSION: u8 = 1;
@@ -44,6 +47,10 @@ pub enum NoteError {
     /// The note names a different issuer.
     #[error("note was issued by a different issuer")]
     WrongIssuer,
+    /// No key is known for the note's generation: it was dropped, or the
+    /// key set predates it.
+    #[error("no key is known for generation {0}")]
+    UnknownGeneration(u64),
     /// The issuer's signature does not verify: the note is forged or altered.
     #[error("issuer signature does not verify")]
     BadSignature,
@@ -64,10 +71,16 @@ impl Note {
     /// Length of a note in bytes.
     pub const LEN: usize = BODY_LEN + 64;
 
-    pub(crate) fn issue(key: &IssuerKey, serial: Serial, amount: u64, holder: PublicKey) -> Self {
+    pub(crate) fn issue(
+        issuer: PublicKey,
+        key: &dyn Sign,
+        serial: Serial,
+        amount: u64,
+        holder: PublicKey,
+    ) -> Self {
         debug_assert!(amount > 0);
         let mut note = Self {
-            issuer: key.public_key(),
+            issuer,
             serial,
             amount,
             holder,
@@ -77,7 +90,7 @@ impl Note {
         note
     }
 
-    /// The issuer that signed the note.
+    /// The issuer key of the issuer that made the note.
     pub fn issuer(&self) -> &PublicKey {
         &self.issuer
     }
@@ -102,13 +115,18 @@ impl Note {
         &self.signature
     }
 
-    /// Checks that `issuer` signed this note. Says nothing about whether it is
-    /// still live; only the issuer's ledger knows that.
-    pub fn verify(&self, issuer: &PublicKey) -> Result<(), NoteError> {
-        if &self.issuer != issuer {
+    /// Checks that the issuer of `keys` made this note, signed by the key of
+    /// its generation. Says nothing about whether it is still live; only the
+    /// issuer's ledger knows that.
+    pub fn verify(&self, keys: &KeySet) -> Result<(), NoteError> {
+        if &self.issuer != keys.issuer() {
             return Err(NoteError::WrongIssuer);
         }
-        if !issuer.verify(&self.signed_message(), &self.signature) {
+        let generation = self.serial.generation;
+        let key = keys
+            .signer(generation)
+            .ok_or(NoteError::UnknownGeneration(generation))?;
+        if !key.verify(&self.signed_message(), &self.signature) {
             return Err(NoteError::BadSignature);
         }
         Ok(())
@@ -249,21 +267,46 @@ mod serde_impls {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::keys::HolderKey;
+    use crate::keys::{GenerationKey, HolderKey, IssuerKey};
+    use crate::keyset::KeyCertificate;
 
-    fn sample() -> (IssuerKey, Note) {
+    /// An issuer whose generation 7 has a key of its own, and a note from it.
+    fn sample() -> (KeySet, Note) {
         let issuer = IssuerKey::generate();
+        let key = GenerationKey::generate();
+        let certificate = KeyCertificate::sign(&issuer, 7, key.public_key());
+        let keys = KeySet::new(issuer.public_key(), 6, vec![certificate]).unwrap();
         let holder = HolderKey::generate().public_key();
-        let note = Note::issue(&issuer, Serial::new(7, 42), 1000, holder);
-        (issuer, note)
+        let note = Note::issue(issuer.public_key(), &key, Serial::new(7, 42), 1000, holder);
+        (keys, note)
     }
 
     #[test]
     fn issued_notes_verify_against_their_issuer_only() {
-        let (issuer, note) = sample();
-        assert_eq!(note.verify(&issuer.public_key()), Ok(()));
-        let stranger = IssuerKey::generate().public_key();
+        let (keys, note) = sample();
+        assert_eq!(note.verify(&keys), Ok(()));
+        let stranger = KeySet::new(IssuerKey::generate().public_key(), 6, Vec::new()).unwrap();
         assert_eq!(note.verify(&stranger), Err(NoteError::WrongIssuer));
+    }
+
+    #[test]
+    fn notes_verify_under_their_own_generations_key() {
+        let (keys, note) = sample();
+        // Generation 6 is signed by the issuer key, so the generation key's
+        // signature does not pass there.
+        let mut bytes = note.to_bytes();
+        bytes[33..41].copy_from_slice(&6u64.to_be_bytes());
+        let moved = Note::from_bytes(&bytes).unwrap();
+        assert_eq!(moved.verify(&keys), Err(NoteError::BadSignature));
+        // Generation 8 has no key yet, and generation 5 was dropped.
+        for generation in [5u64, 8] {
+            bytes[33..41].copy_from_slice(&generation.to_be_bytes());
+            let note = Note::from_bytes(&bytes).unwrap();
+            assert_eq!(
+                note.verify(&keys),
+                Err(NoteError::UnknownGeneration(generation))
+            );
+        }
     }
 
     #[test]
@@ -279,16 +322,13 @@ mod tests {
 
     #[test]
     fn any_altered_field_breaks_the_signature() {
-        let (issuer, note) = sample();
+        let (keys, note) = sample();
         // Flip one bit in each of serial, amount and signature.
-        for offset in [40, 52, 100] {
+        for offset in [44, 52, 100] {
             let mut bytes = note.to_bytes();
             bytes[offset] ^= 1;
             let altered = Note::from_bytes(&bytes).unwrap();
-            assert_eq!(
-                altered.verify(&issuer.public_key()),
-                Err(NoteError::BadSignature)
-            );
+            assert_eq!(altered.verify(&keys), Err(NoteError::BadSignature));
         }
     }
 

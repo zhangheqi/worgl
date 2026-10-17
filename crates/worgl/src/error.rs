@@ -1,6 +1,6 @@
 use thiserror::Error;
 
-use crate::keys::PublicKey;
+use crate::keys::{KeyError, PublicKey};
 use crate::ledger::{ConfigError, Serial};
 use crate::note::NoteError;
 use crate::policy::PolicyError;
@@ -96,9 +96,18 @@ pub enum SetupError {
     /// The snapshot's checksum does not match: it is corrupt.
     #[error("snapshot checksum does not match")]
     Checksum,
-    /// The snapshot belongs to an issuer with a different key.
-    #[error("snapshot belongs to a different issuer key")]
+    /// The snapshot or key ring belongs to an issuer with a different key.
+    #[error("snapshot or key ring belongs to a different issuer key")]
     KeyMismatch,
+    /// The key ring lacks the key of a live generation.
+    #[error("the key ring lacks the key of generation {generation}")]
+    MissingKey {
+        /// The generation whose key is missing.
+        generation: u64,
+    },
+    /// A generation key could not be made.
+    #[error(transparent)]
+    Key(#[from] KeyError),
 }
 
 /// An event does not fit the issuer's current state, so it was not applied.

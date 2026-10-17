@@ -17,6 +17,7 @@
 //! |--------|---------------------|------------------------------------|------------------------|
 //! | GET    | `/healthz`          |                                    | `ok`                   |
 //! | GET    | `/v1/info`          |                                    | [`Info`]               |
+//! | GET    | `/v1/keys`          |                                    | [`KeySet`]             |
 //! | POST   | `/v1/verify`        | `{"note": …}`                      | [`Verified`]           |
 //! | POST   | `/v1/transfer`      | [`TransferRequest`]                | `{"notes": [...]}`     |
 //! | POST   | `/v1/burn`          | [`BurnRequest`]                    | `{"value": …}`         |
@@ -43,9 +44,9 @@ use subtle::ConstantTimeEq;
 use tokio::sync::{mpsc, oneshot};
 use worgl::issuer::LayerSummary;
 use worgl::{
-    BurnRequest, CommitError, Error, MintRequest, Note, NoteStatus, PersistentIssuer, Policy,
-    PublicKey, RotationReport, Serial, Supply, TransferRequest, VerifiedBurn, VerifiedMint,
-    VerifiedTransfer, Verifier,
+    BurnRequest, CommitError, Error, KeySet, MintRequest, Note, NoteError, NoteStatus,
+    PersistentIssuer, Policy, PublicKey, RotationReport, Serial, Supply, TransferRequest,
+    VerifiedBurn, VerifiedMint, VerifiedTransfer, Verifier,
 };
 
 /// Largest request body accepted, in bytes.
@@ -80,7 +81,8 @@ impl std::error::Error for WeakAdminToken {}
 pub struct AppState {
     inner: Arc<Mutex<Inner>>,
     changes: mpsc::Sender<Job>,
-    verifier: Verifier,
+    /// Replaced after every rotation, which adds a generation key.
+    verifier: Arc<RwLock<Verifier>>,
     admin_token: Arc<str>,
     schedule: Arc<RwLock<Option<RotationSchedule>>>,
 }
@@ -119,6 +121,7 @@ struct Job {
 
 struct Inner {
     issuer: PersistentIssuer,
+    verifier: Arc<RwLock<Verifier>>,
     compact_every: u64,
     /// Journal length at which the next snapshot is written.
     compact_at: u64,
@@ -150,8 +153,11 @@ impl Inner {
                     .map_err(ApiError::from),
                 Change::Burn(burn) => batch.burn(&burn).map(Done::Burned).map_err(ApiError::from),
                 Change::Rotate => {
-                    rotated = true;
-                    Ok(Done::Rotated(batch.rotate()))
+                    let report = batch
+                        .rotate()
+                        .map_err(|e| ApiError::from(CommitError::Io(e)));
+                    rotated |= report.is_ok();
+                    report.map(Done::Rotated)
                 }
             })
             .collect();
@@ -164,6 +170,10 @@ impl Inner {
                 .collect();
         }
         if rotated {
+            // Before any answer goes out, since notes of the new generation
+            // only verify with its key.
+            let verifier = self.issuer.issuer().verifier();
+            *self.verifier.write().unwrap_or_else(|e| e.into_inner()) = verifier;
             self.compact();
         } else {
             self.after_write();
@@ -207,9 +217,10 @@ impl AppState {
             return Err(WeakAdminToken);
         }
         let compact_every = compact_every.max(1);
-        let verifier = issuer.issuer().verifier();
+        let verifier = Arc::new(RwLock::new(issuer.issuer().verifier()));
         let inner = Arc::new(Mutex::new(Inner {
             issuer,
+            verifier: verifier.clone(),
             compact_every,
             compact_at: compact_every,
         }));
@@ -238,6 +249,15 @@ impl AppState {
 
     fn rotation_schedule(&self) -> Option<RotationSchedule> {
         *self.schedule.read().unwrap_or_else(|e| e.into_inner())
+    }
+
+    /// The verifier for the issuer's current generations.
+    fn verifier(&self) -> Verifier {
+        // The lock guards a plain value, so a poisoned one still holds a usable verifier.
+        self.verifier
+            .read()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone()
     }
 
     /// Queues a change for the committer and waits until it is on disk.
@@ -326,6 +346,7 @@ pub fn router(state: AppState) -> Router {
     Router::new()
         .route("/healthz", get(|| async { "ok" }))
         .route("/v1/info", get(info))
+        .route("/v1/keys", get(keys))
         .route("/v1/verify", post(verify))
         .route("/v1/transfer", post(transfer))
         .route("/v1/burn", post(burn))
@@ -374,6 +395,11 @@ async fn info(State(state): State<AppState>) -> Result<Json<Info>, ApiError> {
         .await
 }
 
+/// The keys that sign the live generations, certified by the issuer key.
+async fn keys(State(state): State<AppState>) -> Json<KeySet> {
+    Json(state.verifier().keys().clone())
+}
+
 #[derive(Deserialize)]
 struct VerifyBody {
     note: Note,
@@ -397,8 +423,15 @@ async fn verify(
 ) -> Result<Json<Verified>, ApiError> {
     let Json(VerifyBody { note }) = body?;
     // Check the signature before taking the lock; the lookup itself is O(1).
-    note.verify(state.verifier.issuer())
-        .map_err(|error| ApiError::from(Error::Note { input: 0, error }))?;
+    let verifier = state.verifier();
+    let keys = verifier.keys();
+    match note.verify(keys) {
+        Ok(()) => {}
+        // A dropped generation's key is erased; the lookup reports it expired.
+        Err(NoteError::UnknownGeneration(generation))
+            if note.issuer() == keys.issuer() && generation < keys.oldest() => {}
+        Err(error) => return Err(Error::Note { input: 0, error }.into()),
+    }
     state
         .locked(move |inner| {
             let status = inner.issuer.issuer().serial_status(note.serial());
@@ -421,7 +454,7 @@ async fn transfer(
     body: Result<Json<TransferRequest>, JsonRejection>,
 ) -> Result<Json<NotesBody>, ApiError> {
     let Json(request) = body?;
-    let verifier = state.verifier.clone();
+    let verifier = state.verifier();
     let verified = tokio::task::spawn_blocking(move || verifier.verify(&request))
         .await
         .map_err(|_| ApiError::internal("verification panicked"))??;
@@ -443,7 +476,7 @@ async fn burn(
     body: Result<Json<BurnRequest>, JsonRejection>,
 ) -> Result<Json<BurnedBody>, ApiError> {
     let Json(request) = body?;
-    let verifier = state.verifier.clone();
+    let verifier = state.verifier();
     let verified = tokio::task::spawn_blocking(move || verifier.verify_burn(&request))
         .await
         .map_err(|_| ApiError::internal("verification panicked"))??;
@@ -463,7 +496,7 @@ async fn mint(
     body: Result<Json<MintRequest>, JsonRejection>,
 ) -> Result<Json<NoteBody>, ApiError> {
     let Json(request) = body?;
-    let verifier = state.verifier.clone();
+    let verifier = state.verifier();
     let checked = request.clone();
     let verified = tokio::task::spawn_blocking(move || verifier.verify_mint(&checked))
         .await
