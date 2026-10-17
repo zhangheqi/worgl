@@ -18,6 +18,14 @@
 //! a serial from its earlier generation no longer resolves, so an old note can
 //! never match a bit that now belongs to a different note. Every operation is
 //! O(1) except rotation, which wipes the words the dropped layer used.
+//!
+//! Bits are handed out in order within a layer. A ledger made with
+//! [`Ledger::new`] uses the bit as the serial's index. An [`Issuer`]'s ledger
+//! instead maps each bit through a keyed permutation that differs per
+//! generation, so indexes do not reveal the order notes were issued in; the
+//! key comes from the issuer key and is not part of the encoding.
+//!
+//! [`Issuer`]: crate::Issuer
 
 use std::fmt;
 use std::str::FromStr;
@@ -26,14 +34,16 @@ use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
 use crate::codec::{DecodeError, Reader, Writer};
+use crate::permutation::Permutation;
 
 /// The identity of a note: the generation of the layer it was issued into and
-/// its bit within that layer.
+/// its index within that layer, which names one bit of it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
 pub struct Serial {
     /// Generation of the layer the note was issued into. Never reused.
     pub generation: u64,
-    /// Index of the note's bit within that layer.
+    /// Index of the note within that layer: its bit, or the bit's image
+    /// under the issuer's permutation.
     pub index: u32,
 }
 
@@ -195,6 +205,8 @@ pub struct Ledger {
     words: Vec<u64>,
     /// Per-slot counters, indexed by slot.
     slots: Vec<Slot>,
+    /// Maps bits to serial indexes; `None` uses the bit itself.
+    order: Option<Permutation>,
 }
 
 impl fmt::Debug for Ledger {
@@ -202,6 +214,7 @@ impl fmt::Debug for Ledger {
         f.debug_struct("Ledger")
             .field("config", &self.config)
             .field("oldest", &self.oldest)
+            .field("permuted", &self.order.is_some())
             .field("layers", &self.layers().collect::<Vec<_>>())
             .finish_non_exhaustive()
     }
@@ -209,6 +222,7 @@ impl fmt::Debug for Ledger {
 
 impl Ledger {
     /// Creates an empty ledger whose layers hold generations `0..layers`.
+    /// Serial indexes are the bits themselves.
     pub fn new(config: LedgerConfig) -> Result<Self, ConfigError> {
         config.validate()?;
         let words = usize::try_from(Self::words_per_layer(config) * u64::from(config.layers))
@@ -218,7 +232,21 @@ impl Ledger {
             oldest: 0,
             words: vec![0; words],
             slots: vec![Slot::default(); config.layers as usize],
+            order: None,
         })
+    }
+
+    /// Maps bits to serial indexes through `order` from now on. Only an
+    /// empty ledger or one restored from a snapshot that used the same
+    /// permutation may be given one.
+    pub(crate) fn with_order(mut self, order: Permutation) -> Self {
+        self.order = Some(order);
+        self
+    }
+
+    /// Whether serial indexes are a permutation of the bits.
+    pub fn is_permuted(&self) -> bool {
+        self.order.is_some()
     }
 
     /// The ledger's shape.
@@ -254,20 +282,7 @@ impl Ledger {
 
     /// What the ledger knows about a serial. O(1).
     pub fn status(&self, serial: Serial) -> Status {
-        if serial.generation < self.oldest {
-            return Status::Expired;
-        }
-        let Some(position) = self.position(serial.generation) else {
-            return Status::Unissued;
-        };
-        let slot = self.slot_of(serial.generation);
-        if serial.index >= self.slots[slot].next {
-            Status::Unissued
-        } else if self.bit(slot, serial.index) {
-            Status::Live { position }
-        } else {
-            Status::Spent
-        }
+        self.locate(serial).0
     }
 
     /// Whether a serial is live. O(1).
@@ -281,32 +296,40 @@ impl Ledger {
         Some(self.config.layer_size - self.slots[self.slot_of(generation)].next)
     }
 
+    /// The serial the `k`-th next allocation in the layer at `position` would
+    /// get, or `None` if the layer has fewer than `k + 1` free bits. O(1).
+    pub fn next_serial(&self, position: u32, k: u32) -> Option<Serial> {
+        let generation = self.generation_at(position)?;
+        let bit = self.slots[self.slot_of(generation)].next.checked_add(k)?;
+        (bit < self.config.layer_size).then(|| self.serial_of(generation, bit))
+    }
+
     /// Sets the next unused bit of the layer at `position` and returns its serial. O(1).
     pub fn allocate(&mut self, position: u32) -> Result<Serial, LedgerError> {
         let generation = self
             .generation_at(position)
             .ok_or(LedgerError::NoSuchPosition(position))?;
         let slot = self.slot_of(generation);
-        let index = self.slots[slot].next;
-        if index >= self.config.layer_size {
+        let bit = self.slots[slot].next;
+        if bit >= self.config.layer_size {
             return Err(LedgerError::LayerFull { position });
         }
-        self.set_bit(slot, index, true);
+        self.set_bit(slot, bit, true);
         self.slots[slot].next += 1;
         self.slots[slot].live += 1;
-        Ok(Serial { generation, index })
+        Ok(self.serial_of(generation, bit))
     }
 
     /// Clears a live note's bit and returns the position of its layer. O(1).
     pub fn invalidate(&mut self, serial: Serial) -> Result<u32, LedgerError> {
-        match self.status(serial) {
-            Status::Live { position } => {
+        match self.locate(serial) {
+            (Status::Live { position }, bit) => {
                 let slot = self.slot_of(serial.generation);
-                self.set_bit(slot, serial.index, false);
+                self.set_bit(slot, bit, false);
                 self.slots[slot].live -= 1;
                 Ok(position)
             }
-            status => Err(LedgerError::NotLive { serial, status }),
+            (status, _) => Err(LedgerError::NotLive { serial, status }),
         }
     }
 
@@ -445,6 +468,40 @@ impl Ledger {
         (self.config.layer_size / 64) as usize
     }
 
+    fn serial_of(&self, generation: u64, bit: u32) -> Serial {
+        let index = match &self.order {
+            Some(order) => order.index(generation, bit),
+            None => bit,
+        };
+        Serial { generation, index }
+    }
+
+    /// A serial's status and, if it is issued, its bit.
+    fn locate(&self, serial: Serial) -> (Status, u32) {
+        if serial.generation < self.oldest {
+            return (Status::Expired, 0);
+        }
+        let Some(position) = self.position(serial.generation) else {
+            return (Status::Unissued, 0);
+        };
+        if serial.index >= self.config.layer_size {
+            return (Status::Unissued, 0);
+        }
+        let slot = self.slot_of(serial.generation);
+        let bit = match &self.order {
+            Some(order) => order.bit(serial.generation, serial.index),
+            None => serial.index,
+        };
+        let status = if bit >= self.slots[slot].next {
+            Status::Unissued
+        } else if self.bit(slot, bit) {
+            Status::Live { position }
+        } else {
+            Status::Spent
+        };
+        (status, bit)
+    }
+
     fn slot_of(&self, generation: u64) -> usize {
         (generation % u64::from(self.config.layers)) as usize
     }
@@ -505,6 +562,35 @@ mod tests {
         assert_eq!(l.status(Serial::new(9, 0)), Status::Unissued);
         assert_eq!(l.free(2), Some(62));
         assert_eq!(l.allocate(4), Err(LedgerError::NoSuchPosition(4)));
+    }
+
+    #[test]
+    fn a_permuted_ledger_hands_out_bits_in_order_under_scrambled_indexes() {
+        let mut l = ledger(2, 64).with_order(Permutation::new([1; 32], 64));
+        assert!(l.is_permuted());
+        let serials: Vec<Serial> = (0..64)
+            .map(|k| {
+                let next = l.next_serial(0, 0);
+                assert_eq!(l.next_serial(0, 64 - k), None);
+                let serial = l.allocate(0).unwrap();
+                assert_eq!(Some(serial), next);
+                serial
+            })
+            .collect();
+        assert_ne!(serials[1].index, serials[0].index + 1);
+        let mut indexes: Vec<u32> = serials.iter().map(|s| s.index).collect();
+        indexes.sort_unstable();
+        assert_eq!(indexes, (0..64).collect::<Vec<_>>());
+        assert_eq!(l.allocate(0), Err(LedgerError::LayerFull { position: 0 }));
+
+        assert_eq!(l.invalidate(serials[5]), Ok(0));
+        assert_eq!(l.status(serials[5]), Status::Spent);
+        assert_eq!(l.status(serials[6]), Status::Live { position: 0 });
+        assert_eq!(l.status(Serial::new(0, 64)), Status::Unissued);
+        // Each layer still counts its own bits.
+        assert_eq!(l.layer(0).unwrap().live, 63);
+        let other = l.allocate(1).unwrap();
+        assert_eq!(l.status(other), Status::Live { position: 1 });
     }
 
     #[test]

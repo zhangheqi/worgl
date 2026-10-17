@@ -25,16 +25,18 @@ use crate::keys::{IssuerKey, PublicKey, Signature};
 use crate::ledger::{Ledger, LedgerConfig, Serial, Status};
 use crate::mint::{MintAuthorization, MintRequest, VerifiedMint};
 use crate::note::{Note, NoteError, read_key};
+use crate::permutation::Permutation;
 use crate::policy::Policy;
 use crate::transfer::{
     BurnRequest, TransferId, TransferRequest, VerifiedBurn, VerifiedTransfer, Verifier,
 };
 
 const SNAPSHOT_MAGIC: &[u8; 8] = b"WORGLSNP";
-/// Version 2 added the burned value and version 3 each mint authority's last
-/// mint. Older snapshots still restore, with nothing burned and no mints
-/// authorized.
-const SNAPSHOT_VERSION: u16 = 3;
+/// Version 2 added the burned value, version 3 whether serial indexes are
+/// permuted and version 4 each mint authority's last mint. Older snapshots
+/// still restore, with nothing burned, the bits as indexes and no mints
+/// authorized, as they always had.
+const SNAPSHOT_VERSION: u16 = 4;
 
 /// A note created by a mint or transfer.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
@@ -363,9 +365,12 @@ pub struct Issuer {
 }
 
 impl Issuer {
-    /// Creates an issuer with an empty ledger.
+    /// Creates an issuer with an empty ledger. Serial indexes are a keyed
+    /// permutation of the ledger's bits, derived from `key`, so they do not
+    /// reveal the order notes were issued in.
     pub fn new(key: IssuerKey, ledger: LedgerConfig, policy: Policy) -> Result<Self, SetupError> {
-        let ledger = Ledger::new(ledger)?;
+        let ledger =
+            Ledger::new(ledger)?.with_order(Permutation::for_issuer(&key, ledger.layer_size));
         policy.validate(ledger.config())?;
         Ok(Self {
             public: key.public_key(),
@@ -707,7 +712,8 @@ impl Issuer {
     ///
     /// Layout, big-endian: the magic `WORGLSNP`, a `u16` format version, the
     /// issuer public key, the event sequence number, the ledger (see
-    /// [`Ledger::to_bytes`]), the live value of each layer as `u128`, value
+    /// [`Ledger::to_bytes`]), a byte that is 1 if serial indexes are permuted
+    /// and 0 if they are the bits, the live value of each layer as `u128`, value
     /// minted, destroyed and burned as `u128`, the remembered receipts, each
     /// mint authority's last request and note (sorted by authority key), and
     /// finally the SHA-256 of everything before it.
@@ -718,6 +724,7 @@ impl Issuer {
             .bytes(self.public.as_bytes())
             .u64(self.sequence);
         self.ledger.encode(&mut w);
+        w.u8(u8::from(self.ledger.is_permuted()));
         for value in &self.value {
             w.u128(*value);
         }
@@ -767,7 +774,19 @@ impl Issuer {
             return Err(SetupError::KeyMismatch);
         }
         let sequence = r.u64()?;
-        let ledger = Ledger::decode(&mut r)?;
+        let mut ledger = Ledger::decode(&mut r)?;
+        let permuted = match version {
+            1 | 2 => false,
+            _ => match r.u8()? {
+                0 => false,
+                1 => true,
+                _ => return Err(DecodeError::Invalid("serial order").into()),
+            },
+        };
+        if permuted {
+            let order = Permutation::for_issuer(&key, ledger.config().layer_size);
+            ledger = ledger.with_order(order);
+        }
         policy.validate(ledger.config())?;
         let value = (0..ledger.config().layers)
             .map(|_| r.u128())
@@ -785,7 +804,7 @@ impl Issuer {
             receipts.order.push_back(id);
         }
         let mut authorities = BTreeMap::new();
-        if version >= 3 {
+        if version >= 4 {
             let count = r.u32()?;
             for _ in 0..count {
                 let authorization = MintAuthorization {
@@ -821,9 +840,7 @@ impl Issuer {
 
     /// The serial the `k`-th next allocation in the layer at `position` would get.
     fn next_serial(&self, position: u32, k: u32) -> Option<Serial> {
-        let layer = self.ledger.layer(position)?;
-        let index = layer.issued.checked_add(k)?;
-        (index < layer.capacity).then_some(Serial::new(layer.generation, index))
+        self.ledger.next_serial(position, k)
     }
 
     fn sign_all(&self, issued: &[Issued]) -> Vec<Note> {
@@ -1107,9 +1124,10 @@ mod tests {
         let old = i.mint(1, key.public_key()).unwrap();
         i.rotate();
         i.rotate();
-        // Slot 0 now holds generation 2; mint until its bit 0 is set again.
+        // Slot 0 now holds generation 2; its first mint sets bit 0 again.
         let fresh = i.mint(1, key.public_key()).unwrap();
-        assert_eq!(fresh.serial(), Serial::new(2, 0));
+        assert_eq!(fresh.serial().generation, 2);
+        assert_eq!(i.ledger().layer(0).unwrap().issued, 1);
         assert_eq!(i.status(&old), Ok(NoteStatus::Expired));
         assert_eq!(
             pay(&mut i, old, &key).unwrap_err(),
@@ -1362,15 +1380,15 @@ mod tests {
     }
 
     #[test]
-    fn version_2_snapshots_restore_with_no_authorities() {
+    fn version_3_snapshots_restore_with_no_authorities() {
         let mut i = issuer(4, Policy::cash_like());
         let key = HolderKey::generate();
         i.mint(8, key.public_key()).unwrap();
-        // Version 2 ended with the receipts: drop the empty authority list.
+        // Version 3 ended with the receipts: drop the empty authority list.
         let mut body = i.snapshot();
         body.truncate(body.len() - 32);
         assert_eq!(body.split_off(body.len() - 4), [0; 4]);
-        body[8..10].copy_from_slice(&2u16.to_be_bytes());
+        body[8..10].copy_from_slice(&3u16.to_be_bytes());
         let checksum: [u8; 32] = Sha256::digest(&body).into();
         body.extend_from_slice(&checksum);
         let restored = Issuer::restore(i.key.clone(), &body, Policy::cash_like()).unwrap();
@@ -1424,15 +1442,23 @@ mod tests {
 
     #[test]
     fn version_1_snapshots_restore_with_nothing_burned() {
+        // An issuer from before serials were permuted, as version 1 knew them.
         let mut i = issuer(4, Policy::cash_like());
+        i.ledger = Ledger::new(i.ledger.config()).unwrap();
         i.mint(8, HolderKey::generate().public_key()).unwrap();
         let current = i.snapshot();
         // With no receipts and no authorities the body ends in the burned
         // value and two zero counts; version 1 had neither the burned value
-        // nor the authority list.
+        // nor the authority list, and no serial order byte.
         let body = &current[..current.len() - 32];
         let burned_at = body.len() - 4 - 4 - 16;
-        let mut v1 = [&body[..burned_at], &body[burned_at + 16..body.len() - 4]].concat();
+        let flag = 8 + 2 + 32 + 8 + i.ledger.to_bytes().len();
+        let mut v1 = [
+            &body[..flag],
+            &body[flag + 1..burned_at],
+            &body[burned_at + 16..body.len() - 4],
+        ]
+        .concat();
         v1[8..10].copy_from_slice(&1u16.to_be_bytes());
         let checksum: [u8; 32] = Sha256::digest(&v1).into();
         v1.extend_from_slice(&checksum);
@@ -1464,6 +1490,77 @@ mod tests {
             Issuer::restore(IssuerKey::generate(), &snapshot, Policy::cash_like()).unwrap_err(),
             SetupError::KeyMismatch
         );
+    }
+
+    #[test]
+    fn split_outputs_get_unrelated_indexes() {
+        let mut i = issuer(3, Policy::cash_like());
+        let key = HolderKey::generate();
+        let note = i.mint(16, key.public_key()).unwrap();
+        let outputs = (0..16)
+            .map(|_| Output {
+                amount: 1,
+                holder: key.public_key(),
+            })
+            .collect();
+        let request = TransferRequest::sign(&[(note, &key)], outputs).unwrap();
+        let notes = i.transfer(&request).unwrap();
+        let indexes: Vec<u32> = notes.iter().map(|n| n.serial().index).collect();
+        // The outputs took bits 0 to 15 of their layer, but not as indexes.
+        assert_ne!(indexes, (0..16).collect::<Vec<_>>());
+        let mut sorted = indexes.clone();
+        sorted.sort_unstable();
+        sorted.dedup();
+        assert_eq!(sorted.len(), 16);
+
+        // The permutation comes from the key, so a restored issuer agrees.
+        let restored = Issuer::restore(i.key.clone(), &i.snapshot(), Policy::cash_like()).unwrap();
+        for note in &notes {
+            assert!(matches!(restored.status(note), Ok(NoteStatus::Live { .. })));
+        }
+        assert_eq!(restored.next_serial(2, 0), i.next_serial(2, 0));
+    }
+
+    #[test]
+    fn version_2_snapshots_restore_with_bits_as_indexes() {
+        // An issuer from before serials were permuted.
+        let mut i = issuer(3, Policy::cash_like());
+        i.ledger = Ledger::new(i.ledger.config()).unwrap();
+        let key = HolderKey::generate();
+        let first = i.mint(4, key.public_key()).unwrap();
+        assert_eq!(first.serial(), Serial::new(1, 0));
+
+        // Its snapshot as version 2 wrote it: no serial order byte and no
+        // authority list.
+        let flag = 8 + 2 + 32 + 8 + i.ledger.to_bytes().len();
+        let mut body = i.snapshot();
+        body.truncate(body.len() - 32);
+        assert_eq!(body.split_off(body.len() - 4), [0; 4]);
+        assert_eq!(body[flag], 0);
+        body.remove(flag);
+        body[8..10].copy_from_slice(&2u16.to_be_bytes());
+        let checksum: [u8; 32] = Sha256::digest(&body).into();
+        body.extend_from_slice(&checksum);
+
+        let mut restored = Issuer::restore(i.key.clone(), &body, Policy::cash_like()).unwrap();
+        assert!(!restored.ledger().is_permuted());
+        assert!(matches!(
+            restored.status(&first),
+            Ok(NoteStatus::Live { .. })
+        ));
+        let second = restored.mint(4, key.public_key()).unwrap();
+        assert_eq!(second.serial(), Serial::new(1, 1));
+        // Written again, it stays unpermuted.
+        let again = Issuer::restore(i.key.clone(), &restored.snapshot(), Policy::cash_like());
+        assert!(!again.unwrap().ledger().is_permuted());
+
+        // Any other order byte is refused.
+        let mut bad = i.snapshot();
+        bad.truncate(bad.len() - 32);
+        bad[flag] = 2;
+        let checksum: [u8; 32] = Sha256::digest(&bad).into();
+        bad.extend_from_slice(&checksum);
+        assert!(Issuer::restore(i.key.clone(), &bad, Policy::cash_like()).is_err());
     }
 
     #[test]
