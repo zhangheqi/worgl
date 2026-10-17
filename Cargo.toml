@@ -2,6 +2,7 @@
 resolver = "3"
 members = [
     "crates/worgl",
+    "crates/worgl-cli",
     "crates/worgl-client",
     "crates/worgl-sdk",
     "crates/worgl-server",
@@ -18,12 +19,15 @@ authors = ["The Worgl contributors"]
 
 [workspace.dependencies]
 worgl = { path = "crates/worgl", version = "0.1.0" }
+worgl-client = { path = "crates/worgl-client", version = "0.1.0" }
 worgl-sdk = { path = "crates/worgl-sdk", version = "0.1.0" }
 worgl-server = { path = "crates/worgl-server" }
 
 anyhow = "1"
+argon2 = "0.6"
 axum = "0.8"
 base64 = "0.23"
+chacha20poly1305 = "0.11"
 clap = { version = "4", features = ["derive", "env"] }
 ed25519-dalek = "3"
 getrandom = "0.4"
@@ -31,6 +35,7 @@ hex = "0.4"
 http-body-util = "0.1"
 proptest = "1"
 reqwest = { version = "0.13", default-features = false, features = ["http2", "json", "rustls"] }
+rpassword = "7"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 sha2 = "0.11"
@@ -42,6 +47,7 @@ tower = { version = "0.5", features = ["util"] }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 wasm-bindgen = "0.2.129"
+zeroize = "1"
 
 [workspace.lints.rust]
 unsafe_code = "forbid"
@@ -63,4 +69,11 @@ opt-level = 3
 opt-level = 3
 
 [profile.dev.package.sha2]
+opt-level = 3
+
+# Deriving a purse's key from its passphrase is just as slow unoptimised.
+[profile.dev.package.argon2]
+opt-level = 3
+
+[profile.dev.package.blake2]
 opt-level = 3

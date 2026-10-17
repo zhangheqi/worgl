@@ -19,7 +19,7 @@ It is a primitive for autonomous systems that pay each other in credits,
 quotas or any other unit, rather than a cash product. Identity checks and
 regulation are out of scope.
 
-The workspace has five crates and a TypeScript package:
+The workspace has six crates and a TypeScript package:
 
 - [`worgl`](crates/worgl): the library. Ledger, note format, transfer
   protocol, policy, issuer state machine and crash-safe storage.
@@ -30,6 +30,8 @@ The workspace has five crates and a TypeScript package:
   rules, with no networking of its own.
 - [`worgl-client`](crates/worgl-client): talks to the server. Typed calls
   for every route, and a purse that runs a holder over HTTP and saves it.
+- [`worgl-cli`](crates/worgl-cli): `worgl`, a command line purse on
+  `worgl-client`, kept in a passphrase-encrypted file.
 - [`worgl-wasm`](crates/worgl-wasm): `worgl-sdk` compiled to WebAssembly.
 - [`sdk/typescript`](sdk/typescript): the TypeScript SDK, a client and purse
   like `worgl-client`'s on top of `worgl-wasm`, for Node and browsers.
@@ -317,6 +319,29 @@ When the payer submits instead (`Purse::submit`), it hands the notes from the
 answers to the payee, who checks their signatures and keeps them with
 `Purse::accept`.
 
+## The command line
+
+`worgl` keeps a purse in one file, encrypted with XChaCha20-Poly1305 under a
+key derived from a passphrase with Argon2id (64 MiB, three passes). The
+passphrase comes from `WORGL_PASSPHRASE` or a prompt; the server and the
+file from `--server` and `--purse` or `WORGL_SERVER` and `WORGL_PURSE`.
+Requests, payments and handed-over notes are JSON files for the two sides to
+exchange.
+
+```sh
+worgl init                                     # each side, once
+worgl mint $MINT 8 --authority-key mint.key    # as a mint authority, for testing
+worgl request $MINT 5 -o request.json          # payee → send request.json
+worgl pay request.json -o payment.json         # payer → send payment.json
+worgl receive request.json payment.json        # payee: checks, submits, keeps
+worgl settle                                   # payer, later: takes in the change
+worgl balance $MINT
+worgl refresh $MINT                            # once per rotation period
+```
+
+`worgl info`, `notes`, `withdraw`, `submit`, `accept` and `prune` cover the
+rest; `worgl help <command>` explains each.
+
 ## Running the server
 
 ```sh
@@ -405,8 +430,8 @@ behind a reverse proxy for TLS and rate limiting.
   or redemption into other money.
 - **One copy of each mint**, with no replication or failover. The issuer key
   itself never rotates: a new one is a new mint.
-- **No CLI yet**, and no SDK for languages other than Rust and TypeScript;
-  those call the HTTP API directly.
+- **No SDK for other languages yet.** Rust and TypeScript have one, and
+  the `worgl` command covers scripts; others call the HTTP API directly.
 
 ## Development
 
