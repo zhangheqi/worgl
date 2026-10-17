@@ -129,6 +129,14 @@ encourages and the way to save a note before its layer is dropped.
 generation, so `layer_size` caps how many notes can land in one layer per
 rotation period.
 
+**A layer sized to the supply never fills.** Every hop moves value to a
+strictly newer generation, so a unit of value lands in any generation at most
+once, and it stays live until that generation is dropped. A layer therefore
+never hands out more bits than the value live in it and the layers after it.
+While the outstanding value, counted in the smallest amount, stays at or below
+`layer_size`, `layer_full` cannot happen. The property tests check both the
+bound and the guarantee.
+
 **Resending a request is safe.** The issuer remembers recent transfers (65,536
 by default) by the hash of their signed message. If a response is lost, the
 client resends the identical request and gets the identical notes back, since
