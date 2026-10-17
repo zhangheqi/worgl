@@ -19,6 +19,7 @@
 //! | GET    | `/v1/info`          |                                    | [`Info`]               |
 //! | POST   | `/v1/verify`        | `{"note": …}`                      | [`Verified`]           |
 //! | POST   | `/v1/transfer`      | [`TransferRequest`]                | `{"notes": [...]}`     |
+//! | POST   | `/v1/burn`          | [`BurnRequest`]                    | `{"value": …}`         |
 //! | POST   | `/v1/admin/mint`    | `{"amount": …, "holder": …}`       | `{"note": …}`          |
 //! | POST   | `/v1/admin/rotate`  |                                    | [`RotationReport`]     |
 //!
@@ -40,8 +41,8 @@ use subtle::ConstantTimeEq;
 use tokio::sync::{mpsc, oneshot};
 use worgl::issuer::LayerSummary;
 use worgl::{
-    CommitError, Error, Note, NoteStatus, PersistentIssuer, Policy, PublicKey, RotationReport,
-    Serial, Supply, TransferRequest, VerifiedTransfer, Verifier,
+    BurnRequest, CommitError, Error, Note, NoteStatus, PersistentIssuer, Policy, PublicKey,
+    RotationReport, Serial, Supply, TransferRequest, VerifiedBurn, VerifiedTransfer, Verifier,
 };
 
 /// Largest request body accepted, in bytes.
@@ -97,12 +98,14 @@ pub struct RotationSchedule {
 enum Change {
     Mint { amount: u64, holder: PublicKey },
     Transfer(VerifiedTransfer),
+    Burn(VerifiedBurn),
     Rotate,
 }
 
 /// What a change produced.
 enum Done {
     Notes(Vec<Note>),
+    Burned(u128),
     Rotated(RotationReport),
 }
 
@@ -142,6 +145,7 @@ impl Inner {
                     .transfer(&transfer)
                     .map(Done::Notes)
                     .map_err(ApiError::from),
+                Change::Burn(burn) => batch.burn(&burn).map(Done::Burned).map_err(ApiError::from),
                 Change::Rotate => {
                     rotated = true;
                     Ok(Done::Rotated(batch.rotate()))
@@ -265,7 +269,7 @@ impl AppState {
     pub async fn rotate(&self) -> Result<RotationReport, ApiError> {
         match self.submit(Change::Rotate).await? {
             Done::Rotated(report) => Ok(report),
-            Done::Notes(_) => unreachable!("a rotation reports a rotation"),
+            _ => unreachable!("a rotation reports a rotation"),
         }
     }
 
@@ -321,6 +325,7 @@ pub fn router(state: AppState) -> Router {
         .route("/v1/info", get(info))
         .route("/v1/verify", post(verify))
         .route("/v1/transfer", post(transfer))
+        .route("/v1/burn", post(burn))
         .route("/v1/admin/mint", post(mint))
         .route("/v1/admin/rotate", post(rotate))
         .layer(DefaultBodyLimit::max(BODY_LIMIT))
@@ -419,7 +424,29 @@ async fn transfer(
         .map_err(|_| ApiError::internal("verification panicked"))??;
     match state.submit(Change::Transfer(verified)).await? {
         Done::Notes(notes) => Ok(Json(NotesBody { notes })),
-        Done::Rotated(_) => unreachable!("a transfer creates notes"),
+        _ => unreachable!("a transfer creates notes"),
+    }
+}
+
+/// Answer of `POST /v1/burn`: the value destroyed. A resent burn answers
+/// with the same value and destroys nothing more.
+#[derive(Serialize, Deserialize)]
+struct BurnedBody {
+    value: u128,
+}
+
+async fn burn(
+    State(state): State<AppState>,
+    body: Result<Json<BurnRequest>, JsonRejection>,
+) -> Result<Json<BurnedBody>, ApiError> {
+    let Json(request) = body?;
+    let verifier = state.verifier.clone();
+    let verified = tokio::task::spawn_blocking(move || verifier.verify_burn(&request))
+        .await
+        .map_err(|_| ApiError::internal("verification panicked"))??;
+    match state.submit(Change::Burn(verified)).await? {
+        Done::Burned(value) => Ok(Json(BurnedBody { value })),
+        _ => unreachable!("a burn reports its value"),
     }
 }
 
@@ -445,7 +472,7 @@ async fn mint(
         Done::Notes(mut notes) => Ok(Json(NoteBody {
             note: notes.remove(0),
         })),
-        Done::Rotated(_) => unreachable!("a mint creates a note"),
+        _ => unreachable!("a mint creates a note"),
     }
 }
 

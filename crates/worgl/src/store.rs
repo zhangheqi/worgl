@@ -47,7 +47,7 @@ use crate::issuer::{Event, Issuer, Plan, RotationReport};
 use crate::keys::{IssuerKey, PublicKey};
 use crate::note::Note;
 use crate::policy::Policy;
-use crate::transfer::VerifiedTransfer;
+use crate::transfer::{VerifiedBurn, VerifiedTransfer};
 
 const SNAPSHOT: &str = "snapshot.bin";
 const SNAPSHOT_TMP: &str = "snapshot.bin.tmp";
@@ -501,6 +501,15 @@ impl PersistentIssuer {
         }
     }
 
+    /// Carries out a verified burn once it is on disk and returns the value
+    /// destroyed. A resent burn that was already applied writes nothing.
+    pub fn burn(&mut self, burn: &VerifiedBurn) -> Result<u128, CommitError> {
+        if let Plan::Apply(event) = self.issuer.plan_burn(burn)? {
+            self.commit(&event)?;
+        }
+        Ok(burn.value())
+    }
+
     /// Rotates once the rotation is on disk.
     pub fn rotate(&mut self) -> Result<RotationReport, CommitError> {
         let event = self.issuer.plan_rotate();
@@ -580,6 +589,15 @@ impl Batch<'_> {
         }
     }
 
+    /// Carries out a verified burn and returns the value destroyed. A resent
+    /// burn that was already applied adds nothing to the batch.
+    pub fn burn(&mut self, burn: &VerifiedBurn) -> Result<u128, Error> {
+        if let Plan::Apply(event) = self.owner.issuer.plan_burn(burn)? {
+            self.stage(event);
+        }
+        Ok(burn.value())
+    }
+
     /// Rotates.
     pub fn rotate(&mut self) -> RotationReport {
         let event = self.owner.issuer.plan_rotate();
@@ -643,7 +661,7 @@ mod tests {
     use super::*;
     use crate::keys::HolderKey;
     use crate::ledger::LedgerConfig;
-    use crate::transfer::{Output, TransferRequest};
+    use crate::transfer::{BurnRequest, Output, TransferRequest};
 
     const LEDGER: LedgerConfig = LedgerConfig {
         layers: 4,
@@ -868,6 +886,28 @@ mod tests {
             p.issuer().status(&paid),
             Ok(crate::NoteStatus::Live { .. })
         ));
+    }
+
+    #[test]
+    fn a_burn_resent_in_the_same_batch_burns_once() {
+        let dir = tempfile::tempdir().unwrap();
+        let (key, mut p) = fresh(dir.path());
+        let holder = HolderKey::generate();
+        let note = p.mint(8, holder.public_key()).unwrap();
+        let request = BurnRequest::single(note, &holder).unwrap();
+        let verified = p.issuer().verifier().verify_burn(&request).unwrap();
+
+        let mut batch = p.batch().unwrap();
+        assert_eq!(batch.burn(&verified).unwrap(), 8);
+        assert_eq!(batch.burn(&verified).unwrap(), 8);
+        assert_eq!(batch.len(), 1);
+        batch.commit().unwrap();
+        assert_eq!(p.issuer().supply().burned, 8);
+
+        let expected = p.issuer().snapshot();
+        drop(p);
+        let p = PersistentIssuer::open(dir.path(), key, Policy::cash_like()).unwrap();
+        assert_eq!(p.issuer().snapshot(), expected);
     }
 
     #[test]

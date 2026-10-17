@@ -7,8 +7,8 @@ use http_body_util::BodyExt;
 use serde_json::{Value, json};
 use tower::ServiceExt;
 use worgl::{
-    HolderKey, Issuer, IssuerKey, LedgerConfig, Note, Output, PersistentIssuer, Policy,
-    TransferRequest,
+    BurnRequest, HolderKey, Issuer, IssuerKey, LedgerConfig, Note, Output, PersistentIssuer,
+    Policy, TransferRequest,
 };
 use worgl_server::{AppState, Info, RotationSchedule, router};
 
@@ -310,6 +310,51 @@ async fn concurrent_requests_all_land_and_never_double_spend() {
     let info: Info = serde_json::from_value(answer).unwrap();
     assert_eq!(info.sequence, 128);
     assert_eq!(info.supply.outstanding, 64 * 8);
+}
+
+#[tokio::test]
+async fn burning_destroys_a_note_once_even_in_the_last_layer() {
+    let server = Server::new();
+    let alice = HolderKey::generate();
+    let note = server.mint(8, &alice).await;
+    let (request, bob) = pay(note, &alice);
+    let (code, answer) = server.transfer(&request).await;
+    assert_eq!(code, StatusCode::OK, "{answer}");
+    let bobs: Note = serde_json::from_value(answer["notes"][0].clone()).unwrap();
+
+    // Bob's note is frozen in the last layer, but it can still be burned.
+    let burn = serde_json::to_value(BurnRequest::single(bobs, &bob).unwrap()).unwrap();
+    let (code, answer) = server
+        .call(Method::POST, "/v1/burn", None, burn.clone())
+        .await;
+    assert_eq!(code, StatusCode::OK, "{answer}");
+    assert_eq!(answer["value"], 8);
+    assert_eq!(server.verify(&bobs).await["state"], "spent");
+
+    // Sending the same burn again destroys nothing more.
+    let (code, again) = server.call(Method::POST, "/v1/burn", None, burn).await;
+    assert_eq!(code, StatusCode::OK);
+    assert_eq!(again, answer);
+
+    // Only the holder can burn, and a spent note cannot be burned.
+    let mut forged = BurnRequest::single(bobs, &bob).unwrap();
+    forged.inputs[0].signature = BurnRequest::single(note, &alice).unwrap().inputs[0].signature;
+    let forged = serde_json::to_value(forged).unwrap();
+    let (code, answer) = server.call(Method::POST, "/v1/burn", None, forged).await;
+    assert_eq!(code, StatusCode::FORBIDDEN, "{answer}");
+    assert_eq!(answer["error"], "unauthorized");
+    let burn = serde_json::to_value(BurnRequest::single(note, &alice).unwrap()).unwrap();
+    let (code, answer) = server.call(Method::POST, "/v1/burn", None, burn).await;
+    assert_eq!(code, StatusCode::CONFLICT);
+    assert_eq!(answer["error"], "spent");
+
+    let (_, answer) = server
+        .call(Method::GET, "/v1/info", None, Value::Null)
+        .await;
+    let info: Info = serde_json::from_value(answer).unwrap();
+    assert_eq!(info.supply.minted, 8);
+    assert_eq!(info.supply.burned, 8);
+    assert_eq!(info.supply.outstanding, 0);
 }
 
 #[tokio::test]
