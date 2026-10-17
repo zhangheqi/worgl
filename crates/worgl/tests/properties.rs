@@ -6,8 +6,8 @@ use std::collections::{BTreeSet, VecDeque};
 use proptest::prelude::*;
 use worgl::ledger::Status;
 use worgl::{
-    Denominations, Event, HolderKey, Issuer, IssuerKey, Ledger, LedgerConfig, Note, Output, Plan,
-    Policy, Serial, TransferRequest,
+    Denominations, Error, Event, HolderKey, Issuer, IssuerKey, Ledger, LedgerConfig, Note, Output,
+    Plan, Policy, Serial, TransferRequest,
 };
 
 #[derive(Debug, Clone)]
@@ -161,6 +161,16 @@ fn issuer_op() -> impl Strategy<Value = IssuerOp> {
     ]
 }
 
+/// Rarer rotations and wider splits than [`issuer_op`], so that layers crowd.
+fn crowding_op() -> impl Strategy<Value = IssuerOp> {
+    prop_oneof![
+        2 => any::<u8>().prop_map(IssuerOp::Mint),
+        12 => (any::<usize>(), 1u8..17).prop_map(|(k, parts)| IssuerOp::Transfer { k, parts }),
+        2 => (any::<usize>(), any::<usize>()).prop_map(|(k, j)| IssuerOp::Merge { k, j }),
+        1 => Just(IssuerOp::Rotate),
+    ]
+}
+
 /// Deterministic holder keys, so failures shrink and reproduce.
 struct Keys(u64);
 
@@ -197,11 +207,41 @@ fn split(amount: u64, parts: u8, policy: &Policy) -> Vec<u64> {
     }
 }
 
-fn run_history(policy: Policy, ops: Vec<IssuerOp>) -> Result<(), TestCaseError> {
+/// Every unit of value lands in a given generation at most once, since each
+/// hop moves it to a strictly newer one, and it stays live in that generation
+/// or a newer one until the generation is dropped. So no layer can have handed
+/// out more bits than the value now live in it and the layers after it.
+fn layers_are_bounded_by_value(issuer: &Issuer) -> Result<(), TestCaseError> {
+    let mut later = 0u128;
+    for layer in issuer.layers().iter().rev() {
+        later += layer.value;
+        prop_assert!(
+            u128::from(layer.issued) <= later,
+            "layer {} handed out {} bits but only {} value is live from it on",
+            layer.position,
+            layer.issued,
+            later
+        );
+    }
+    Ok(())
+}
+
+/// Runs a random history. With `supply_cap`, mints that would push the
+/// outstanding value past it are skipped, and no layer may ever be full: the
+/// cap equals the layer size, so by [`layers_are_bounded_by_value`] there is
+/// always a free bit.
+fn run_history(
+    policy: Policy,
+    ops: Vec<IssuerOp>,
+    supply_cap: Option<u128>,
+) -> Result<(), TestCaseError> {
     let config = LedgerConfig {
         layers: 4,
         layer_size: 64,
     };
+    if let Some(cap) = supply_cap {
+        prop_assert_eq!(cap, u128::from(config.layer_size));
+    }
     let key = IssuerKey::from_secret_bytes(&[9; 32]);
     let mut issuer = Issuer::new(key.clone(), config, policy.clone()).unwrap();
     let genesis = issuer.snapshot();
@@ -223,10 +263,21 @@ fn run_history(policy: Policy, ops: Vec<IssuerOp>) -> Result<(), TestCaseError> 
                     Denominations::PowersOfTwo => 1u64 << (exp % 12),
                     _ => u64::from(exp) + 1,
                 };
+                if let Some(cap) = supply_cap
+                    && issuer.supply().outstanding + u128::from(amount) > cap
+                {
+                    continue;
+                }
                 let holder = keys.next();
-                if let Ok(event) = issuer.plan_mint(amount, holder.public_key()) {
-                    let note = commit(&mut issuer, event).remove(0);
-                    wallet.push((note, holder));
+                match issuer.plan_mint(amount, holder.public_key()) {
+                    Ok(event) => {
+                        let note = commit(&mut issuer, event).remove(0);
+                        wallet.push((note, holder));
+                    }
+                    Err(error) => prop_assert!(
+                        supply_cap.is_none(),
+                        "a capped supply was refused a mint: {error}"
+                    ),
                 }
             }
             IssuerOp::Transfer { k, parts } if !wallet.is_empty() => {
@@ -258,6 +309,9 @@ fn run_history(policy: Policy, ops: Vec<IssuerOp>) -> Result<(), TestCaseError> 
                         spent.push((note, holder));
                     }
                     Ok(Plan::Replay(_)) => prop_assert!(false, "fresh outputs never replay"),
+                    Err(Error::LayerFull { position }) if supply_cap.is_some() => {
+                        prop_assert!(false, "layer {position} filled under a capped supply")
+                    }
                     // Frozen in the last layer, or the next layer is full.
                     Err(_) => wallet.push((note, holder)),
                 }
@@ -282,12 +336,18 @@ fn run_history(policy: Policy, ops: Vec<IssuerOp>) -> Result<(), TestCaseError> 
                     prop_assert!(verified.is_err(), "the policy forbids merging");
                     continue;
                 }
-                if let Ok(Plan::Apply(event)) = issuer.plan_transfer(&verified.unwrap()) {
-                    let note = commit(&mut issuer, event).remove(0);
-                    wallet.retain(|(n, _)| n != &a && n != &b);
-                    wallet.push((note, out));
-                    spent.push((a, ka));
-                    spent.push((b, kb));
+                match issuer.plan_transfer(&verified.unwrap()) {
+                    Ok(Plan::Apply(event)) => {
+                        let note = commit(&mut issuer, event).remove(0);
+                        wallet.retain(|(n, _)| n != &a && n != &b);
+                        wallet.push((note, out));
+                        spent.push((a, ka));
+                        spent.push((b, kb));
+                    }
+                    Err(Error::LayerFull { position }) if supply_cap.is_some() => {
+                        prop_assert!(false, "layer {position} filled under a capped supply")
+                    }
+                    _ => {}
                 }
             }
             IssuerOp::Transfer { .. } | IssuerOp::Merge { .. } => {}
@@ -307,6 +367,7 @@ fn run_history(policy: Policy, ops: Vec<IssuerOp>) -> Result<(), TestCaseError> 
         for (note, _) in &wallet {
             prop_assert!(issuer.ledger().is_live(note.serial()));
         }
+        layers_are_bounded_by_value(&issuer)?;
     }
 
     // No spent note can be spent again.
@@ -338,12 +399,26 @@ proptest! {
 
     #[test]
     fn cash_like_histories_keep_the_invariants(ops in prop::collection::vec(issuer_op(), 1..120)) {
-        run_history(Policy::cash_like(), ops)?;
+        run_history(Policy::cash_like(), ops, None)?;
     }
 
     #[test]
     fn flexible_histories_keep_the_invariants(ops in prop::collection::vec(issuer_op(), 1..120)) {
-        run_history(Policy::flexible(), ops)?;
+        run_history(Policy::flexible(), ops, None)?;
+    }
+
+    #[test]
+    fn cash_like_supply_capped_at_layer_size_never_fills_a_layer(
+        ops in prop::collection::vec(crowding_op(), 1..400),
+    ) {
+        run_history(Policy::cash_like(), ops, Some(64))?;
+    }
+
+    #[test]
+    fn flexible_supply_capped_at_layer_size_never_fills_a_layer(
+        ops in prop::collection::vec(crowding_op(), 1..400),
+    ) {
+        run_history(Policy::flexible(), ops, Some(64))?;
     }
 }
 

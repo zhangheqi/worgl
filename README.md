@@ -137,6 +137,14 @@ receipt without destroying anything more.
 generation, so `layer_size` caps how many notes can land in one layer per
 rotation period.
 
+**A layer sized to the supply never fills.** Every hop moves value to a
+strictly newer generation, so a unit of value lands in any generation at most
+once, and it stays live until that generation is dropped. A layer therefore
+never hands out more bits than the value live in it and the layers after it.
+While the outstanding value, counted in the smallest amount, stays at or below
+`layer_size`, `layer_full` cannot happen. The property tests check both the
+bound and the guarantee.
+
 **Resending a request is safe.** The issuer remembers recent transfers (65,536
 by default) by the hash of their signed message. If a response is lost, the
 client resends the identical request and gets the identical notes back, since
@@ -152,7 +160,9 @@ destroyed by rotations and burned, so
 `outstanding = minted − destroyed − burned` can be audited at any time.
 
 **Rotation is an admin call or a schedule** aligned to multiples of the
-period since the Unix epoch, so restarts do not shift it. The server records
+period since the Unix epoch, so restarts do not shift it. When a schedule is
+set, `/v1/info` reports its period and the time of the next rotation, so
+clients know when frozen notes thaw and when idle ones must be refreshed. The server records
 the last scheduled boundary, so a wall clock that steps backwards cannot
 rotate twice in one period. Boundaries missed while the server is down are
 not made up.
@@ -219,7 +229,7 @@ missing fields take their cash-like defaults:
 | Method | Path | Body | Answer |
 |---|---|---|---|
 | GET | `/healthz` | | `ok` |
-| GET | `/v1/info` | | layers, supply, policy |
+| GET | `/v1/info` | | layers, supply, policy, rotation schedule |
 | POST | `/v1/verify` | `{"note"}` | serial, amount, state, position, hops left |
 | POST | `/v1/transfer` | `{"inputs": [{"note", "signature"}], "outputs": [{"amount", "holder"}]}` | `{"notes"}` |
 | POST | `/v1/burn` | `{"inputs": [{"note", "signature"}]}` | `{"value"}` burned |
