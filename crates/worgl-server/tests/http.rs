@@ -10,12 +10,13 @@ use worgl::{
     HolderKey, Issuer, IssuerKey, LedgerConfig, Note, Output, PersistentIssuer, Policy,
     TransferRequest,
 };
-use worgl_server::{AppState, Info, router};
+use worgl_server::{AppState, Info, RotationSchedule, router};
 
 const TOKEN: &str = "test-admin-token-0123456789abcdef";
 
 struct Server {
     app: Router,
+    state: AppState,
     _dir: tempfile::TempDir,
 }
 
@@ -28,8 +29,12 @@ impl Server {
         };
         let issuer = Issuer::new(IssuerKey::generate(), ledger, Policy::cash_like()).unwrap();
         let issuer = PersistentIssuer::create(dir.path(), issuer).unwrap();
-        let app = router(AppState::new(issuer, TOKEN, 1000).unwrap());
-        Self { app, _dir: dir }
+        let state = AppState::new(issuer, TOKEN, 1000).unwrap();
+        Self {
+            app: router(state.clone()),
+            state,
+            _dir: dir,
+        }
     }
 
     async fn call(
@@ -305,4 +310,25 @@ async fn concurrent_requests_all_land_and_never_double_spend() {
     let info: Info = serde_json::from_value(answer).unwrap();
     assert_eq!(info.sequence, 128);
     assert_eq!(info.supply.outstanding, 64 * 8);
+}
+
+#[tokio::test]
+async fn info_reports_the_rotation_schedule() {
+    let server = Server::new();
+    let (_, answer) = server
+        .call(Method::GET, "/v1/info", None, Value::Null)
+        .await;
+    assert_eq!(answer["rotation"], Value::Null);
+
+    let schedule = RotationSchedule {
+        period_secs: 86_400,
+        next_at: 1_792_281_600,
+    };
+    server.state.set_rotation_schedule(Some(schedule));
+    let (_, answer) = server
+        .call(Method::GET, "/v1/info", None, Value::Null)
+        .await;
+    assert_eq!(answer["rotation"]["period_secs"], 86_400);
+    let info: Info = serde_json::from_value(answer).unwrap();
+    assert_eq!(info.rotation, Some(schedule));
 }

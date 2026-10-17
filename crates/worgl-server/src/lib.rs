@@ -26,7 +26,7 @@
 //! status code and `{"error": code, "message": text}`, where `code` is one
 //! of the stable strings listed on [`ApiError::code`].
 
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, RwLock};
 use std::thread;
 
 use axum::extract::rejection::JsonRejection;
@@ -78,6 +78,19 @@ pub struct AppState {
     changes: mpsc::Sender<Job>,
     verifier: Verifier,
     admin_token: Arc<str>,
+    schedule: Arc<RwLock<Option<RotationSchedule>>>,
+}
+
+/// When the issuer rotates on its own, as reported by `GET /v1/info`.
+///
+/// Clients use it to tell when a frozen note can move again and when a note
+/// must be refreshed before its layer is dropped.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RotationSchedule {
+    /// Seconds between rotations.
+    pub period_secs: u64,
+    /// Unix time, in seconds, of the next scheduled rotation.
+    pub next_at: u64,
 }
 
 /// A change for the committer to make.
@@ -204,7 +217,20 @@ impl AppState {
             inner,
             changes,
             admin_token: admin_token.into(),
+            schedule: Arc::new(RwLock::new(None)),
         })
+    }
+
+    /// Records the rotation schedule that `GET /v1/info` reports. The
+    /// scheduler calls this whenever it picks its next boundary; `None` means
+    /// rotation happens only through the admin API.
+    pub fn set_rotation_schedule(&self, schedule: Option<RotationSchedule>) {
+        // The lock guards a plain value, so a poisoned one still holds a usable schedule.
+        *self.schedule.write().unwrap_or_else(|e| e.into_inner()) = schedule;
+    }
+
+    fn rotation_schedule(&self) -> Option<RotationSchedule> {
+        *self.schedule.read().unwrap_or_else(|e| e.into_inner())
     }
 
     /// Queues a change for the committer and waits until it is on disk.
@@ -316,11 +342,16 @@ pub struct Info {
     pub supply: Supply,
     /// The rules in force.
     pub policy: Policy,
+    /// The rotation schedule, or `null` when rotation happens only through
+    /// the admin API.
+    #[serde(default)]
+    pub rotation: Option<RotationSchedule>,
 }
 
 async fn info(State(state): State<AppState>) -> Result<Json<Info>, ApiError> {
+    let rotation = state.rotation_schedule();
     state
-        .locked(|inner| {
+        .locked(move |inner| {
             let issuer = inner.issuer.issuer();
             Ok(Json(Info {
                 issuer: *issuer.public_key(),
@@ -329,6 +360,7 @@ async fn info(State(state): State<AppState>) -> Result<Json<Info>, ApiError> {
                 layers: issuer.layers(),
                 supply: issuer.supply(),
                 policy: issuer.policy().clone(),
+                rotation,
             }))
         })
         .await
