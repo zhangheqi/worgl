@@ -2264,6 +2264,18 @@ dependencies = [
 ]
 
 [[package]]
+name = "worgl-wasm"
+version = "0.1.0"
+dependencies = [
+ "getrandom 0.4.3",
+ "serde",
+ "serde_json",
+ "wasm-bindgen",
+ "worgl",
+ "worgl-sdk",
+]
+
+[[package]]
 name = "writeable"
 version = "0.6.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"

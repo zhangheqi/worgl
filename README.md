@@ -19,7 +19,7 @@ It is a primitive for autonomous systems that pay each other in credits,
 quotas or any other unit, rather than a cash product. Identity checks and
 regulation are out of scope.
 
-The workspace has four crates:
+The workspace has five crates and a TypeScript package:
 
 - [`worgl`](crates/worgl): the library. Ledger, note format, transfer
   protocol, policy, issuer state machine and crash-safe storage.
@@ -30,6 +30,9 @@ The workspace has four crates:
   rules, with no networking of its own.
 - [`worgl-client`](crates/worgl-client): talks to the server. Typed calls
   for every route, and a purse that runs a holder over HTTP and saves it.
+- [`worgl-wasm`](crates/worgl-wasm): `worgl-sdk` compiled to WebAssembly.
+- [`sdk/typescript`](sdk/typescript): the TypeScript SDK, a client and purse
+  like `worgl-client`'s on top of `worgl-wasm`, for Node and browsers.
 
 > **Status:** 0.1. The design and code have not had an independent security
 > review. Do not use it to hold anything you cannot afford to lose.
@@ -402,8 +405,8 @@ behind a reverse proxy for TLS and rate limiting.
   or redemption into other money.
 - **One copy of each mint**, with no replication or failover. The issuer key
   itself never rotates: a new one is a new mint.
-- **No CLI or TypeScript SDK yet.** Rust applications use `worgl-client`;
-  others call the HTTP API directly.
+- **No CLI yet**, and no SDK for languages other than Rust and TypeScript;
+  those call the HTTP API directly.
 
 ## Development
 
@@ -414,7 +417,15 @@ cargo fmt --all --check
 ```
 
 The minimum supported Rust version is 1.89. CI runs all of the above plus the
-docs and the example on every push and pull request.
+docs and the example on every push and pull request, and the TypeScript SDK's
+tests against a real server:
+
+```sh
+rustup target add wasm32-unknown-unknown
+cargo install wasm-bindgen-cli --version 0.2.129 --locked  # the version Cargo.lock pins
+cargo build -p worgl-server
+cd sdk/typescript && npm ci && npm run build && npm run check && npm test
+```
 
 ## License
 

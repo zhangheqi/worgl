@@ -1,0 +1,40 @@
+{
+  "name": "worgl",
+  "version": "0.1.0",
+  "private": true,
+  "description": "Hold, pay and receive Worgl notes from TypeScript, on the same Rust core as the Rust SDK",
+  "license": "MIT OR Apache-2.0",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/zhangheqi/worgl.git",
+    "directory": "sdk/typescript"
+  },
+  "type": "module",
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "default": "./dist/index.js"
+    },
+    "./node": {
+      "types": "./dist/node.d.ts",
+      "default": "./dist/node.js"
+    }
+  },
+  "files": [
+    "dist",
+    "wasm"
+  ],
+  "engines": {
+    "node": ">=22.18"
+  },
+  "scripts": {
+    "wasm": "node scripts/build-wasm.mjs",
+    "build": "npm run wasm && tsc -p tsconfig.json",
+    "check": "tsc -p tsconfig.check.json",
+    "test": "node --test --test-reporter=spec \"test/**/*.test.ts\""
+  },
+  "devDependencies": {
+    "@types/node": "^22.18.0",
+    "typescript": "~6.0.2"
+  }
+}
