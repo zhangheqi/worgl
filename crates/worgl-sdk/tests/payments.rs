@@ -301,6 +301,34 @@ fn a_lost_answer_is_recovered_by_resending() {
 }
 
 #[test]
+fn resending_spaces_the_outgoing_transfers() {
+    let mut mint = issuer(4);
+    let (mut alice, mut bob) = (Holder::new(), Holder::new());
+    fund(&mut mint, &mut alice, &[2, 2, 2, 2]);
+    let request = bob.request_at_most(&view(&mint), 8, 2).unwrap();
+    let payment = alice
+        .pay(&view(&mint), &request, Spacing::default())
+        .unwrap();
+    assert_eq!(payment.transfers.len(), 4);
+
+    let spacing = Spacing {
+        min_secs: 5,
+        max_secs: 9,
+    };
+    let resent = alice.resend(spacing);
+    let mut sent: Vec<_> = resent.iter().map(|t| t.request.clone()).collect();
+    let mut outgoing: Vec<_> = alice.outgoing().cloned().collect();
+    sent.sort_by_key(|r| r.inputs[0].note.serial());
+    outgoing.sort_by_key(|r| r.inputs[0].note.serial());
+    assert_eq!(sent, outgoing);
+    assert_eq!(resent[0].after_secs, 0);
+    for pair in resent.windows(2) {
+        let gap = pair[1].after_secs - pair[0].after_secs;
+        assert!((5..=9).contains(&gap), "gap {gap}");
+    }
+}
+
+#[test]
 fn a_saved_store_spends_after_loading() {
     let mut mint = issuer(4);
     let (mut alice, mut bob) = (Holder::new(), Holder::new());

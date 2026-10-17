@@ -258,7 +258,7 @@ impl Holder {
         let plan = self.plan(mint, request)?;
         let mut transfers = Vec::with_capacity(plan.len());
         let mut expected = Vec::new();
-        let mut after_secs = 0;
+        let mut after_secs = 0u64;
         for (n, part) in plan.iter().enumerate() {
             let held = &self.notes[part.note];
             let mut outputs = part.paid.clone();
@@ -277,7 +277,7 @@ impl Holder {
             random::shuffle(&mut outputs);
             let request = TransferRequest::sign(&[(held.note, &held.key)], outputs)?;
             if n > 0 {
-                after_secs += random::between(spacing.min_secs, spacing.max_secs);
+                after_secs = after_secs.saturating_add(spacing.gap());
             }
             transfers.push(ScheduledTransfer {
                 after_secs,
@@ -458,10 +458,37 @@ impl Holder {
         self.notes.push(outgoing.spends);
     }
 
-    /// Transfers not yet answered. Resend them after a crash or a timeout:
-    /// the mint answers an identical request with the identical notes.
+    /// Transfers not yet answered. Resend them after a crash or a timeout,
+    /// with [`resend`](Self::resend): the mint answers an identical request
+    /// with the identical notes.
     pub fn outgoing(&self) -> impl Iterator<Item = &TransferRequest> {
         self.outgoing.iter().map(|o| &o.request)
+    }
+
+    /// The [outgoing](Self::outgoing) transfers in random order, each with a
+    /// time to resend it, spaced by `spacing`. Resent together, they would
+    /// tell the mint their notes had one owner.
+    ///
+    /// The mint remembers the answers to its most recent transfers only
+    /// (the policy's `receipt_capacity`); resend before then, or a transfer
+    /// already applied is refused as spent and its change is lost.
+    pub fn resend(&self, spacing: Spacing) -> Vec<ScheduledTransfer> {
+        let mut requests: Vec<TransferRequest> = self.outgoing().cloned().collect();
+        random::shuffle(&mut requests);
+        let mut after_secs = 0u64;
+        requests
+            .into_iter()
+            .enumerate()
+            .map(|(n, request)| {
+                if n > 0 {
+                    after_secs = after_secs.saturating_add(spacing.gap());
+                }
+                ScheduledTransfer {
+                    after_secs,
+                    request,
+                }
+            })
+            .collect()
     }
 
     /// Pays each of `mint`'s notes that dies at the next rotation to a fresh

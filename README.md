@@ -281,7 +281,8 @@ A payment takes one round trip between the two holders:
    to the mint at its time, and takes the new notes in with
    `Holder::absorb`. The payer records the same answers with
    `Holder::settle`, which takes in its change. A payer that never saw the
-   answer resends its outgoing transfers and gets the same notes back.
+   answer resends its outgoing transfers, spaced out by `Holder::resend`,
+   and gets the same notes back.
 
 A `MintView`, read from the mint's info, tells the store which notes can
 move now, which are frozen until the next rotation and which die at it, and

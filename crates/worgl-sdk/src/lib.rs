@@ -28,8 +28,8 @@
 //! 3. The payee checks it with [`PaymentRequest::check`], submits each
 //!    transfer at its time, and takes the new notes in with
 //!    [`Holder::absorb`].
-//! 4. The payer gets the same answers, by resending its
-//!    [outgoing](Holder::outgoing) transfers or from the payee, and records
+//! 4. The payer gets the same answers, from the payee or by resending its
+//!    outgoing transfers at the times [`Holder::resend`] gives, and records
 //!    them with [`Holder::settle`], which takes in its change.
 //!
 //! ```

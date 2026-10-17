@@ -111,6 +111,13 @@ pub struct Spacing {
     pub max_secs: u64,
 }
 
+impl Spacing {
+    /// One gap, drawn at random.
+    pub(crate) fn gap(self) -> u64 {
+        crate::random::between(self.min_secs, self.max_secs)
+    }
+}
+
 impl Default for Spacing {
     /// Gaps of 2 to 60 seconds.
     fn default() -> Self {
