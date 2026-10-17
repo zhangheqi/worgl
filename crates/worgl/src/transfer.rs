@@ -37,6 +37,7 @@ use crate::Error;
 use crate::codec::Writer;
 use crate::hex_serde;
 use crate::keys::{HolderKey, PublicKey, Signature};
+use crate::keyset::KeySet;
 use crate::ledger::Serial;
 use crate::note::Note;
 use crate::policy::Policy;
@@ -229,25 +230,31 @@ impl<'de> Deserialize<'de> for TransferId {
     }
 }
 
-/// Checks transfer requests against one issuer's key and policy.
+/// Checks requests against one issuer's keys and policy.
 ///
 /// Verification needs no ledger state, so a server can run it before taking
 /// the issuer's lock and keep the signature checks off the critical section.
-/// Get one from [`Issuer::verifier`](crate::Issuer::verifier).
+/// Get one from [`Issuer::verifier`](crate::Issuer::verifier), and a fresh
+/// one after every rotation, which adds a generation key.
 #[derive(Debug, Clone)]
 pub struct Verifier {
-    issuer: PublicKey,
+    keys: KeySet,
     policy: Policy,
 }
 
 impl Verifier {
-    pub(crate) fn new(issuer: PublicKey, policy: Policy) -> Self {
-        Self { issuer, policy }
+    pub(crate) fn new(keys: KeySet, policy: Policy) -> Self {
+        Self { keys, policy }
     }
 
     /// The issuer this verifier checks for.
     pub fn issuer(&self) -> &PublicKey {
-        &self.issuer
+        self.keys.issuer()
+    }
+
+    /// The keys that sign the issuer's live generations.
+    pub fn keys(&self) -> &KeySet {
+        &self.keys
     }
 
     /// The policy it checks against.
@@ -262,10 +269,10 @@ impl Verifier {
         let inputs: Vec<u64> = request.inputs.iter().map(|s| s.note.amount()).collect();
         let outputs: Vec<u64> = request.outputs.iter().map(|o| o.amount).collect();
         self.policy.check_transfer(&inputs, &outputs)?;
-        let message = message(&self.issuer, &serials(&request.inputs), &request.outputs);
+        let message = message(self.issuer(), &serials(&request.inputs), &request.outputs);
         self.check_inputs(&request.inputs, &message)?;
         Ok(VerifiedTransfer {
-            issuer: self.issuer,
+            issuer: *self.issuer(),
             id: TransferId::of(&message),
             inputs: request.inputs.iter().map(|spend| spend.note).collect(),
             outputs: request.outputs.clone(),
@@ -276,10 +283,10 @@ impl Verifier {
     /// note's issuer signature, no note twice and every holder signature.
     pub fn verify_burn(&self, request: &BurnRequest) -> Result<VerifiedBurn, Error> {
         self.policy.check_burn(request.inputs.len())?;
-        let message = burn_message(&self.issuer, &serials(&request.inputs));
+        let message = burn_message(self.issuer(), &serials(&request.inputs));
         self.check_inputs(&request.inputs, &message)?;
         Ok(VerifiedBurn {
-            issuer: self.issuer,
+            issuer: *self.issuer(),
             id: TransferId::of(&message),
             inputs: request.inputs.iter().map(|spend| spend.note).collect(),
         })
@@ -292,9 +299,12 @@ impl Verifier {
             return Err(Error::DuplicateInput(pair[0]));
         }
         for (input, spend) in inputs.iter().enumerate() {
-            spend
-                .note
-                .verify(&self.issuer)
+            let note = &spend.note;
+            // A dropped generation's key is erased, but its notes are simply expired.
+            if note.issuer() == self.issuer() && note.serial().generation < self.keys.oldest() {
+                return Err(Error::Expired(note.serial()));
+            }
+            note.verify(&self.keys)
                 .map_err(|error| Error::Note { input, error })?;
         }
         for (input, spend) in inputs.iter().enumerate() {
@@ -380,15 +390,18 @@ mod tests {
     }
 
     impl Fixture {
+        /// An issuer whose live generations, 1 and up, are signed by its own key.
         fn new(policy: Policy) -> Self {
             let issuer = IssuerKey::generate();
-            let verifier = Verifier::new(issuer.public_key(), policy);
+            let keys = KeySet::new(issuer.public_key(), 1, Vec::new()).unwrap();
+            let verifier = Verifier::new(keys, policy);
             Self { issuer, verifier }
         }
 
         fn note(&self, index: u32, amount: u64) -> (Note, HolderKey) {
             let holder = HolderKey::generate();
             let note = Note::issue(
+                self.issuer.public_key(),
                 &self.issuer,
                 Serial::new(1, index),
                 amount,

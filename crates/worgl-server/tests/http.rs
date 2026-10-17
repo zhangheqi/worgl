@@ -9,8 +9,8 @@ use http_body_util::BodyExt;
 use serde_json::{Value, json};
 use tower::ServiceExt;
 use worgl::{
-    BurnRequest, HolderKey, Issuer, IssuerKey, LedgerConfig, MintKey, MintRequest, Note, Output,
-    PersistentIssuer, Policy, PublicKey, TransferRequest,
+    BurnRequest, HolderKey, Issuer, IssuerKey, KeySet, LedgerConfig, MintKey, MintRequest, Note,
+    Output, PersistentIssuer, Policy, PublicKey, TransferRequest,
 };
 use worgl_server::{AppState, Info, RotationSchedule, router};
 
@@ -440,4 +440,64 @@ async fn info_reports_the_rotation_schedule() {
     assert_eq!(answer["rotation"]["period_secs"], 86_400);
     let info: Info = serde_json::from_value(answer).unwrap();
     assert_eq!(info.rotation, Some(schedule));
+}
+
+#[tokio::test]
+async fn each_rotation_publishes_a_new_generation_key_that_verifies_at_once() {
+    let server = Server::new();
+    let (code, answer) = server
+        .call(Method::GET, "/v1/keys", None, Value::Null)
+        .await;
+    assert_eq!(code, StatusCode::OK);
+    let keys: KeySet = serde_json::from_value(answer).unwrap();
+    assert_eq!(keys.issuer(), &server.issuer);
+    assert_eq!(keys.certificates().len(), 4);
+
+    let alice = HolderKey::generate();
+    let note = server.mint(8, &alice).await;
+    assert_eq!(note.verify(&keys), Ok(()));
+    let (code, report) = server
+        .call(Method::POST, "/v1/admin/rotate", Some(TOKEN), Value::Null)
+        .await;
+    assert_eq!(code, StatusCode::OK);
+    assert_eq!(report["key"]["generation"], 4);
+
+    // The note moves twice, into the generation the rotation created.
+    let (request, bob) = pay(note, &alice);
+    let (code, answer) = server.transfer(&request).await;
+    assert_eq!(code, StatusCode::OK, "{answer}");
+    let note: Note = serde_json::from_value(answer["notes"][0].clone()).unwrap();
+    let (request, carol) = pay(note, &bob);
+    let (code, answer) = server.transfer(&request).await;
+    assert_eq!(code, StatusCode::OK, "{answer}");
+    let note: Note = serde_json::from_value(answer["notes"][0].clone()).unwrap();
+    assert_eq!(note.serial().generation, 4);
+
+    // Its key is published, and the server verifies it straight away.
+    let (_, answer) = server
+        .call(Method::GET, "/v1/keys", None, Value::Null)
+        .await;
+    let keys: KeySet = serde_json::from_value(answer).unwrap();
+    assert_eq!(keys.oldest(), 1);
+    assert_eq!(keys.certificates().last().unwrap().generation, 4);
+    assert_eq!(note.verify(&keys), Ok(()));
+    assert_eq!(server.verify(&note).await["state"], "live");
+    let burn = serde_json::to_value(BurnRequest::single(note, &carol).unwrap()).unwrap();
+    let (code, answer) = server.call(Method::POST, "/v1/burn", None, burn).await;
+    assert_eq!(code, StatusCode::OK, "{answer}");
+
+    // A note whose generation was dropped is reported expired, not forged.
+    let dave = HolderKey::generate();
+    let old = server.mint(4, &dave).await;
+    for _ in 0..3 {
+        let (code, _) = server
+            .call(Method::POST, "/v1/admin/rotate", Some(TOKEN), Value::Null)
+            .await;
+        assert_eq!(code, StatusCode::OK);
+    }
+    assert_eq!(server.verify(&old).await["state"], "expired");
+    let (request, _) = pay(old, &dave);
+    let (code, answer) = server.transfer(&request).await;
+    assert_eq!(code, StatusCode::CONFLICT);
+    assert_eq!(answer["error"], "expired");
 }

@@ -171,6 +171,7 @@ impl Verifier {
 mod tests {
     use super::*;
     use crate::keys::{HolderKey, IssuerKey};
+    use crate::keyset::KeySet;
     use crate::ledger::Serial;
     use crate::policy::Policy;
 
@@ -190,7 +191,7 @@ mod tests {
             };
             Self {
                 issuer,
-                verifier: Verifier::new(issuer, policy),
+                verifier: Verifier::new(KeySet::new(issuer, 0, Vec::new()).unwrap(), policy),
                 mint,
             }
         }

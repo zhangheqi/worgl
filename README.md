@@ -73,7 +73,7 @@ choose each note's serial, because the serial names the note's bit.
 | Design point | Where it lives |
 |---|---|
 | Centralized, no wallets | One [`Issuer`](crates/worgl/src/issuer.rs). It keeps no accounts and stores no notes; holders keep their own notes. |
-| Asymmetric crypto issues notes | Ed25519 via `ed25519-dalek`, strict verification ([`keys.rs`](crates/worgl/src/keys.rs)). |
+| Asymmetric crypto issues notes | Ed25519 via `ed25519-dalek`, strict verification ([`keys.rs`](crates/worgl/src/keys.rs)); each generation signs with its own key, certified by the issuer key ([`keyset.rs`](crates/worgl/src/keyset.rs)). |
 | Serial numbers | [`Serial`](crates/worgl/src/ledger.rs) is `generation:index`; the index is a keyed permutation of the note's bit ([`permutation.rs`](crates/worgl/src/permutation.rs)). |
 | Bit array of valid notes | [`Ledger`](crates/worgl/src/ledger.rs): one flat array, slot-major, `u64` words. |
 | Transfer invalidates and reissues | [`Issuer::plan_transfer`](crates/worgl/src/issuer.rs) and `apply`. |
@@ -103,6 +103,20 @@ indexes, because its notes already carry them.
 key and the issuer's signature. In text they are unpadded URL-safe base64. The
 issuer stores no notes: the signature makes a note self-authenticating and the
 bit array says whether it is live. See [`note.rs`](crates/worgl/src/note.rs).
+
+**Each generation has its own signing key.** The issuer key is the issuer's
+identity, which every note names, but it does not sign notes. At every
+rotation the issuer makes a fresh key for the new last layer, certifies it
+with the issuer key and signs that generation's notes with it. The key's
+secret is erased once its generation is dropped. A leaked generation key
+therefore forges notes for at most as many rotations as there are layers, and
+a leak exposes no key made after it. The certificates of the live generations
+are published at `/v1/keys`, so anyone who knows the issuer key can check a
+note offline. The issuer checks notes against its own keys only, so a leaked
+issuer key cannot get a forged note past it; it could certify a false key
+that fools someone checking offline, though, so a leaked issuer key still
+means moving to a new issuer. Issuers from before this change keep their
+generations signed by the issuer key until those are dropped.
 
 **Each note is bound to a one-time key.** To be paid, the receiver makes a
 fresh key and hands out its public half. Spending the note needs a signature
@@ -199,6 +213,14 @@ readable follows it, which is the one place a crash can leave a torn write.
 Damage anywhere else stops the store from opening rather than silently
 losing acknowledged transfers.
 
+**Generation keys live in their own file.** The snapshot and journal hold
+only public keys and certificates, so they can be copied or audited without
+exposing a secret. The secrets are in `keys.bin` (mode 0600) next to them. A
+rotation writes its new key there before journaling the rotation, and keys of
+dropped generations leave the file at the next snapshot. Back `keys.bin` up
+with the rest of the state: without it the live generations' notes cannot be
+signed and the store does not open.
+
 ### What the rules imply
 
 Once a note reaches the last layer it can move at most once per rotation. With
@@ -245,7 +267,8 @@ cargo build --release
 
 `init` writes the issuer key, a random 64-character admin token and a mint
 authority key `mint.key` (all mode 0600), the policy as `policy.json` with the
-mint key listed in `mint_authorities`, and an empty ledger. The server never
+mint key listed in `mint_authorities`, and an empty ledger with a generation
+key for each layer in `keys.bin` (mode 0600). The server never
 reads `mint.key`; move it to wherever you mint from. The server refuses to
 start with an admin token shorter than 32 characters. Edit `policy.json` to
 change the rules; missing fields take their cash-like defaults:
@@ -258,11 +281,12 @@ change the rules; missing fields take their cash-like defaults:
 |---|---|---|---|
 | GET | `/healthz` | | `ok` |
 | GET | `/v1/info` | | layers, supply, policy, rotation schedule |
+| GET | `/v1/keys` | | the live generations' keys and their certificates |
 | POST | `/v1/verify` | `{"note"}` | serial, amount, state, position, hops left |
 | POST | `/v1/transfer` | `{"inputs": [{"note", "signature"}], "outputs": [{"amount", "holder"}]}` | `{"notes"}` |
 | POST | `/v1/burn` | `{"inputs": [{"note", "signature"}]}` | `{"value"}` burned |
 | POST | `/v1/mint` | `{"authority", "sequence", "amount", "holder", "signature"}` | `{"note"}` |
-| POST | `/v1/admin/rotate` | | what was destroyed |
+| POST | `/v1/admin/rotate` | | what was destroyed, and the new generation's key |
 
 To mint, sign a request with the mint key and post it. The issuer key is the
 one `init` printed and `/v1/info` reports:
@@ -289,7 +313,8 @@ rate limiting.
 - **The issuer sees lineage.** Inherent to the design; see above.
 - **No backing.** A mint authority decides what to mint; there is no deposit
   or redemption into other money.
-- **One issuer key** with no key rotation, and no replication or failover.
+- **One server per issuer**, with no replication or failover. The issuer key
+  itself never rotates: a new one is a new issuer.
 - **No client CLI.** Holders use the library, or any HTTP client plus Ed25519.
 
 ## Development

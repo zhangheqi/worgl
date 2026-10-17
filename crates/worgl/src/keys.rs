@@ -1,11 +1,14 @@
 //! Ed25519 keys and signatures.
 //!
-//! The issuer signs notes with an [`IssuerKey`]. Whoever is to be paid makes
-//! a fresh [`HolderKey`] and hands out only its [`PublicKey`]; the note they
-//! receive names that key, and spending the note needs a signature from it.
-//! A holder key is meant to be used for exactly one note, so nothing at the
-//! issuer ties two notes to the same holder. A [`MintKey`] belongs to a mint
-//! authority, whose signature the issuer requires before it mints.
+//! An issuer is known by its [`IssuerKey`], whose public half every note
+//! names. Each generation's notes are signed by a [`GenerationKey`] of its
+//! own, which the issuer key certifies (see [`keyset`](crate::keyset)).
+//! Whoever is to be paid makes a fresh [`HolderKey`] and hands out only its
+//! [`PublicKey`]; the note they receive names that key, and spending the note
+//! needs a signature from it. A holder key is meant to be used for exactly one
+//! note, so nothing at the issuer ties two notes to the same holder. A
+//! [`MintKey`] belongs to a mint authority, whose signature the issuer
+//! requires before it mints.
 //!
 //! Keys and signatures travel as lowercase hex in human-readable formats such
 //! as JSON, and as raw bytes in binary ones.
@@ -136,6 +139,11 @@ impl FromStr for Signature {
     }
 }
 
+/// Any of the secret key types, for code that signs with whichever one it is handed.
+pub(crate) trait Sign {
+    fn sign(&self, message: &[u8]) -> Signature;
+}
+
 macro_rules! secret_key {
     ($(#[$doc:meta])* $name:ident) => {
         $(#[$doc])*
@@ -185,6 +193,12 @@ macro_rules! secret_key {
             }
         }
 
+        impl Sign for $name {
+            fn sign(&self, message: &[u8]) -> Signature {
+                $name::sign(self, message)
+            }
+        }
+
         impl fmt::Debug for $name {
             fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
                 f.debug_struct(stringify!($name))
@@ -196,8 +210,21 @@ macro_rules! secret_key {
 }
 
 secret_key!(
-    /// The issuer's signing key. Every note carries a signature from it.
+    /// The issuer's identity key. Every note names its public half.
+    ///
+    /// It certifies the [`GenerationKey`] that signs each generation's notes,
+    /// and signs notes itself only in generations created before generation
+    /// keys existed. Serial indexes are also permuted under a key derived
+    /// from it.
     IssuerKey
+);
+
+secret_key!(
+    /// The key that signs one generation's notes, certified by the
+    /// [`IssuerKey`]. The issuer makes a new one at every rotation and erases
+    /// it once its generation is dropped, so a leaked generation key forges
+    /// notes only until then.
+    GenerationKey
 );
 
 secret_key!(
