@@ -79,5 +79,5 @@ pub use keys::{HolderKey, IssuerKey, PublicKey, Signature};
 pub use ledger::{Ledger, LedgerConfig, Serial};
 pub use note::{Note, NoteError};
 pub use policy::{Denominations, Policy, PolicyError};
-pub use store::{CommitError, FileStore, PersistentIssuer, StoreError};
+pub use store::{Batch, CommitError, FileStore, PersistentIssuer, StoreError};
 pub use transfer::{Output, Spend, TransferId, TransferRequest, VerifiedTransfer, Verifier};

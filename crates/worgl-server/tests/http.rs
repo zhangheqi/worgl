@@ -237,3 +237,72 @@ async fn info_reports_layers_and_supply() {
     assert_eq!(info.layers[2].value, 12);
     assert_eq!(info.supply.outstanding, 12);
 }
+
+/// Posts JSON to a router without borrowing a `Server`, for spawned tasks.
+async fn post(app: Router, path: &'static str, body: Value) -> (StatusCode, Value) {
+    let request = Request::builder()
+        .method(Method::POST)
+        .uri(path)
+        .header(header::CONTENT_TYPE, "application/json");
+    let request = request.header(header::AUTHORIZATION, format!("Bearer {TOKEN}"));
+    let response = app
+        .oneshot(request.body(Body::from(body.to_string())).unwrap())
+        .await
+        .unwrap();
+    let status = response.status();
+    let bytes = response.into_body().collect().await.unwrap().to_bytes();
+    (
+        status,
+        serde_json::from_slice(&bytes).unwrap_or(Value::Null),
+    )
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn concurrent_requests_all_land_and_never_double_spend() {
+    let server = Server::new();
+    let keys: Vec<HolderKey> = (0..64).map(|_| HolderKey::generate()).collect();
+    let mints: Vec<_> = keys
+        .iter()
+        .map(|key| {
+            let body = json!({"amount": 8, "holder": key.public_key()});
+            tokio::spawn(post(server.app.clone(), "/v1/admin/mint", body))
+        })
+        .collect();
+    let mut notes = Vec::new();
+    for mint in mints {
+        let (code, answer) = mint.await.unwrap();
+        assert_eq!(code, StatusCode::OK, "{answer}");
+        notes.push(serde_json::from_value::<Note>(answer["note"].clone()).unwrap());
+    }
+    let mut serials: Vec<_> = notes.iter().map(Note::serial).collect();
+    serials.sort_unstable();
+    serials.dedup();
+    assert_eq!(serials.len(), 64);
+
+    // Each note is paid to two different keys at once: one payment wins.
+    let mut races = Vec::new();
+    for (note, key) in notes.iter().zip(&keys) {
+        for _ in 0..2 {
+            let (request, _) = pay(*note, key);
+            let body = serde_json::to_value(&request).unwrap();
+            races.push(tokio::spawn(post(server.app.clone(), "/v1/transfer", body)));
+        }
+    }
+    let mut won = 0;
+    for race in races {
+        let (code, answer) = race.await.unwrap();
+        match code {
+            StatusCode::OK => won += 1,
+            StatusCode::CONFLICT => assert_eq!(answer["error"], "spent"),
+            other => panic!("unexpected {other}: {answer}"),
+        }
+    }
+    assert_eq!(won, 64);
+
+    let (_, answer) = server
+        .call(Method::GET, "/v1/info", None, Value::Null)
+        .await;
+    let info: Info = serde_json::from_value(answer).unwrap();
+    assert_eq!(info.sequence, 128);
+    assert_eq!(info.supply.outstanding, 64 * 8);
+}

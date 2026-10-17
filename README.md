@@ -61,6 +61,11 @@ choose each note's serial, because the serial is the note's bit position.
 - **Rotation:** one word write per 64 bits the dropped layer used.
 - **Per transfer:** two signature checks per input (issuer and holder) and one
   signature per output.
+- **Durability:** one flush per batch of changes, not per change. On a 4-core
+  cloud VM the server went from about 4,000 transfers/s, whatever the
+  number of clients, to about 8,800 with 8 concurrent clients and 17,000
+  with 64, where signature checks become the limit. The library alone
+  commits about 41,000 transfers/s in batches of 256.
 
 ## How the design maps onto the code
 
@@ -138,7 +143,9 @@ Ed25519 signatures are deterministic.
 that the issuer plans without side effects, the store writes and flushes to a
 journal, and only then the issuer applies. Applying is deterministic and
 checked, so a snapshot plus its journal rebuilds the exact same state, and a
-note is never handed out unless the event that created it is on disk. The
+note is never handed out unless the event that created it is on disk. A
+`Batch` shares one journal record and one flush among many events; the server
+puts every request waiting at the moment of a flush into the next one. The
 issuer also keeps the live value of each layer and the value minted and
 destroyed, so `outstanding = minted − destroyed` can be audited at any time.
 
