@@ -269,7 +269,7 @@ impl KeyRing {
     }
 
     /// Adds every key of `other`.
-    pub(crate) fn extend(&mut self, other: &KeyRing) {
+    pub fn extend(&mut self, other: &KeyRing) {
         for (public, key) in &other.keys {
             self.keys.entry(*public).or_insert_with(|| key.clone());
         }

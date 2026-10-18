@@ -19,12 +19,15 @@ It is a primitive for autonomous systems that pay each other in credits,
 quotas or any other unit, rather than a cash product. Identity checks and
 regulation are out of scope.
 
-The workspace has six crates and a TypeScript package:
+The workspace has seven crates and a TypeScript package:
 
 - [`worgl`](crates/worgl): the library. Ledger, note format, transfer
   protocol, policy, issuer state machine and crash-safe storage.
 - [`worgl-server`](crates/worgl-server): an HTTP server built on it that
   hosts many issuers, called mints, side by side.
+- [`worgl-raft`](crates/worgl-raft): Raft replication for one mint, so a
+  group of replicas keeps its log and any of them can take over as leader.
+  The server does not use it yet.
 - [`worgl-sdk`](crates/worgl-sdk): the holder's side. A note store that
   requests, pays, receives and refreshes notes while keeping the privacy
   rules, with no networking of its own.
@@ -452,8 +455,9 @@ behind a reverse proxy for TLS and rate limiting.
 - **The issuer sees lineage.** Inherent to the design; see above.
 - **No backing.** A mint authority decides what to mint; there is no deposit
   or redemption into other money.
-- **One copy of each mint**, with no replication or failover. The issuer key
-  itself never rotates: a new one is a new mint.
+- **One copy of each mint** in the server, with no failover yet;
+  `worgl-raft` replicates a mint, and the server is next to use it. The
+  issuer key itself never rotates: a new one is a new mint.
 - **No SDK for other languages yet.** Rust and TypeScript have one, and
   the `worgl` command covers scripts; others call the HTTP API directly.
 

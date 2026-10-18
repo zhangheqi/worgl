@@ -19,6 +19,7 @@ use std::path::Path;
 
 use chacha20poly1305::aead::{Aead, KeyInit, Payload};
 use chacha20poly1305::{Key, XChaCha20Poly1305, XNonce};
+use serde::{Deserialize, Deserializer, Serialize, Serializer};
 use thiserror::Error;
 use zeroize::Zeroizing;
 
@@ -164,8 +165,9 @@ impl Kek for FileKek {
 }
 
 /// A generation key's secret sealed by a KEK, as a rotation's log entry
-/// carries it to the replicas that did not make the key.
-#[derive(Clone, PartialEq, Eq)]
+/// carries it to the replicas that did not make the key. In JSON the sealed
+/// bytes are hex.
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SealedKey {
     /// The generation the key signs.
     pub generation: u64,
@@ -173,7 +175,17 @@ pub struct SealedKey {
     pub public: PublicKey,
     /// The secret, sealed under a context naming the issuer, the generation
     /// and the public half, so it opens in this one place only.
+    #[serde(serialize_with = "to_hex", deserialize_with = "from_hex")]
     pub sealed: Vec<u8>,
+}
+
+fn to_hex<S: Serializer>(bytes: &[u8], s: S) -> Result<S::Ok, S::Error> {
+    s.serialize_str(&hex::encode(bytes))
+}
+
+fn from_hex<'de, D: Deserializer<'de>>(d: D) -> Result<Vec<u8>, D::Error> {
+    let text = String::deserialize(d)?;
+    hex::decode(text).map_err(serde::de::Error::custom)
 }
 
 impl SealedKey {
@@ -274,6 +286,8 @@ mod tests {
             };
             assert_eq!(cut.unseal(&kek, &issuer).unwrap_err(), KekError::Rejected);
         }
+        let json = serde_json::to_string(&sealed).unwrap();
+        assert_eq!(serde_json::from_str::<SealedKey>(&json).unwrap(), sealed);
         // Two seals of one key differ, by their nonces.
         let again = SealedKey::seal(&kek, &issuer, 5, &key).unwrap();
         assert_ne!(again.sealed, sealed.sealed);

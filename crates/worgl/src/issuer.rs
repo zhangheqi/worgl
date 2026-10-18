@@ -33,6 +33,7 @@ use sha2::{Digest, Sha256};
 
 use crate::codec::{DecodeError, Reader, Writer};
 use crate::error::{ApplyError, Error, SetupError};
+use crate::kek::{Kek, KekError, SealedKey};
 use crate::keys::{GenerationKey, IssuerKey, PublicKey, Signature};
 use crate::keyset::{KeyCertificate, KeyRing, KeySet, signing_key};
 use crate::ledger::{Ledger, LedgerConfig, Serial, Status};
@@ -562,6 +563,26 @@ impl Issuer {
     /// [`kek`](crate::kek)): applying a rotation needs its key in the ring.
     pub fn add_key(&mut self, key: GenerationKey) {
         self.ring.insert(key);
+    }
+
+    /// Seals with `kek` the key of every live generation that has one, as a
+    /// replica sends them along with its [`snapshot`](Self::snapshot) to a
+    /// replica that lacks them. [`SealedKey::unseal`] opens each into a ring
+    /// to [`restore`](Self::restore) the snapshot with.
+    pub fn seal_keys(&self, kek: &dyn Kek) -> Result<Vec<SealedKey>, KekError> {
+        self.keys
+            .certificates()
+            .iter()
+            .filter_map(|certificate| {
+                let key = self.ring.get(&certificate.key)?;
+                Some(SealedKey::seal(
+                    kek,
+                    &self.public,
+                    certificate.generation,
+                    key,
+                ))
+            })
+            .collect()
     }
 
     /// Checks a note's signature and looks up its state. O(1) after the
@@ -1325,7 +1346,7 @@ impl Issuer {
     /// Erases every secret in the ring that signs no live generation, such
     /// as one left by a rotation that was planned but never applied. Call it
     /// only once no logged rotation remains to be replayed.
-    pub(crate) fn retire_keys(&mut self) {
+    pub fn retire_keys(&mut self) {
         let live = &self.keys;
         self.ring
             .retain(|public| live.certificates().iter().any(|c| &c.key == public));
@@ -2098,6 +2119,34 @@ mod tests {
         });
         assert!(i.apply(&bare).is_err());
         assert_eq!(i.snapshot(), before);
+    }
+
+    #[test]
+    fn sealed_keys_restore_a_snapshot_on_a_replica_without_its_ring() {
+        let mut i = issuer(3, Policy::cash_like());
+        let holder = HolderKey::generate();
+        let note = i.mint(8, holder.public_key()).unwrap();
+        i.rotate().unwrap();
+        let kek = crate::kek::FileKek::from_bytes(&[9; 32]);
+        let sealed = i.seal_keys(&kek).unwrap();
+        let generations: Vec<_> = sealed.iter().map(|s| s.generation).collect();
+        let live: Vec<_> = i
+            .keys()
+            .certificates()
+            .iter()
+            .map(|c| c.generation)
+            .collect();
+        assert_eq!(generations, live);
+
+        let mut ring = KeyRing::new(i.public);
+        for sealed in &sealed {
+            ring.insert(sealed.unseal(&kek, &i.public).unwrap());
+        }
+        let restored =
+            Issuer::restore(i.key.clone(), ring, &i.snapshot(), Policy::cash_like()).unwrap();
+        assert_eq!(restored.status(&note).unwrap(), i.status(&note).unwrap());
+        let next = restored.plan_mint(4, holder.public_key()).unwrap();
+        assert_eq!(restored.notes(&next), i.notes(&next));
     }
 
     #[test]
