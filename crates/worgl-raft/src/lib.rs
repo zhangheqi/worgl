@@ -46,15 +46,24 @@
 //! the store had never joined a group, call [`Replica::initialize`] with the
 //! whole membership.
 //!
+//! # Registry
+//!
+//! A [`registry::Registry`] is a small group of its own that lists which
+//! mints exist, each with a record its creator wrote, so that a mint
+//! created on one member reaches every member, including one that was away
+//! when it was created.
+//!
 //! # Transport
 //!
 //! The crate leaves the network to its user: [`Replica::open`] takes any
 //! [`RaftNetworkFactory`](openraft::RaftNetworkFactory) for the RPCs a
-//! replica sends, and the RPCs it receives go to [`Replica::raft`]. A
-//! [`SnapshotData`] travels as [`SnapshotData::to_bytes`].
+//! replica sends, and the RPCs it receives go to [`Replica::raft`] (or
+//! [`registry::Registry::raft`]). A [`SnapshotData`] travels as
+//! [`SnapshotData::to_bytes`], a registry's snapshot as JSON.
 
 mod log_store;
 mod prepare;
+pub mod registry;
 mod replica;
 mod state_machine;
 

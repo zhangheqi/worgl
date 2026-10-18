@@ -17,7 +17,6 @@ use worgl::{FileLog, PublicKey, StoreError};
 use crate::{NodeId, Request, TypeConfig, blocking};
 
 pub(crate) const VOTE: &str = "vote.json";
-const VOTE_TMP: &str = "vote.json.tmp";
 
 /// A replica's log: openraft's entries in the mint's `log.bin`, and its
 /// vote in `vote.json`.
@@ -109,7 +108,7 @@ impl RaftLogStorage<TypeConfig> for LogStore {
     async fn save_vote(&mut self, vote: &Vote<NodeId>) -> Result<(), StorageError<NodeId>> {
         let mut inner = self.lock();
         let bytes = serde_json::to_vec(vote).map_err(|e| StorageIOError::write_vote(&e))?;
-        blocking(|| write_atomically(&inner.dir, &bytes))
+        blocking(|| write_atomically(&inner.dir, VOTE, &bytes))
             .map_err(|e| StorageIOError::write_vote(&e))?;
         inner.vote = Some(*vote);
         Ok(())
@@ -215,15 +214,15 @@ fn from_entry(entry: Entry) -> Result<openraft::Entry<TypeConfig>, serde_json::E
     })
 }
 
-/// Writes the vote to a temporary file, flushes it and renames it over
-/// `vote.json`.
-fn write_atomically(dir: &Path, bytes: &[u8]) -> io::Result<()> {
-    let tmp = dir.join(VOTE_TMP);
+/// Writes `bytes` to a temporary file, flushes it and renames it over the
+/// file `name` in `dir`.
+pub(crate) fn write_atomically(dir: &Path, name: &str, bytes: &[u8]) -> io::Result<()> {
+    let tmp = dir.join(format!("{name}.tmp"));
     let mut file = File::create(&tmp)?;
     file.write_all(bytes)?;
     file.sync_all()?;
     drop(file);
-    fs::rename(&tmp, dir.join(VOTE))?;
+    fs::rename(&tmp, dir.join(name))?;
     sync_dir(dir)
 }
 
