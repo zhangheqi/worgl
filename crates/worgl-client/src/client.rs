@@ -1,0 +1,263 @@
+//! Typed calls to a Worgl server, one per route.
+
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
+
+use reqwest::{Method, RequestBuilder, Response};
+use serde::de::DeserializeOwned;
+use serde::{Deserialize, Serialize};
+use worgl::issuer::LayerSummary;
+use worgl::{
+    BurnRequest, KeySet, MintRequest, Note, NoteStatus, Policy, PublicKey, RotationReport, Serial,
+    Supply, TransferRequest,
+};
+use worgl_sdk::{MintInfo, MintView, Schedule};
+
+use crate::error::{Error, Refusal};
+
+/// How long a request may take, connection included.
+const TIMEOUT: Duration = Duration::from_secs(30);
+
+/// How long connecting may take.
+const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// Most bytes of an error answer without a code kept in [`Refusal::message`].
+const MESSAGE_LIMIT: usize = 512;
+
+/// A connection to one Worgl server, which may host many mints.
+///
+/// Every call is a single request with no retry. Transfers and burns are
+/// idempotent, so resending one after an [`Error::is_transient`] failure is
+/// safe; a [`Purse`](crate::Purse) does that itself. Cloning is cheap and
+/// shares the connection pool.
+#[derive(Debug, Clone)]
+pub struct Client {
+    http: reqwest::Client,
+    base: String,
+}
+
+/// A mint's `info`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Info {
+    /// The mint's issuer key.
+    pub issuer: PublicKey,
+    /// Events the mint has applied since it was created.
+    pub sequence: u64,
+    /// Position new money is minted into.
+    pub mint_layer: u32,
+    /// Every layer, first to last.
+    pub layers: Vec<LayerSummary>,
+    /// Value minted, destroyed, burned and outstanding.
+    pub supply: Supply,
+    /// The rules in force.
+    pub policy: Policy,
+    /// When the mint rotates on its own; `None` when only on request.
+    #[serde(default)]
+    pub rotation: Option<Schedule>,
+    /// Whether the mint is paused: it then refuses transfers, burns, mints
+    /// and rotations.
+    #[serde(default)]
+    pub paused: bool,
+}
+
+impl Info {
+    /// What a [`Holder`](worgl_sdk::Holder) needs of it.
+    pub fn mint_info(&self) -> MintInfo {
+        MintInfo {
+            issuer: self.issuer,
+            layers: self.layers.clone(),
+            policy: self.policy.clone(),
+            rotation: self.rotation,
+            paused: self.paused,
+        }
+    }
+}
+
+/// The mint's answer about a genuine note.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Verified {
+    /// The note's serial.
+    pub serial: Serial,
+    /// Its amount.
+    pub amount: u64,
+    /// Whether it is live, spent, expired or unknown to the ledger.
+    #[serde(flatten)]
+    pub status: NoteStatus,
+}
+
+#[derive(Serialize)]
+struct NoteRef<'a> {
+    note: &'a Note,
+}
+
+#[derive(Deserialize)]
+struct NoteBody {
+    note: Note,
+}
+
+#[derive(Deserialize)]
+struct NotesBody {
+    notes: Vec<Note>,
+}
+
+#[derive(Deserialize)]
+struct BurnedBody {
+    value: u128,
+}
+
+#[derive(Deserialize)]
+struct PausedBody {
+    #[expect(dead_code, reason = "the status code already says it worked")]
+    paused: bool,
+}
+
+impl Client {
+    /// A client for the server at `base_url`, such as
+    /// `https://mint.example.com`. Requests time out after 30 seconds.
+    pub fn new(base_url: &str) -> Result<Self, Error> {
+        let http = reqwest::Client::builder()
+            .user_agent(concat!("worgl-client/", env!("CARGO_PKG_VERSION")))
+            .timeout(TIMEOUT)
+            .connect_timeout(CONNECT_TIMEOUT)
+            .build()?;
+        Self::with_http(http, base_url)
+    }
+
+    /// A client that sends its requests through `http`, for custom timeouts,
+    /// proxies or certificates.
+    pub fn with_http(http: reqwest::Client, base_url: &str) -> Result<Self, Error> {
+        let url = reqwest::Url::parse(base_url).map_err(|_| Error::Url(base_url.into()))?;
+        if !matches!(url.scheme(), "http" | "https") || url.cannot_be_a_base() {
+            return Err(Error::Url(base_url.into()));
+        }
+        Ok(Self {
+            http,
+            base: url.as_str().trim_end_matches('/').to_owned(),
+        })
+    }
+
+    /// The server URL requests go to.
+    pub fn base_url(&self) -> &str {
+        &self.base
+    }
+
+    /// `GET /v1/mints/{mint}/info`.
+    pub async fn info(&self, mint: &PublicKey) -> Result<Info, Error> {
+        self.send(self.mint_route(Method::GET, mint, "info")).await
+    }
+
+    /// The mint's info as a [`MintView`] of now, ready for a
+    /// [`Holder`](worgl_sdk::Holder).
+    pub async fn view(&self, mint: &PublicKey) -> Result<MintView, Error> {
+        let info = self.info(mint).await?;
+        Ok(MintView::new(&info.mint_info())?.at(unix_now()))
+    }
+
+    /// `GET /v1/mints/{mint}/keys`: the keys that sign the mint's live
+    /// generations, each certified by the issuer key. Fails with
+    /// [`Error::Keys`] if the set is another issuer's.
+    pub async fn keys(&self, mint: &PublicKey) -> Result<KeySet, Error> {
+        let keys: KeySet = self
+            .send(self.mint_route(Method::GET, mint, "keys"))
+            .await?;
+        if keys.issuer() == mint {
+            Ok(keys)
+        } else {
+            Err(Error::Keys)
+        }
+    }
+
+    /// `POST /v1/verify`: what the note's mint says about it.
+    pub async fn verify(&self, note: &Note) -> Result<Verified, Error> {
+        let request = self
+            .route(Method::POST, "/v1/verify")
+            .json(&NoteRef { note });
+        self.send(request).await
+    }
+
+    /// `POST /v1/transfer`: the new notes, in the order of the outputs.
+    pub async fn transfer(&self, request: &TransferRequest) -> Result<Vec<Note>, Error> {
+        let request = self.route(Method::POST, "/v1/transfer").json(request);
+        Ok(self.send::<NotesBody>(request).await?.notes)
+    }
+
+    /// `POST /v1/burn`: the value destroyed.
+    pub async fn burn(&self, request: &BurnRequest) -> Result<u128, Error> {
+        let request = self.route(Method::POST, "/v1/burn").json(request);
+        Ok(self.send::<BurnedBody>(request).await?.value)
+    }
+
+    /// `POST /v1/mints/{mint}/mint`: a new note, for a request signed by one
+    /// of the mint's authorities.
+    pub async fn mint(&self, mint: &PublicKey, request: &MintRequest) -> Result<Note, Error> {
+        let request = self.mint_route(Method::POST, mint, "mint").json(request);
+        Ok(self.send::<NoteBody>(request).await?.note)
+    }
+
+    /// `POST /v1/mints/{mint}/rotate`, with the mint's admin token.
+    pub async fn rotate(&self, mint: &PublicKey, token: &str) -> Result<RotationReport, Error> {
+        let request = self.mint_route(Method::POST, mint, "rotate");
+        self.send(request.bearer_auth(token)).await
+    }
+
+    /// `POST /v1/mints/{mint}/pause`, with the mint's admin token.
+    pub async fn pause(&self, mint: &PublicKey, token: &str) -> Result<(), Error> {
+        let request = self.mint_route(Method::POST, mint, "pause");
+        self.send::<PausedBody>(request.bearer_auth(token)).await?;
+        Ok(())
+    }
+
+    /// `POST /v1/mints/{mint}/resume`, with the mint's admin token.
+    pub async fn resume(&self, mint: &PublicKey, token: &str) -> Result<(), Error> {
+        let request = self.mint_route(Method::POST, mint, "resume");
+        self.send::<PausedBody>(request.bearer_auth(token)).await?;
+        Ok(())
+    }
+
+    fn route(&self, method: Method, path: &str) -> RequestBuilder {
+        self.http.request(method, format!("{}{path}", self.base))
+    }
+
+    fn mint_route(&self, method: Method, mint: &PublicKey, route: &str) -> RequestBuilder {
+        self.route(method, &format!("/v1/mints/{mint}/{route}"))
+    }
+
+    async fn send<T: DeserializeOwned>(&self, request: RequestBuilder) -> Result<T, Error> {
+        let response = request.send().await?;
+        if response.status().is_success() {
+            Ok(response.json().await?)
+        } else {
+            Err(Error::Refused(refusal(response).await))
+        }
+    }
+}
+
+/// Reads an error answer, keeping what it says even without a code.
+async fn refusal(response: Response) -> Refusal {
+    let status = response.status().as_u16();
+    let text = response.text().await.unwrap_or_default();
+    match serde_json::from_str::<Refusal>(&text) {
+        Ok(refusal) => Refusal { status, ..refusal },
+        Err(_) => {
+            let mut message = text.trim().to_owned();
+            if message.len() > MESSAGE_LIMIT {
+                let mut end = MESSAGE_LIMIT;
+                while !message.is_char_boundary(end) {
+                    end -= 1;
+                }
+                message.truncate(end);
+            }
+            Refusal {
+                status,
+                code: "http".into(),
+                message,
+            }
+        }
+    }
+}
+
+/// Seconds since the Unix epoch, as mints count time.
+pub(crate) fn unix_now() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_or(0, |elapsed| elapsed.as_secs())
+}

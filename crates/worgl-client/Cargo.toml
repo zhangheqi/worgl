@@ -1,0 +1,28 @@
+[package]
+name = "worgl-client"
+description = "Talks to a Worgl server: typed calls for every route, and a purse that pays, receives and refreshes notes over HTTP"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+keywords = ["ecash", "token", "client", "sdk"]
+categories = ["cryptography", "web-programming::http-client"]
+
+[dependencies]
+reqwest.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+tokio.workspace = true
+worgl.workspace = true
+worgl-sdk.workspace = true
+
+[dev-dependencies]
+axum.workspace = true
+tempfile.workspace = true
+worgl-server.workspace = true
+
+[lints]
+workspace = true
