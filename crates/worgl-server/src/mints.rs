@@ -31,7 +31,10 @@
 //! [`Replica`] of its group instead of a store of its own, and its directory
 //! also holds the replica's `vote.json`. Changes are answered once a
 //! majority of the members hold them on disk, and the leader alone makes
-//! them, scheduled rotations included.
+//! them, scheduled rotations included. A mint created while the cluster
+//! runs is a record in the cluster's registry first, holding its secrets
+//! sealed by the key-encryption key and its first state; each member writes
+//! the mint's directory from that record, so all of them start alike.
 
 use std::collections::HashMap;
 use std::fmt;
@@ -51,8 +54,9 @@ use worgl::{
     NoteError, PersistentIssuer, Policy, PublicKey, RotationReport, SetupError, TransferRequest,
     VerifiedBurn, VerifiedMint, VerifiedTransfer, Verifier,
 };
-use worgl::{FileKek, Kek};
-use worgl_raft::{Options, Replica, default_config};
+use worgl::{FileKek, Kek, KeyRing};
+use worgl_raft::registry::Records;
+use worgl_raft::{Options, Replica, SnapshotData, default_config};
 
 use crate::cluster::Cluster;
 use crate::files::{self, read_json, read_key, read_secret, write_secret};
@@ -67,6 +71,11 @@ const POLICY_FILE: &str = "policy.json";
 const SETTINGS_FILE: &str = "mint.json";
 const LEGACY_SCHEDULE_FILE: &str = "last_rotation";
 const NEW_PREFIX: &str = ".new-";
+
+/// What a registry record's sealed secrets are bound to, before the mint's
+/// issuer key.
+const ISSUER_KEY_CONTEXT: &[u8] = b"worgl/registry/issuer-key/v1";
+const ADMIN_TOKEN_CONTEXT: &[u8] = b"worgl/registry/admin-token/v1";
 
 /// Changes that may wait for a mint's committer before senders have to wait too.
 const QUEUE: usize = 4096;
@@ -161,49 +170,184 @@ pub(crate) fn open_kek(dir: &Path) -> Result<Arc<dyn Kek>> {
 /// [`AppState::create_mint`](crate::AppState::create_mint) instead to add a
 /// mint while serving.
 pub fn create_mint(state: &Path, spec: &MintSpec) -> Result<CreatedMint, CreateError> {
+    let (key, issuer) = new_issuer(spec)?;
+    let token = files::random_token().map_err(CreateError::Storage)?;
+    write_mint(state, &key, &token, &spec.policy, spec.rotate_every, issuer)
+        .map_err(CreateError::Storage)?;
+    Ok(CreatedMint {
+        mint: key.public_key(),
+        token,
+    })
+}
+
+/// A fresh issuer key and the new issuer `spec` describes.
+fn new_issuer(spec: &MintSpec) -> Result<(IssuerKey, Issuer), CreateError> {
     if spec.rotate_every == Some(0) {
         return Err(CreateError::Invalid(
             "rotate_every must be at least 1 second".into(),
         ));
     }
     let key = IssuerKey::generate();
-    let issuer = match Issuer::new(key.clone(), spec.ledger, spec.policy.clone()) {
-        Ok(issuer) => issuer,
+    match Issuer::new(key.clone(), spec.ledger, spec.policy.clone()) {
+        Ok(issuer) => Ok((key, issuer)),
         Err(error @ (SetupError::Ledger(_) | SetupError::Policy(_))) => {
-            return Err(CreateError::Invalid(error.to_string()));
+            Err(CreateError::Invalid(error.to_string()))
         }
-        Err(error) => return Err(CreateError::Storage(error.into())),
-    };
+        Err(error) => Err(CreateError::Storage(error.into())),
+    }
+}
+
+/// Writes the directory of the mint `issuer`, whose key is `key`, under
+/// `state`: built in a hidden directory and renamed into place once
+/// complete.
+fn write_mint(
+    state: &Path,
+    key: &IssuerKey,
+    token: &str,
+    policy: &Policy,
+    rotate_every: Option<u64>,
+    issuer: Issuer,
+) -> Result<()> {
     let mint = *issuer.public_key();
     let mints = state.join(MINTS_DIR);
     let new = mints.join(format!("{NEW_PREFIX}{mint}"));
     let done = mints.join(mint.to_string());
-    let build = || -> Result<String> {
-        let token = files::random_token()?;
+    let build = || -> Result<()> {
+        // One a crash left half made, while writing it from the registry.
+        if new.exists() {
+            fs::remove_dir_all(&new).with_context(|| format!("removing {}", new.display()))?;
+        }
         fs::create_dir(&new).with_context(|| format!("creating {}", new.display()))?;
         write_secret(&new.join(KEY_FILE), &hex::encode(key.to_secret_bytes()))?;
-        write_secret(&new.join(TOKEN_FILE), &token)?;
-        files::write_json(&new, POLICY_FILE, &spec.policy)?;
+        write_secret(&new.join(TOKEN_FILE), token)?;
+        files::write_json(&new, POLICY_FILE, policy)?;
         let settings = Settings {
-            rotate_every: spec.rotate_every,
+            rotate_every,
             ..Settings::default()
         };
         files::write_json(&new, SETTINGS_FILE, &settings)?;
         drop(PersistentIssuer::create(&new, issuer)?);
         fs::rename(&new, &done)?;
         files::sync_dir(&mints)?;
-        Ok(token)
+        Ok(())
     };
-    match build() {
-        Ok(token) => Ok(CreatedMint { mint, token }),
-        Err(error) => {
-            // The key is fresh, so nothing else can be in either directory,
-            // and nobody was told of the mint yet.
-            let _ = fs::remove_dir_all(&new);
-            let _ = fs::remove_dir_all(&done);
-            Err(CreateError::Storage(error))
-        }
+    build().inspect_err(|_| {
+        // The key is fresh, or this member has no directory for it yet, so
+        // nothing else can be in either directory.
+        let _ = fs::remove_dir_all(&new);
+        let _ = fs::remove_dir_all(&done);
+    })
+}
+
+/// What a cluster's registry keeps about a mint created while the cluster
+/// runs: everything a member needs to write the mint's directory, with the
+/// secrets sealed by the key-encryption key the members share.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub(crate) struct MintRecord {
+    policy: Policy,
+    rotate_every: Option<u64>,
+    /// The issuer key, sealed, in hex.
+    issuer_key: String,
+    /// The admin token's bytes, sealed, in hex.
+    admin_token: String,
+    /// The new issuer, as [`SnapshotData::to_bytes`] encodes it with its
+    /// generation keys sealed, in hex.
+    genesis: String,
+}
+
+fn context(label: &[u8], mint: &PublicKey) -> Vec<u8> {
+    [label, mint.as_bytes()].concat()
+}
+
+/// Makes a new mint as `spec` describes for a cluster's registry: the record
+/// every member writes the mint from, and what to tell its creator.
+pub(crate) fn new_record(
+    spec: &MintSpec,
+    kek: &dyn Kek,
+) -> Result<(CreatedMint, MintRecord), CreateError> {
+    let (key, issuer) = new_issuer(spec)?;
+    let mint = key.public_key();
+    let mut token = [0u8; 32];
+    getrandom::fill(&mut token)
+        .map_err(|e| CreateError::Storage(anyhow::anyhow!("system RNG failed: {e}")))?;
+    let sealing = |error| CreateError::Storage(anyhow::anyhow!("sealing the mint: {error}"));
+    let issuer_key = kek
+        .seal(&key.to_secret_bytes(), &context(ISSUER_KEY_CONTEXT, &mint))
+        .map_err(sealing)?;
+    let admin_token = kek
+        .seal(&token, &context(ADMIN_TOKEN_CONTEXT, &mint))
+        .map_err(sealing)?;
+    let genesis = SnapshotData {
+        issuer: issuer.snapshot(),
+        keys: issuer.seal_keys(kek).map_err(sealing)?,
+    };
+    let record = MintRecord {
+        policy: spec.policy.clone(),
+        rotate_every: spec.rotate_every,
+        issuer_key: hex::encode(issuer_key),
+        admin_token: hex::encode(admin_token),
+        genesis: hex::encode(genesis.to_bytes()),
+    };
+    let created = CreatedMint {
+        mint,
+        token: hex::encode(token),
+    };
+    Ok((created, record))
+}
+
+/// Writes the directory of the mint `mint` under `state` from its registry
+/// `record`, unless there is one, and returns where it is.
+pub(crate) fn materialize(
+    state: &Path,
+    mint: &PublicKey,
+    record: &serde_json::Value,
+    kek: &dyn Kek,
+) -> Result<PathBuf> {
+    let done = state.join(MINTS_DIR).join(mint.to_string());
+    if done.exists() {
+        return Ok(done);
     }
+    let record = MintRecord::deserialize(record).context("reading the mint's record")?;
+    let unseal = |sealed: &str, label: &[u8], what: &str| {
+        let sealed = hex::decode(sealed).with_context(|| format!("decoding the {what}"))?;
+        kek.unseal(&sealed, &context(label, mint))
+            .with_context(|| format!("unsealing the {what}"))
+    };
+    let key = IssuerKey::from_secret_bytes(&*unseal(
+        &record.issuer_key,
+        ISSUER_KEY_CONTEXT,
+        "issuer key",
+    )?);
+    if key.public_key() != *mint {
+        bail!("the record holds the key of another mint");
+    }
+    let token = hex::encode(*unseal(
+        &record.admin_token,
+        ADMIN_TOKEN_CONTEXT,
+        "admin token",
+    )?);
+    let genesis = hex::decode(&record.genesis).context("decoding the first state")?;
+    let genesis = SnapshotData::from_bytes(&genesis).context("decoding the first state")?;
+    let mut ring = KeyRing::new(*mint);
+    for sealed in &genesis.keys {
+        ring.insert(
+            sealed
+                .unseal(kek, mint)
+                .with_context(|| format!("unsealing generation {}'s key", sealed.generation))?,
+        );
+    }
+    let issuer = Issuer::restore(key.clone(), ring, &genesis.issuer, record.policy.clone())
+        .context("restoring the first state")?;
+    write_mint(
+        state,
+        &key,
+        &token,
+        &record.policy,
+        record.rotate_every,
+        issuer,
+    )?;
+    tracing::info!(%mint, "wrote a mint from the registry");
+    Ok(done)
 }
 
 /// The directory of every mint under `state`, clearing half-made ones.
@@ -234,16 +378,23 @@ pub(crate) fn load_all(state: &Path, kek: &Arc<dyn Kek>) -> Result<Vec<Loaded>> 
 }
 
 /// Reads every mint under `state` and opens it as a replica of its group in
-/// `cluster`, as [`load_member`] does.
+/// `cluster`, as [`load_member`] does; those in `registered` came from the
+/// cluster's registry.
 pub(crate) async fn load_all_members(
     state: &Path,
     kek: &Arc<dyn Kek>,
     cluster: &Arc<Cluster>,
     compact_every: u64,
+    registered: &Records,
 ) -> Result<Vec<Loaded>> {
     let mut loaded = Vec::new();
     for dir in mint_dirs(state)? {
-        loaded.push(load_member(&dir, kek.clone(), cluster, compact_every).await?);
+        let from_registry = dir
+            .file_name()
+            .and_then(|name| name.to_str())
+            .and_then(|name| name.parse::<PublicKey>().ok())
+            .is_some_and(|key| registered.contains_key(&key));
+        loaded.push(load_member(&dir, kek.clone(), cluster, compact_every, from_registry).await?);
     }
     Ok(loaded)
 }
@@ -346,12 +497,15 @@ pub(crate) fn load(dir: &Path, kek: Arc<dyn Kek>) -> Result<Loaded> {
 /// Reads the mint in `dir` and opens it as a replica of its group in
 /// `cluster`. A store that has never joined the group, whether new or one a
 /// server ran the mint on alone, is readied for it first (see
-/// [`worgl_raft::prepare`]), and the group formed.
+/// [`worgl_raft::prepare`]), and the group formed: by the first member, or,
+/// for a mint `from_registry`, by the member that created it, and by the
+/// others only if it has not after a while.
 pub(crate) async fn load_member(
     dir: &Path,
     kek: Arc<dyn Kek>,
     cluster: &Arc<Cluster>,
     compact_every: u64,
+    from_registry: bool,
 ) -> Result<Loaded> {
     if !worgl_raft::has_joined(dir) {
         // Open it as a server on its own would first, which converts older
@@ -377,7 +531,13 @@ pub(crate) async fn load_member(
         .with_context(|| format!("opening {} as a replica", dir.display()))?;
     let replica = Arc::new(replica);
     if new {
-        tokio::spawn(cluster.clone().form(replica.clone()));
+        let raft = replica.raft().clone();
+        let at_once = cluster.is_first() && !from_registry;
+        tokio::spawn(
+            cluster
+                .clone()
+                .form(raft, format!("mint {public}"), at_once),
+        );
     }
     Ok(Loaded {
         dir: dir.to_owned(),
@@ -999,4 +1159,4 @@ fn unix_now() -> u64 {
 }
 
 /// The mints a server hosts, by issuer key.
-pub(crate) type Registry = HashMap<PublicKey, Arc<Mint>>;
+pub(crate) type Hosted = HashMap<PublicKey, Arc<Mint>>;

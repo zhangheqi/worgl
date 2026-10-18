@@ -55,16 +55,19 @@
 //! leader, as for a second or two after its leader fails, its requests are
 //! answered `503 no_leader`, and sending them again is safe. Members also
 //! serve [`raft_router`] on a port of their own, for each other only.
-//! Creating a mint while serving is not supported on a cluster yet.
+//! Creating a mint goes through the cluster's registry, from which every
+//! member writes and serves the new mint; a creation answered `503 timeout`
+//! may have made a mint, so list the mints before creating another.
 
 pub mod cluster;
 pub mod files;
 pub mod mints;
 
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, RwLock};
+use std::sync::{Arc, Mutex, RwLock};
+use std::time::{Duration, Instant};
 
-use anyhow::bail;
+use anyhow::{Context, bail};
 use axum::extract::rejection::JsonRejection;
 use axum::extract::{DefaultBodyLimit, Path as UrlPath, State};
 use axum::http::{HeaderMap, StatusCode, header};
@@ -74,17 +77,20 @@ use axum::routing::{get, post};
 use axum::{Json, Router};
 use serde::{Deserialize, Serialize};
 use subtle::ConstantTimeEq;
+use tokio::sync::watch;
+use tokio::task::JoinHandle;
 use worgl::issuer::LayerSummary;
 use worgl::{
     BurnRequest, CommitError, Error, Kek, KeySet, MintRequest, Note, NoteStatus, Policy, PublicKey,
     RotationReport, Serial, Supply, TransferRequest,
 };
+use worgl_raft::registry::{Records, Registry};
 use worgl_raft::{NodeId, Replica, ReplicaError};
 
 use cluster::{Cluster, RAFT_BODY_LIMIT};
 pub use cluster::{ClusterConfig, Member, is_member, join_cluster};
 pub use mints::{CreateError, CreatedMint, MintSpec, create_mint, init_state};
-use mints::{Mint, Registry};
+use mints::{Hosted, Mint};
 
 /// Largest request body accepted, in bytes.
 pub const BODY_LIMIT: usize = 64 * 1024;
@@ -100,11 +106,15 @@ pub const MAX_BATCH: usize = 256;
 pub struct AppState {
     dir: Arc<Path>,
     kek: Arc<dyn Kek>,
-    mints: Arc<RwLock<Registry>>,
+    mints: Arc<RwLock<Hosted>>,
     operator_token: Arc<str>,
     compact_every: u64,
     /// The cluster this server is a member of, if any.
     cluster: Option<Arc<Cluster>>,
+    /// The cluster's registry of mints, on a member.
+    registry: Option<Arc<Registry>>,
+    /// The task serving the mints the registry gains, on a member.
+    following: Arc<Mutex<Option<JoinHandle<()>>>>,
 }
 
 /// When a mint rotates on its own, as reported by its `info`.
@@ -141,6 +151,7 @@ impl AppState {
             operator_token,
             compact_every,
             None,
+            None,
             loaded,
         ))
     }
@@ -148,20 +159,33 @@ impl AppState {
     /// Opens the server state of a cluster member in `dir`, made by
     /// [`init_state`] and [`join_cluster`], as [`open`](Self::open) does, with
     /// every mint a replica of its group. The group of a mint whose store
-    /// has never joined one is formed once the members are up. Must be
-    /// called within a multi-threaded Tokio runtime.
+    /// has never joined one is formed once the members are up. Mints the
+    /// cluster's registry gains, now or later, are written from their
+    /// records and served too. Must be called within a multi-threaded Tokio
+    /// runtime.
     pub async fn open_member(dir: &Path, compact_every: u64) -> anyhow::Result<Self> {
         let (operator_token, kek) = Self::read_state(dir)?;
         let cluster = Cluster::open(dir)?;
-        let loaded = mints::load_all_members(dir, &kek, &cluster, compact_every).await?;
+        let registry = cluster::open_registry(dir, &cluster).await?;
+        let records = registry.records();
+        // Mints created while this member was away.
+        let current = records.borrow().clone();
+        for (mint, record) in &current {
+            mints::materialize(dir, mint, record, &*kek)
+                .with_context(|| format!("writing the mint {mint} from the registry"))?;
+        }
+        let loaded = mints::load_all_members(dir, &kek, &cluster, compact_every, &current).await?;
         let state = Self::start(
             dir,
             kek,
             operator_token,
             compact_every,
             Some(cluster),
+            Some(registry),
             loaded,
         );
+        let following = tokio::spawn(follow_registry(state.clone(), records));
+        *state.following.lock().unwrap_or_else(|e| e.into_inner()) = Some(following);
         Ok(state)
     }
 
@@ -190,21 +214,24 @@ impl AppState {
         operator_token: String,
         compact_every: u64,
         cluster: Option<Arc<Cluster>>,
+        registry: Option<Arc<Registry>>,
         loaded: Vec<mints::Loaded>,
     ) -> Self {
-        let mut registry = Registry::new();
+        let mut hosted = Hosted::new();
         for loaded in loaded {
             let key = *loaded.key();
             tracing::info!(mint = %key, "mint loaded");
-            registry.insert(key, Mint::start(loaded, compact_every));
+            hosted.insert(key, Mint::start(loaded, compact_every));
         }
         Self {
             dir: dir.into(),
             kek,
-            mints: Arc::new(RwLock::new(registry)),
+            mints: Arc::new(RwLock::new(hosted)),
             operator_token: operator_token.into(),
             compact_every,
             cluster,
+            registry,
+            following: Arc::default(),
         }
     }
 
@@ -215,11 +242,39 @@ impl AppState {
         self.replica(mint)?.leader()
     }
 
-    /// Stops the replicas of a cluster member's mints and waits until their
-    /// directories are unlocked. Requests to them fail from then on.
+    /// The id of the member leading the cluster's registry, which creates
+    /// mints, as far as this member knows, or `None` if it knows of none or
+    /// this server is not a cluster member.
+    pub fn registry_leader(&self) -> Option<NodeId> {
+        self.registry()?.leader()
+    }
+
+    /// Stops a cluster member's copy of the registry and the replicas of its
+    /// mints, and waits until their directories are unlocked. Requests to
+    /// them fail from then on.
     pub async fn shutdown(&self) {
+        let mut stopped = true;
+        if let Some(registry) = &self.registry
+            && let Err(error) = registry.shutdown().await
+        {
+            tracing::warn!(%error, "stopping the registry failed");
+            stopped = false;
+        }
+        let following = self
+            .following
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .take();
+        if let Some(following) = following {
+            // Once the registry stops, the task adds the mint it may be
+            // adding and ends, so no mint is added after this.
+            if !stopped {
+                following.abort();
+            }
+            let _ = following.await;
+        }
         let replicas: Vec<_> = self
-            .registry()
+            .hosted()
             .values()
             .filter_map(|mint| mint.replica().cloned())
             .collect();
@@ -234,10 +289,15 @@ impl AppState {
         self.cluster.as_ref()
     }
 
+    /// The cluster's registry, on a member.
+    fn registry(&self) -> Option<&Arc<Registry>> {
+        self.registry.as_ref()
+    }
+
     /// The replica of the mint with issuer key `key`, if this is a cluster
     /// member hosting that mint.
     fn replica(&self, key: &PublicKey) -> Option<Arc<Replica>> {
-        self.registry().get(key)?.replica().cloned()
+        self.hosted().get(key)?.replica().cloned()
     }
 
     /// The replica of the mint named in a Raft route's path.
@@ -250,21 +310,17 @@ impl AppState {
 
     /// The issuer keys of every mint, in order.
     pub fn mints(&self) -> Vec<PublicKey> {
-        let mut keys: Vec<_> = self.registry().keys().copied().collect();
+        let mut keys: Vec<_> = self.hosted().keys().copied().collect();
         keys.sort_unstable();
         keys
     }
 
-    /// Creates a mint and starts serving it.
+    /// Creates a mint and starts serving it. On a cluster member, this must
+    /// be the member that leads the registry: the mint is added to the
+    /// registry, from which every member writes and serves it.
     pub async fn create_mint(&self, spec: MintSpec) -> Result<CreatedMint, ApiError> {
-        if self.cluster.is_some() {
-            return Err(ApiError::new(
-                StatusCode::NOT_IMPLEMENTED,
-                "not_supported",
-                "a cluster cannot create mints while serving yet; create one with \
-                 `worgl-server create-mint` on one member while the members are stopped, \
-                 and copy its directory to the others",
-            ));
+        if let Some(registry) = &self.registry {
+            return self.register_mint(registry, spec).await;
         }
         let dir = PathBuf::from(&*self.dir);
         let kek = self.kek.clone();
@@ -285,14 +341,83 @@ impl AppState {
         Ok(created)
     }
 
-    fn registry(&self) -> std::sync::RwLockReadGuard<'_, Registry> {
+    async fn register_mint(
+        &self,
+        registry: &Registry,
+        spec: MintSpec,
+    ) -> Result<CreatedMint, ApiError> {
+        let kek = self.kek.clone();
+        let (created, record) =
+            tokio::task::spawn_blocking(move || mints::new_record(&spec, &*kek))
+                .await
+                .map_err(|_| ApiError::internal("creating a mint panicked"))??;
+        let record = serde_json::to_value(record)
+            .map_err(|_| ApiError::internal("the mint's record does not serialize"))?;
+        match registry.insert(created.mint, record).await {
+            Ok(true) => {}
+            Ok(false) => return Err(ApiError::internal("a fresh issuer key is taken")),
+            Err(ReplicaError::NotLeader { .. }) => return Err(ApiError::no_registry_leader()),
+            Err(ReplicaError::Timeout) => return Err(ApiError::registry_timeout()),
+            Err(error) => return Err(error.into()),
+        }
+        tracing::info!(mint = %created.mint, "mint created");
+        // Every member now writes and serves it, and this one forms its
+        // group. Wait, for a while, until the group here knows a leader, so
+        // the creator can use the mint at once.
+        let deadline = Instant::now() + READY_WAIT;
+        let mut formed = false;
+        while Instant::now() < deadline {
+            if let Some(replica) = self.replica(&created.mint) {
+                if replica.leader().is_some() {
+                    break;
+                }
+                if !formed && let Some(cluster) = self.cluster() {
+                    let raft = replica.raft().clone();
+                    let what = format!("mint {}", created.mint);
+                    tokio::spawn(cluster.clone().form(raft, what, true));
+                    formed = true;
+                }
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        Ok(created)
+    }
+
+    /// Writes the mint `mint` from its registry `record`, unless this member
+    /// has it, and starts serving it.
+    async fn add_registered(
+        &self,
+        mint: PublicKey,
+        record: serde_json::Value,
+    ) -> anyhow::Result<()> {
+        let cluster = self
+            .cluster
+            .clone()
+            .context("only a cluster member has a registry")?;
+        let dir = PathBuf::from(&*self.dir);
+        let kek = self.kek.clone();
+        let path =
+            tokio::task::spawn_blocking(move || mints::materialize(&dir, &mint, &record, &*kek))
+                .await??;
+        let loaded =
+            mints::load_member(&path, self.kek.clone(), &cluster, self.compact_every, true).await?;
+        let started = Mint::start(loaded, self.compact_every);
+        self.mints
+            .write()
+            .unwrap_or_else(|e| e.into_inner())
+            .insert(mint, started);
+        tracing::info!(%mint, "serving a mint from the registry");
+        Ok(())
+    }
+
+    fn hosted(&self) -> std::sync::RwLockReadGuard<'_, Hosted> {
         // Mints are only ever added, so a poisoned map is still a usable one.
         self.mints.read().unwrap_or_else(|e| e.into_inner())
     }
 
     /// The mint with issuer key `key`.
     fn mint(&self, key: &PublicKey) -> Result<Arc<Mint>, ApiError> {
-        self.registry().get(key).cloned().ok_or_else(|| {
+        self.hosted().get(key).cloned().ok_or_else(|| {
             ApiError::new(
                 StatusCode::NOT_FOUND,
                 "unknown_mint",
@@ -315,6 +440,30 @@ impl AppState {
 
     fn check_operator(&self, headers: &HeaderMap) -> Result<(), ApiError> {
         check_bearer(headers, &self.operator_token, "operator")
+    }
+}
+
+/// How long creating a mint on a cluster waits for the mint's group to have
+/// a leader before answering anyway.
+const READY_WAIT: Duration = Duration::from_secs(15);
+
+/// Serves each mint the registry gains while the member runs, until the
+/// registry stops. A mint that cannot be added is tried again at the next
+/// change.
+async fn follow_registry(state: AppState, mut records: watch::Receiver<Records>) {
+    loop {
+        let current = records.borrow_and_update().clone();
+        for (mint, record) in current {
+            if state.hosted().contains_key(&mint) {
+                continue;
+            }
+            if let Err(error) = state.add_registered(mint, record).await {
+                tracing::error!(%mint, error = format!("{error:#}"), "could not add a mint from the registry");
+            }
+        }
+        if records.changed().await.is_err() {
+            return;
+        }
     }
 }
 
@@ -364,13 +513,19 @@ pub fn router(state: AppState) -> Router {
 /// `Authorization: Bearer <cluster token>`. Serve them on a port of their
 /// own that only the members can reach.
 ///
-/// | method | path                     | body                                |
-/// |--------|--------------------------|-------------------------------------|
-/// | POST   | `/raft/{mint}/append`    | openraft's `AppendEntriesRequest`   |
-/// | POST   | `/raft/{mint}/vote`      | openraft's `VoteRequest`            |
-/// | POST   | `/raft/{mint}/snapshot`  | a vote, a snapshot's meta and data  |
+/// | method | path                       | body                              |
+/// |--------|----------------------------|-----------------------------------|
+/// | POST   | `/raft/{mint}/append`      | openraft's `AppendEntriesRequest` |
+/// | POST   | `/raft/{mint}/vote`        | openraft's `VoteRequest`          |
+/// | POST   | `/raft/{mint}/snapshot`    | a vote, a snapshot's meta and data |
+/// | POST   | `/raft/registry/append`    | the same, for the registry        |
+/// | POST   | `/raft/registry/vote`      | the same, for the registry        |
+/// | POST   | `/raft/registry/snapshot`  | the same, for the registry        |
 pub fn raft_router(state: AppState) -> Router {
     Router::new()
+        .route("/raft/registry/append", post(cluster::registry_append))
+        .route("/raft/registry/vote", post(cluster::registry_vote))
+        .route("/raft/registry/snapshot", post(cluster::registry_snapshot))
         .route("/raft/{mint}/append", post(cluster::append))
         .route("/raft/{mint}/vote", post(cluster::vote))
         .route("/raft/{mint}/snapshot", post(cluster::snapshot))
@@ -648,6 +803,24 @@ impl ApiError {
         )
     }
 
+    fn no_registry_leader() -> Self {
+        Self::new(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "no_leader",
+            "no member leading the registry could be reached; nothing was created, so send \
+             the request again",
+        )
+    }
+
+    fn registry_timeout() -> Self {
+        Self::new(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "timeout",
+            "the registry did not answer in time; the mint may still be created, so list the \
+             mints before creating another",
+        )
+    }
+
     /// The HTTP status.
     pub fn status(&self) -> StatusCode {
         self.status
@@ -658,9 +831,9 @@ impl ApiError {
     /// `unknown_authority`, `admin_unauthorized` (a missing or wrong token),
     /// `unknown_mint`, `paused`, `spent`, `expired`, `unissued`, `frozen`,
     /// `stale_mint`, `stale_rotation`, `layer_full`, `storage`, `internal`,
-    /// and on a cluster `no_leader` (send the request again), `timeout`
-    /// (the change may still be made; send the same request again) and
-    /// `not_supported`.
+    /// and on a cluster `no_leader` (nothing was done; send the request
+    /// again) and `timeout` (the change may still be made: send the same
+    /// note request again, but list the mints before creating another).
     pub fn code(&self) -> &'static str {
         self.code
     }

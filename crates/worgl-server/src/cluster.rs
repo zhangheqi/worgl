@@ -7,13 +7,24 @@
 //! - `cluster.json`, this member's id and every member's addresses, as
 //!   [`ClusterConfig`], and
 //! - `cluster.token`, which members show each other on their Raft ports,
-//!   mode 0600.
+//!   mode 0600, and
+//! - `registry/`, this member's copy of the cluster's registry (see
+//!   [`worgl_raft::registry`]).
 //!
 //! Every member hosts every mint, and each mint is a Raft group of all the
 //! members, so each mint has a leader of its own. The members' state
 //! directories start as copies of one, with the same mints, operator token,
 //! key-encryption key and cluster token, and differ only in `node`. A mint
 //! that ran on a server alone carries on from where it was.
+//!
+//! The registry, a Raft group of all the members too, lists the mints
+//! created while the cluster runs. Its leader creates them: it adds a
+//! mint's record, which holds the mint's secrets sealed by the
+//! key-encryption key and its first state, and every member writes the
+//! mint's directory from the record when it applies it, or when it starts
+//! again if it was away, and serves the mint. The registry's leader forms
+//! the mint's group and answers once the group has a leader, or after a
+//! while if it has none yet.
 //!
 //! Members send each other Raft's RPCs as HTTP requests to their Raft ports,
 //! with the cluster token. Nothing on that port is encrypted yet, so it must
@@ -24,10 +35,14 @@
 //! cannot reach the one it knows of, it answers `503 no_leader`; if the
 //! leader does not answer, `503 timeout`. Either way the client sends the
 //! same request again: a mint, transfer or burn the mint already carried
-//! out is answered as it was the first time.
+//! out is answered as it was the first time. A request to create a mint goes
+//! to the registry's leader the same way, but is not answered as before if
+//! sent again: after a `503 timeout`, list the mints before creating
+//! another.
 
 use std::collections::BTreeMap;
 use std::future::Future;
+use std::marker::PhantomData;
 use std::path::Path;
 use std::sync::Arc;
 use std::time::Duration;
@@ -37,7 +52,7 @@ use axum::Json;
 use axum::body::{Body, Bytes};
 use axum::extract::{Path as UrlPath, Request, State};
 use axum::http::request::Parts;
-use axum::http::{HeaderName, StatusCode, header};
+use axum::http::{HeaderName, Method, StatusCode, header};
 use axum::middleware::Next;
 use axum::response::{IntoResponse, Response};
 use openraft::error::{
@@ -48,17 +63,24 @@ use openraft::network::RPCOption;
 use openraft::raft::{
     AppendEntriesRequest, AppendEntriesResponse, SnapshotResponse, VoteRequest, VoteResponse,
 };
-use openraft::{BasicNode, RaftNetwork, RaftNetworkFactory, Snapshot, SnapshotMeta, Vote};
+use openraft::{
+    BasicNode, RaftNetwork, RaftNetworkFactory, RaftTypeConfig, Snapshot, SnapshotMeta,
+    SnapshotPolicy, Vote,
+};
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 use worgl::{Note, PublicKey};
-use worgl_raft::{NodeId, Replica, SnapshotData, TypeConfig};
+use worgl_raft::registry::{Records, Registry, RegistryConfig};
+use worgl_raft::{NodeId, SnapshotData, TypeConfig, default_config};
 
 use crate::files::{self, read_json, read_secret, write_secret};
 use crate::{ApiError, AppState, BODY_LIMIT, MIN_ADMIN_TOKEN_LEN, check_bearer};
 
 pub(crate) const CLUSTER_FILE: &str = "cluster.json";
 const TOKEN_FILE: &str = "cluster.token";
+/// The directory, in a member's state directory, of its copy of the
+/// registry.
+const REGISTRY_DIR: &str = "registry";
 
 /// Marks a request one member passed on to another, so it is passed on at
 /// most once.
@@ -177,32 +199,44 @@ impl Cluster {
     }
 
     /// The Raft RPCs a mint's replica sends.
-    pub(crate) fn network(self: &Arc<Self>, mint: PublicKey) -> Network {
-        Network {
-            cluster: self.clone(),
-            mint,
-        }
+    pub(crate) fn network(self: &Arc<Self>, mint: PublicKey) -> Network<TypeConfig> {
+        Network::new(self, format!("raft/{mint}"))
     }
 
-    /// Forms the group of a mint whose store had never joined one. The first
-    /// member does it at once; another waits in case the first does, since
-    /// members that start elections together delay each other.
-    pub(crate) async fn form(self: Arc<Self>, replica: Arc<Replica>) {
-        let first = self.config.members.keys().next().copied();
-        if first != Some(self.node()) {
+    /// The Raft RPCs this member's copy of the registry sends.
+    pub(crate) fn registry_network(self: &Arc<Self>) -> Network<RegistryConfig> {
+        Network::new(self, "raft/registry".into())
+    }
+
+    /// Whether this is the member with the lowest id, which forms the groups
+    /// of the stores the members start with.
+    pub(crate) fn is_first(&self) -> bool {
+        self.config.members.keys().next() == Some(&self.node())
+    }
+
+    /// Forms a group, `what`, whose members' stores had never joined one: at
+    /// once if `at_once`, as one member only should, or else after a while
+    /// and only if no member has formed it by then, since members that start
+    /// elections together delay each other.
+    pub(crate) async fn form<C>(
+        self: Arc<Self>,
+        raft: openraft::Raft<C>,
+        what: String,
+        at_once: bool,
+    ) where
+        C: RaftTypeConfig<NodeId = NodeId, Node = BasicNode>,
+    {
+        if !at_once {
             tokio::time::sleep(FORM_AFTER).await;
-            if !matches!(replica.raft().is_initialized().await, Ok(false)) {
+            if !matches!(raft.is_initialized().await, Ok(false)) {
                 return;
             }
         }
-        match replica.initialize(self.members()).await {
-            Ok(()) => {
-                tracing::info!(mint = %replica.public_key(), "formed the mint's group");
-            }
-            Err(error) if matches!(*error, RaftError::APIError(InitializeError::NotAllowed(_))) => {
-            }
+        match raft.initialize(self.members()).await {
+            Ok(()) => tracing::info!(group = what, "formed the group"),
+            Err(RaftError::APIError(InitializeError::NotAllowed(_))) => {}
             Err(error) => {
-                tracing::error!(mint = %replica.public_key(), %error, "could not form the mint's group");
+                tracing::error!(group = what, %error, "could not form the group");
             }
         }
     }
@@ -236,6 +270,33 @@ impl Cluster {
     }
 }
 
+/// Opens this member's copy of the cluster's registry, in its state
+/// directory `state`, and forms the registry's group if it never was.
+pub(crate) async fn open_registry(state: &Path, cluster: &Arc<Cluster>) -> Result<Arc<Registry>> {
+    let dir = state.join(REGISTRY_DIR);
+    let new = Registry::is_new(&dir);
+    let config = openraft::Config {
+        // Records are few and the log is rewritten whole on every change,
+        // so it is kept short.
+        snapshot_policy: SnapshotPolicy::LogsSinceLast(32),
+        max_in_snapshot_log_to_keep: 32,
+        ..default_config()
+    };
+    let registry = Registry::open(cluster.node(), &dir, config, cluster.registry_network())
+        .await
+        .with_context(|| format!("opening the registry in {}", dir.display()))?;
+    let registry = Arc::new(registry);
+    if new {
+        let raft = registry.raft().clone();
+        tokio::spawn(
+            cluster
+                .clone()
+                .form(raft, "registry".into(), cluster.is_first()),
+        );
+    }
+    Ok(registry)
+}
+
 /// Passes a request for a mint this member does not lead on to the member
 /// that does. See the [module documentation](self).
 pub(crate) async fn forward(
@@ -248,12 +309,13 @@ pub(crate) async fn forward(
     };
     let (parts, body) = request.into_parts();
     let path = parts.uri.path();
+    let creates = parts.method == Method::POST && path == "/v1/admin/mints";
     let by_path = path
         .strip_prefix("/v1/mints/")
         .and_then(|rest| rest.split('/').next())
         .and_then(|key| key.parse::<PublicKey>().ok());
     let by_note = matches!(path, "/v1/verify" | "/v1/transfer" | "/v1/burn");
-    if by_path.is_none() && !by_note {
+    if by_path.is_none() && !by_note && !creates {
         return next.run(Request::from_parts(parts, body)).await;
     }
     let Ok(bytes) = axum::body::to_bytes(body, BODY_LIMIT).await else {
@@ -264,33 +326,54 @@ pub(crate) async fn forward(
         )
         .into_response();
     };
-    let key = by_path.or_else(|| issuer_of(path, &bytes));
-    let replica = key.and_then(|key| state.replica(&key));
-    let Some(replica) = replica.filter(|replica| !replica.is_leader()) else {
+    // Whether this member leads the group that decides the request, and
+    // which member does as far as it knows: the registry's for a new mint,
+    // the mint's for the rest.
+    let group = if creates {
+        state
+            .registry()
+            .map(|registry| (registry.is_leader(), registry.leader()))
+    } else {
+        by_path
+            .or_else(|| issuer_of(path, &bytes))
+            .and_then(|key| state.replica(&key))
+            .map(|replica| (replica.is_leader(), replica.leader()))
+    };
+    let Some((false, leader)) = group else {
         return next
             .run(Request::from_parts(parts, Body::from(bytes)))
             .await;
     };
+    let no_leader = || {
+        if creates {
+            ApiError::no_registry_leader()
+        } else {
+            ApiError::no_leader()
+        }
+    };
     if parts.headers.contains_key(FORWARDED) {
-        return ApiError::no_leader().into_response();
+        return no_leader().into_response();
     }
-    let leader = replica
-        .leader()
+    let leader = leader
         .filter(|&leader| leader != cluster.node())
         .and_then(|leader| cluster.config.members.get(&leader));
     let Some(leader) = leader else {
-        return ApiError::no_leader().into_response();
+        return no_leader().into_response();
     };
     match cluster.relay(&leader.api, &parts, bytes).await {
         Ok(response) => response,
         Err(error) if error.is_connect() => {
             tracing::warn!(leader = %leader.api, %error, "could not reach the leader");
-            ApiError::no_leader().into_response()
+            no_leader().into_response()
         }
         // The leader may have carried the request out.
         Err(error) => {
             tracing::warn!(leader = %leader.api, %error, "the leader did not answer");
-            ApiError::timeout().into_response()
+            if creates {
+                ApiError::registry_timeout().into_response()
+            } else {
+                ApiError::timeout().into_response()
+            }
         }
     }
 }
@@ -362,6 +445,79 @@ pub(crate) async fn vote(
     Ok(Json(replica.raft().vote(rpc).await))
 }
 
+pub(crate) async fn snapshot(
+    State(state): State<AppState>,
+    UrlPath(mint): UrlPath<String>,
+    body: Bytes,
+) -> Result<Answer<SnapshotResponse<NodeId>, Fatal<NodeId>>, ApiError> {
+    let replica = state.replica_at(&mint)?;
+    let (vote, snapshot) = decode_snapshot(&body)?;
+    Ok(Json(
+        replica.raft().install_full_snapshot(vote, snapshot).await,
+    ))
+}
+
+pub(crate) async fn registry_append(
+    State(state): State<AppState>,
+    Json(rpc): Json<AppendEntriesRequest<RegistryConfig>>,
+) -> Result<Answer<AppendEntriesResponse<NodeId>, RaftError<NodeId>>, ApiError> {
+    let registry = state.registry().ok_or_else(not_member)?;
+    Ok(Json(registry.raft().append_entries(rpc).await))
+}
+
+pub(crate) async fn registry_vote(
+    State(state): State<AppState>,
+    Json(rpc): Json<VoteRequest<NodeId>>,
+) -> Result<Answer<VoteResponse<NodeId>, RaftError<NodeId>>, ApiError> {
+    let registry = state.registry().ok_or_else(not_member)?;
+    Ok(Json(registry.raft().vote(rpc).await))
+}
+
+pub(crate) async fn registry_snapshot(
+    State(state): State<AppState>,
+    body: Bytes,
+) -> Result<Answer<SnapshotResponse<NodeId>, Fatal<NodeId>>, ApiError> {
+    let registry = state.registry().ok_or_else(not_member)?;
+    let (vote, snapshot) = decode_snapshot(&body)?;
+    Ok(Json(
+        registry.raft().install_full_snapshot(vote, snapshot).await,
+    ))
+}
+
+fn not_member() -> ApiError {
+    ApiError::new(
+        StatusCode::NOT_FOUND,
+        "unknown_mint",
+        "this server is not a cluster member",
+    )
+}
+
+/// A snapshot as it crosses the network.
+pub(crate) trait Wire: Sized {
+    fn to_wire(&self) -> Vec<u8>;
+    fn from_wire(bytes: &[u8]) -> Option<Self>;
+}
+
+impl Wire for SnapshotData {
+    fn to_wire(&self) -> Vec<u8> {
+        self.to_bytes()
+    }
+
+    fn from_wire(bytes: &[u8]) -> Option<Self> {
+        Self::from_bytes(bytes).ok()
+    }
+}
+
+impl Wire for Records {
+    fn to_wire(&self) -> Vec<u8> {
+        serde_json::to_vec(self).expect("records serialize")
+    }
+
+    fn from_wire(bytes: &[u8]) -> Option<Self> {
+        serde_json::from_slice(bytes).ok()
+    }
+}
+
 /// What travels before a snapshot's data.
 #[derive(Serialize, Deserialize)]
 struct SnapshotHeader {
@@ -370,16 +526,17 @@ struct SnapshotHeader {
 }
 
 /// A snapshot request's body: the header's length as a big-endian `u32`,
-/// the header as JSON, then [`SnapshotData::to_bytes`].
-fn encode_snapshot(
-    vote: Vote<NodeId>,
-    snapshot: Snapshot<TypeConfig>,
-) -> serde_json::Result<Vec<u8>> {
+/// the header as JSON, then the data as [`Wire`] encodes it.
+fn encode_snapshot<C>(vote: Vote<NodeId>, snapshot: Snapshot<C>) -> serde_json::Result<Vec<u8>>
+where
+    C: RaftTypeConfig<NodeId = NodeId, Node = BasicNode>,
+    C::SnapshotData: Wire,
+{
     let header = serde_json::to_vec(&SnapshotHeader {
         vote,
         meta: snapshot.meta,
     })?;
-    let data = snapshot.snapshot.to_bytes();
+    let data = snapshot.snapshot.to_wire();
     let mut body = Vec::with_capacity(4 + header.len() + data.len());
     body.extend_from_slice(&(header.len() as u32).to_be_bytes());
     body.extend_from_slice(&header);
@@ -387,53 +544,65 @@ fn encode_snapshot(
     Ok(body)
 }
 
-fn decode_snapshot(body: &[u8]) -> Option<(Vote<NodeId>, Snapshot<TypeConfig>)> {
-    let len = u32::from_be_bytes(body.get(..4)?.try_into().ok()?) as usize;
-    let header: SnapshotHeader = serde_json::from_slice(body.get(4..4 + len)?).ok()?;
-    let data = SnapshotData::from_bytes(&body[4 + len..]).ok()?;
-    let snapshot = Snapshot {
-        meta: header.meta,
-        snapshot: Box::new(data),
+fn decode_snapshot<C>(body: &[u8]) -> Result<(Vote<NodeId>, Snapshot<C>), ApiError>
+where
+    C: RaftTypeConfig<NodeId = NodeId, Node = BasicNode>,
+    C::SnapshotData: Wire,
+{
+    let decode = || {
+        let len = u32::from_be_bytes(body.get(..4)?.try_into().ok()?) as usize;
+        let header: SnapshotHeader = serde_json::from_slice(body.get(4..4 + len)?).ok()?;
+        let data = C::SnapshotData::from_wire(&body[4 + len..])?;
+        let snapshot = Snapshot {
+            meta: header.meta,
+            snapshot: Box::new(data),
+        };
+        Some((header.vote, snapshot))
     };
-    Some((header.vote, snapshot))
+    decode()
+        .ok_or_else(|| ApiError::new(StatusCode::BAD_REQUEST, "malformed", "unreadable snapshot"))
 }
 
-pub(crate) async fn snapshot(
-    State(state): State<AppState>,
-    UrlPath(mint): UrlPath<String>,
-    body: Bytes,
-) -> Result<Answer<SnapshotResponse<NodeId>, Fatal<NodeId>>, ApiError> {
-    let replica = state.replica_at(&mint)?;
-    let (vote, snapshot) = decode_snapshot(&body).ok_or_else(|| {
-        ApiError::new(StatusCode::BAD_REQUEST, "malformed", "unreadable snapshot")
-    })?;
-    Ok(Json(
-        replica.raft().install_full_snapshot(vote, snapshot).await,
-    ))
-}
-
-/// Sends a mint's Raft RPCs to the other members' Raft ports.
-pub(crate) struct Network {
+/// Sends one group's Raft RPCs to the other members' Raft ports.
+pub(crate) struct Network<C> {
     cluster: Arc<Cluster>,
-    mint: PublicKey,
+    /// The group's routes, below each Raft port.
+    path: String,
+    config: PhantomData<fn() -> C>,
 }
 
-impl RaftNetworkFactory<TypeConfig> for Network {
-    type Network = Connection;
-
-    async fn new_client(&mut self, target: NodeId, node: &BasicNode) -> Connection {
-        Connection {
-            cluster: self.cluster.clone(),
-            target,
-            base: format!("http://{}/raft/{}", node.addr, self.mint),
+impl<C> Network<C> {
+    fn new(cluster: &Arc<Cluster>, path: String) -> Self {
+        Self {
+            cluster: cluster.clone(),
+            path,
+            config: PhantomData,
         }
     }
 }
 
-pub(crate) struct Connection {
+impl<C> RaftNetworkFactory<C> for Network<C>
+where
+    C: RaftTypeConfig<NodeId = NodeId, Node = BasicNode>,
+    C::SnapshotData: Wire,
+{
+    type Network = Connection<C>;
+
+    async fn new_client(&mut self, target: NodeId, node: &BasicNode) -> Connection<C> {
+        Connection {
+            cluster: self.cluster.clone(),
+            target,
+            base: format!("http://{}/{}", node.addr, self.path),
+            config: PhantomData,
+        }
+    }
+}
+
+pub(crate) struct Connection<C> {
     cluster: Arc<Cluster>,
     target: NodeId,
     base: String,
+    config: PhantomData<fn() -> C>,
 }
 
 /// Why an RPC got no answer.
@@ -451,7 +620,10 @@ impl From<Failure> for RPCError<NodeId, BasicNode, RaftError<NodeId>> {
     }
 }
 
-impl From<Failure> for StreamingError<TypeConfig, Fatal<NodeId>> {
+impl<C> From<Failure> for StreamingError<C, Fatal<NodeId>>
+where
+    C: RaftTypeConfig<NodeId = NodeId, Node = BasicNode>,
+{
     fn from(failure: Failure) -> Self {
         match failure {
             Failure::Unreachable(error) => Self::Unreachable(error),
@@ -460,7 +632,7 @@ impl From<Failure> for StreamingError<TypeConfig, Fatal<NodeId>> {
     }
 }
 
-impl Connection {
+impl<C> Connection<C> {
     async fn post<T: DeserializeOwned>(
         &self,
         route: &str,
@@ -494,10 +666,14 @@ impl Connection {
     }
 }
 
-impl RaftNetwork<TypeConfig> for Connection {
+impl<C> RaftNetwork<C> for Connection<C>
+where
+    C: RaftTypeConfig<NodeId = NodeId, Node = BasicNode>,
+    C::SnapshotData: Wire,
+{
     async fn append_entries(
         &mut self,
-        rpc: AppendEntriesRequest<TypeConfig>,
+        rpc: AppendEntriesRequest<C>,
         option: RPCOption,
     ) -> Result<AppendEntriesResponse<NodeId>, RPCError<NodeId, BasicNode, RaftError<NodeId>>> {
         let request = self.cluster.client.post(self.url("append")).json(&rpc);
@@ -520,10 +696,10 @@ impl RaftNetwork<TypeConfig> for Connection {
     async fn full_snapshot(
         &mut self,
         vote: Vote<NodeId>,
-        snapshot: Snapshot<TypeConfig>,
+        snapshot: Snapshot<C>,
         cancel: impl Future<Output = ReplicationClosed> + Send + 'static,
         option: RPCOption,
-    ) -> Result<SnapshotResponse<NodeId>, StreamingError<TypeConfig, Fatal<NodeId>>> {
+    ) -> Result<SnapshotResponse<NodeId>, StreamingError<C, Fatal<NodeId>>> {
         let body = encode_snapshot(vote, snapshot)
             .map_err(|error| Failure::Network(NetworkError::new(&error)))?;
         let request = self.cluster.client.post(self.url("snapshot")).body(body);

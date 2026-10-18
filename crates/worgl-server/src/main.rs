@@ -36,9 +36,8 @@ enum Command {
     },
     /// Create a mint: an issuer key, an admin token, a mint authority key
     /// and an empty ledger. A running server sees it once restarted; POST
-    /// /v1/admin/mints creates one while serving. On a cluster, create it on
-    /// one member while all are stopped, and copy its directory to the
-    /// others.
+    /// /v1/admin/mints creates one while serving, and on a cluster creates
+    /// it on every member.
     CreateMint {
         /// State directory made by `init`.
         #[arg(long, env = "WORGL_STATE")]
