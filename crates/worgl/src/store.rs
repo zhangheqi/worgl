@@ -142,6 +142,75 @@ pub enum StoreError {
     },
 }
 
+/// A store's directory apart from its log, for a replication layer that
+/// keeps the log itself in a [`FileLog`] and applies entries as they commit.
+///
+/// It holds the directory's lock while open, so no [`FileStore`] or other
+/// `StateFiles` opens the same store.
+#[derive(Debug)]
+pub struct StateFiles {
+    dir: PathBuf,
+    _lock: File,
+}
+
+/// What `snapshot.bin` holds.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SnapshotFile {
+    /// The id of the last entry the snapshot holds.
+    pub applied: Option<LogId>,
+    /// The latest membership change the snapshot holds, with its id.
+    pub membership: Option<(LogId, Vec<u8>)>,
+    /// The issuer's state, as [`Issuer::snapshot`] encodes it.
+    pub issuer: Vec<u8>,
+}
+
+impl StateFiles {
+    /// Locks the store in `dir`, which must exist.
+    pub fn open(dir: impl AsRef<Path>) -> Result<Self, StoreError> {
+        let dir = dir.as_ref().to_path_buf();
+        let lock = lock(&dir)?;
+        Ok(Self { dir, _lock: lock })
+    }
+
+    /// The store's directory.
+    pub fn dir(&self) -> &Path {
+        &self.dir
+    }
+
+    /// The key ring in `keys.bin`, or an empty one for a store from before
+    /// generation keys.
+    pub fn keys(&self, key: &IssuerKey) -> Result<KeyRing, StoreError> {
+        read_keys(&self.dir, key)
+    }
+
+    /// Replaces `keys.bin` with `ring`, readable by its owner only.
+    pub fn save_keys(&self, ring: &KeyRing) -> io::Result<()> {
+        write_keys(&self.dir, ring)
+    }
+
+    /// Reads `snapshot.bin`. A store from before the log has a snapshot of
+    /// another kind; open it once as a [`FileStore`] to convert it.
+    pub fn snapshot(&self) -> Result<SnapshotFile, StoreError> {
+        let bytes = fs::read(self.dir.join(SNAPSHOT))?;
+        let (applied, membership, issuer) = parse_snapshot(&bytes)?;
+        Ok(SnapshotFile {
+            applied,
+            membership,
+            issuer: issuer.to_vec(),
+        })
+    }
+
+    /// Replaces `snapshot.bin`.
+    pub fn save_snapshot(&self, snapshot: &SnapshotFile) -> io::Result<()> {
+        write_snapshot(
+            &self.dir,
+            snapshot.applied,
+            snapshot.membership.as_ref(),
+            &snapshot.issuer,
+        )
+    }
+}
+
 /// A snapshot and log in one directory. See the [module documentation](self).
 #[derive(Debug)]
 pub struct FileStore {
@@ -1609,6 +1678,48 @@ mod tests {
         assert_eq!(store.applied(), Some(blank));
         assert_eq!(store.membership(), Some((change, &b"voters 7, 8, 9"[..])));
         assert_eq!(store.log().next_index(), 3);
+    }
+
+    #[test]
+    fn state_files_read_and_replace_what_a_store_wrote() {
+        let dir = tempfile::tempdir().unwrap();
+        let (key, mut p) = fresh(dir.path());
+        activity(&mut p);
+        p.compact().unwrap();
+        let expected = p.issuer().snapshot();
+        let ring = p.issuer().key_ring().clone();
+        assert!(matches!(
+            StateFiles::open(dir.path()),
+            Err(StoreError::Locked)
+        ));
+        drop(p);
+
+        let files = StateFiles::open(dir.path()).unwrap();
+        assert!(matches!(
+            FileStore::open(dir.path(), key.clone(), Policy::cash_like()),
+            Err(StoreError::Locked)
+        ));
+        assert_eq!(files.dir(), dir.path());
+        let snapshot = files.snapshot().unwrap();
+        assert_eq!(snapshot.issuer, expected);
+        assert_eq!(snapshot.applied, Some(LogId::standalone(3)));
+        assert_eq!(snapshot.membership, None);
+        assert_eq!(files.keys(&key).unwrap().to_bytes(), ring.to_bytes());
+
+        let id = LogId {
+            term: 2,
+            node: 1,
+            index: 9,
+        };
+        let replaced = SnapshotFile {
+            applied: Some(id),
+            membership: Some((id, b"members".to_vec())),
+            ..snapshot
+        };
+        files.save_snapshot(&replaced).unwrap();
+        files.save_keys(&KeyRing::new(key.public_key())).unwrap();
+        assert_eq!(files.snapshot().unwrap(), replaced);
+        assert!(files.keys(&key).unwrap().is_empty());
     }
 
     #[test]

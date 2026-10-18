@@ -4,6 +4,7 @@ members = [
     "crates/worgl",
     "crates/worgl-cli",
     "crates/worgl-client",
+    "crates/worgl-raft",
     "crates/worgl-sdk",
     "crates/worgl-server",
     "crates/worgl-wasm",
@@ -20,6 +21,7 @@ authors = ["The Worgl contributors"]
 [workspace.dependencies]
 worgl = { path = "crates/worgl", version = "0.1.0" }
 worgl-client = { path = "crates/worgl-client", version = "0.1.0" }
+worgl-raft = { path = "crates/worgl-raft" }
 worgl-sdk = { path = "crates/worgl-sdk", version = "0.1.0" }
 worgl-server = { path = "crates/worgl-server" }
 
@@ -33,6 +35,7 @@ ed25519-dalek = "3"
 getrandom = "0.4"
 hex = "0.4"
 http-body-util = "0.1"
+openraft = { version = "0.9.25", features = ["serde", "storage-v2", "generic-snapshot-data"] }
 proptest = "1"
 reqwest = { version = "0.13", default-features = false, features = ["http2", "json", "rustls"] }
 rpassword = "7"

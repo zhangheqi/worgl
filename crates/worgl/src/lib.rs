@@ -93,7 +93,9 @@ pub use log::{FileLog, LogId};
 pub use mint::{MintAuthorization, MintRequest, VerifiedMint};
 pub use note::{Note, NoteError};
 pub use policy::{Denominations, Policy, PolicyError};
-pub use store::{Batch, CommitError, FileStore, PersistentIssuer, StoreError};
+pub use store::{
+    Batch, CommitError, FileStore, PersistentIssuer, SnapshotFile, StateFiles, StoreError,
+};
 pub use transfer::{
     BurnRequest, Output, Spend, TransferId, TransferRequest, VerifiedBurn, VerifiedTransfer,
     Verifier,
