@@ -557,6 +557,13 @@ impl Issuer {
         &self.ring
     }
 
+    /// Adds a generation key to the [`key_ring`](Self::key_ring), as a
+    /// replica does with the key a rotation's log entry carries sealed (see
+    /// [`kek`](crate::kek)): applying a rotation needs its key in the ring.
+    pub fn add_key(&mut self, key: GenerationKey) {
+        self.ring.insert(key);
+    }
+
     /// Checks a note's signature and looks up its state. O(1) after the
     /// signature check. A note of a dropped generation is expired, and its
     /// signature is no longer checked, because its key has been erased.

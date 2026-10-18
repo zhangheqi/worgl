@@ -3,7 +3,10 @@
 //!
 //! A server's state directory holds
 //!
-//! - `operator.token`, which authorizes creating and listing mints, and
+//! - `operator.token`, which authorizes creating and listing mints,
+//! - `kek.key`, the key-encryption key that seals each new generation key
+//!   into its rotation's log entry, mode 0600 (a [`FileKek`], for
+//!   development; replicas will share one from a KMS), and
 //! - `mints/<issuer key>/`, one directory per mint, named by its issuer key
 //!   in hex.
 //!
@@ -40,11 +43,13 @@ use worgl::{
     NoteError, PersistentIssuer, Policy, PublicKey, RotationReport, SetupError, TransferRequest,
     VerifiedBurn, VerifiedMint, VerifiedTransfer, Verifier,
 };
+use worgl::{FileKek, Kek};
 
 use crate::files::{self, read_json, read_key, read_secret, write_secret};
 use crate::{ApiError, Info, MAX_BATCH, MIN_ADMIN_TOKEN_LEN, RotationSchedule, Verified};
 
 pub(crate) const OPERATOR_TOKEN_FILE: &str = "operator.token";
+pub(crate) const KEK_FILE: &str = "kek.key";
 pub(crate) const MINTS_DIR: &str = "mints";
 const KEY_FILE: &str = "issuer.key";
 const TOKEN_FILE: &str = "admin.token";
@@ -109,14 +114,32 @@ struct Settings {
     paused: bool,
 }
 
-/// Creates a server's state directory: an operator token and no mints.
+/// Creates a server's state directory: an operator token, a key-encryption
+/// key and no mints.
 pub fn init_state(dir: &Path) -> Result<()> {
     if dir.join(OPERATOR_TOKEN_FILE).exists() {
         bail!("{} already holds a server", dir.display());
     }
     fs::create_dir_all(dir.join(MINTS_DIR))
         .with_context(|| format!("creating {}", dir.display()))?;
+    FileKek::create(&dir.join(KEK_FILE))
+        .with_context(|| format!("creating {}", dir.join(KEK_FILE).display()))?;
     write_secret(&dir.join(OPERATOR_TOKEN_FILE), &files::random_token()?)
+}
+
+/// Reads the state directory's key-encryption key, making one for a state
+/// directory from before they existed.
+pub(crate) fn open_kek(dir: &Path) -> Result<Arc<dyn Kek>> {
+    let path = dir.join(KEK_FILE);
+    let kek = match FileKek::open(&path) {
+        Ok(kek) => kek,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            tracing::info!(path = %path.display(), "creating a key-encryption key");
+            FileKek::create(&path).with_context(|| format!("creating {}", path.display()))?
+        }
+        Err(error) => return Err(error).with_context(|| format!("reading {}", path.display())),
+    };
+    Ok(Arc::new(kek))
 }
 
 /// Creates a mint in the state directory `state` with a fresh issuer key and
@@ -170,7 +193,7 @@ pub fn create_mint(state: &Path, spec: &MintSpec) -> Result<CreatedMint, CreateE
 }
 
 /// Reads and opens every mint under `state`, clearing half-made ones.
-pub(crate) fn load_all(state: &Path) -> Result<Vec<Loaded>> {
+pub(crate) fn load_all(state: &Path, kek: &Arc<dyn Kek>) -> Result<Vec<Loaded>> {
     let mints = state.join(MINTS_DIR);
     let mut loaded = Vec::new();
     for entry in fs::read_dir(&mints).with_context(|| format!("reading {}", mints.display()))? {
@@ -182,7 +205,7 @@ pub(crate) fn load_all(state: &Path) -> Result<Vec<Loaded>> {
             fs::remove_dir_all(entry.path())
                 .with_context(|| format!("removing {}", entry.path().display()))?;
         } else if !name.starts_with('.') && entry.file_type()?.is_dir() {
-            loaded.push(load(&entry.path())?);
+            loaded.push(load(&entry.path(), kek.clone())?);
         }
     }
     Ok(loaded)
@@ -202,8 +225,9 @@ impl Loaded {
     }
 }
 
-/// Reads the mint in `dir` and opens its store.
-pub(crate) fn load(dir: &Path) -> Result<Loaded> {
+/// Reads the mint in `dir` and opens its store, which seals the keys of its
+/// rotations with `kek`.
+pub(crate) fn load(dir: &Path, kek: Arc<dyn Kek>) -> Result<Loaded> {
     let key = IssuerKey::from_secret_bytes(&read_key(&dir.join(KEY_FILE))?);
     let name = key.public_key().to_string();
     if dir.file_name().and_then(|name| name.to_str()) != Some(&name) {
@@ -232,7 +256,7 @@ pub(crate) fn load(dir: &Path) -> Result<Loaded> {
             dir.join(SETTINGS_FILE).display()
         );
     }
-    let mut issuer = PersistentIssuer::open(dir, key, policy)
+    let mut issuer = PersistentIssuer::open_with_kek(dir, key, policy, kek)
         .with_context(|| format!("opening {}", dir.display()))?;
     if settings.paused {
         // An older server paused it in mint.json. Log the pause first, so a

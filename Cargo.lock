@@ -2352,6 +2352,7 @@ name = "worgl"
 version = "0.1.0"
 dependencies = [
  "base64",
+ "chacha20poly1305",
  "ed25519-dalek",
  "getrandom 0.4.3",
  "hex",
@@ -2361,6 +2362,7 @@ dependencies = [
  "sha2",
  "tempfile",
  "thiserror",
+ "zeroize",
 ]
 
 [[package]]

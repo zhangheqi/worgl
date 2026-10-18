@@ -242,6 +242,15 @@ dropped generations leave the file at the next snapshot. Back `keys.bin` up
 with the rest of the state: without it the live generations' notes cannot be
 signed and the store does not open.
 
+**A rotation's log entry can carry its key, sealed.** Replicas that apply a
+rotation they did not make need its key, and the log is all they share. Given
+a key-encryption key (`Kek`), a store seals each new generation key with
+XChaCha20-Poly1305 into the entry of the rotation that certifies it, bound to
+the issuer, the generation and the key, and unseals it on opening if
+`keys.bin` lacks it. `FileKek` keeps the KEK in a file for development; a
+cloud KMS can stand behind the same trait. `FileLog::export` reads a log
+without the sealed keys, and without touching a log in use, for auditors.
+
 ### What the rules imply
 
 Once a note reaches the last layer it can move at most once per rotation. With
@@ -367,7 +376,8 @@ its issuer key. A note names its issuer, so the holder routes take no mint in
 their path and find it from the note.
 
 `init` writes a random 64-character operator token, which creates and lists
-mints. `create-mint` writes the mint's issuer key, its own admin token, which
+mints, and `kek.key` (mode 0600), the key-encryption key that seals each
+mint's new generation keys into their rotations' log entries. `create-mint` writes the mint's issuer key, its own admin token, which
 rotates and pauses that mint only, and a mint authority key `mint.key` (all
 mode 0600), the policy as `policy.json` with the mint key listed in
 `mint_authorities`, its period in `mint.json`, and an empty ledger with a
@@ -427,6 +437,10 @@ spent"}`; the codes are listed in
 library's own (`TransferRequest`, `BurnRequest`, `MintRequest`, `Note`,
 `PublicKey`), so a Rust client signs with the library and posts the JSON it
 serializes to.
+
+`worgl-server export-log --mint server/mints/<mint>` prints a mint's log for
+an audit, one JSON object per entry, with no sealed keys. It is safe to run
+while the server serves the mint.
 
 The server is one process. Each mint commits on its own, so a busy mint does
 not slow the others, and an idle one holds no thread. A lock file per mint

@@ -2,13 +2,16 @@
 //! them over HTTP, and sign mint requests.
 
 use std::fs;
+use std::io::Write;
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
 
-use anyhow::{Context, Result};
+use anyhow::{Context, Result, anyhow};
 use clap::{Parser, Subcommand};
+use serde_json::json;
 use tracing_subscriber::EnvFilter;
-use worgl::{LedgerConfig, MintKey, MintRequest, Policy, PublicKey};
+use worgl::log::Payload;
+use worgl::{FileLog, LedgerConfig, LogId, MintKey, MintRequest, Policy, PublicKey};
 use worgl_server::files::{read_key, write_secret};
 use worgl_server::{AppState, MintSpec, router};
 
@@ -71,6 +74,14 @@ enum Command {
         #[arg(long)]
         holder: PublicKey,
     },
+    /// Print a mint's log for an audit, one JSON object per entry, without
+    /// the sealed generation keys its rotations carry. Safe to run while
+    /// the mint is being served.
+    ExportLog {
+        /// The mint's directory, `mints/<issuer key>` in the state directory.
+        #[arg(long)]
+        mint: PathBuf,
+    },
     /// Serve every mint in a state directory over HTTP.
     Serve {
         /// State directory made by `init`.
@@ -126,6 +137,7 @@ async fn main() -> Result<()> {
             println!("{}", serde_json::to_string_pretty(&request)?);
             Ok(())
         }
+        Command::ExportLog { mint } => export_log(&mint),
         Command::Serve {
             state,
             listen,
@@ -160,6 +172,36 @@ fn create_mint(state: &Path, mut spec: MintSpec) -> Result<()> {
             "mint key    {} (the server does not need it; keep it where you mint from)",
             path.display()
         );
+    }
+    Ok(())
+}
+
+fn export_log(dir: &Path) -> Result<()> {
+    let issuer: PublicKey = dir
+        .file_name()
+        .and_then(|name| name.to_str())
+        .and_then(|name| name.parse().ok())
+        .ok_or_else(|| {
+            anyhow!(
+                "{} is not a mint's directory, which is named by its issuer key",
+                dir.display()
+            )
+        })?;
+    let entries = FileLog::export(dir, &issuer)
+        .with_context(|| format!("reading the log in {}", dir.display()))?;
+    let mut out = std::io::stdout().lock();
+    for entry in entries {
+        let LogId { term, node, index } = entry.id;
+        let mut line = json!({"index": index, "term": term, "node": node});
+        match entry.payload {
+            Payload::Blank => {}
+            Payload::Events { first, events, .. } => {
+                line["first"] = json!(first);
+                line["events"] = json!(events);
+            }
+            Payload::Membership(bytes) => line["membership"] = json!(hex::encode(bytes)),
+        }
+        writeln!(out, "{line}")?;
     }
     Ok(())
 }

@@ -32,6 +32,11 @@
 //! refuses all further changes until it is reopened, which restores exactly
 //! what reached the disk.
 //!
+//! Given a [`Kek`], a [`PersistentIssuer`] also seals each new generation
+//! key into the log entry of the rotation that certifies it, for replicas
+//! that will apply the entry without having made the key. Opening a store
+//! with the KEK unseals any such key that `keys.bin` lacks.
+//!
 //! The split into a log and a snapshot that records the last entry it holds
 //! is the one Raft replication needs. A store on its own is the only writer
 //! of its log, so every entry it appends is applied at once, under the ids
@@ -53,6 +58,7 @@
 use std::fs::{self, File, OpenOptions, TryLockError};
 use std::io::{self, Write};
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 
 use sha2::{Digest, Sha256};
 use thiserror::Error;
@@ -60,7 +66,8 @@ use thiserror::Error;
 use crate::codec::DecodeError;
 use crate::error::{ApplyError, Error, SetupError};
 use crate::issuer::{Event, Issuer, Plan, RotationReport};
-use crate::keys::{GenerationKey, IssuerKey, PublicKey};
+use crate::kek::{Kek, KekError, SealedKey};
+use crate::keys::{GenerationKey, IssuerKey, PUBLIC_KEY_LEN, PublicKey};
 use crate::keyset::KeyRing;
 use crate::log::{
     self, ENTRY_HEAD, EVENTS_HEAD, Entry, FileLog, ID_LEN, LogId, MAX_PAYLOAD, Payload, read_id,
@@ -120,6 +127,19 @@ pub enum StoreError {
         /// Why it does not apply.
         error: ApplyError,
     },
+    /// A logged rotation's key is missing from `keys.bin`, and the sealed
+    /// copy in its entry could not be opened.
+    #[error(
+        "log entry {index} seals the key of generation {generation}, which cannot be unsealed: {error}"
+    )]
+    Unseal {
+        /// The entry's index.
+        index: u64,
+        /// The generation the key signs.
+        generation: u64,
+        /// Why it could not be unsealed.
+        error: KekError,
+    },
 }
 
 /// A snapshot and log in one directory. See the [module documentation](self).
@@ -178,6 +198,17 @@ impl FileStore {
         key: IssuerKey,
         policy: Policy,
     ) -> Result<(Self, Issuer), StoreError> {
+        Self::open_with_kek(dir, key, policy, None)
+    }
+
+    /// Opens a store as [`open`](Self::open) does, unsealing with `kek` the
+    /// key of any logged rotation that `keys.bin` lacks.
+    pub fn open_with_kek(
+        dir: impl AsRef<Path>,
+        key: IssuerKey,
+        policy: Policy,
+        kek: Option<&dyn Kek>,
+    ) -> Result<(Self, Issuer), StoreError> {
         let dir = dir.as_ref().to_path_buf();
         let lock = lock(&dir)?;
         let ring = read_keys(&dir, &key)?;
@@ -208,14 +239,20 @@ impl FileStore {
             });
         }
         let mut events = 0;
+        let mut unsealed = false;
         for entry in entries {
             // Entries up to the snapshot's are left over from a compaction
             // that stopped before purging them.
             if applied.is_some_and(|applied| entry.id.index <= applied.index) {
                 continue;
             }
+            unsealed |= unseal_keys(&mut issuer, &entry, kek)?;
             events += replay(&mut issuer, &entry, &mut membership)?;
             applied = Some(entry.id);
+        }
+        if unsealed {
+            keys.extend(issuer.key_ring());
+            write_keys(&dir, &keys)?;
         }
         if let Some(applied) = applied
             && log.next_index() <= applied.index
@@ -260,6 +297,17 @@ impl FileStore {
     ///
     /// Failures are handled as for [`append`](Self::append).
     pub fn append_all(&mut self, first: u64, events: &[Event]) -> io::Result<()> {
+        self.append_sealed(first, events, &[])
+    }
+
+    /// Logs events as [`append_all`](Self::append_all) does, in an entry
+    /// that also carries the sealed keys of their rotations.
+    pub fn append_sealed(
+        &mut self,
+        first: u64,
+        events: &[Event],
+        keys: &[SealedKey],
+    ) -> io::Result<()> {
         if events.is_empty() {
             return Ok(());
         }
@@ -268,6 +316,7 @@ impl FileStore {
             payload: Payload::Events {
                 first,
                 events: events.to_vec(),
+                keys: keys.to_vec(),
             },
         };
         self.log.append(std::slice::from_ref(&entry))?;
@@ -351,7 +400,7 @@ fn replay(
             *membership = Some((entry.id, bytes.clone()));
             Ok(0)
         }
-        Payload::Events { first, events } => {
+        Payload::Events { first, events, .. } => {
             let next = issuer.sequence() + 1;
             if *first != next {
                 return Err(StoreError::Replay {
@@ -367,6 +416,34 @@ fn replay(
             Ok(events.len() as u64)
         }
     }
+}
+
+/// Adds to the issuer's ring the sealed keys in `entry` that it lacks, and
+/// returns whether there were any.
+fn unseal_keys(
+    issuer: &mut Issuer,
+    entry: &Entry,
+    kek: Option<&dyn Kek>,
+) -> Result<bool, StoreError> {
+    let Payload::Events { keys, .. } = &entry.payload else {
+        return Ok(false);
+    };
+    let mut any = false;
+    for sealed in keys {
+        if issuer.key_ring().get(&sealed.public).is_some() {
+            continue;
+        }
+        let unseal = |error| StoreError::Unseal {
+            index: entry.id.index,
+            generation: sealed.generation,
+            error,
+        };
+        let kek = kek.ok_or_else(|| unseal(KekError::Unavailable("none was given".into())))?;
+        let key = sealed.unseal(kek, issuer.public_key()).map_err(unseal)?;
+        issuer.add_key(key);
+        any = true;
+    }
+    Ok(any)
 }
 
 fn lock(dir: &Path) -> Result<File, StoreError> {
@@ -674,6 +751,8 @@ pub enum CommitError {
 pub struct PersistentIssuer {
     issuer: Issuer,
     store: FileStore,
+    /// Seals the keys of new generations into the log, if set.
+    kek: Option<Arc<dyn Kek>>,
     /// Set when a batch took effect in memory but not on disk.
     ahead: bool,
 }
@@ -685,21 +764,51 @@ impl PersistentIssuer {
         Ok(Self {
             issuer,
             store,
+            kek: None,
             ahead: false,
         })
     }
 
     /// Opens an existing store, replays its log and compacts it.
     pub fn open(dir: impl AsRef<Path>, key: IssuerKey, policy: Policy) -> Result<Self, StoreError> {
-        let (mut store, issuer) = FileStore::open(dir, key, policy)?;
+        Self::open_inner(dir, key, policy, None)
+    }
+
+    /// Opens an existing store as [`open`](Self::open) does, unsealing with
+    /// `kek` the logged keys `keys.bin` lacks, and seals with it the keys of
+    /// later rotations. See [`set_kek`](Self::set_kek).
+    pub fn open_with_kek(
+        dir: impl AsRef<Path>,
+        key: IssuerKey,
+        policy: Policy,
+        kek: Arc<dyn Kek>,
+    ) -> Result<Self, StoreError> {
+        Self::open_inner(dir, key, policy, Some(kek))
+    }
+
+    fn open_inner(
+        dir: impl AsRef<Path>,
+        key: IssuerKey,
+        policy: Policy,
+        kek: Option<Arc<dyn Kek>>,
+    ) -> Result<Self, StoreError> {
+        let (mut store, issuer) = FileStore::open_with_kek(dir, key, policy, kek.as_deref())?;
         if !store.log.is_empty() {
             store.compact(&issuer)?;
         }
         Ok(Self {
             issuer,
             store,
+            kek,
             ahead: false,
         })
+    }
+
+    /// Seals the key of every later rotation with `kek` into the
+    /// rotation's log entry, so a replica applying the entry can unseal it.
+    /// The key goes to `keys.bin` as well.
+    pub fn set_kek(&mut self, kek: Arc<dyn Kek>) {
+        self.kek = Some(kek);
     }
 
     /// Starts a group commit. See [`Batch`].
@@ -709,6 +818,7 @@ impl PersistentIssuer {
             first: self.issuer.sequence() + 1,
             owner: self,
             events: Vec::new(),
+            keys: Vec::new(),
             bytes: 0,
         })
     }
@@ -801,28 +911,54 @@ impl PersistentIssuer {
 
     fn rotate_due(&mut self, due: Option<u64>) -> Result<RotationReport, CommitError> {
         self.check_in_step()?;
-        let report = self.plan_rotate(due)?;
-        self.commit(&Event::Rotate(report))?;
+        let (report, sealed) = self.plan_rotate(due)?;
+        self.commit_sealed(&Event::Rotate(report), sealed.as_slice())?;
         Ok(report)
     }
 
-    /// Plans a rotation with a fresh key and saves the key ring with it.
-    fn plan_rotate(&mut self, due: Option<u64>) -> Result<RotationReport, CommitError> {
+    /// Plans a rotation with a fresh key, saves the key ring with it and
+    /// seals the key if there is a KEK.
+    fn plan_rotate(
+        &mut self,
+        due: Option<u64>,
+    ) -> Result<(RotationReport, Option<SealedKey>), CommitError> {
         let next = GenerationKey::try_generate().map_err(io::Error::other)?;
-        let event = match due {
+        let report = match due {
             Some(due) => self.issuer.plan_scheduled_rotation(next, due)?,
             None => self.issuer.plan_rotate(next)?,
         };
+        let Event::Rotate(report) = report else {
+            unreachable!("a rotation is planned as one")
+        };
+        let certificate = report.key.expect("a planned rotation certifies its key");
+        let sealed = match &self.kek {
+            Some(kek) => {
+                let key = self
+                    .issuer
+                    .key_ring()
+                    .get(&certificate.key)
+                    .expect("planning a rotation adds its key to the ring");
+                let sealed = SealedKey::seal(&**kek, self.issuer.public_key(), report.created, key)
+                    .map_err(io::Error::other)?;
+                Some(sealed)
+            }
+            None => None,
+        };
         self.store.save_keys(self.issuer.key_ring())?;
-        match event {
-            Event::Rotate(report) => Ok(report),
-            _ => unreachable!("a rotation is planned as one"),
-        }
+        Ok((report, sealed))
     }
 
     fn commit(&mut self, event: &Event) -> io::Result<()> {
+        self.commit_sealed(event, &[])
+    }
+
+    fn commit_sealed(&mut self, event: &Event, keys: &[SealedKey]) -> io::Result<()> {
         self.check_in_step()?;
-        self.store.append(self.issuer.sequence() + 1, event)?;
+        self.store.append_sealed(
+            self.issuer.sequence() + 1,
+            std::slice::from_ref(event),
+            keys,
+        )?;
         self.issuer
             .apply(event)
             .expect("an event planned under the same borrow applies");
@@ -854,6 +990,7 @@ pub struct Batch<'a> {
     owner: &'a mut PersistentIssuer,
     first: u64,
     events: Vec<Event>,
+    keys: Vec<SealedKey>,
     bytes: usize,
 }
 
@@ -919,7 +1056,16 @@ impl Batch<'_> {
     }
 
     fn rotate_due(&mut self, due: Option<u64>) -> Result<RotationReport, CommitError> {
-        let report = self.owner.plan_rotate(due)?;
+        let (report, sealed) = self.owner.plan_rotate(due)?;
+        if let Some(sealed) = sealed {
+            // The key count once, then generation, public key, length and
+            // the sealed bytes.
+            if self.keys.is_empty() {
+                self.bytes += 4;
+            }
+            self.bytes += 8 + PUBLIC_KEY_LEN + 4 + sealed.sealed.len();
+            self.keys.push(sealed);
+        }
         self.stage(Event::Rotate(report));
         Ok(report)
     }
@@ -934,8 +1080,8 @@ impl Batch<'_> {
         self.events.is_empty()
     }
 
-    /// Encoded size of the events staged so far. Commit before it would pass
-    /// [`MAX_BATCH_BYTES`].
+    /// Encoded size of the events and sealed keys staged so far. Commit
+    /// before it would pass [`MAX_BATCH_BYTES`].
     pub fn bytes(&self) -> usize {
         self.bytes
     }
@@ -944,7 +1090,8 @@ impl Batch<'_> {
     /// this succeeds may the batch's results be handed out.
     pub fn commit(mut self) -> io::Result<()> {
         let events = std::mem::take(&mut self.events);
-        let written = self.owner.store.append_all(self.first, &events);
+        let keys = std::mem::take(&mut self.keys);
+        let written = self.owner.store.append_sealed(self.first, &events, &keys);
         if written.is_err() && !events.is_empty() {
             self.owner.ahead = true;
         }
@@ -976,6 +1123,7 @@ impl Drop for Batch<'_> {
 mod tests {
     use super::*;
     use crate::issuer::NoteStatus;
+    use crate::kek::FileKek;
     use crate::keys::{HolderKey, MintKey};
     use crate::ledger::LedgerConfig;
     use crate::log::HEADER_LEN;
@@ -1084,6 +1232,81 @@ mod tests {
         assert_eq!(p.issuer().snapshot(), expected);
         assert!(!p.issuer().is_paused());
         assert_eq!(p.issuer().last_scheduled_rotation(), Some(1200));
+    }
+
+    #[test]
+    fn a_sealed_rotation_restores_a_key_the_ring_lacks() {
+        let dir = tempfile::tempdir().unwrap();
+        let (key, mut p) = fresh(dir.path());
+        let alice = HolderKey::generate();
+        p.rotate().unwrap();
+        let kek: Arc<dyn Kek> = Arc::new(FileKek::from_bytes(&[3; 32]));
+        p.set_kek(kek.clone());
+        p.mint(8, alice.public_key()).unwrap();
+        // The ring as a replica holds it before the next rotations.
+        let keys_before = fs::read(dir.path().join(KEYS)).unwrap();
+        let first = p.rotate().unwrap();
+        let mut batch = p.batch().unwrap();
+        let second = batch.rotate().unwrap();
+        let rotation = Event::Rotate(second).to_bytes().len();
+        assert_eq!(batch.bytes(), 4 + rotation + 4 + 8 + 32 + 4 + 73);
+        batch.mint(4, alice.public_key()).unwrap();
+        batch.commit().unwrap();
+        let expected = p.issuer().snapshot();
+        let made: Vec<_> = [first, second]
+            .iter()
+            .map(|report| {
+                let public = report.key.unwrap().key;
+                p.issuer().key_ring().get(&public).unwrap().clone()
+            })
+            .collect();
+
+        // Only the rotations made with the KEK carry their keys, sealed.
+        let keys: Vec<_> = p
+            .store
+            .log()
+            .read(..)
+            .unwrap()
+            .into_iter()
+            .map(|entry| match entry.payload {
+                Payload::Events { keys, .. } => keys,
+                _ => panic!("events"),
+            })
+            .collect();
+        assert_eq!(keys.iter().map(Vec::len).collect::<Vec<_>>(), [0, 0, 1, 1]);
+        assert_eq!(keys[2][0].generation, first.created);
+        assert_eq!(keys[3][0].public, made[1].public_key());
+        let log = fs::read(log_path(dir.path())).unwrap();
+        for made in &made {
+            let secret = made.to_secret_bytes();
+            assert!(!log.windows(32).any(|bytes| bytes == secret));
+        }
+        drop(p);
+
+        // A replica that never had the keys opens only with the KEK.
+        fs::write(dir.path().join(KEYS), &keys_before).unwrap();
+        assert!(matches!(
+            FileStore::open(dir.path(), key.clone(), Policy::cash_like()),
+            Err(StoreError::Unseal {
+                index: 2,
+                error: KekError::Unavailable(_),
+                ..
+            })
+        ));
+        let wrong = FileKek::from_bytes(&[4; 32]);
+        assert!(matches!(
+            FileStore::open_with_kek(dir.path(), key.clone(), Policy::cash_like(), Some(&wrong)),
+            Err(StoreError::Unseal {
+                error: KekError::Rejected,
+                ..
+            })
+        ));
+        let p = PersistentIssuer::open_with_kek(dir.path(), key, Policy::cash_like(), kek).unwrap();
+        assert_eq!(p.issuer().snapshot(), expected);
+        let ring = KeyRing::from_bytes(&fs::read(dir.path().join(KEYS)).unwrap()).unwrap();
+        for made in &made {
+            assert!(ring.get(&made.public_key()).is_some());
+        }
     }
 
     #[test]

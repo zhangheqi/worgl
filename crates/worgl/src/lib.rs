@@ -40,6 +40,8 @@
 //!   and outputs per transfer, where new money lands.
 //! - [`issuer`]: ties the above together as an event-sourced state machine.
 //! - [`log`]: the numbered, append-only log of changes, ready for Raft.
+//! - [`kek`]: key-encryption keys, which seal the generation keys a log
+//!   carries to replicas.
 //! - [`store`]: crash-safe persistence as a snapshot plus a log.
 //!
 //! # Example
@@ -68,6 +70,7 @@ mod codec;
 mod error;
 mod hex_serde;
 pub mod issuer;
+pub mod kek;
 pub mod keys;
 pub mod keyset;
 pub mod ledger;
@@ -82,6 +85,7 @@ pub mod transfer;
 pub use codec::DecodeError;
 pub use error::{ApplyError, Error, SetupError};
 pub use issuer::{Event, Issuer, NoteStatus, Plan, RotationReport, Supply};
+pub use kek::{FileKek, Kek, KekError, SealedKey};
 pub use keys::{GenerationKey, HolderKey, IssuerKey, MintKey, PublicKey, Signature};
 pub use keyset::{KeyCertificate, KeyRing, KeySet};
 pub use ledger::{Ledger, LedgerConfig, Serial};
