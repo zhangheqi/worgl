@@ -31,6 +31,8 @@ const LEDGER: LedgerConfig = LedgerConfig {
     layer_size: 128,
 };
 const WAIT: Duration = Duration::from_secs(10);
+/// How long a replica waits for its group, unless a test says otherwise.
+const TIMEOUT: Duration = Duration::from_secs(2);
 
 /// Delivers RPCs between the replicas of one process.
 #[derive(Clone, Default)]
@@ -127,22 +129,29 @@ struct Cluster {
     dirs: BTreeMap<NodeId, TempDir>,
     key: IssuerKey,
     kek: Arc<FileKek>,
+    timeout: Duration,
     replicas: BTreeMap<NodeId, Replica>,
 }
 
 impl Cluster {
     /// A group formed from three copies of a new mint.
     async fn start() -> Self {
+        Self::start_with(TIMEOUT).await
+    }
+
+    /// A group formed from three copies of a new mint, whose replicas wait
+    /// `timeout` for the group.
+    async fn start_with(timeout: Duration) -> Self {
         let key = IssuerKey::generate();
         let issuer = Issuer::new(key.clone(), LEDGER, Policy::cash_like()).unwrap();
         let seed = tempfile::tempdir().unwrap();
         drop(FileStore::create(seed.path(), &issuer).unwrap());
-        Self::from_copies(seed.path(), key).await
+        Self::from_copies(seed.path(), key, timeout).await
     }
 
     /// Readies three copies of the mint in `seed`, opens a replica on each
     /// and forms the group from the first.
-    async fn from_copies(seed: &Path, key: IssuerKey) -> Self {
+    async fn from_copies(seed: &Path, key: IssuerKey, timeout: Duration) -> Self {
         let dirs: BTreeMap<_, _> = (1..=3)
             .map(|id| (id, tempfile::tempdir().unwrap()))
             .collect();
@@ -151,6 +160,7 @@ impl Cluster {
             dirs,
             key,
             kek: Arc::new(FileKek::from_bytes(&[7; 32])),
+            timeout,
             replicas: BTreeMap::new(),
         };
         for id in 1..=3 {
@@ -189,7 +199,7 @@ impl Cluster {
             max_in_snapshot_log_to_keep: 0,
             ..default_config()
         };
-        options.timeout = Duration::from_secs(2);
+        options.timeout = self.timeout;
         let network = Network {
             router: self.router.clone(),
             from: id,
@@ -344,18 +354,23 @@ async fn a_new_leader_takes_over_when_the_old_one_is_cut_off() {
     let new = cluster.leader().await;
     assert_ne!(new, old);
     // The note the old leader minted pays on through the new one.
-    let (paid, bob) = pay(cluster.replica(new), note, &alice).await;
+    let (paid, _) = pay(cluster.replica(new), note, &alice).await;
     assert_eq!(status(cluster.replica(new), &note), NoteStatus::Spent);
 
-    // Cut off, the old leader can neither change nor read anything.
-    let mut batch = match cluster.replica(old).batch().await {
-        Ok(batch) => batch,
-        Err(error) => panic!("the old leader still thinks it leads: {error}"),
-    };
-    batch.mint(1, bob.public_key()).unwrap();
+    // Cut off, the old leader stops counting itself the leader once it has
+    // gone a lease without hearing from the others, and then refuses
+    // changes and reads at once.
+    let deadline = Instant::now() + WAIT;
+    while cluster.replica(old).is_leader() {
+        assert!(
+            Instant::now() < deadline,
+            "the old leader still thinks it leads"
+        );
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
     assert!(matches!(
-        batch.commit().await,
-        Err(ReplicaError::Timeout | ReplicaError::NotLeader { .. })
+        cluster.replica(old).batch().await,
+        Err(ReplicaError::NotLeader { leader: None, .. })
     ));
     assert!(cluster.replica(old).read(|_| ()).await.is_err());
 
@@ -382,6 +397,54 @@ async fn a_new_leader_takes_over_when_the_old_one_is_cut_off() {
         status(cluster.replica(old), &carol),
         NoteStatus::Live { .. }
     ));
+    cluster.shutdown().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_leader_cut_off_mid_commit_gives_up_once_its_lease_lapses() {
+    // A timeout far past the lease, so only the lease can end the wait.
+    let cluster = Cluster::start_with(Duration::from_secs(60)).await;
+    let old = cluster.leader().await;
+    let alice = HolderKey::generate();
+    mint(cluster.replica(old), 8, &alice).await;
+
+    let mut batch = cluster.replica(old).batch().await.unwrap();
+    batch.mint(1, alice.public_key()).unwrap();
+    cluster.isolate(old);
+    let cut = Instant::now();
+    assert_eq!(batch.commit().await, Err(ReplicaError::Timeout));
+    let waited = cut.elapsed();
+    assert!(
+        waited < WAIT,
+        "waited {waited:?} for a group it cannot reach"
+    );
+
+    // Nor does it take new changes or reads.
+    assert!(!cluster.replica(old).is_leader());
+    let asked = Instant::now();
+    assert!(matches!(
+        cluster.replica(old).batch().await,
+        Err(ReplicaError::NotLeader { leader: None, .. })
+    ));
+    assert!(matches!(
+        cluster.replica(old).read(|_| ()).await,
+        Err(ReplicaError::NotLeader { .. })
+    ));
+    assert!(asked.elapsed() < Duration::from_secs(5));
+
+    // Back on the network, it follows the leader the others elected, and
+    // the mint it gave up on never reached them.
+    let new = cluster.leader().await;
+    assert_ne!(new, old);
+    cluster.heal(old);
+    mint(cluster.replica(new), 4, &HolderKey::generate()).await;
+    cluster.caught_up(old, new).await;
+    assert_eq!(
+        cluster.replica(old).read_local(Issuer::snapshot),
+        cluster.replica(new).read_local(Issuer::snapshot)
+    );
+    let supply = cluster.replica(new).read(|i| i.supply()).await.unwrap();
+    assert_eq!(supply.minted, 12);
     cluster.shutdown().await;
 }
 
@@ -539,7 +602,7 @@ async fn a_mint_that_ran_alone_carries_on_as_a_group() {
         (note, store.issuer().snapshot())
     };
 
-    let mut cluster = Cluster::from_copies(seed.path(), key).await;
+    let mut cluster = Cluster::from_copies(seed.path(), key, TIMEOUT).await;
     let leader = cluster.leader().await;
     assert_eq!(
         cluster
