@@ -623,6 +623,7 @@ mod tests {
             destroyed_notes: 0,
             destroyed_value: 0,
             key: None,
+            due: None,
         });
         let entries = vec![
             Entry {

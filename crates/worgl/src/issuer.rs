@@ -9,6 +9,12 @@
 //! [`Issuer::burn`] and [`Issuer::rotate`] do all three steps for in-memory
 //! use.
 //!
+//! An issuer can be paused, as an emergency stop: until it resumes it plans
+//! and applies no mint, transfer, burn or rotation, so no note moves and none
+//! expires. The pause is an event like any other, so a replica of the log
+//! agrees on it. So is the time a scheduled rotation was due, which keeps a
+//! rotation schedule from repeating a period after a restart or a failover.
+//!
 //! A rotation is the one event that needs a secret the log must not hold:
 //! the key that signs the new generation's notes. [`Issuer::plan_rotate`]
 //! takes it from the caller and puts it in the issuer's
@@ -40,12 +46,13 @@ use crate::transfer::{
 
 const SNAPSHOT_MAGIC: &[u8; 8] = b"WORGLSNP";
 /// Version 2 added the burned value, version 3 records whether serial
-/// indexes are permuted, version 4 keeps each mint authority's last mint and
-/// version 5 the certificates of the generation keys. Older snapshots still
-/// restore, with nothing burned, with bits as indexes, with no mint
-/// authorities and with every generation signed by the issuer key, as they
-/// always had.
-const SNAPSHOT_VERSION: u16 = 5;
+/// indexes are permuted, version 4 keeps each mint authority's last mint,
+/// version 5 the certificates of the generation keys and version 6 whether
+/// the issuer is paused and when its last scheduled rotation was due. Older
+/// snapshots still restore, with nothing burned, with bits as indexes, with
+/// no mint authorities, with every generation signed by the issuer key,
+/// running and with no rotation scheduled, as they always had.
+const SNAPSHOT_VERSION: u16 = 6;
 
 /// A note created by a mint or transfer.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
@@ -83,6 +90,10 @@ pub struct RotationReport {
     /// layers the issuer key signed.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub key: Option<KeyCertificate>,
+    /// For a rotation a schedule made, the time it was due, in seconds since
+    /// the Unix epoch. `None` for a rotation made on request.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub due: Option<u64>,
 }
 
 /// One state change of the issuer.
@@ -117,6 +128,10 @@ pub enum Event {
         /// The note created.
         issued: Issued,
     },
+    /// The issuer stopped making changes until it resumes.
+    Pause,
+    /// The issuer makes changes again.
+    Resume,
 }
 
 impl Event {
@@ -137,12 +152,20 @@ impl Event {
                 }
             }
             Event::Rotate(r) => {
-                // Tag 3 is the rotation as written before generation keys.
-                w.u8(if r.key.is_some() { 6 } else { 3 })
-                    .u64(r.dropped)
-                    .u64(r.created)
-                    .u32(r.destroyed_notes)
-                    .u128(r.destroyed_value);
+                // Tag 3 is the rotation as written before generation keys,
+                // tag 6 one with a key, and tag 9 a scheduled one.
+                w.u8(match (&r.key, r.due) {
+                    (_, Some(_)) => 9,
+                    (Some(_), None) => 6,
+                    (None, None) => 3,
+                })
+                .u64(r.dropped)
+                .u64(r.created)
+                .u32(r.destroyed_notes)
+                .u128(r.destroyed_value);
+                if let Some(due) = r.due {
+                    w.u8(u8::from(r.key.is_some())).u64(due);
+                }
                 if let Some(key) = &r.key {
                     key.write(&mut w);
                 }
@@ -161,6 +184,12 @@ impl Event {
                     .bytes(&authorization.signature.to_bytes());
                 write_issued(&mut w, issued);
             }
+            Event::Pause => {
+                w.u8(7);
+            }
+            Event::Resume => {
+                w.u8(8);
+            }
         }
         w.finish()
     }
@@ -176,17 +205,33 @@ impl Event {
                 let issued = read_list(&mut r, 52, read_issued)?;
                 Event::Transfer { id, spent, issued }
             }
-            tag @ (3 | 6) => Event::Rotate(RotationReport {
-                dropped: r.u64()?,
-                created: r.u64()?,
-                destroyed_notes: r.u32()?,
-                destroyed_value: r.u128()?,
-                key: if tag == 6 {
-                    Some(KeyCertificate::read(&mut r)?)
-                } else {
-                    None
-                },
-            }),
+            tag @ (3 | 6 | 9) => {
+                let (dropped, created) = (r.u64()?, r.u64()?);
+                let (destroyed_notes, destroyed_value) = (r.u32()?, r.u128()?);
+                let (keyed, due) = match tag {
+                    9 => {
+                        let keyed = match r.u8()? {
+                            0 => false,
+                            1 => true,
+                            _ => return Err(DecodeError::Invalid("rotation key flag")),
+                        };
+                        (keyed, Some(r.u64()?))
+                    }
+                    _ => (tag == 6, None),
+                };
+                Event::Rotate(RotationReport {
+                    dropped,
+                    created,
+                    destroyed_notes,
+                    destroyed_value,
+                    key: if keyed {
+                        Some(KeyCertificate::read(&mut r)?)
+                    } else {
+                        None
+                    },
+                    due,
+                })
+            }
             4 => Event::Burn {
                 id: TransferId::from_bytes(r.array()?),
                 spent: read_spent(&mut r)?,
@@ -199,6 +244,8 @@ impl Event {
                 },
                 issued: read_issued(&mut r)?,
             },
+            7 => Event::Pause,
+            8 => Event::Resume,
             _ => return Err(DecodeError::Invalid("event type")),
         };
         r.finish()?;
@@ -389,6 +436,9 @@ pub struct Issuer {
     receipts: Receipts,
     /// Each mint authority's last accepted request and the note it created.
     authorities: BTreeMap<PublicKey, (MintAuthorization, Issued)>,
+    paused: bool,
+    /// When the last scheduled rotation was due.
+    last_due: Option<u64>,
 }
 
 impl Issuer {
@@ -424,6 +474,8 @@ impl Issuer {
             burned: 0,
             receipts: Receipts::default(),
             authorities: BTreeMap::new(),
+            paused: false,
+            last_due: None,
         })
     }
 
@@ -445,6 +497,17 @@ impl Issuer {
     /// Number of events applied since the issuer was created.
     pub fn sequence(&self) -> u64 {
         self.sequence
+    }
+
+    /// Whether the issuer is paused. See the [module documentation](self).
+    pub fn is_paused(&self) -> bool {
+        self.paused
+    }
+
+    /// When the last scheduled rotation was due, in seconds since the Unix
+    /// epoch, if one was ever logged.
+    pub fn last_scheduled_rotation(&self) -> Option<u64> {
+        self.last_due
     }
 
     /// Position of the layer new money lands in.
@@ -522,6 +585,7 @@ impl Issuer {
 
     /// Plans minting a note of `amount` bound to `holder`.
     pub fn plan_mint(&self, amount: u64, holder: PublicKey) -> Result<Event, Error> {
+        self.check_running()?;
         self.policy.check_mint(amount)?;
         let position = self.mint_position();
         let serial = self
@@ -549,6 +613,7 @@ impl Issuer {
     /// again, which is cheap, in case the request was verified under a
     /// different one.
     pub fn plan_authorized_mint(&self, mint: &VerifiedMint) -> Result<Plan, Error> {
+        self.check_running()?;
         if mint.issuer != self.public {
             return Err(Error::MintUnauthorized);
         }
@@ -599,6 +664,7 @@ impl Issuer {
     /// The transfer's shape is checked against this issuer's policy again,
     /// which is cheap, in case it was verified under a different one.
     pub fn plan_transfer(&self, transfer: &VerifiedTransfer) -> Result<Plan, Error> {
+        self.check_running()?;
         if transfer.issuer != self.public {
             return Err(Error::Note {
                 input: 0,
@@ -645,6 +711,7 @@ impl Issuer {
     /// Plans a verified burn against the ledger: every input must be live.
     /// Notes frozen in the last layer can be burned, since nothing moves.
     pub fn plan_burn(&self, burn: &VerifiedBurn) -> Result<Plan, Error> {
+        self.check_running()?;
         if burn.issuer != self.public {
             return Err(Error::Note {
                 input: 0,
@@ -675,16 +742,54 @@ impl Issuer {
     /// The event carries the issuer key's certificate for `next`, and `next`
     /// joins the [`key_ring`](Self::key_ring) at once, since applying the
     /// event needs it. Save the ring before logging the event: a log
-    /// that names a key nobody kept cannot be replayed.
-    pub fn plan_rotate(&mut self, next: GenerationKey) -> Event {
+    /// that names a key nobody kept cannot be replayed. Refused while the
+    /// issuer is paused, and then `next` is not kept.
+    pub fn plan_rotate(&mut self, next: GenerationKey) -> Result<Event, Error> {
+        self.plan_rotation(next, None)
+    }
+
+    /// Plans a rotation a schedule calls for, which was due at `due` seconds
+    /// since the Unix epoch. It must be due after the last scheduled
+    /// rotation, so a schedule that resumes after a restart or a failover
+    /// never rotates twice for one period. Otherwise as
+    /// [`plan_rotate`](Self::plan_rotate).
+    pub fn plan_scheduled_rotation(
+        &mut self,
+        next: GenerationKey,
+        due: u64,
+    ) -> Result<Event, Error> {
+        self.plan_rotation(next, Some(due))
+    }
+
+    fn plan_rotation(&mut self, next: GenerationKey, due: Option<u64>) -> Result<Event, Error> {
+        self.check_running()?;
+        if let (Some(due), Some(last)) = (due, self.last_due)
+            && due <= last
+        {
+            return Err(Error::StaleRotation { due, last });
+        }
         let mut report = self.rotation();
         report.key = Some(KeyCertificate::sign(
             &self.key,
             report.created,
             next.public_key(),
         ));
+        report.due = due;
         self.ring.insert(next);
-        Event::Rotate(report)
+        Ok(Event::Rotate(report))
+    }
+
+    /// Plans pausing the issuer, or resuming it if `paused` is false. `None`
+    /// if it already is.
+    pub fn plan_pause(&self, paused: bool) -> Option<Event> {
+        (paused != self.paused).then_some(if paused { Event::Pause } else { Event::Resume })
+    }
+
+    fn check_running(&self) -> Result<(), Error> {
+        if self.paused {
+            return Err(Error::Paused);
+        }
+        Ok(())
     }
 
     /// What the next rotation drops and creates, without its key.
@@ -699,12 +804,24 @@ impl Issuer {
             destroyed_notes: first.live,
             destroyed_value: self.value[0],
             key: None,
+            due: None,
         }
     }
 
     /// Applies an event, or changes nothing and explains why it does not fit.
     pub fn apply(&mut self, event: &Event) -> Result<(), ApplyError> {
         match event {
+            Event::Pause | Event::Resume => {
+                let paused = matches!(event, Event::Pause);
+                if paused == self.paused {
+                    return Err(ApplyError(format!(
+                        "the issuer is already {}",
+                        if paused { "paused" } else { "running" }
+                    )));
+                }
+                self.paused = paused;
+            }
+            _ if self.paused => return Err(ApplyError("the issuer is paused".into())),
             Event::Mint(issued) => self.apply_mint(issued)?,
             Event::Transfer { id, spent, issued } => self.apply_transfer(*id, spent, issued)?,
             Event::Rotate(report) => self.apply_rotate(report)?,
@@ -728,7 +845,7 @@ impl Issuer {
                 self.sign_all(std::slice::from_ref(issued))
             }
             Event::Transfer { issued, .. } => self.sign_all(issued),
-            Event::Rotate(_) | Event::Burn { .. } => Vec::new(),
+            Event::Rotate(_) | Event::Burn { .. } | Event::Pause | Event::Resume => Vec::new(),
         }
     }
 
@@ -776,17 +893,24 @@ impl Issuer {
         Ok(notes.remove(0))
     }
 
-    /// Rotates in memory, with a fresh generation key.
+    /// Rotates in memory, with a fresh generation key. Refused while paused.
     ///
     /// # Panics
     ///
     /// If the system random number generator fails.
-    pub fn rotate(&mut self) -> RotationReport {
-        let event = self.plan_rotate(GenerationKey::generate());
+    pub fn rotate(&mut self) -> Result<RotationReport, Error> {
+        let event = self.plan_rotate(GenerationKey::generate())?;
         self.apply(&event).expect("a freshly planned event applies");
         match event {
-            Event::Rotate(report) => report,
+            Event::Rotate(report) => Ok(report),
             _ => unreachable!("plan_rotate plans a rotation"),
+        }
+    }
+
+    /// Pauses the issuer in memory, or resumes it if `paused` is false.
+    pub fn set_paused(&mut self, paused: bool) {
+        if let Some(event) = self.plan_pause(paused) {
+            self.apply(&event).expect("a freshly planned event applies");
         }
     }
 
@@ -798,8 +922,10 @@ impl Issuer {
     /// and 0 if they are the bits, the live value of each layer as `u128`, value
     /// minted, destroyed and burned as `u128`, the remembered receipts, each
     /// mint authority's last request and note (sorted by authority key), the
-    /// certificates of the live generations' keys (oldest first), and finally
-    /// the SHA-256 of everything before it.
+    /// certificates of the live generations' keys (oldest first), a byte that
+    /// is 1 if the issuer is paused, a byte that is 1 if a scheduled rotation
+    /// was logged followed by the time it was due as `u64` (0 if none), and
+    /// finally the SHA-256 of everything before it.
     pub fn snapshot(&self) -> Vec<u8> {
         let mut w = Writer::default();
         w.bytes(SNAPSHOT_MAGIC)
@@ -831,6 +957,9 @@ impl Issuer {
         for certificate in self.keys.certificates() {
             certificate.write(&mut w);
         }
+        w.u8(u8::from(self.paused))
+            .u8(u8::from(self.last_due.is_some()))
+            .u64(self.last_due.unwrap_or(0));
         let mut bytes = w.finish();
         let checksum: [u8; 32] = Sha256::digest(&bytes).into();
         bytes.extend_from_slice(&checksum);
@@ -925,6 +1054,19 @@ impl Issuer {
         } else {
             Vec::new()
         };
+        let flag = |r: &mut Reader<'_>, what| match r.u8()? {
+            0 => Ok(false),
+            1 => Ok(true),
+            _ => Err(DecodeError::Invalid(what)),
+        };
+        let (paused, last_due) = if version >= 6 {
+            let paused = flag(&mut r, "paused flag")?;
+            let scheduled = flag(&mut r, "schedule flag")?;
+            let due = r.u64()?;
+            (paused, scheduled.then_some(due))
+        } else {
+            (false, None)
+        };
         r.finish()?;
         let public = key.public_key();
         let keys = KeySet::new(public, ledger.oldest_generation(), certificates)?;
@@ -959,6 +1101,8 @@ impl Issuer {
             burned,
             receipts,
             authorities,
+            paused,
+            last_due,
         })
     }
 
@@ -1092,11 +1236,19 @@ impl Issuer {
     fn apply_rotate(&mut self, report: &RotationReport) -> Result<(), ApplyError> {
         let expected = RotationReport {
             key: report.key,
+            due: report.due,
             ..self.rotation()
         };
         if *report != expected {
             return Err(ApplyError(format!(
                 "rotation {report:?} does not match the ledger"
+            )));
+        }
+        if let (Some(due), Some(last)) = (report.due, self.last_due)
+            && due <= last
+        {
+            return Err(ApplyError(format!(
+                "a rotation due at {due} follows one due at {last}"
             )));
         }
         match &report.key {
@@ -1148,6 +1300,9 @@ impl Issuer {
             self.ring.remove(&dropped.key);
         }
         self.keys = self.keys.rotated(oldest, report.key);
+        if report.due.is_some() {
+            self.last_due = report.due;
+        }
         Ok(())
     }
 
@@ -1214,6 +1369,16 @@ mod tests {
         Issuer::new(IssuerKey::generate(), config, policy).unwrap()
     }
 
+    /// The snapshot as version 5 wrote it, without its checksum: version 6
+    /// added the pause and schedule, which must be unset.
+    fn version_5_body(i: &Issuer) -> Vec<u8> {
+        let mut body = i.snapshot();
+        body.truncate(body.len() - 32);
+        assert_eq!(body.split_off(body.len() - 10), [0; 10]);
+        body[8..10].copy_from_slice(&5u16.to_be_bytes());
+        body
+    }
+
     fn without_generation_keys(i: &mut Issuer) {
         i.forget_generation_keys();
     }
@@ -1270,7 +1435,7 @@ mod tests {
             pay(&mut i, bobs, &bob).unwrap_err(),
             Error::Frozen(bobs.serial())
         );
-        i.rotate();
+        i.rotate().unwrap();
         assert!(pay(&mut i, bobs, &bob).is_ok());
     }
 
@@ -1302,7 +1467,7 @@ mod tests {
         for _ in 0..4 {
             // Refresh: pay the note to a fresh key of one's own.
             (busy_note, busy_key) = pay(&mut i, busy_note, &busy_key).unwrap();
-            i.rotate();
+            i.rotate().unwrap();
         }
         assert_eq!(i.status(&idle_note), Ok(NoteStatus::Expired));
         assert!(matches!(i.status(&busy_note), Ok(NoteStatus::Live { .. })));
@@ -1323,8 +1488,8 @@ mod tests {
         let key = HolderKey::generate();
         // Minted into layer 0, generation 0, bit 0.
         let old = i.mint(1, key.public_key()).unwrap();
-        i.rotate();
-        i.rotate();
+        i.rotate().unwrap();
+        i.rotate().unwrap();
         // Slot 0 now holds generation 2; its first mint sets bit 0 again.
         let fresh = i.mint(1, key.public_key()).unwrap();
         assert_eq!(fresh.serial().generation, 2);
@@ -1363,7 +1528,7 @@ mod tests {
 
         // After a rotation the filled layer moves forward and its notes can
         // move on into the fresh last layer.
-        i.rotate();
+        i.rotate().unwrap();
         let (note, owner) = &paid[0];
         assert!(pay(&mut i, *note, owner).is_ok());
     }
@@ -1375,7 +1540,7 @@ mod tests {
         let young = i.mint(3, key.public_key()).unwrap();
         let old = i.mint(4, key.public_key()).unwrap();
         let (old, old_key) = pay(&mut i, old, &key).unwrap();
-        i.rotate();
+        i.rotate().unwrap();
         // young is at position 1, old at position 2.
         let out = HolderKey::generate();
         let request = TransferRequest::sign(
@@ -1601,8 +1766,7 @@ mod tests {
         i.mint(8, key.public_key()).unwrap();
         // Version 3 ended with the receipts: drop the empty authority and
         // certificate lists.
-        let mut body = i.snapshot();
-        body.truncate(body.len() - 32);
+        let mut body = version_5_body(&i);
         assert_eq!(body.split_off(body.len() - 8), [0; 8]);
         body[8..10].copy_from_slice(&3u16.to_be_bytes());
         let checksum: [u8; 32] = Sha256::digest(&body).into();
@@ -1643,7 +1807,7 @@ mod tests {
         assert_eq!(i.layers()[3].value, 0);
 
         // A resent burn answers the same, even after rotations, and changes nothing.
-        i.rotate();
+        i.rotate().unwrap();
         let sequence = i.sequence();
         assert_eq!(i.burn(&burn), Ok(8));
         assert_eq!(i.sequence(), sequence);
@@ -1669,11 +1833,10 @@ mod tests {
         without_generation_keys(&mut i);
         i.ledger = Ledger::new(i.ledger.config()).unwrap();
         i.mint(8, HolderKey::generate().public_key()).unwrap();
-        let current = i.snapshot();
         // With no receipts, authorities or certificates the body ends in the
         // burned value and three zero counts; version 1 had neither the
         // burned value nor the last two lists, and no serial order byte.
-        let body = &current[..current.len() - 32];
+        let body = &version_5_body(&i)[..];
         let flag = 8 + 2 + 32 + 8 + i.ledger.to_bytes().len();
         let burned_at = body.len() - 12 - 16;
         let mut v1 = [
@@ -1694,7 +1857,7 @@ mod tests {
         )
         .unwrap();
         assert_eq!(restored.supply(), i.supply());
-        assert_eq!(restored.snapshot(), current);
+        assert_eq!(restored.snapshot(), i.snapshot());
     }
 
     #[test]
@@ -1703,7 +1866,7 @@ mod tests {
         let key = HolderKey::generate();
         let note = i.mint(8, key.public_key()).unwrap();
         pay(&mut i, note, &key).unwrap();
-        i.rotate();
+        i.rotate().unwrap();
         let snapshot = i.snapshot();
         let restored = Issuer::restore(
             i.key.clone(),
@@ -1787,8 +1950,7 @@ mod tests {
         // Its snapshot as version 2 wrote it: no serial order byte and no
         // authority or certificate list.
         let flag = 8 + 2 + 32 + 8 + i.ledger.to_bytes().len();
-        let mut body = i.snapshot();
-        body.truncate(body.len() - 32);
+        let mut body = version_5_body(&i);
         assert_eq!(body.split_off(body.len() - 8), [0; 8]);
         assert_eq!(body[flag], 0);
         body.remove(flag);
@@ -1854,7 +2016,7 @@ mod tests {
         // the dropped generation's key.
         let before = i.verifier();
         let dropped = *i.keys().signer(0).unwrap();
-        let report = i.rotate();
+        let report = i.rotate().unwrap();
         let certificate = report.key.unwrap();
         assert_eq!(certificate.generation, report.created);
         assert!(certificate.verify(&i.public));
@@ -1874,8 +2036,8 @@ mod tests {
         assert_eq!(moved.verify(i.verifier().keys()), Ok(()));
 
         // Once the note's generation is dropped, it is expired whoever signed it.
-        i.rotate();
-        i.rotate();
+        i.rotate().unwrap();
+        i.rotate().unwrap();
         assert!(generation < i.keys().oldest());
         let carol = HolderKey::generate();
         let note = Note::issue(i.public, &i.key, note.serial(), 8, carol.public_key());
@@ -1897,12 +2059,12 @@ mod tests {
         // Certified by another issuer key.
         let mut other = i.clone();
         other.key = IssuerKey::generate();
-        let forged = other.plan_rotate(GenerationKey::generate());
+        let forged = other.plan_rotate(GenerationKey::generate()).unwrap();
         assert!(i.apply(&forged).is_err());
 
         // Certified, but its secret is in nobody's ring.
         let mut planner = i.clone();
-        let Event::Rotate(report) = planner.plan_rotate(GenerationKey::generate()) else {
+        let Event::Rotate(report) = planner.plan_rotate(GenerationKey::generate()).unwrap() else {
             panic!("a rotation")
         };
         assert!(i.apply(&Event::Rotate(report)).is_err());
@@ -1916,10 +2078,10 @@ mod tests {
             .clone();
         assert!(
             reuse
-                .apply(&reuse.clone().plan_rotate(again.clone()))
+                .apply(&reuse.clone().plan_rotate(again.clone()).unwrap())
                 .is_err()
         );
-        let event = reuse.plan_rotate(again);
+        let event = reuse.plan_rotate(again).unwrap();
         assert!(reuse.apply(&event).is_err());
 
         // Without a key, once generations have keys of their own.
@@ -1936,7 +2098,7 @@ mod tests {
         let mut i = issuer(3, Policy::cash_like());
         let key = HolderKey::generate();
         let note = i.mint(8, key.public_key()).unwrap();
-        i.rotate();
+        i.rotate().unwrap();
         let snapshot = i.snapshot();
         let restored = Issuer::restore(
             i.key.clone(),
@@ -1968,9 +2130,10 @@ mod tests {
             SetupError::KeyMismatch
         );
 
-        // A certificate altered in the snapshot is caught even under a fixed checksum.
+        // A certificate altered in the snapshot is caught even under a fixed
+        // checksum. The pause and schedule (10 bytes) follow the last one.
         let mut body = snapshot[..snapshot.len() - 32].to_vec();
-        let last = body.len() - 1;
+        let last = body.len() - 11;
         body[last] ^= 1;
         let checksum: [u8; 32] = Sha256::digest(&body).into();
         body.extend_from_slice(&checksum);
@@ -2001,7 +2164,7 @@ mod tests {
         assert_eq!(replayed.keys().certificates(), &[]);
 
         // From the next rotation on, new generations have keys of their own.
-        let report = i.rotate();
+        let report = i.rotate().unwrap();
         let created = report.key.unwrap();
         assert_eq!(i.keys().certificates(), &[created]);
         assert_eq!(i.key_ring().len(), 1);
@@ -2046,7 +2209,7 @@ mod tests {
         let note = i.authorized_mint(&request).unwrap();
         assert_eq!(i.authorized_mint(&request), Ok(note));
         for _ in 0..2 {
-            i.rotate();
+            i.rotate().unwrap();
         }
         assert_eq!(
             i.authorized_mint(&request),
@@ -2102,12 +2265,163 @@ mod tests {
             },
         };
         let legacy = Event::Rotate(i.rotation());
-        let rotate = i.plan_rotate(GenerationKey::generate());
-        for event in [mint, transfer, burn, rotate, legacy, authorized] {
+        let rotate = i.plan_rotate(GenerationKey::generate()).unwrap();
+        let scheduled = i
+            .plan_scheduled_rotation(GenerationKey::generate(), 3600)
+            .unwrap();
+        let scheduled_bare = Event::Rotate(RotationReport {
+            due: Some(60),
+            ..i.rotation()
+        });
+        for event in [
+            mint,
+            transfer,
+            burn,
+            rotate,
+            legacy,
+            authorized,
+            Event::Pause,
+            Event::Resume,
+            scheduled,
+            scheduled_bare.clone(),
+        ] {
             assert_eq!(Event::from_bytes(&event.to_bytes()), Ok(event.clone()));
             let json = serde_json::to_string(&event).unwrap();
             assert_eq!(serde_json::from_str::<Event>(&json).unwrap(), event);
         }
         assert!(Event::from_bytes(&[9]).is_err());
+        assert!(Event::from_bytes(&[10]).is_err());
+        // The key flag after a scheduled rotation's counts is 0 or 1.
+        let mut bad = scheduled_bare.to_bytes();
+        bad[1 + 8 + 8 + 4 + 16] = 2;
+        assert!(Event::from_bytes(&bad).is_err());
+    }
+
+    #[test]
+    fn a_paused_issuer_changes_nothing_until_it_resumes() {
+        let mut i = issuer(4, Policy::cash_like());
+        let alice = HolderKey::generate();
+        let note = i.mint(8, alice.public_key()).unwrap();
+        let output = Output {
+            amount: 8,
+            holder: HolderKey::generate().public_key(),
+        };
+        let request = TransferRequest::single(note, &alice, output).unwrap();
+        let verified = i.verifier().verify(&request).unwrap();
+        let burn = BurnRequest::single(note, &alice).unwrap();
+        let burn = i.verifier().verify_burn(&burn).unwrap();
+        // Planned while running, arriving after the pause.
+        let Plan::Apply(transfer) = i.plan_transfer(&verified).unwrap() else {
+            panic!("fresh transfer")
+        };
+        let mint = i.plan_mint(4, alice.public_key()).unwrap();
+
+        let pause = i.plan_pause(true).unwrap();
+        assert_eq!(pause, Event::Pause);
+        i.apply(&pause).unwrap();
+        assert!(i.is_paused());
+        assert_eq!(i.plan_pause(true), None);
+        let before = i.snapshot();
+        assert!(i.apply(&Event::Pause).is_err());
+        assert_eq!(i.plan_mint(4, alice.public_key()), Err(Error::Paused));
+        assert!(matches!(i.plan_transfer(&verified), Err(Error::Paused)));
+        assert!(matches!(i.plan_burn(&burn), Err(Error::Paused)));
+        let ring = i.key_ring().len();
+        assert_eq!(i.plan_rotate(GenerationKey::generate()), Err(Error::Paused));
+        assert_eq!(i.rotate(), Err(Error::Paused));
+        assert_eq!(i.key_ring().len(), ring);
+        assert!(i.apply(&transfer).is_err());
+        assert!(i.apply(&mint).is_err());
+        assert!(i.apply(&Event::Rotate(i.rotation())).is_err());
+        assert_eq!(i.snapshot(), before);
+
+        // The pause is part of the state a snapshot keeps.
+        let restored = Issuer::restore(
+            i.key.clone(),
+            i.key_ring().clone(),
+            &before,
+            Policy::cash_like(),
+        )
+        .unwrap();
+        assert!(restored.is_paused());
+
+        let resume = i.plan_pause(false).unwrap();
+        assert_eq!(resume, Event::Resume);
+        i.apply(&resume).unwrap();
+        assert!(!i.is_paused());
+        assert!(i.apply(&Event::Resume).is_err());
+        i.apply(&transfer).unwrap();
+        i.apply(&mint).unwrap();
+        i.set_paused(true);
+        i.set_paused(true);
+        assert!(i.is_paused());
+    }
+
+    #[test]
+    fn a_scheduled_rotation_must_be_due_after_the_last() {
+        let mut i = issuer(4, Policy::cash_like());
+        assert_eq!(i.last_scheduled_rotation(), None);
+        let first = i
+            .plan_scheduled_rotation(GenerationKey::generate(), 600)
+            .unwrap();
+        i.apply(&first).unwrap();
+        assert_eq!(i.last_scheduled_rotation(), Some(600));
+
+        // Refused when planned, saying why, and when applied.
+        assert_eq!(
+            i.plan_scheduled_rotation(GenerationKey::generate(), 600),
+            Err(Error::StaleRotation {
+                due: 600,
+                last: 600
+            })
+        );
+        let Event::Rotate(mut report) = i
+            .plan_scheduled_rotation(GenerationKey::generate(), 1200)
+            .unwrap()
+        else {
+            panic!("a rotation")
+        };
+        let before = i.snapshot();
+        for due in [300, 600] {
+            report.due = Some(due);
+            assert!(i.apply(&Event::Rotate(report)).is_err());
+        }
+        assert_eq!(i.snapshot(), before);
+        report.due = Some(1200);
+        i.apply(&Event::Rotate(report)).unwrap();
+        assert_eq!(i.last_scheduled_rotation(), Some(1200));
+
+        // A rotation on request leaves the schedule alone.
+        i.rotate().unwrap();
+        assert_eq!(i.last_scheduled_rotation(), Some(1200));
+        let restored = Issuer::restore(
+            i.key.clone(),
+            i.key_ring().clone(),
+            &i.snapshot(),
+            Policy::cash_like(),
+        )
+        .unwrap();
+        assert_eq!(restored.last_scheduled_rotation(), Some(1200));
+        assert_eq!(restored.snapshot(), i.snapshot());
+    }
+
+    #[test]
+    fn version_5_snapshots_restore_running_with_no_schedule() {
+        let mut i = issuer(4, Policy::cash_like());
+        i.mint(8, HolderKey::generate().public_key()).unwrap();
+        i.rotate().unwrap();
+        let mut body = version_5_body(&i);
+        let checksum: [u8; 32] = Sha256::digest(&body).into();
+        body.extend_from_slice(&checksum);
+        let restored = Issuer::restore(
+            i.key.clone(),
+            i.key_ring().clone(),
+            &body,
+            Policy::cash_like(),
+        )
+        .unwrap();
+        assert!(!restored.is_paused());
+        assert_eq!(restored.last_scheduled_rotation(), None);
+        assert_eq!(restored.snapshot(), i.snapshot());
     }
 }

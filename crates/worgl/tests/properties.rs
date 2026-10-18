@@ -356,7 +356,7 @@ fn run_history(
             IssuerOp::Rotate => {
                 let next = GenerationKey::generate();
                 ring.insert(next.clone());
-                let event = issuer.plan_rotate(next);
+                let event = issuer.plan_rotate(next).unwrap();
                 commit(&mut issuer, event);
                 let oldest = issuer.ledger().oldest_generation();
                 wallet.retain(|(note, _)| note.serial().generation >= oldest);

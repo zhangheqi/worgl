@@ -11,9 +11,14 @@
 //!
 //! - `issuer.key`, the issuer's secret key, and `admin.token`, which
 //!   authorizes rotating and pausing this mint only, both mode 0600,
-//! - `policy.json`, the mint's rules,
-//! - `mint.json`, its rotation period and whether it is paused, and
-//! - `last_rotation`, the last scheduled rotation boundary.
+//! - `policy.json`, the mint's rules, and
+//! - `mint.json`, its rotation period.
+//!
+//! Whether a mint is paused, and when its last scheduled rotation was due,
+//! are events in its log, so a replica of the log agrees on both. Older
+//! servers kept them in `mint.json` and a `last_rotation` file: a mint from
+//! then logs its pause when it opens, and keeps the file as a floor for its
+//! schedule until its next scheduled rotation is logged.
 //!
 //! A new mint is built in a hidden `.new-<issuer key>` directory and renamed
 //! into place once complete, so a crash never leaves a mint half made; the
@@ -45,7 +50,7 @@ const KEY_FILE: &str = "issuer.key";
 const TOKEN_FILE: &str = "admin.token";
 const POLICY_FILE: &str = "policy.json";
 const SETTINGS_FILE: &str = "mint.json";
-const SCHEDULE_FILE: &str = "last_rotation";
+const LEGACY_SCHEDULE_FILE: &str = "last_rotation";
 const NEW_PREFIX: &str = ".new-";
 
 /// Changes that may wait for a mint's committer before senders have to wait too.
@@ -99,6 +104,8 @@ impl std::error::Error for CreateError {}
 #[serde(default)]
 struct Settings {
     rotate_every: Option<u64>,
+    /// Read from older servers' files only; the pause is logged now.
+    #[serde(skip_serializing)]
     paused: bool,
 }
 
@@ -142,7 +149,7 @@ pub fn create_mint(state: &Path, spec: &MintSpec) -> Result<CreatedMint, CreateE
         files::write_json(&new, POLICY_FILE, &spec.policy)?;
         let settings = Settings {
             rotate_every: spec.rotate_every,
-            paused: false,
+            ..Settings::default()
         };
         files::write_json(&new, SETTINGS_FILE, &settings)?;
         drop(PersistentIssuer::create(&new, issuer)?);
@@ -225,8 +232,16 @@ pub(crate) fn load(dir: &Path) -> Result<Loaded> {
             dir.join(SETTINGS_FILE).display()
         );
     }
-    let issuer = PersistentIssuer::open(dir, key, policy)
+    let mut issuer = PersistentIssuer::open(dir, key, policy)
         .with_context(|| format!("opening {}", dir.display()))?;
+    if settings.paused {
+        // An older server paused it in mint.json. Log the pause first, so a
+        // crash before the file is rewritten loses nothing.
+        issuer
+            .set_paused(true)
+            .with_context(|| format!("logging the pause of {}", dir.display()))?;
+        files::write_json(dir, SETTINGS_FILE, &settings)?;
+    }
     Ok(Loaded {
         dir: dir.to_owned(),
         issuer,
@@ -240,7 +255,8 @@ enum Change {
     Mint(VerifiedMint),
     Transfer(VerifiedTransfer),
     Burn(VerifiedBurn),
-    Rotate,
+    /// With the boundary a schedule rotates for, or `None` on request.
+    Rotate(Option<u64>),
 }
 
 /// What a change produced.
@@ -262,9 +278,9 @@ pub(crate) struct Mint {
     changes: mpsc::Sender<Job>,
     /// Replaced after every rotation, which adds a generation key.
     verifier: Arc<RwLock<Verifier>>,
-    /// Mirrors [`Settings::paused`], which only changes under the lock, so
-    /// requests to a paused mint are refused before their signatures are
-    /// checked. The committer decides from the settings themselves.
+    /// Mirrors whether the issuer is paused, which only changes under the
+    /// lock, so requests to a paused mint are refused before their
+    /// signatures are checked. The issuer itself decides in the committer.
     paused: Arc<AtomicBool>,
     token: Box<str>,
     schedule: RwLock<Option<RotationSchedule>>,
@@ -272,8 +288,6 @@ pub(crate) struct Mint {
 
 struct Inner {
     issuer: PersistentIssuer,
-    dir: PathBuf,
-    settings: Settings,
     verifier: Arc<RwLock<Verifier>>,
     paused: Arc<AtomicBool>,
     compact_every: u64,
@@ -294,11 +308,10 @@ impl Mint {
         let key = *issuer.public_key();
         let compact_every = compact_every.max(1);
         let verifier = Arc::new(RwLock::new(issuer.issuer().verifier()));
-        let paused = Arc::new(AtomicBool::new(settings.paused));
+        let paused = Arc::new(AtomicBool::new(issuer.issuer().is_paused()));
+        let logged = issuer.issuer().last_scheduled_rotation().unwrap_or(0);
         let inner = Arc::new(Mutex::new(Inner {
             issuer,
-            dir: dir.clone(),
-            settings,
             verifier: verifier.clone(),
             paused: paused.clone(),
             compact_every,
@@ -316,14 +329,16 @@ impl Mint {
             schedule: RwLock::new(None),
         });
         if let Some(period) = settings.rotate_every {
-            let marker = dir.join(SCHEDULE_FILE);
-            let saved = fs::read_to_string(&marker)
+            let legacy = dir.join(LEGACY_SCHEDULE_FILE);
+            let saved = fs::read_to_string(&legacy)
                 .ok()
-                .and_then(|text| text.trim().parse::<u64>().ok())
-                .unwrap_or(0);
-            let last = saved.max(unix_now() / period * period);
+                .and_then(|text| text.trim().parse::<u64>().ok());
+            let last = logged
+                .max(saved.unwrap_or(0))
+                .max(unix_now() / period * period);
             mint.set_schedule(period, last);
-            tokio::spawn(rotate_on_schedule(mint.clone(), period, last, marker));
+            let legacy = saved.is_some().then_some(legacy);
+            tokio::spawn(rotate_on_schedule(mint.clone(), period, last, legacy));
         }
         mint
     }
@@ -401,7 +416,7 @@ impl Mint {
                 supply: issuer.supply(),
                 policy: issuer.policy().clone(),
                 rotation,
-                paused: inner.settings.paused,
+                paused: issuer.is_paused(),
             })
         })
         .await
@@ -471,9 +486,11 @@ impl Mint {
         }
     }
 
-    /// Rotates and writes a fresh snapshot. A paused mint refuses.
-    pub(crate) async fn rotate(&self) -> Result<RotationReport, ApiError> {
-        match self.submit(Change::Rotate).await? {
+    /// Rotates and writes a fresh snapshot. `due` is the boundary a schedule
+    /// rotates for, or `None` for a rotation on request. A paused mint
+    /// refuses.
+    pub(crate) async fn rotate(&self, due: Option<u64>) -> Result<RotationReport, ApiError> {
+        match self.submit(Change::Rotate(due)).await? {
             Done::Rotated(report) => Ok(report),
             _ => unreachable!("a rotation reports a rotation"),
         }
@@ -491,9 +508,6 @@ impl Inner {
     /// refuses gets its error; if the flush fails, every other change gets a
     /// storage error.
     fn commit(&mut self, changes: Vec<Change>) -> Vec<Result<Done, ApiError>> {
-        if self.settings.paused {
-            return changes.iter().map(|_| Err(ApiError::paused())).collect();
-        }
         let mut batch = match self.issuer.batch() {
             Ok(batch) => batch,
             Err(error) => {
@@ -514,10 +528,12 @@ impl Inner {
                     .map(Done::Notes)
                     .map_err(ApiError::from),
                 Change::Burn(burn) => batch.burn(&burn).map(Done::Burned).map_err(ApiError::from),
-                Change::Rotate => {
-                    let report = batch
-                        .rotate()
-                        .map_err(|e| ApiError::from(CommitError::Io(e)));
+                Change::Rotate(due) => {
+                    let report = match due {
+                        Some(due) => batch.rotate_scheduled(due),
+                        None => batch.rotate(),
+                    }
+                    .map_err(ApiError::from);
                     rotated |= report.is_ok();
                     report.map(Done::Rotated)
                 }
@@ -566,16 +582,10 @@ impl Inner {
     }
 
     fn set_paused(&mut self, paused: bool) -> Result<(), ApiError> {
-        if self.settings.paused == paused {
+        if self.issuer.issuer().is_paused() == paused {
             return Ok(());
         }
-        let settings = Settings {
-            paused,
-            ..self.settings
-        };
-        files::write_json(&self.dir, SETTINGS_FILE, &settings)
-            .map_err(|error| ApiError::from(CommitError::Io(error)))?;
-        self.settings = settings;
+        self.issuer.set_paused(paused)?;
         self.paused.store(paused, Ordering::Release);
         tracing::info!(mint = %self.issuer.public_key(), paused, "pause switched");
         Ok(())
@@ -621,10 +631,17 @@ async fn run_committer(inner: Arc<Mutex<Inner>>, mut queue: mpsc::Receiver<Job>)
 /// schedule survives restarts. Boundaries missed while the server was down,
 /// and those reached while the mint is paused, are not made up.
 ///
-/// The boundary of the last scheduled rotation is kept in `marker`, and a
-/// rotation happens only once the wall clock has passed the boundary after
-/// it, so a clock that steps backwards can never rotate twice for one period.
-async fn rotate_on_schedule(mint: Arc<Mint>, period: u64, mut last: u64, marker: PathBuf) {
+/// Each scheduled rotation logs the boundary it was due at, and the issuer
+/// refuses one that is not due after the last, so neither a clock that steps
+/// backwards nor a restart can rotate twice for one period. `legacy` is the
+/// file an older server kept the last boundary in, removed once a scheduled
+/// rotation is logged.
+async fn rotate_on_schedule(
+    mint: Arc<Mint>,
+    period: u64,
+    mut last: u64,
+    mut legacy: Option<PathBuf>,
+) {
     loop {
         let now = unix_now();
         let next = last.saturating_add(period);
@@ -634,10 +651,21 @@ async fn rotate_on_schedule(mint: Arc<Mint>, period: u64, mut last: u64, marker:
             tokio::time::sleep(Duration::from_secs(next - now)).await;
             continue;
         }
-        match mint.rotate().await {
-            Ok(report) => tracing::info!(mint = %mint.key, ?report, "scheduled rotation"),
+        let due = now / period * period;
+        match mint.rotate(Some(due)).await {
+            Ok(report) => {
+                tracing::info!(mint = %mint.key, ?report, "scheduled rotation");
+                if let Some(file) = legacy.take()
+                    && let Err(error) = fs::remove_file(&file)
+                {
+                    tracing::warn!(mint = %mint.key, %error, "could not remove {}", file.display());
+                }
+            }
             Err(error) if error.code() == "paused" => {
                 tracing::info!(mint = %mint.key, "paused; skipped a scheduled rotation");
+            }
+            Err(error) if error.code() == "stale_rotation" => {
+                tracing::info!(mint = %mint.key, due, "this period's rotation is already logged");
             }
             Err(error) => {
                 tracing::error!(mint = %mint.key, ?error, "scheduled rotation failed; retrying");
@@ -645,12 +673,7 @@ async fn rotate_on_schedule(mint: Arc<Mint>, period: u64, mut last: u64, marker:
                 continue;
             }
         }
-        last = now / period * period;
-        let tmp = marker.with_extension("tmp");
-        let saved = fs::write(&tmp, format!("{last}\n")).and_then(|()| fs::rename(&tmp, &marker));
-        if let Err(error) = saved {
-            tracing::error!(mint = %mint.key, %error, "could not record the rotation time");
-        }
+        last = due;
     }
 }
 

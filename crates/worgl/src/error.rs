@@ -69,6 +69,19 @@ pub enum Error {
     /// A mint request's signature does not verify.
     #[error("the mint authority's signature does not verify")]
     MintUnauthorized,
+    /// The issuer is paused: it mints, moves, burns and rotates nothing
+    /// until it resumes.
+    #[error("the issuer is paused")]
+    Paused,
+    /// A scheduled rotation is due no later than the last one logged, so
+    /// that one already covered it.
+    #[error("a rotation due at {due} is not after the last scheduled one, due at {last}")]
+    StaleRotation {
+        /// When the refused rotation was due, in seconds since the Unix epoch.
+        due: u64,
+        /// When the last scheduled rotation was due.
+        last: u64,
+    },
     /// A mint request reuses a sequence number, or goes below one, that its
     /// authority already used.
     #[error("mint sequence {sequence} is not above {last}, the authority's last")]

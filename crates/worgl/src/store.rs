@@ -768,13 +768,24 @@ impl PersistentIssuer {
     /// Rotates once the rotation is on disk, with a fresh generation key
     /// that is saved before the rotation is logged.
     pub fn rotate(&mut self) -> Result<RotationReport, CommitError> {
-        self.check_in_step()?;
-        let event = self.plan_rotate()?;
-        self.commit(&event)?;
-        match event {
-            Event::Rotate(report) => Ok(report),
-            _ => unreachable!("plan_rotate plans a rotation"),
+        self.rotate_due(None)
+    }
+
+    /// Rotates for a schedule's period that was due at `due` seconds since
+    /// the Unix epoch, which must be after the last one logged. See
+    /// [`Issuer::plan_scheduled_rotation`]; otherwise as
+    /// [`rotate`](Self::rotate).
+    pub fn rotate_scheduled(&mut self, due: u64) -> Result<RotationReport, CommitError> {
+        self.rotate_due(Some(due))
+    }
+
+    /// Pauses the issuer once the pause is on disk, or resumes it if
+    /// `paused` is false. Writes nothing if it already is.
+    pub fn set_paused(&mut self, paused: bool) -> Result<(), CommitError> {
+        if let Some(event) = self.issuer.plan_pause(paused) {
+            self.commit(&event)?;
         }
+        Ok(())
     }
 
     /// Writes a fresh snapshot and purges the log up to it.
@@ -788,12 +799,25 @@ impl PersistentIssuer {
         self.store.log_events()
     }
 
+    fn rotate_due(&mut self, due: Option<u64>) -> Result<RotationReport, CommitError> {
+        self.check_in_step()?;
+        let report = self.plan_rotate(due)?;
+        self.commit(&Event::Rotate(report))?;
+        Ok(report)
+    }
+
     /// Plans a rotation with a fresh key and saves the key ring with it.
-    fn plan_rotate(&mut self) -> io::Result<Event> {
+    fn plan_rotate(&mut self, due: Option<u64>) -> Result<RotationReport, CommitError> {
         let next = GenerationKey::try_generate().map_err(io::Error::other)?;
-        let event = self.issuer.plan_rotate(next);
+        let event = match due {
+            Some(due) => self.issuer.plan_scheduled_rotation(next, due)?,
+            None => self.issuer.plan_rotate(next)?,
+        };
         self.store.save_keys(self.issuer.key_ring())?;
-        Ok(event)
+        match event {
+            Event::Rotate(report) => Ok(report),
+            _ => unreachable!("a rotation is planned as one"),
+        }
     }
 
     fn commit(&mut self, event: &Event) -> io::Result<()> {
@@ -876,13 +900,28 @@ impl Batch<'_> {
 
     /// Rotates, with a fresh generation key. The key is saved to the key
     /// ring at once; if that fails, nothing is staged.
-    pub fn rotate(&mut self) -> io::Result<RotationReport> {
-        let event = self.owner.plan_rotate()?;
-        self.stage(event.clone());
-        match event {
-            Event::Rotate(report) => Ok(report),
-            _ => unreachable!("plan_rotate plans a rotation"),
+    pub fn rotate(&mut self) -> Result<RotationReport, CommitError> {
+        self.rotate_due(None)
+    }
+
+    /// Rotates for a schedule's period that was due at `due`. See
+    /// [`PersistentIssuer::rotate_scheduled`].
+    pub fn rotate_scheduled(&mut self, due: u64) -> Result<RotationReport, CommitError> {
+        self.rotate_due(Some(due))
+    }
+
+    /// Pauses the issuer, or resumes it if `paused` is false. Stages nothing
+    /// if it already is. Changes after a pause in the same batch are refused.
+    pub fn set_paused(&mut self, paused: bool) {
+        if let Some(event) = self.owner.issuer.plan_pause(paused) {
+            self.stage(event);
         }
+    }
+
+    fn rotate_due(&mut self, due: Option<u64>) -> Result<RotationReport, CommitError> {
+        let report = self.owner.plan_rotate(due)?;
+        self.stage(Event::Rotate(report));
+        Ok(report)
     }
 
     /// Events staged so far.
@@ -996,6 +1035,55 @@ mod tests {
         let (store, issuer) = FileStore::open(dir.path(), key, Policy::cash_like()).unwrap();
         assert_eq!(issuer.snapshot(), expected);
         assert_eq!(store.log_events(), 1);
+    }
+
+    #[test]
+    fn pauses_and_the_schedule_are_logged() {
+        let dir = tempfile::tempdir().unwrap();
+        let (key, mut p) = fresh(dir.path());
+        let holder = HolderKey::generate().public_key();
+        p.rotate_scheduled(600).unwrap();
+        p.set_paused(true).unwrap();
+        let events = p.log_events();
+        p.set_paused(true).unwrap();
+        assert_eq!(p.log_events(), events, "pausing again writes nothing");
+        assert!(matches!(
+            p.mint(1, holder),
+            Err(CommitError::Rejected(Error::Paused))
+        ));
+        assert!(matches!(
+            p.rotate(),
+            Err(CommitError::Rejected(Error::Paused))
+        ));
+        drop(p);
+        let mut p = PersistentIssuer::open(dir.path(), key.clone(), Policy::cash_like()).unwrap();
+        assert!(p.issuer().is_paused());
+        assert_eq!(p.issuer().last_scheduled_rotation(), Some(600));
+
+        // In a batch, a pause refuses the changes after it.
+        let mut batch = p.batch().unwrap();
+        batch.set_paused(false);
+        batch.mint(1, holder).unwrap();
+        batch.set_paused(true);
+        assert!(matches!(batch.mint(1, holder), Err(Error::Paused)));
+        assert!(matches!(
+            batch.rotate_scheduled(1200),
+            Err(CommitError::Rejected(Error::Paused))
+        ));
+        batch.set_paused(false);
+        assert!(matches!(
+            batch.rotate_scheduled(600),
+            Err(CommitError::Rejected(Error::StaleRotation { .. }))
+        ));
+        batch.rotate_scheduled(1200).unwrap();
+        assert_eq!(batch.len(), 5);
+        batch.commit().unwrap();
+        let expected = p.issuer().snapshot();
+        drop(p);
+        let p = PersistentIssuer::open(dir.path(), key, Policy::cash_like()).unwrap();
+        assert_eq!(p.issuer().snapshot(), expected);
+        assert!(!p.issuer().is_paused());
+        assert_eq!(p.issuer().last_scheduled_rotation(), Some(1200));
     }
 
     #[test]
@@ -1472,7 +1560,7 @@ mod tests {
         fs::write(dir.join(SNAPSHOT), issuer.snapshot()).unwrap();
         let mint = issuer.plan_mint(8, alice.public_key()).unwrap();
         issuer.apply(&mint).unwrap();
-        let rotate = issuer.plan_rotate(GenerationKey::generate());
+        let rotate = issuer.plan_rotate(GenerationKey::generate()).unwrap();
         // Saved before the rotation applies, which retires the dropped
         // generation's key.
         write_keys(dir, issuer.key_ring()).unwrap();
