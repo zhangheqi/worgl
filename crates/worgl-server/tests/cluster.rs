@@ -219,13 +219,23 @@ impl Cluster {
 
     /// The member leading `mint`, once every running member knows it.
     async fn leader(&self, mint: &PublicKey) -> usize {
+        self.agreed(|state| state.leader(mint)).await
+    }
+
+    /// The member leading the registry, once every running member knows it.
+    async fn registry_leader(&self) -> usize {
+        self.agreed(AppState::registry_leader).await
+    }
+
+    /// The leader every running member names in `view`.
+    async fn agreed(&self, view: impl Fn(&AppState) -> Option<u64>) -> usize {
         let deadline = Instant::now() + PATIENCE;
         loop {
             let views: Vec<_> = self
                 .servers
                 .iter()
                 .filter_map(Server::state)
-                .map(|state| state.leader(mint))
+                .map(&view)
                 .collect();
             if let Some(&Some(leader)) = views.first()
                 && views.iter().all(|&view| view == Some(leader))
@@ -237,6 +247,59 @@ impl Cluster {
             }
             assert!(Instant::now() < deadline, "no agreed leader: {views:?}");
             tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+    }
+
+    /// Creates a mint through `server`, sending the request again only
+    /// while it surely made nothing.
+    async fn create(&self, server: usize) -> TestMint {
+        let authority = MintKey::generate();
+        let spec = json!({
+            "ledger": LEDGER,
+            "policy": {"mint_authorities": [authority.public_key()]},
+        });
+        let deadline = Instant::now() + PATIENCE;
+        let answer = loop {
+            let (status, answer) = self
+                .call_once(
+                    server,
+                    Method::POST,
+                    "/v1/admin/mints",
+                    Some(&self.operator),
+                    &spec,
+                )
+                .await;
+            if status == StatusCode::SERVICE_UNAVAILABLE
+                && answer["error"] == "no_leader"
+                && Instant::now() < deadline
+            {
+                tokio::time::sleep(Duration::from_millis(100)).await;
+                continue;
+            }
+            assert_eq!(status, StatusCode::OK, "{answer}");
+            break answer;
+        };
+        TestMint {
+            key: answer["mint"].as_str().unwrap().parse().unwrap(),
+            token: answer["token"].as_str().unwrap().to_owned(),
+            authority,
+            sequence: AtomicU64::new(0),
+        }
+    }
+
+    /// Waits until every running member serves `mint`, and checks that each
+    /// wrote it with the token its creator was given.
+    async fn hosts(&self, mint: &TestMint) {
+        let deadline = Instant::now() + PATIENCE;
+        for server in self.running() {
+            let state = self.servers[server].state().unwrap();
+            while !state.mints().contains(&mint.key) {
+                assert!(Instant::now() < deadline, "member {server} lacks the mint");
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+            let dir = self.servers[server].dir.join("mints");
+            let token = read_token(&dir.join(mint.key.to_string()).join("admin.token"));
+            assert_eq!(token, mint.token);
         }
     }
 
@@ -473,21 +536,6 @@ async fn any_member_answers_for_the_leader() {
     assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
     assert_eq!(answer["error"], "no_leader");
 
-    // Mints are made offline for now.
-    let spec =
-        json!({"ledger": LEDGER, "policy": {"mint_authorities": [mint.authority.public_key()]}});
-    let (status, answer) = cluster
-        .call_once(
-            leader,
-            Method::POST,
-            "/v1/admin/mints",
-            Some(&cluster.operator),
-            &spec,
-        )
-        .await;
-    assert_eq!(status, StatusCode::NOT_IMPLEMENTED);
-    assert_eq!(answer["error"], "not_supported");
-
     // The Raft port takes the cluster token only.
     let vote = format!(
         "http://{}/raft/{}/vote",
@@ -622,6 +670,138 @@ async fn a_mint_that_ran_alone_carries_on_in_a_cluster() {
     cluster.mint(follower, &mint, 4, &carol).await;
     let (last, _) = cluster.pay(follower, &paid, &bob).await;
     assert_eq!(cluster.state_of(follower, &last).await, "live");
+    cluster.stop().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_mint_created_through_any_member_is_served_by_all() {
+    let (seed, _) = seed(None);
+    let cluster = Cluster::from_seed(seed).await;
+    let leader = cluster.registry_leader().await;
+    let follower = (leader + 1) % 3;
+    let other = (leader + 2) % 3;
+
+    // A follower passes the request on to the registry's leader, and every
+    // member writes the mint from the registry.
+    let mint = cluster.create(follower).await;
+    cluster.hosts(&mint).await;
+    for server in 0..3 {
+        let (status, listed) = cluster
+            .call(
+                server,
+                Method::GET,
+                "/v1/admin/mints",
+                Some(&cluster.operator),
+                Value::Null,
+            )
+            .await;
+        assert_eq!(status, StatusCode::OK, "{listed}");
+        assert_eq!(listed["mints"].as_array().unwrap().len(), 2, "{listed}");
+    }
+    let alice = HolderKey::generate();
+    let note = cluster.mint(other, &mint, 8, &alice).await;
+    let (paid, _) = cluster.pay(follower, &note, &alice).await;
+    for server in 0..3 {
+        assert_eq!(cluster.state_of(server, &note).await, "spent");
+        assert_eq!(cluster.state_of(server, &paid).await, "live");
+    }
+    let (status, report) = cluster
+        .call(
+            other,
+            Method::POST,
+            &mint.path("rotate"),
+            Some(&mint.token),
+            Value::Null,
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK, "{report}");
+    let info = cluster.info(leader, &mint).await;
+    for server in 0..3 {
+        assert_eq!(cluster.info(server, &mint).await, info);
+    }
+
+    // A creation one member passed on is not passed on again, and makes
+    // nothing.
+    let answer = cluster
+        .client
+        .post(format!("http://{}/v1/admin/mints", cluster.servers[follower].api))
+        .bearer_auth(&cluster.operator)
+        .header("x-worgl-forwarded-by", "9")
+        .json(&json!({"ledger": LEDGER, "policy": {"mint_authorities": [mint.authority.public_key()]}}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(answer.status(), StatusCode::SERVICE_UNAVAILABLE);
+    let answer: Value = answer.json().await.unwrap();
+    assert_eq!(answer["error"], "no_leader");
+    assert_eq!(cluster.servers[leader].state().unwrap().mints().len(), 2);
+    cluster.stop().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_member_away_while_a_mint_is_created_serves_it_when_back() {
+    let (seed, _) = seed(None);
+    let mut cluster = Cluster::from_seed(seed).await;
+    cluster.registry_leader().await;
+    // The first member, which forms the groups of the mints the members
+    // start with, is away: the member that creates a mint forms its group.
+    cluster.servers[0].stop().await;
+    let mint = cluster.create(1).await;
+    cluster.hosts(&mint).await;
+    let alice = HolderKey::generate();
+    let note = cluster.mint(2, &mint, 8, &alice).await;
+    let (paid, bob) = cluster.pay(1, &note, &alice).await;
+    let (status, report) = cluster
+        .call(
+            2,
+            Method::POST,
+            &mint.path("rotate"),
+            Some(&mint.token),
+            Value::Null,
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK, "{report}");
+    let away = cluster.servers[0]
+        .dir
+        .join("mints")
+        .join(mint.key.to_string());
+    assert!(!away.exists());
+
+    // Back, it writes the mint, joins its group and catches up: with
+    // another member stopped, the group needs it for a majority.
+    cluster.servers[0].restart().await;
+    cluster.hosts(&mint).await;
+    cluster.leader(&mint.key).await;
+    cluster.servers[1].stop().await;
+    let (last, _) = cluster.pay(0, &paid, &bob).await;
+    for server in cluster.running() {
+        assert_eq!(cluster.state_of(server, &note).await, "spent");
+        assert_eq!(cluster.state_of(server, &paid).await, "spent");
+        assert_eq!(cluster.state_of(server, &last).await, "live");
+    }
+    cluster.stop().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_new_registry_leader_creates_mints() {
+    let (seed, _) = seed(None);
+    let mut cluster = Cluster::from_seed(seed).await;
+    let first = cluster.registry_leader().await;
+    cluster.servers[first].stop().await;
+    let other = (first + 1) % 3;
+    let mint = cluster.create(other).await;
+    assert_ne!(cluster.registry_leader().await, first);
+    cluster.hosts(&mint).await;
+    let alice = HolderKey::generate();
+    let note = cluster.mint(other, &mint, 8, &alice).await;
+
+    // The member that led learns of the mint from the new leader.
+    cluster.servers[first].restart().await;
+    cluster.hosts(&mint).await;
+    cluster.leader(&mint.key).await;
+    for server in 0..3 {
+        assert_eq!(cluster.state_of(server, &note).await, "live");
+    }
     cluster.stop().await;
 }
 

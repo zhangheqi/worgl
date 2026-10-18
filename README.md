@@ -26,8 +26,9 @@ The workspace has seven crates and a TypeScript package:
 - [`worgl-server`](crates/worgl-server): an HTTP server built on it that
   hosts many issuers, called mints, side by side.
 - [`worgl-raft`](crates/worgl-raft): Raft replication for one mint, so a
-  group of replicas keeps its log and any of them can take over as leader.
-  The server runs on it as a cluster.
+  group of replicas keeps its log and any of them can take over as leader,
+  and a registry group that lists a cluster's mints. The server runs on it
+  as a cluster.
 - [`worgl-sdk`](crates/worgl-sdk): the holder's side. A note store that
   requests, pays, receives and refreshes notes while keeping the privacy
   rules, with no networking of its own.
@@ -462,7 +463,6 @@ state directory:
 S=./target/release/worgl-server
 MEMBERS="--member 1=10.0.0.1:8080,10.0.0.1:7080 --member 2=10.0.0.2:8080,10.0.0.2:7080 --member 3=10.0.0.3:8080,10.0.0.3:7080"
 $S init         --state ./server
-$S create-mint  --state ./server --layers 4 --layer-size 1048576 --rotate-every 86400
 $S join-cluster --state ./server --node 1 $MEMBERS
 # Copy ./server to the other two machines and run join-cluster there with --node 2 and --node 3.
 $S serve        --state ./server --listen 0.0.0.0:8080
@@ -484,10 +484,22 @@ others elect a new one within a few seconds. Until then, requests are answered
 `503 no_leader`, and sending the same request again is safe. Only the leader
 makes scheduled rotations.
 
+With the members running, `POST /v1/admin/mints` to any of them creates a mint
+on all three. It goes to the member leading the cluster's registry, a Raft
+group of the members that lists the mints created this way. A mint's record
+holds its policy, period and first state, with its issuer key, admin token and
+generation keys sealed by the key-encryption key the members share. Every
+member writes the mint's directory from that record, so all of them start the
+mint alike, and a member that was away writes it when it returns. The answer
+comes once the mint's group has a leader; a member that has not yet read the
+record answers `404 unknown_mint` for a moment. A creation answered `503
+no_leader` made nothing, so send it again. One answered `503 timeout` may have
+made a mint the answer never named: list the mints before creating another,
+and read its admin token from `admin.token` in its directory on any member.
+
 The Raft port speaks plain HTTP and checks only the cluster token, so keep it
-on a network that only the members can reach. Mints are created offline, with
-every member stopped, so `POST /v1/admin/mints` answers `501 not_supported` on
-a cluster. The members are fixed once the cluster starts.
+on a network that only the members can reach. The members are fixed once the
+cluster starts.
 
 ## Not covered yet
 
@@ -495,8 +507,7 @@ a cluster. The members are fixed once the cluster starts.
 - **No backing.** A mint authority decides what to mint; there is no deposit
   or redemption into other money.
 - **Clusters are fixed and their members talk in the clear.** Members cannot
-  be added or removed, a mint cannot be created while a cluster runs, and the
-  Raft port has no TLS. The issuer key itself never rotates: a new one is a
+  be added or removed, and the Raft port has no TLS. The issuer key itself never rotates: a new one is a
   new mint.
 - **No SDK for other languages yet.** Rust and TypeScript have one, and
   the `worgl` command covers scripts; others call the HTTP API directly.
