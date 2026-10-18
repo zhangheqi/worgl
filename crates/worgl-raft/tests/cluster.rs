@@ -20,7 +20,7 @@ use openraft::{
 use tempfile::TempDir;
 use worgl::{
     FileKek, FileStore, HolderKey, Issuer, IssuerKey, LedgerConfig, Note, NoteStatus, Output,
-    Policy, TransferRequest,
+    PersistentIssuer, Policy, StoreError, TransferRequest,
 };
 use worgl_raft::{
     NodeId, Options, Raft, Replica, ReplicaError, SnapshotData, TypeConfig, default_config,
@@ -131,18 +131,21 @@ struct Cluster {
 }
 
 impl Cluster {
-    /// Seeds three copies of a new mint, opens a replica on each and forms
-    /// the group.
+    /// A group formed from three copies of a new mint.
     async fn start() -> Self {
         let key = IssuerKey::generate();
         let issuer = Issuer::new(key.clone(), LEDGER, Policy::cash_like()).unwrap();
+        let seed = tempfile::tempdir().unwrap();
+        drop(FileStore::create(seed.path(), &issuer).unwrap());
+        Self::from_copies(seed.path(), key).await
+    }
+
+    /// Readies three copies of the mint in `seed`, opens a replica on each
+    /// and forms the group from the first.
+    async fn from_copies(seed: &Path, key: IssuerKey) -> Self {
         let dirs: BTreeMap<_, _> = (1..=3)
             .map(|id| (id, tempfile::tempdir().unwrap()))
             .collect();
-        drop(FileStore::create(dirs[&1].path(), &issuer).unwrap());
-        for dir in [&dirs[&2], &dirs[&3]] {
-            copy_store(dirs[&1].path(), dir.path());
-        }
         let mut cluster = Self {
             router: Router::default(),
             dirs,
@@ -151,6 +154,14 @@ impl Cluster {
             replicas: BTreeMap::new(),
         };
         for id in 1..=3 {
+            let dir = cluster.dirs[&id].path();
+            copy_store(seed, dir);
+            let ready =
+                worgl_raft::prepare(dir, cluster.key.clone(), Policy::cash_like(), &*cluster.kek);
+            assert!(
+                ready.unwrap(),
+                "a copy of a new store has never joined a group"
+            );
             cluster.open(id).await;
         }
         let members = (1..=3)
@@ -512,5 +523,56 @@ async fn a_group_restarted_whole_restores_what_it_committed() {
     assert!(batch.is_empty());
     batch.commit().await.unwrap();
     pay(cluster.replica(leader), paid, &bob).await;
+    cluster.shutdown().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_mint_that_ran_alone_carries_on_as_a_group() {
+    let key = IssuerKey::generate();
+    let issuer = Issuer::new(key.clone(), LEDGER, Policy::cash_like()).unwrap();
+    let seed = tempfile::tempdir().unwrap();
+    let alice = HolderKey::generate();
+    let (note, alone) = {
+        let mut store = PersistentIssuer::create(seed.path(), issuer).unwrap();
+        let note = store.mint(8, alice.public_key()).unwrap();
+        store.rotate().unwrap();
+        (note, store.issuer().snapshot())
+    };
+
+    let mut cluster = Cluster::from_copies(seed.path(), key).await;
+    let leader = cluster.leader().await;
+    assert_eq!(
+        cluster
+            .replica(leader)
+            .read(Issuer::snapshot)
+            .await
+            .unwrap(),
+        alone
+    );
+    let (paid, _) = pay(cluster.replica(leader), note, &alice).await;
+
+    // Readying a member that has joined leaves it as it is.
+    let member = (1..=3).find(|&id| id != leader).unwrap();
+    cluster.caught_up(member, leader).await;
+    cluster.stop(member).await;
+    let dir = cluster.dirs[&member].path().to_owned();
+    let ready = |dir: &Path| {
+        worgl_raft::prepare(dir, cluster.key.clone(), Policy::cash_like(), &*cluster.kek)
+    };
+    assert!(!ready(&dir).unwrap());
+    // A copy of its store without its vote is refused, not re-based.
+    let copy = tempfile::tempdir().unwrap();
+    copy_store(&dir, copy.path());
+    assert!(matches!(
+        ready(copy.path()),
+        Err(StoreError::Corrupt { .. })
+    ));
+
+    cluster.open(member).await;
+    cluster.caught_up(member, leader).await;
+    assert!(matches!(
+        status(cluster.replica(member), &paid),
+        NoteStatus::Live { .. }
+    ));
     cluster.shutdown().await;
 }

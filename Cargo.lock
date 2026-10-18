@@ -2907,6 +2907,8 @@ dependencies = [
  "getrandom 0.4.3",
  "hex",
  "http-body-util",
+ "openraft",
+ "reqwest",
  "serde",
  "serde_json",
  "subtle",
@@ -2916,6 +2918,7 @@ dependencies = [
  "tracing",
  "tracing-subscriber",
  "worgl",
+ "worgl-raft",
 ]
 
 [[package]]

@@ -26,6 +26,12 @@
 //! A new mint is built in a hidden `.new-<issuer key>` directory and renamed
 //! into place once complete, so a crash never leaves a mint half made; the
 //! server clears such leftovers when it starts.
+//!
+//! On a cluster member (see [`cluster`](crate::cluster)), a mint is a
+//! [`Replica`] of its group instead of a store of its own, and its directory
+//! also holds the replica's `vote.json`. Changes are answered once a
+//! majority of the members hold them on disk, and the leader alone makes
+//! them, scheduled rotations included.
 
 use std::collections::HashMap;
 use std::fmt;
@@ -36,15 +42,19 @@ use std::sync::{Arc, Mutex, RwLock};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context, Result, bail};
+use openraft::SnapshotPolicy;
 use serde::{Deserialize, Serialize};
-use tokio::sync::{mpsc, oneshot};
+use tokio::runtime::{Handle, RuntimeFlavor};
+use tokio::sync::{mpsc, oneshot, watch};
 use worgl::{
     BurnRequest, CommitError, Error, Issuer, IssuerKey, KeySet, LedgerConfig, MintRequest, Note,
     NoteError, PersistentIssuer, Policy, PublicKey, RotationReport, SetupError, TransferRequest,
     VerifiedBurn, VerifiedMint, VerifiedTransfer, Verifier,
 };
 use worgl::{FileKek, Kek};
+use worgl_raft::{Options, Replica, default_config};
 
+use crate::cluster::Cluster;
 use crate::files::{self, read_json, read_key, read_secret, write_secret};
 use crate::{ApiError, Info, MAX_BATCH, MIN_ADMIN_TOKEN_LEN, RotationSchedule, Verified};
 
@@ -60,6 +70,10 @@ const NEW_PREFIX: &str = ".new-";
 
 /// Changes that may wait for a mint's committer before senders have to wait too.
 const QUEUE: usize = 4096;
+
+/// How long a replica that does not lead waits for its leader to log a
+/// scheduled rotation before looking again.
+const FOLLOWER_WAIT: Duration = Duration::from_secs(1);
 
 /// What a mint is created with.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -192,10 +206,10 @@ pub fn create_mint(state: &Path, spec: &MintSpec) -> Result<CreatedMint, CreateE
     }
 }
 
-/// Reads and opens every mint under `state`, clearing half-made ones.
-pub(crate) fn load_all(state: &Path, kek: &Arc<dyn Kek>) -> Result<Vec<Loaded>> {
+/// The directory of every mint under `state`, clearing half-made ones.
+fn mint_dirs(state: &Path) -> Result<Vec<PathBuf>> {
     let mints = state.join(MINTS_DIR);
-    let mut loaded = Vec::new();
+    let mut dirs = Vec::new();
     for entry in fs::read_dir(&mints).with_context(|| format!("reading {}", mints.display()))? {
         let entry = entry?;
         let name = entry.file_name();
@@ -205,8 +219,31 @@ pub(crate) fn load_all(state: &Path, kek: &Arc<dyn Kek>) -> Result<Vec<Loaded>> 
             fs::remove_dir_all(entry.path())
                 .with_context(|| format!("removing {}", entry.path().display()))?;
         } else if !name.starts_with('.') && entry.file_type()?.is_dir() {
-            loaded.push(load(&entry.path(), kek.clone())?);
+            dirs.push(entry.path());
         }
+    }
+    Ok(dirs)
+}
+
+/// Reads and opens every mint under `state`, clearing half-made ones.
+pub(crate) fn load_all(state: &Path, kek: &Arc<dyn Kek>) -> Result<Vec<Loaded>> {
+    mint_dirs(state)?
+        .iter()
+        .map(|dir| load(dir, kek.clone()))
+        .collect()
+}
+
+/// Reads every mint under `state` and opens it as a replica of its group in
+/// `cluster`, as [`load_member`] does.
+pub(crate) async fn load_all_members(
+    state: &Path,
+    kek: &Arc<dyn Kek>,
+    cluster: &Arc<Cluster>,
+    compact_every: u64,
+) -> Result<Vec<Loaded>> {
+    let mut loaded = Vec::new();
+    for dir in mint_dirs(state)? {
+        loaded.push(load_member(&dir, kek.clone(), cluster, compact_every).await?);
     }
     Ok(loaded)
 }
@@ -214,20 +251,34 @@ pub(crate) fn load_all(state: &Path, kek: &Arc<dyn Kek>) -> Result<Vec<Loaded>> 
 /// A mint's files read and its store opened, before its tasks start.
 pub(crate) struct Loaded {
     dir: PathBuf,
-    issuer: PersistentIssuer,
+    key: PublicKey,
+    store: Store,
     token: String,
     settings: Settings,
 }
 
+enum Store {
+    /// A store of the mint's own.
+    Local(Box<PersistentIssuer>),
+    /// A replica of the mint's group.
+    Replicated(Arc<Replica>),
+}
+
 impl Loaded {
     pub(crate) fn key(&self) -> &PublicKey {
-        self.issuer.public_key()
+        &self.key
     }
 }
 
-/// Reads the mint in `dir` and opens its store, which seals the keys of its
-/// rotations with `kek`.
-pub(crate) fn load(dir: &Path, kek: Arc<dyn Kek>) -> Result<Loaded> {
+/// What a mint's directory holds beside its store.
+struct Files {
+    key: IssuerKey,
+    token: String,
+    policy: Policy,
+    settings: Settings,
+}
+
+fn read_files(dir: &Path) -> Result<Files> {
     let key = IssuerKey::from_secret_bytes(&read_key(&dir.join(KEY_FILE))?);
     let name = key.public_key().to_string();
     if dir.file_name().and_then(|name| name.to_str()) != Some(&name) {
@@ -256,6 +307,23 @@ pub(crate) fn load(dir: &Path, kek: Arc<dyn Kek>) -> Result<Loaded> {
             dir.join(SETTINGS_FILE).display()
         );
     }
+    Ok(Files {
+        key,
+        token,
+        policy,
+        settings,
+    })
+}
+
+/// Reads the mint in `dir` and opens its store, which seals the keys of its
+/// rotations with `kek`.
+pub(crate) fn load(dir: &Path, kek: Arc<dyn Kek>) -> Result<Loaded> {
+    let Files {
+        key,
+        token,
+        policy,
+        settings,
+    } = read_files(dir)?;
     let mut issuer = PersistentIssuer::open_with_kek(dir, key, policy, kek)
         .with_context(|| format!("opening {}", dir.display()))?;
     if settings.paused {
@@ -268,7 +336,53 @@ pub(crate) fn load(dir: &Path, kek: Arc<dyn Kek>) -> Result<Loaded> {
     }
     Ok(Loaded {
         dir: dir.to_owned(),
-        issuer,
+        key: *issuer.public_key(),
+        store: Store::Local(Box::new(issuer)),
+        token,
+        settings,
+    })
+}
+
+/// Reads the mint in `dir` and opens it as a replica of its group in
+/// `cluster`. A store that has never joined the group, whether new or one a
+/// server ran the mint on alone, is readied for it first (see
+/// [`worgl_raft::prepare`]), and the group formed.
+pub(crate) async fn load_member(
+    dir: &Path,
+    kek: Arc<dyn Kek>,
+    cluster: &Arc<Cluster>,
+    compact_every: u64,
+) -> Result<Loaded> {
+    if !worgl_raft::has_joined(dir) {
+        // Open it as a server on its own would first, which converts older
+        // stores and logs an older server's pause.
+        drop(load(dir, kek.clone())?);
+    }
+    let Files {
+        key,
+        token,
+        policy,
+        settings,
+    } = read_files(dir)?;
+    let public = key.public_key();
+    let new = worgl_raft::prepare(dir, key.clone(), policy.clone(), &*kek)
+        .with_context(|| format!("readying {} for its group", dir.display()))?;
+    let mut options = Options::new(cluster.node(), dir, key, policy, kek);
+    options.raft = openraft::Config {
+        snapshot_policy: SnapshotPolicy::LogsSinceLast(compact_every.max(1)),
+        ..default_config()
+    };
+    let replica = Replica::open(options, cluster.network(public))
+        .await
+        .with_context(|| format!("opening {} as a replica", dir.display()))?;
+    let replica = Arc::new(replica);
+    if new {
+        tokio::spawn(cluster.clone().form(replica.clone()));
+    }
+    Ok(Loaded {
+        dir: dir.to_owned(),
+        key: public,
+        store: Store::Replicated(replica),
         token,
         settings,
     })
@@ -281,6 +395,8 @@ enum Change {
     Burn(VerifiedBurn),
     /// With the boundary a schedule rotates for, or `None` on request.
     Rotate(Option<u64>),
+    /// Pauses, or resumes if false.
+    Pause(bool),
 }
 
 /// What a change produced.
@@ -288,6 +404,7 @@ enum Done {
     Notes(Vec<Note>),
     Burned(u128),
     Rotated(RotationReport),
+    Paused,
 }
 
 struct Job {
@@ -298,16 +415,30 @@ struct Job {
 /// A mint the server hosts.
 pub(crate) struct Mint {
     key: PublicKey,
-    inner: Arc<Mutex<Inner>>,
+    backend: Backend,
     changes: mpsc::Sender<Job>,
-    /// Replaced after every rotation, which adds a generation key.
-    verifier: Arc<RwLock<Verifier>>,
-    /// Mirrors whether the issuer is paused, which only changes under the
-    /// lock, so requests to a paused mint are refused before their
-    /// signatures are checked. The issuer itself decides in the committer.
-    paused: Arc<AtomicBool>,
     token: Box<str>,
     schedule: RwLock<Option<RotationSchedule>>,
+}
+
+enum Backend {
+    /// A store of the mint's own.
+    Local {
+        inner: Arc<Mutex<Inner>>,
+        /// Replaced after every rotation, which adds a generation key.
+        verifier: Arc<RwLock<Verifier>>,
+        /// Mirrors whether the issuer is paused, which only changes under
+        /// the lock, so requests to a paused mint are refused before their
+        /// signatures are checked. The issuer itself decides in the
+        /// committer.
+        paused: Arc<AtomicBool>,
+    },
+    /// A replica of the mint's group, whose verifier changes as it applies
+    /// rotations.
+    Replicated {
+        replica: Arc<Replica>,
+        verifier: watch::Receiver<Verifier>,
+    },
 }
 
 struct Inner {
@@ -325,30 +456,44 @@ impl Mint {
     pub(crate) fn start(loaded: Loaded, compact_every: u64) -> Arc<Self> {
         let Loaded {
             dir,
-            issuer,
+            key,
+            store,
             token,
             settings,
         } = loaded;
-        let key = *issuer.public_key();
-        let compact_every = compact_every.max(1);
-        let verifier = Arc::new(RwLock::new(issuer.issuer().verifier()));
-        let paused = Arc::new(AtomicBool::new(issuer.issuer().is_paused()));
-        let logged = issuer.issuer().last_scheduled_rotation().unwrap_or(0);
-        let inner = Arc::new(Mutex::new(Inner {
-            issuer,
-            verifier: verifier.clone(),
-            paused: paused.clone(),
-            compact_every,
-            compact_at: compact_every,
-        }));
         let (changes, queue) = mpsc::channel(QUEUE);
-        tokio::spawn(run_committer(inner.clone(), queue));
+        let (backend, logged) = match store {
+            Store::Local(issuer) => {
+                let compact_every = compact_every.max(1);
+                let verifier = Arc::new(RwLock::new(issuer.issuer().verifier()));
+                let paused = Arc::new(AtomicBool::new(issuer.issuer().is_paused()));
+                let logged = issuer.issuer().last_scheduled_rotation();
+                let inner = Arc::new(Mutex::new(Inner {
+                    issuer: *issuer,
+                    verifier: verifier.clone(),
+                    paused: paused.clone(),
+                    compact_every,
+                    compact_at: compact_every,
+                }));
+                tokio::spawn(run_committer(inner.clone(), queue));
+                let backend = Backend::Local {
+                    inner,
+                    verifier,
+                    paused,
+                };
+                (backend, logged)
+            }
+            Store::Replicated(replica) => {
+                let logged = replica.read_local(Issuer::last_scheduled_rotation);
+                tokio::spawn(run_replicated(replica.clone(), queue));
+                let verifier = replica.verifier();
+                (Backend::Replicated { replica, verifier }, logged)
+            }
+        };
         let mint = Arc::new(Self {
             key,
-            inner,
+            backend,
             changes,
-            verifier,
-            paused,
             token: token.into(),
             schedule: RwLock::new(None),
         });
@@ -358,10 +503,11 @@ impl Mint {
                 .ok()
                 .and_then(|text| text.trim().parse::<u64>().ok());
             let last = logged
+                .unwrap_or(0)
                 .max(saved.unwrap_or(0))
                 .max(unix_now() / period * period);
             mint.set_schedule(period, last);
-            let legacy = saved.is_some().then_some(legacy);
+            let legacy = saved.map(|floor| (legacy, floor));
             tokio::spawn(rotate_on_schedule(mint.clone(), period, last, legacy));
         }
         mint
@@ -375,13 +521,50 @@ impl Mint {
         &self.token
     }
 
+    /// The mint's replica, if it is one.
+    pub(crate) fn replica(&self) -> Option<&Arc<Replica>> {
+        match &self.backend {
+            Backend::Local { .. } => None,
+            Backend::Replicated { replica, .. } => Some(replica),
+        }
+    }
+
     /// The verifier for the mint's current generations.
     fn verifier(&self) -> Verifier {
-        // The lock guards a plain value, so a poisoned one still holds a usable verifier.
-        self.verifier
-            .read()
-            .unwrap_or_else(|e| e.into_inner())
-            .clone()
+        match &self.backend {
+            // The lock guards a plain value, so a poisoned one still holds a usable verifier.
+            Backend::Local { verifier, .. } => {
+                verifier.read().unwrap_or_else(|e| e.into_inner()).clone()
+            }
+            Backend::Replicated { verifier, .. } => verifier.borrow().clone(),
+        }
+    }
+
+    fn is_paused(&self) -> bool {
+        match &self.backend {
+            Backend::Local { paused, .. } => paused.load(Ordering::Acquire),
+            Backend::Replicated { replica, .. } => replica.read_local(Issuer::is_paused),
+        }
+    }
+
+    /// Whether this server makes the mint's changes: always for a store of
+    /// its own, and only while it leads for a replica.
+    fn leads(&self) -> bool {
+        match &self.backend {
+            Backend::Local { .. } => true,
+            Backend::Replicated { replica, .. } => replica.is_leader(),
+        }
+    }
+
+    /// For a replica, the boundary of the last scheduled rotation its group
+    /// logged, whichever member made it.
+    fn logged_rotation(&self) -> Option<u64> {
+        match &self.backend {
+            Backend::Local { .. } => None,
+            Backend::Replicated { replica, .. } => {
+                replica.read_local(Issuer::last_scheduled_rotation)
+            }
+        }
     }
 
     fn set_schedule(&self, period: u64, last: u64) {
@@ -393,7 +576,7 @@ impl Mint {
     }
 
     fn check_running(&self) -> Result<(), ApiError> {
-        if self.paused.load(Ordering::Acquire) {
+        if self.is_paused() {
             Err(ApiError::paused())
         } else {
             Ok(())
@@ -411,44 +594,51 @@ impl Mint {
             .map_err(|_| ApiError::internal("the committer dropped a request"))?
     }
 
-    /// Runs `f` on the blocking pool with the mint locked.
-    async fn locked<T, F>(&self, f: F) -> Result<T, ApiError>
+    /// Reads the issuer: with its store locked, on the blocking pool, for a
+    /// mint of its own, and once the leader has confirmed it leads and is up
+    /// to date for a replica.
+    async fn read<T, F>(&self, read: F) -> Result<T, ApiError>
     where
         T: Send + 'static,
-        F: FnOnce(&mut Inner) -> Result<T, ApiError> + Send + 'static,
+        F: FnOnce(&Issuer) -> T + Send + 'static,
     {
-        let inner = self.inner.clone();
-        tokio::task::spawn_blocking(move || {
-            let mut inner = inner
-                .lock()
-                .map_err(|_| ApiError::internal("issuer state is poisoned by an earlier panic"))?;
-            f(&mut inner)
-        })
-        .await
-        .map_err(|_| ApiError::internal("request handler panicked"))?
+        match &self.backend {
+            Backend::Local { inner, .. } => {
+                let inner = inner.clone();
+                tokio::task::spawn_blocking(move || {
+                    let inner = inner.lock().map_err(|_| {
+                        ApiError::internal("issuer state is poisoned by an earlier panic")
+                    })?;
+                    Ok(read(inner.issuer.issuer()))
+                })
+                .await
+                .map_err(|_| ApiError::internal("request handler panicked"))?
+            }
+            Backend::Replicated { replica, .. } => Ok(replica.read(read).await?),
+        }
     }
 
     pub(crate) async fn info(&self) -> Result<Info, ApiError> {
         let rotation = *self.schedule.read().unwrap_or_else(|e| e.into_inner());
-        self.locked(move |inner| {
-            let issuer = inner.issuer.issuer();
-            Ok(Info {
-                issuer: *issuer.public_key(),
-                sequence: issuer.sequence(),
-                mint_layer: issuer.mint_position(),
-                layers: issuer.layers(),
-                supply: issuer.supply(),
-                policy: issuer.policy().clone(),
-                rotation,
-                paused: issuer.is_paused(),
-            })
+        self.read(move |issuer| Info {
+            issuer: *issuer.public_key(),
+            sequence: issuer.sequence(),
+            mint_layer: issuer.mint_position(),
+            layers: issuer.layers(),
+            supply: issuer.supply(),
+            policy: issuer.policy().clone(),
+            rotation,
+            paused: issuer.is_paused(),
         })
         .await
     }
 
     /// The keys that sign the live generations, certified by the issuer key.
-    pub(crate) fn keys(&self) -> KeySet {
-        self.verifier().keys().clone()
+    pub(crate) async fn keys(&self) -> Result<KeySet, ApiError> {
+        match &self.backend {
+            Backend::Local { .. } => Ok(self.verifier().keys().clone()),
+            Backend::Replicated { .. } => self.read(|issuer| issuer.keys().clone()).await,
+        }
     }
 
     pub(crate) async fn verify(&self, note: Note) -> Result<Verified, ApiError> {
@@ -462,13 +652,11 @@ impl Mint {
                 if note.issuer() == keys.issuer() && generation < keys.oldest() => {}
             Err(error) => return Err(Error::Note { input: 0, error }.into()),
         }
-        self.locked(move |inner| {
-            let status = inner.issuer.issuer().serial_status(note.serial());
-            Ok(Verified {
-                serial: note.serial(),
-                amount: note.amount(),
-                status,
-            })
+        let (serial, amount) = (note.serial(), note.amount());
+        self.read(move |issuer| Verified {
+            serial,
+            amount,
+            status: issuer.serial_status(serial),
         })
         .await
     }
@@ -520,10 +708,15 @@ impl Mint {
         }
     }
 
-    /// Pauses or resumes the mint, durably, once the batch being committed
-    /// has finished.
+    /// Pauses or resumes the mint, durably, after the changes queued before.
     pub(crate) async fn set_paused(&self, paused: bool) -> Result<(), ApiError> {
-        self.locked(move |inner| inner.set_paused(paused)).await
+        match self.submit(Change::Pause(paused)).await? {
+            Done::Paused => {
+                tracing::info!(mint = %self.key, paused, "pause switched");
+                Ok(())
+            }
+            _ => unreachable!("a pause reports nothing"),
+        }
     }
 }
 
@@ -561,6 +754,10 @@ impl Inner {
                     rotated |= report.is_ok();
                     report.map(Done::Rotated)
                 }
+                Change::Pause(paused) => {
+                    batch.set_paused(paused);
+                    Ok(Done::Paused)
+                }
             })
             .collect();
         if let Err(error) = batch.commit() {
@@ -574,6 +771,8 @@ impl Inner {
                 .map(|result| result.and(Err(error.clone())))
                 .collect();
         }
+        let paused = self.issuer.issuer().is_paused();
+        self.paused.store(paused, Ordering::Release);
         if rotated {
             // Before any answer goes out, since notes of the new generation
             // only verify with its key.
@@ -604,16 +803,6 @@ impl Inner {
             }
         }
     }
-
-    fn set_paused(&mut self, paused: bool) -> Result<(), ApiError> {
-        if self.issuer.issuer().is_paused() == paused {
-            return Ok(());
-        }
-        self.issuer.set_paused(paused)?;
-        self.paused.store(paused, Ordering::Release);
-        tracing::info!(mint = %self.issuer.public_key(), paused, "pause switched");
-        Ok(())
-    }
 }
 
 /// Takes every change waiting, up to [`MAX_BATCH`], commits them together on
@@ -621,15 +810,7 @@ impl Inner {
 /// mint holds no thread.
 async fn run_committer(inner: Arc<Mutex<Inner>>, mut queue: mpsc::Receiver<Job>) {
     while let Some(first) = queue.recv().await {
-        let mut jobs = vec![first];
-        while jobs.len() < MAX_BATCH {
-            match queue.try_recv() {
-                Ok(job) => jobs.push(job),
-                Err(_) => break,
-            }
-        }
-        let (changes, replies): (Vec<_>, Vec<_>) =
-            jobs.into_iter().map(|job| (job.change, job.reply)).unzip();
+        let (changes, replies) = take_waiting(first, &mut queue);
         let count = changes.len();
         let inner = inner.clone();
         let results = tokio::task::spawn_blocking(move || match inner.lock() {
@@ -644,10 +825,95 @@ async fn run_committer(inner: Arc<Mutex<Inner>>, mut queue: mpsc::Receiver<Job>)
             let error = ApiError::internal("the committer panicked");
             (0..count).map(|_| Err(error.clone())).collect()
         });
-        for (reply, result) in replies.into_iter().zip(results) {
-            // The client may have gone away; the change stands regardless.
-            let _ = reply.send(result);
+        answer(replies, results);
+    }
+}
+
+type Reply = oneshot::Sender<Result<Done, ApiError>>;
+
+/// `first` and every job waiting behind it, up to [`MAX_BATCH`].
+fn take_waiting(first: Job, queue: &mut mpsc::Receiver<Job>) -> (Vec<Change>, Vec<Reply>) {
+    let mut jobs = vec![first];
+    while jobs.len() < MAX_BATCH {
+        match queue.try_recv() {
+            Ok(job) => jobs.push(job),
+            Err(_) => break,
         }
+    }
+    jobs.into_iter().map(|job| (job.change, job.reply)).unzip()
+}
+
+fn answer(replies: Vec<Reply>, results: Vec<Result<Done, ApiError>>) {
+    for (reply, result) in replies.into_iter().zip(results) {
+        // The client may have gone away; the change stands regardless.
+        let _ = reply.send(result);
+    }
+}
+
+/// The committer of a replica: takes every change waiting, as
+/// [`run_committer`] does, and commits them through the group as one entry.
+/// A replica that does not lead refuses them all.
+async fn run_replicated(replica: Arc<Replica>, mut queue: mpsc::Receiver<Job>) {
+    while let Some(first) = queue.recv().await {
+        let (changes, replies) = take_waiting(first, &mut queue);
+        let results = commit_replicated(&replica, changes).await;
+        answer(replies, results);
+    }
+}
+
+async fn commit_replicated(replica: &Replica, changes: Vec<Change>) -> Vec<Result<Done, ApiError>> {
+    let mut batch = match replica.batch().await {
+        Ok(batch) => batch,
+        Err(error) => {
+            let error = ApiError::from(error);
+            return changes.iter().map(|_| Err(error.clone())).collect();
+        }
+    };
+    // Planning signs every new note.
+    let results: Vec<_> = blocking(|| {
+        changes
+            .into_iter()
+            .map(|change| match change {
+                Change::Mint(mint) => batch
+                    .authorized_mint(&mint)
+                    .map(|note| Done::Notes(vec![note]))
+                    .map_err(ApiError::from),
+                Change::Transfer(transfer) => batch
+                    .transfer(&transfer)
+                    .map(Done::Notes)
+                    .map_err(ApiError::from),
+                Change::Burn(burn) => batch.burn(&burn).map(Done::Burned).map_err(ApiError::from),
+                Change::Rotate(due) => match due {
+                    Some(due) => batch.rotate_scheduled(due),
+                    None => batch.rotate(),
+                }
+                .map(Done::Rotated)
+                .map_err(ApiError::from),
+                Change::Pause(paused) => {
+                    batch.set_paused(paused);
+                    Ok(Done::Paused)
+                }
+            })
+            .collect()
+    });
+    if let Err(error) = batch.commit().await {
+        let error = ApiError::from(error);
+        return results
+            .into_iter()
+            .map(|result| result.and(Err(error.clone())))
+            .collect();
+    }
+    results
+}
+
+/// Runs `work` without stalling the tasks that share the thread, where the
+/// runtime allows it.
+fn blocking<T>(work: impl FnOnce() -> T) -> T {
+    match Handle::try_current() {
+        Ok(handle) if handle.runtime_flavor() == RuntimeFlavor::MultiThread => {
+            tokio::task::block_in_place(work)
+        }
+        _ => work(),
     }
 }
 
@@ -657,16 +923,24 @@ async fn run_committer(inner: Arc<Mutex<Inner>>, mut queue: mpsc::Receiver<Job>)
 ///
 /// Each scheduled rotation logs the boundary it was due at, and the issuer
 /// refuses one that is not due after the last, so neither a clock that steps
-/// backwards nor a restart can rotate twice for one period. `legacy` is the
-/// file an older server kept the last boundary in, removed once a scheduled
-/// rotation is logged.
+/// backwards nor a restart can rotate twice for one period. For a replica,
+/// only the leader rotates; the others follow what the group logs, so a new
+/// leader carries on from the last rotation logged. `legacy` is the file an
+/// older server kept the last boundary in, with that boundary, removed once
+/// a scheduled rotation after it is logged.
 async fn rotate_on_schedule(
     mint: Arc<Mint>,
     period: u64,
     mut last: u64,
-    mut legacy: Option<PathBuf>,
+    mut legacy: Option<(PathBuf, u64)>,
 ) {
     loop {
+        if let Some(logged) = mint.logged_rotation() {
+            last = last.max(logged);
+            if legacy.as_ref().is_some_and(|&(_, floor)| logged >= floor) {
+                remove_legacy(&mint, legacy.take());
+            }
+        }
         let now = unix_now();
         let next = last.saturating_add(period);
         mint.set_schedule(period, last);
@@ -676,28 +950,44 @@ async fn rotate_on_schedule(
             continue;
         }
         let due = now / period * period;
-        match mint.rotate(Some(due)).await {
-            Ok(report) => {
-                tracing::info!(mint = %mint.key, ?report, "scheduled rotation");
-                if let Some(file) = legacy.take()
-                    && let Err(error) = fs::remove_file(&file)
-                {
-                    tracing::warn!(mint = %mint.key, %error, "could not remove {}", file.display());
-                }
-            }
-            Err(error) if error.code() == "paused" => {
-                tracing::info!(mint = %mint.key, "paused; skipped a scheduled rotation");
-            }
-            Err(error) if error.code() == "stale_rotation" => {
-                tracing::info!(mint = %mint.key, due, "this period's rotation is already logged");
-            }
-            Err(error) => {
-                tracing::error!(mint = %mint.key, ?error, "scheduled rotation failed; retrying");
-                tokio::time::sleep(Duration::from_secs(period.min(60))).await;
+        if !mint.leads() {
+            if !mint.is_paused() {
+                // The leader rotates; look again once it has likely logged it.
+                tokio::time::sleep(FOLLOWER_WAIT).await;
                 continue;
+            }
+        } else {
+            match mint.rotate(Some(due)).await {
+                Ok(report) => {
+                    tracing::info!(mint = %mint.key, ?report, "scheduled rotation");
+                    remove_legacy(&mint, legacy.take());
+                }
+                Err(error) if error.code() == "paused" => {
+                    tracing::info!(mint = %mint.key, "paused; skipped a scheduled rotation");
+                }
+                Err(error) if error.code() == "stale_rotation" => {
+                    tracing::info!(mint = %mint.key, due, "this period's rotation is already logged");
+                }
+                Err(error) if error.code() == "no_leader" => {
+                    tokio::time::sleep(FOLLOWER_WAIT).await;
+                    continue;
+                }
+                Err(error) => {
+                    tracing::error!(mint = %mint.key, ?error, "scheduled rotation failed; retrying");
+                    tokio::time::sleep(Duration::from_secs(period.min(60))).await;
+                    continue;
+                }
             }
         }
         last = due;
+    }
+}
+
+fn remove_legacy(mint: &Mint, legacy: Option<(PathBuf, u64)>) {
+    if let Some((file, _)) = legacy
+        && let Err(error) = fs::remove_file(&file)
+    {
+        tracing::warn!(mint = %mint.key, %error, "could not remove {}", file.display());
     }
 }
 

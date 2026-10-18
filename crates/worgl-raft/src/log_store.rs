@@ -16,7 +16,7 @@ use worgl::{FileLog, PublicKey, StoreError};
 
 use crate::{NodeId, Request, TypeConfig, blocking};
 
-const VOTE: &str = "vote.json";
+pub(crate) const VOTE: &str = "vote.json";
 const VOTE_TMP: &str = "vote.json.tmp";
 
 /// A replica's log: openraft's entries in the mint's `log.bin`, and its

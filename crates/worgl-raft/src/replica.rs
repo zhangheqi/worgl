@@ -219,6 +219,17 @@ impl Replica {
         self.id
     }
 
+    /// Whether this replica leads its group, as far as it knows. A leader
+    /// cut off from the rest may not know yet that it no longer does.
+    pub fn is_leader(&self) -> bool {
+        self.leading().is_ok()
+    }
+
+    /// The leader this replica knows of, which may be itself.
+    pub fn leader(&self) -> Option<NodeId> {
+        self.raft.metrics().borrow().current_leader
+    }
+
     /// The replica's Raft node: give it the RPCs other replicas send, and
     /// read its metrics.
     pub fn raft(&self) -> &Raft {

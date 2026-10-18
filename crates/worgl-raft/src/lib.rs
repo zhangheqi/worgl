@@ -39,10 +39,12 @@
 //!
 //! # Starting a group
 //!
-//! Create the mint's directory with [`FileStore::create`](worgl::FileStore::create)
-//! and copy it to every member, so they all start from the same snapshot and
-//! key ring. Open a [`Replica`] on each, then call
-//! [`Replica::initialize`] on one of them with the whole membership.
+//! Copy the mint's directory, whether new from
+//! [`FileStore::create`](worgl::FileStore::create) or one a mint ran on
+//! alone, to every member, so they all start from the same snapshot and key
+//! ring. On each, run [`prepare`], open a [`Replica`] and, if `prepare` said
+//! the store had never joined a group, call [`Replica::initialize`] with the
+//! whole membership.
 //!
 //! # Transport
 //!
@@ -52,6 +54,7 @@
 //! [`SnapshotData`] travels as [`SnapshotData::to_bytes`].
 
 mod log_store;
+mod prepare;
 mod replica;
 mod state_machine;
 
@@ -63,6 +66,7 @@ use serde::{Deserialize, Serialize};
 use worgl::{DecodeError, Event, PublicKey, SealedKey};
 
 pub use log_store::LogStore;
+pub use prepare::{has_joined, prepare};
 pub use replica::{Batch, OpenError, Options, Replica, ReplicaError};
 pub use state_machine::{SnapshotBuilder, StateMachine};
 
@@ -182,14 +186,18 @@ impl fmt::Debug for SnapshotData {
 }
 
 /// Timings and snapshot policy for a group on one network: heartbeats every
-/// 250 ms, an election after 1 to 2 s without one, and a snapshot every
-/// 10,000 entries (and after every rotation, which [`Replica`] asks for).
+/// 250 ms, an election after 1 to 2 s without one, a minute to send a
+/// snapshot, and a snapshot every 10,000 entries (and after every rotation,
+/// which [`Replica`] asks for).
 pub fn default_config() -> openraft::Config {
     openraft::Config {
         cluster_name: "worgl".into(),
         heartbeat_interval: 250,
         election_timeout_min: 1_000,
         election_timeout_max: 2_000,
+        // A snapshot holds the whole ledger, which takes more than one
+        // heartbeat to send and install.
+        install_snapshot_timeout: 60_000,
         // Entries are group commits of up to 16 MiB; keep RPCs bounded.
         max_payload_entries: 64,
         snapshot_policy: SnapshotPolicy::LogsSinceLast(10_000),

@@ -27,7 +27,7 @@ The workspace has seven crates and a TypeScript package:
   hosts many issuers, called mints, side by side.
 - [`worgl-raft`](crates/worgl-raft): Raft replication for one mint, so a
   group of replicas keeps its log and any of them can take over as leader.
-  The server does not use it yet.
+  The server runs on it as a cluster.
 - [`worgl-sdk`](crates/worgl-sdk): the holder's side. A note store that
   requests, pays, receives and refreshes notes while keeping the privacy
   rules, with no networking of its own.
@@ -450,14 +450,54 @@ not slow the others, and an idle one holds no thread. A lock file per mint
 stops a second process from opening it. The server speaks plain HTTP: put it
 behind a reverse proxy for TLS and rate limiting.
 
+### Running a cluster
+
+Three servers can run as a cluster that keeps every mint on all three, so each
+mint carries on when one server fails. Each mint is a Raft group of the
+members, built on [`worgl-raft`](crates/worgl-raft), and a change is answered
+once two of the three hold it on disk. Every member starts from a copy of one
+state directory:
+
+```sh
+S=./target/release/worgl-server
+MEMBERS="--member 1=10.0.0.1:8080,10.0.0.1:7080 --member 2=10.0.0.2:8080,10.0.0.2:7080 --member 3=10.0.0.3:8080,10.0.0.3:7080"
+$S init         --state ./server
+$S create-mint  --state ./server --layers 4 --layer-size 1048576 --rotate-every 86400
+$S join-cluster --state ./server --node 1 $MEMBERS
+# Copy ./server to the other two machines and run join-cluster there with --node 2 and --node 3.
+$S serve        --state ./server --listen 0.0.0.0:8080
+```
+
+Each `--member` gives a member's id, the address of its public API and the
+address of its Raft port. `join-cluster` writes `cluster.json` and, the first
+time, `cluster.token` (mode 0600), which the members show each other on their
+Raft ports. Copy the directory before any member starts: the copies share the
+mints, tokens and key-encryption key, and differ only in `--node`. A directory
+a server has already run mints in can join too, and its mints carry on with
+every note and setting. On a member, `serve` also listens on its Raft port, or
+on `--raft-listen` if given.
+
+Any member takes any request, and one that does not lead the mint passes it on
+to the one that does. A read is answered once the leader confirms it still
+leads, so no answer is older than one already given. When a leader fails, the
+others elect a new one within a few seconds. Until then, requests are answered
+`503 no_leader`, and sending the same request again is safe. Only the leader
+makes scheduled rotations.
+
+The Raft port speaks plain HTTP and checks only the cluster token, so keep it
+on a network that only the members can reach. Mints are created offline, with
+every member stopped, so `POST /v1/admin/mints` answers `501 not_supported` on
+a cluster. The members are fixed once the cluster starts.
+
 ## Not covered yet
 
 - **The issuer sees lineage.** Inherent to the design; see above.
 - **No backing.** A mint authority decides what to mint; there is no deposit
   or redemption into other money.
-- **One copy of each mint** in the server, with no failover yet;
-  `worgl-raft` replicates a mint, and the server is next to use it. The
-  issuer key itself never rotates: a new one is a new mint.
+- **Clusters are fixed and their members talk in the clear.** Members cannot
+  be added or removed, a mint cannot be created while a cluster runs, and the
+  Raft port has no TLS. The issuer key itself never rotates: a new one is a
+  new mint.
 - **No SDK for other languages yet.** Rust and TypeScript have one, and
   the `worgl` command covers scripts; others call the HTTP API directly.
 
