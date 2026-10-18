@@ -71,19 +71,18 @@ pub enum OpenError {
     Store(#[from] StoreError),
     /// The Raft configuration is invalid.
     #[error("the raft configuration is invalid: {0}")]
-    Config(#[from] openraft::ConfigError),
+    Config(Box<openraft::ConfigError>),
     /// Raft could not start.
     #[error("raft did not start: {0}")]
-    Raft(#[from] Fatal<NodeId>),
+    Raft(Box<Fatal<NodeId>>),
 }
 
 /// A change or read the group did not carry out, or whose outcome is not
 /// known.
 #[derive(Debug, Clone, PartialEq, Eq, Error)]
 pub enum ReplicaError {
-    /// This replica does not lead its group, or cannot confirm that it
-    /// does. Nothing was changed. Send the request to the leader, if one is
-    /// known.
+    /// This replica does not lead its group. Nothing was changed. Send the
+    /// request to the leader, if one is known.
     #[error("this replica does not lead its group")]
     NotLeader {
         /// The leader this replica knows of.
@@ -91,9 +90,10 @@ pub enum ReplicaError {
         /// Where to reach it.
         node: Option<BasicNode>,
     },
-    /// The group did not answer in time. A batch may still commit, so send
-    /// the same requests again: a resent transfer, burn or authorized mint
-    /// is carried out once.
+    /// The group did not answer in time, as when a leader is cut off from
+    /// the rest of it. A batch may still commit, so send the same requests
+    /// again: a resent transfer, burn or authorized mint is carried out
+    /// once.
     #[error("the group did not answer in time")]
     Timeout,
     /// The batch reached the log but did not apply as planned, since it was
@@ -121,6 +121,7 @@ pub struct Replica {
     planner: Mutex<Option<Planner>>,
     kek: Arc<dyn Kek>,
     timeout: Duration,
+    heartbeat: Duration,
     /// Asks openraft for the snapshots the state machine wants.
     snapshots: JoinHandle<()>,
     /// Closes once the state machine has released the directory.
@@ -152,7 +153,11 @@ impl Replica {
             raft,
             timeout,
         } = options;
-        let config = Arc::new(raft.validate()?);
+        let config = raft
+            .validate()
+            .map_err(|error| OpenError::Config(Box::new(error)))?;
+        let config = Arc::new(config);
+        let heartbeat = Duration::from_millis(config.heartbeat_interval);
         let files = StateFiles::open(&dir)?;
         let public = key.public_key();
         let (wanted, mut snapshots) = mpsc::unbounded_channel();
@@ -173,7 +178,9 @@ impl Replica {
             }
             .into());
         }
-        let raft = Raft::new(node, config, network, log, machine).await?;
+        let raft = Raft::new(node, config, network, log, machine)
+            .await
+            .map_err(|fatal| OpenError::Raft(Box::new(fatal)))?;
         let handle = raft.clone();
         let snapshots = tokio::spawn(async move {
             while snapshots.recv().await.is_some() {
@@ -191,6 +198,7 @@ impl Replica {
             planner: Mutex::new(None),
             kek,
             timeout,
+            heartbeat,
             snapshots,
             released: Mutex::new(Some(released)),
         })
@@ -202,8 +210,8 @@ impl Replica {
     pub async fn initialize(
         &self,
         members: BTreeMap<NodeId, BasicNode>,
-    ) -> Result<(), RaftError<NodeId, InitializeError<NodeId, BasicNode>>> {
-        self.raft.initialize(members).await
+    ) -> Result<(), Box<RaftError<NodeId, InitializeError<NodeId, BasicNode>>>> {
+        self.raft.initialize(members).await.map_err(Box::new)
     }
 
     /// The replica's id within its group.
@@ -324,21 +332,27 @@ impl Replica {
     }
 
     async fn confirm_and_catch_up(&self) -> Result<(), ReplicaError> {
-        match self.raft.ensure_linearizable().await {
-            Ok(_) => {}
-            Err(RaftError::APIError(CheckIsLeaderError::ForwardToLeader(forward))) => {
-                return Err(ReplicaError::NotLeader {
-                    leader: forward.leader_id,
-                    node: forward.leader_node,
-                });
+        loop {
+            match self.raft.ensure_linearizable().await {
+                Ok(_) => break,
+                Err(RaftError::APIError(CheckIsLeaderError::ForwardToLeader(forward))) => {
+                    return Err(ReplicaError::NotLeader {
+                        leader: forward.leader_id,
+                        node: forward.leader_node,
+                    });
+                }
+                Err(RaftError::APIError(CheckIsLeaderError::QuorumNotEnough(_))) => {
+                    // Too few members answered within one heartbeat interval,
+                    // which a member busy syncing its disk is enough for. Ask
+                    // again while this replica still leads; one cut off from
+                    // the group asks until the caller's timeout.
+                    self.leading()?;
+                    tokio::time::sleep(self.heartbeat).await;
+                }
+                Err(RaftError::Fatal(fatal)) => {
+                    return Err(ReplicaError::Stopped(fatal.to_string()));
+                }
             }
-            Err(RaftError::APIError(CheckIsLeaderError::QuorumNotEnough(_))) => {
-                return Err(ReplicaError::NotLeader {
-                    leader: None,
-                    node: None,
-                });
-            }
-            Err(RaftError::Fatal(fatal)) => return Err(ReplicaError::Stopped(fatal.to_string())),
         }
         // A leader that restarts takes up its term again without knowing how
         // far it had committed, so openraft's read index can trail what it

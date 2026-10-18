@@ -169,9 +169,9 @@ impl Cluster {
             self.kek.clone(),
         );
         options.raft = openraft::Config {
-            heartbeat_interval: 50,
-            election_timeout_min: 300,
-            election_timeout_max: 600,
+            heartbeat_interval: 100,
+            election_timeout_min: 500,
+            election_timeout_max: 1_000,
             snapshot_policy: SnapshotPolicy::LogsSinceLast(1_000),
             // Every entry a snapshot holds leaves the log, so a replica that
             // fell behind needs the snapshot.
@@ -224,15 +224,15 @@ impl Cluster {
         }
     }
 
-    /// Waits until replica `id` has applied as far as replica `of` has.
+    /// Waits until replica `id` has applied every event replica `of` has.
+    /// (A replica's metrics can trail what it applied, so they cannot say.)
     async fn caught_up(&self, id: NodeId, of: NodeId) {
-        let applied = self.replicas[&of].raft().metrics().borrow().last_applied;
-        self.replicas[&id]
-            .raft()
-            .wait(Some(WAIT))
-            .applied_index_at_least(applied.map(|a| a.index), "caught up")
-            .await
-            .unwrap();
+        let sequence = self.replicas[&of].read_local(Issuer::sequence);
+        let deadline = Instant::now() + WAIT;
+        while self.replicas[&id].read_local(Issuer::sequence) < sequence {
+            assert!(Instant::now() < deadline, "replica {id} did not catch up");
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
     }
 
     fn replica(&self, id: NodeId) -> &Replica {
