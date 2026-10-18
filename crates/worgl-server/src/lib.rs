@@ -60,7 +60,7 @@ use serde::{Deserialize, Serialize};
 use subtle::ConstantTimeEq;
 use worgl::issuer::LayerSummary;
 use worgl::{
-    BurnRequest, CommitError, Error, KeySet, MintRequest, Note, NoteStatus, Policy, PublicKey,
+    BurnRequest, CommitError, Error, Kek, KeySet, MintRequest, Note, NoteStatus, Policy, PublicKey,
     RotationReport, Serial, Supply, TransferRequest,
 };
 
@@ -80,6 +80,7 @@ pub const MAX_BATCH: usize = 256;
 #[derive(Clone)]
 pub struct AppState {
     dir: Arc<Path>,
+    kek: Arc<dyn Kek>,
     mints: Arc<RwLock<Registry>>,
     operator_token: Arc<str>,
     compact_every: u64,
@@ -120,14 +121,16 @@ impl AppState {
                 token_file.display()
             );
         }
+        let kek = mints::open_kek(dir)?;
         let mut registry = Registry::new();
-        for loaded in mints::load_all(dir)? {
+        for loaded in mints::load_all(dir, &kek)? {
             let key = *loaded.key();
             tracing::info!(mint = %key, "mint loaded");
             registry.insert(key, Mint::start(loaded, compact_every));
         }
         Ok(Self {
             dir: dir.into(),
+            kek,
             mints: Arc::new(RwLock::new(registry)),
             operator_token: operator_token.into(),
             compact_every,
@@ -144,10 +147,11 @@ impl AppState {
     /// Creates a mint and starts serving it.
     pub async fn create_mint(&self, spec: MintSpec) -> Result<CreatedMint, ApiError> {
         let dir = PathBuf::from(&*self.dir);
+        let kek = self.kek.clone();
         let (created, loaded) = tokio::task::spawn_blocking(move || {
             let created = mints::create_mint(&dir, &spec)?;
             let path = dir.join(mints::MINTS_DIR).join(created.mint.to_string());
-            let loaded = mints::load(&path).map_err(CreateError::Storage)?;
+            let loaded = mints::load(&path, kek).map_err(CreateError::Storage)?;
             Ok::<_, CreateError>((created, loaded))
         })
         .await

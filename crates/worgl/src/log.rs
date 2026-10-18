@@ -2,8 +2,9 @@
 //! term and node of the leader that wrote it.
 //!
 //! A [`FileStore`](crate::FileStore) keeps every change since its snapshot
-//! here. An entry carries a batch of issuer [`Event`]s, nothing (a blank
-//! entry) or an opaque membership change. The term and node are for
+//! here. An entry carries a batch of issuer [`Event`]s, with the sealed
+//! secrets of any generation keys its rotations made (see [`kek`](crate::kek)),
+//! nothing (a blank entry) or an opaque membership change. The term and node are for
 //! replication, as Raft numbers its log: a store used on its own writes
 //! every entry under term 0 of node 0, and only ever appends to the log and
 //! purges it. Replication also reads entries back for followers and
@@ -20,7 +21,9 @@
 //! the record, length included. Kind 0 is a blank entry with an empty body;
 //! kind 1 carries events, its body `first sequence: u64 ‖ count: u32 ‖
 //! (event length: u32 ‖ event) × count`; kind 2 is a membership change,
-//! whose body the issuer never reads.
+//! whose body the issuer never reads; kind 3 carries events and sealed keys,
+//! its body that of kind 1 followed by `count: u32 ‖ (generation: u64 ‖
+//! public key ‖ sealed length: u32 ‖ sealed) × count`, with at least one key.
 //!
 //! Indexes count from 0 and follow each other with no gaps: the first entry
 //! in the file is the one after the last purged entry. An append writes its
@@ -37,7 +40,8 @@ use std::path::{Path, PathBuf};
 
 use crate::error::SetupError;
 use crate::issuer::Event;
-use crate::keys::PublicKey;
+use crate::kek::SealedKey;
+use crate::keys::{PUBLIC_KEY_LEN, PublicKey};
 use crate::store::{StoreError, checksum, sync_dir};
 
 pub(crate) const LOG: &str = "log.bin";
@@ -93,6 +97,10 @@ pub enum Payload {
         first: u64,
         /// The events, at least one.
         events: Vec<Event>,
+        /// The sealed secrets of the generation keys the events' rotations
+        /// certify, for replicas that lack them. Empty when no KEK sealed
+        /// them, as on a store of its own, which keeps them in `keys.bin`.
+        keys: Vec<SealedKey>,
     },
     /// A change of the replicas that keep the log, encoded by the
     /// replication layer. The issuer never reads it; the store keeps the
@@ -159,34 +167,12 @@ impl FileLog {
         let mut file = open_file(&dir)?;
         let mut bytes = Vec::new();
         file.read_to_end(&mut bytes)?;
-        let purged = parse_header(&bytes, issuer)?;
-        let mut next = next_after(purged);
-        let mut entries = Vec::new();
-        let mut ids = Vec::new();
-        let mut offset = HEADER_LEN as usize;
-        while offset < bytes.len() {
-            if let Some((entry, end)) = record_at(&bytes, offset) {
-                if entry.id.index != next {
-                    return Err(StoreError::Corrupt {
-                        offset: offset as u64,
-                        reason: format!("entry {} where entry {next} belongs", entry.id.index),
-                    });
-                }
-                ids.push((entry.id, offset as u64));
-                entries.push(entry);
-                next += 1;
-                offset = end;
-                continue;
-            }
-            // Only a torn final write may be unreadable: nothing readable may follow.
-            if (offset + 1..bytes.len()).any(|later| record_at(&bytes, later).is_some()) {
-                return Err(StoreError::Corrupt {
-                    offset: offset as u64,
-                    reason: "unreadable record followed by readable ones".into(),
-                });
-            }
-            break;
-        }
+        let Parsed {
+            purged,
+            entries,
+            ids,
+            end: offset,
+        } = parse(&bytes, issuer)?;
         if offset < bytes.len() {
             // Drop the torn tail so new records follow the last intact one.
             file.set_len(offset as u64)?;
@@ -202,6 +188,21 @@ impl FileLog {
             poisoned: false,
         };
         Ok((log, entries))
+    }
+
+    /// Reads the log in `dir`, which must hold `issuer`'s entries, without
+    /// changing it, for an audit: every intact entry, with the sealed keys
+    /// left out. A torn final record, as a running store may be writing, is
+    /// skipped, not cut off.
+    pub fn export(dir: impl AsRef<Path>, issuer: &PublicKey) -> Result<Vec<Entry>, StoreError> {
+        let bytes = fs::read(dir.as_ref().join(LOG))?;
+        let mut entries = parse(&bytes, issuer)?.entries;
+        for entry in &mut entries {
+            if let Payload::Events { keys, .. } = &mut entry.payload {
+                keys.clear();
+            }
+        }
+        Ok(entries)
     }
 
     /// Appends `entries`, whose indexes must carry on from
@@ -416,6 +417,54 @@ impl FileLog {
     }
 }
 
+/// A log file read through.
+struct Parsed {
+    purged: Option<LogId>,
+    entries: Vec<Entry>,
+    /// The id and offset of each entry.
+    ids: Vec<(LogId, u64)>,
+    /// Where the intact records end.
+    end: usize,
+}
+
+/// Reads a log file, stopping at a torn final record.
+fn parse(bytes: &[u8], issuer: &PublicKey) -> Result<Parsed, StoreError> {
+    let purged = parse_header(bytes, issuer)?;
+    let mut next = next_after(purged);
+    let mut entries = Vec::new();
+    let mut ids = Vec::new();
+    let mut offset = HEADER_LEN as usize;
+    while offset < bytes.len() {
+        if let Some((entry, end)) = record_at(bytes, offset) {
+            if entry.id.index != next {
+                return Err(StoreError::Corrupt {
+                    offset: offset as u64,
+                    reason: format!("entry {} where entry {next} belongs", entry.id.index),
+                });
+            }
+            ids.push((entry.id, offset as u64));
+            entries.push(entry);
+            next += 1;
+            offset = end;
+            continue;
+        }
+        // Only a torn final write may be unreadable: nothing readable may follow.
+        if (offset + 1..bytes.len()).any(|later| record_at(bytes, later).is_some()) {
+            return Err(StoreError::Corrupt {
+                offset: offset as u64,
+                reason: "unreadable record followed by readable ones".into(),
+            });
+        }
+        break;
+    }
+    Ok(Parsed {
+        purged,
+        entries,
+        ids,
+        end: offset,
+    })
+}
+
 /// The index of the entry after `id`, or 0 after none.
 fn next_after(id: Option<LogId>) -> u64 {
     id.map_or(0, |id| id.index + 1)
@@ -509,14 +558,27 @@ fn encode_record(entry: &Entry) -> Vec<u8> {
     }
     match &entry.payload {
         Payload::Blank => record.push(0),
-        Payload::Events { first, events } => {
-            record.push(1);
+        Payload::Events {
+            first,
+            events,
+            keys,
+        } => {
+            record.push(if keys.is_empty() { 1 } else { 3 });
             record.extend_from_slice(&first.to_be_bytes());
             record.extend_from_slice(&(events.len() as u32).to_be_bytes());
             for event in events {
                 let event = event.to_bytes();
                 record.extend_from_slice(&(event.len() as u32).to_be_bytes());
                 record.extend_from_slice(&event);
+            }
+            if !keys.is_empty() {
+                record.extend_from_slice(&(keys.len() as u32).to_be_bytes());
+                for key in keys {
+                    record.extend_from_slice(&key.generation.to_be_bytes());
+                    record.extend_from_slice(key.public.as_bytes());
+                    record.extend_from_slice(&(key.sealed.len() as u32).to_be_bytes());
+                    record.extend_from_slice(&key.sealed);
+                }
             }
         }
         Payload::Membership(bytes) => {
@@ -553,7 +615,7 @@ fn record_at(bytes: &[u8], offset: usize) -> Option<(Entry, usize)> {
     let rest = &body[4 + ENTRY_HEAD..];
     let payload = match body[28] {
         0 if rest.is_empty() => Payload::Blank,
-        1 => {
+        kind @ (1 | 3) => {
             let first = u64::from_be_bytes(rest.get(..8)?.try_into().ok()?);
             let count = u32::from_be_bytes(rest.get(8..12)?.try_into().ok()?);
             let mut rest = &rest[EVENTS_HEAD..];
@@ -563,10 +625,36 @@ fn record_at(bytes: &[u8], offset: usize) -> Option<(Entry, usize)> {
                 events.push(Event::from_bytes(rest.get(4..4 + len)?).ok()?);
                 rest = &rest[4 + len..];
             }
+            let mut keys = Vec::new();
+            if kind == 3 {
+                let count = u32::from_be_bytes(rest.get(..4)?.try_into().ok()?);
+                rest = &rest[4..];
+                for _ in 0..count {
+                    let generation = u64::from_be_bytes(rest.get(..8)?.try_into().ok()?);
+                    let public = rest.get(8..8 + PUBLIC_KEY_LEN)?.try_into().ok()?;
+                    let public = PublicKey::from_bytes(public).ok()?;
+                    rest = &rest[8 + PUBLIC_KEY_LEN..];
+                    let len = u32::from_be_bytes(rest.get(..4)?.try_into().ok()?) as usize;
+                    let sealed = rest.get(4..4 + len)?.to_vec();
+                    rest = &rest[4 + len..];
+                    keys.push(SealedKey {
+                        generation,
+                        public,
+                        sealed,
+                    });
+                }
+                if keys.is_empty() {
+                    return None;
+                }
+            }
             if !rest.is_empty() || events.is_empty() {
                 return None;
             }
-            Payload::Events { first, events }
+            Payload::Events {
+                first,
+                events,
+                keys,
+            }
         }
         2 => Payload::Membership(rest.to_vec()),
         _ => return None,
@@ -599,7 +687,16 @@ mod tests {
             payload: Payload::Events {
                 first: index + 1,
                 events: vec![mint(index)],
+                keys: Vec::new(),
             },
+        }
+    }
+
+    fn sealed(generation: u64) -> SealedKey {
+        SealedKey {
+            generation,
+            public: HolderKey::from_secret_bytes(&[generation as u8; 32]).public_key(),
+            sealed: vec![generation as u8; 73],
         }
     }
 
@@ -647,6 +744,19 @@ mod tests {
                 payload: Payload::Events {
                     first: 1,
                     events: vec![mint(0), rotation],
+                    keys: Vec::new(),
+                },
+            },
+            Entry {
+                id: LogId {
+                    term: 1,
+                    node: 2,
+                    index: 3,
+                },
+                payload: Payload::Events {
+                    first: 3,
+                    events: vec![mint(2)],
+                    keys: vec![sealed(4), sealed(5)],
                 },
             },
         ];
@@ -654,13 +764,13 @@ mod tests {
         assert_eq!(log.read(..).unwrap(), entries);
         assert_eq!(log.read(1..=1).unwrap(), entries[1..2]);
         assert_eq!(log.read(2..9).unwrap(), entries[2..]);
-        assert!(log.read(3..).unwrap().is_empty());
-        assert_eq!(log.last_id(), Some(entries[2].id));
+        assert!(log.read(4..).unwrap().is_empty());
+        assert_eq!(log.last_id(), Some(entries[3].id));
         drop(log);
 
         let (log, read) = reopen(dir.path(), &issuer);
         assert_eq!(read, entries);
-        assert_eq!(log.next_index(), 3);
+        assert_eq!(log.next_index(), 4);
         assert_eq!(
             log.bytes(),
             fs::metadata(dir.path().join(LOG)).unwrap().len()
@@ -683,6 +793,7 @@ mod tests {
             payload: Payload::Events {
                 first: 3,
                 events: Vec::new(),
+                keys: Vec::new(),
             },
         };
         assert!(log.append(&[empty]).is_err());
@@ -773,6 +884,59 @@ mod tests {
         log.append(&[entry(1, 1)]).unwrap();
         drop(log);
         assert_eq!(reopen(dir.path(), &issuer).1.len(), 2);
+    }
+
+    #[test]
+    fn an_export_leaves_out_sealed_keys_and_changes_nothing() {
+        let (dir, issuer, mut log) = fresh();
+        let keyed = Entry {
+            id: LogId::standalone(1),
+            payload: Payload::Events {
+                first: 2,
+                events: vec![mint(1)],
+                keys: vec![sealed(4)],
+            },
+        };
+        log.append(&[entry(1, 0), keyed.clone(), entry(1, 2)])
+            .unwrap();
+        let len = log.bytes();
+        drop(log);
+        // A record being written as the export reads the file.
+        let mut file = OpenOptions::new()
+            .append(true)
+            .open(dir.path().join(LOG))
+            .unwrap();
+        file.write_all(&encode_record(&entry(1, 3))[..20]).unwrap();
+        drop(file);
+
+        let exported = FileLog::export(dir.path(), &issuer).unwrap();
+        let mut bare = keyed;
+        if let Payload::Events { keys, .. } = &mut bare.payload {
+            keys.clear();
+        }
+        assert_eq!(exported, [entry(1, 0), bare, entry(1, 2)]);
+        assert_eq!(
+            fs::metadata(dir.path().join(LOG)).unwrap().len(),
+            len + 20,
+            "the torn record is left for its writer"
+        );
+        let other = IssuerKey::generate().public_key();
+        assert!(FileLog::export(dir.path(), &other).is_err());
+    }
+
+    #[test]
+    fn a_keyed_entry_with_no_keys_is_unreadable() {
+        let mut record = encode_record(&entry(1, 0));
+        // Kind 3 with a key count of 0: the same entry, written two ways.
+        record[28] = 3;
+        let at = record.len() - 8;
+        record.splice(at..at, [0; 4]);
+        let len = (record.len() - 12) as u32;
+        record[..4].copy_from_slice(&len.to_be_bytes());
+        let at = record.len() - 8;
+        let sum = checksum(&record[..at]);
+        record[at..].copy_from_slice(&sum);
+        assert!(record_at(&record, 0).is_none());
     }
 
     #[test]

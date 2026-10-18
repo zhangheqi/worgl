@@ -739,6 +739,66 @@ async fn a_logged_scheduled_rotation_retires_the_last_rotation_file() {
 }
 
 #[tokio::test]
+async fn the_state_directory_keeps_a_private_kek() {
+    let server = Server::new().await;
+    let path = server.dir.path().join("kek.key");
+    let kek = fs::read_to_string(&path).unwrap();
+    assert_eq!(kek.trim().len(), 64);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let mode = fs::metadata(&path).unwrap().permissions().mode();
+        assert_eq!(mode & 0o777, 0o600);
+    }
+    // Rotations seal their keys with it, and the mint opens again after them.
+    let (code, _) = server.admin(&server.first, "rotate").await;
+    assert_eq!(code, StatusCode::OK);
+    let server = server.restart().await;
+    assert_eq!(fs::read_to_string(&path).unwrap(), kek);
+    server.mint(8, &HolderKey::generate()).await;
+
+    // A state directory from before KEKs gets one when it opens.
+    fs::remove_file(&path).unwrap();
+    let server = server.restart().await;
+    assert!(path.exists());
+    server.mint(8, &HolderKey::generate()).await;
+}
+
+#[tokio::test]
+async fn export_log_prints_each_entry_as_json() {
+    let server = Server::new().await;
+    let alice = HolderKey::generate();
+    server.mint(8, &alice).await;
+    server.mint(4, &alice).await;
+    let dir = server.dir.path().join("mints").join(server.key.to_string());
+    let export = |dir: &Path| {
+        std::process::Command::new(env!("CARGO_BIN_EXE_worgl-server"))
+            .args(["export-log", "--mint"])
+            .arg(dir)
+            .output()
+            .unwrap()
+    };
+    let output = export(&dir);
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let lines: Vec<Value> = String::from_utf8(output.stdout)
+        .unwrap()
+        .lines()
+        .map(|line| serde_json::from_str(line).unwrap())
+        .collect();
+    assert_eq!(lines.len(), 2);
+    assert_eq!(
+        (&lines[1]["index"], &lines[1]["term"], &lines[1]["first"]),
+        (&json!(1), &json!(0), &json!(2))
+    );
+    assert_eq!(lines[1]["events"].as_array().unwrap().len(), 1);
+    assert!(!export(server.dir.path()).status.success());
+}
+
+#[tokio::test]
 async fn info_reports_the_rotation_schedule() {
     let server = Server::with_policy(Policy::cash_like(), Some(86_400)).await;
     let schedule = server.info().await.rotation.unwrap();
