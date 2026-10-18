@@ -371,7 +371,7 @@ async fn rotate(
 ) -> Result<Json<RotationReport>, ApiError> {
     let mint = state.mint_at(&mint)?;
     check_bearer(&headers, mint.token(), "mint admin")?;
-    let report = mint.rotate().await?;
+    let report = mint.rotate(None).await?;
     tracing::info!(mint = %mint.key(), ?report, "rotated by admin request");
     Ok(Json(report))
 }
@@ -488,7 +488,7 @@ impl ApiError {
     /// `unauthorized` (a holder's or mint authority's signature),
     /// `unknown_authority`, `admin_unauthorized` (a missing or wrong token),
     /// `unknown_mint`, `paused`, `spent`, `expired`, `unissued`, `frozen`,
-    /// `stale_mint`, `layer_full`, `storage`, `internal`.
+    /// `stale_mint`, `stale_rotation`, `layer_full`, `storage`, `internal`.
     pub fn code(&self) -> &'static str {
         self.code
     }
@@ -497,6 +497,7 @@ impl ApiError {
 impl From<Error> for ApiError {
     fn from(error: Error) -> Self {
         let (status, code) = match &error {
+            Error::Paused => return Self::paused(),
             Error::Policy(_) => (StatusCode::BAD_REQUEST, "policy"),
             Error::Note { .. } => (StatusCode::BAD_REQUEST, "invalid_note"),
             Error::DuplicateInput(_) => (StatusCode::BAD_REQUEST, "duplicate_input"),
@@ -505,6 +506,7 @@ impl From<Error> for ApiError {
             }
             Error::UnknownAuthority(_) => (StatusCode::FORBIDDEN, "unknown_authority"),
             Error::StaleMint { .. } => (StatusCode::CONFLICT, "stale_mint"),
+            Error::StaleRotation { .. } => (StatusCode::CONFLICT, "stale_rotation"),
             Error::Spent(_) => (StatusCode::CONFLICT, "spent"),
             Error::Expired(_) => (StatusCode::CONFLICT, "expired"),
             Error::Unissued(_) => (StatusCode::CONFLICT, "unissued"),

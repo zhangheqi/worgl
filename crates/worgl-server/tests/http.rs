@@ -110,6 +110,36 @@ impl Server {
         }
     }
 
+    /// A server whose one mint was made offline and then changed on disk by
+    /// `edit`, given the mint's directory, before the server opened it.
+    async fn opened_after(rotate_every: Option<u64>, edit: impl FnOnce(&Path)) -> Self {
+        let dir = tempfile::tempdir().unwrap();
+        init_state(dir.path()).unwrap();
+        let operator = read_token(&dir.path().join("operator.token"));
+        let authority = MintKey::generate();
+        let mut policy = Policy::cash_like();
+        policy.mint_authorities.push(authority.public_key());
+        let spec = MintSpec {
+            ledger: LEDGER,
+            policy,
+            rotate_every,
+        };
+        let created = create_mint(dir.path(), &spec).unwrap();
+        edit(&dir.path().join("mints").join(created.mint.to_string()));
+        let app = router(AppState::open(dir.path(), 1000).unwrap());
+        Self {
+            app,
+            operator,
+            first: TestMint {
+                key: created.mint,
+                token: created.token,
+                authority,
+                sequence: AtomicU64::new(0),
+            },
+            dir,
+        }
+    }
+
     /// Creates another mint through the operator API.
     async fn add_mint(&self, policy: Policy) -> TestMint {
         add_mint(&self.app, &self.operator, policy, None).await
@@ -643,10 +673,69 @@ async fn a_paused_mint_moves_nothing_until_resumed_even_after_a_restart() {
     assert_eq!(code, StatusCode::OK, "{answer}");
     let info = server.info().await;
     assert!(!info.paused);
-    assert_eq!(info.sequence, 3);
+    // Two mints and a transfer, with the pause and resume logged between.
+    assert_eq!(info.sequence, 5);
     // Resuming a running mint changes nothing.
     let (code, answer) = server.admin(&server.first, "resume").await;
     assert_eq!((code, &answer["paused"]), (StatusCode::OK, &json!(false)));
+}
+
+#[tokio::test]
+async fn a_pause_an_older_server_kept_in_mint_json_is_logged() {
+    let server = Server::opened_after(None, |dir| {
+        fs::write(dir.join("mint.json"), r#"{"paused": true}"#).unwrap();
+    })
+    .await;
+    let info = server.info().await;
+    assert!(info.paused);
+    assert_eq!(info.sequence, 1, "the pause is an event");
+    let dir = server.dir.path().join("mints").join(server.key.to_string());
+    let settings: Value =
+        serde_json::from_slice(&fs::read(dir.join("mint.json")).unwrap()).unwrap();
+    assert_eq!(settings, json!({"rotate_every": null}));
+
+    // Resumed, it stays resumed across a restart.
+    let (code, _) = server.admin(&server.first, "resume").await;
+    assert_eq!(code, StatusCode::OK);
+    let server = server.restart().await;
+    assert!(!server.info().await.paused);
+    server.mint(8, &HolderKey::generate()).await;
+}
+
+#[tokio::test]
+async fn an_older_servers_last_rotation_file_is_a_floor_for_the_schedule() {
+    let period = 86_400;
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_secs();
+    let floor = (now / period + 4) * period;
+    let server = Server::opened_after(Some(period), |dir| {
+        fs::write(dir.join("last_rotation"), format!("{floor}\n")).unwrap();
+    })
+    .await;
+    assert_eq!(
+        server.info().await.rotation.unwrap().next_at,
+        floor + period
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_logged_scheduled_rotation_retires_the_last_rotation_file() {
+    let mut dir = None;
+    let server = Server::opened_after(Some(1), |mint| {
+        fs::write(mint.join("last_rotation"), "1\n").unwrap();
+        dir = Some(mint.to_owned());
+    })
+    .await;
+    let legacy = dir.unwrap().join("last_rotation");
+    for _ in 0..100 {
+        if server.info().await.sequence > 0 && !legacy.exists() {
+            return;
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    panic!("no scheduled rotation removed {}", legacy.display());
 }
 
 #[tokio::test]

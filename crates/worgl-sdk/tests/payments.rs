@@ -206,7 +206,7 @@ fn frozen_notes_wait_for_the_next_rotation() {
         }
     );
 
-    mint.rotate();
+    mint.rotate().unwrap();
     let payment = bob.pay(&view(&mint), &request, Spacing::default()).unwrap();
     let answers = submit(&mut mint, &payment);
     assert_eq!(carol.absorb(&answers[0]), 1);
@@ -219,7 +219,7 @@ fn refreshing_keeps_notes_alive() {
     let mut alice = Holder::new();
     // Minted into the second to last layer, position 1 of 3.
     fund(&mut mint, &mut alice, &[2, 4]);
-    mint.rotate();
+    mint.rotate().unwrap();
     let v = view(&mint);
     assert_eq!(alice.balance(&v).expiring, 6);
 
@@ -233,7 +233,7 @@ fn refreshing_keeps_notes_alive() {
     alice.cancel(&refreshes[1].request);
     assert_eq!(alice.balance(&view(&mint)).expiring, 6 - refreshed);
 
-    mint.rotate();
+    mint.rotate().unwrap();
     let v = view(&mint);
     assert_eq!(alice.prune(&v), 6 - refreshed);
     assert_eq!(total(&alice, &v), refreshed);

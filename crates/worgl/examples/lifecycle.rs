@@ -46,7 +46,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let refused = pay(&mut issuer, &mut alice, 4).unwrap_err();
     println!("Alice pays 4 right away: refused, {refused}\n");
 
-    let report = issuer.rotate();
+    let report = issuer.rotate().unwrap();
     println!(
         "rotation: generation {} dropped, {} notes destroyed\n",
         report.dropped, report.destroyed_notes
@@ -72,7 +72,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let refused = issuer.transfer(&again).unwrap_err();
     println!("Alice replays her old 16: refused, {refused}\n");
 
-    issuer.rotate();
+    issuer.rotate().unwrap();
     let mut carol: Pocket = Vec::new();
     carol.push(pay(&mut issuer, &mut bob, 4)?);
     show(&issuer, "Carol's 4", &carol[0].0);
@@ -80,7 +80,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Four rotations: Alice leaves her change alone, Carol refreshes hers by
     // paying it to a fresh key of her own once per period.
     for round in 1..=4 {
-        let report = issuer.rotate();
+        let report = issuer.rotate().unwrap();
         println!(
             "rotation {round}: {} notes worth {} destroyed",
             report.destroyed_notes, report.destroyed_value

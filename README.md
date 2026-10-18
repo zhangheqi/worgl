@@ -214,9 +214,11 @@ time.
 period since the Unix epoch, so restarts do not shift it. Each mint has its
 own period, and its `info` reports the period and the time of the next
 rotation, so clients know when frozen notes thaw and when idle ones must be
-refreshed. The server records the last scheduled boundary, so a wall clock
-that steps backwards cannot rotate twice in one period. Boundaries missed
-while the server is down, or while the mint is paused, are not made up.
+refreshed. A scheduled rotation logs the boundary it was due at, and the
+issuer refuses one that is not due after the last, so neither a wall clock
+that steps backwards nor a restart can rotate twice in one period.
+Boundaries missed while the server is down, or while the mint is paused, are
+not made up.
 
 **Storage fails loudly.** The log is tied to its issuer's key, every
 record is checksummed, and a damaged record is only dropped when nothing
@@ -228,7 +230,9 @@ losing acknowledged transfers.
 term and node of the leader that wrote it, as Raft numbers its log; the
 snapshot records the last entry it holds; and the log can drop a tail that a
 new leader overwrote. A store on its own writes every entry under term 0.
-Stores from before the log convert the first time they are opened.
+Stores from before the log convert the first time they are opened. Pausing,
+resuming and the time a scheduled rotation was due are events in the log
+too, so every replica of a mint agrees on them.
 
 **Generation keys live in their own file.** The snapshot and log hold
 only public keys and certificates, so they can be copied or audited without
@@ -412,9 +416,9 @@ printed:
 **Pausing stops a mint without costing anyone a note.** A paused mint refuses
 transfers, burns, mints and rotations, scheduled or requested, and still
 verifies notes, so nothing moves and nothing expires until it resumes. Its
-`info` shows the pause to everyone, and the pause survives restarts. It is
-for incidents such as a leaked key or an attack on one mint; the others carry
-on.
+`info` shows the pause to everyone, and the pause is logged, so it survives
+restarts. It is for incidents such as a leaked key or an attack on one mint;
+the others carry on.
 
 Routes with a token need `Authorization: Bearer <token>`. Errors carry a
 stable code, such as `{"error": "spent", "message": "note 3:17 is already
