@@ -1256,6 +1256,19 @@ dependencies = [
 ]
 
 [[package]]
+name = "worgl-sdk"
+version = "0.1.0"
+dependencies = [
+ "getrandom",
+ "hex",
+ "proptest",
+ "serde",
+ "serde_json",
+ "thiserror",
+ "worgl",
+]
+
+[[package]]
 name = "worgl-server"
 version = "0.1.0"
 dependencies = [
