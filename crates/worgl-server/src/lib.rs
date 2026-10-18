@@ -42,7 +42,22 @@
 //! cannot refresh it; it still verifies notes. Errors answer with a status
 //! code and `{"error": code, "message": text}`, where `code` is one of the
 //! stable strings listed on [`ApiError::code`].
+//!
+//! # Clusters
+//!
+//! A server can also be one member of a cluster that replicates every mint
+//! across its members (see [`cluster`]), opened with
+//! [`AppState::open_member`]. Any member takes any request: one that does not
+//! lead the mint passes it on to the member that does. A change is answered
+//! once a majority of the members hold it on disk, and a read once the
+//! leader has confirmed it still leads, so no answer is lost when a member
+//! fails and none reflects less than an earlier one. While a mint has no
+//! leader, as for a second or two after its leader fails, its requests are
+//! answered `503 no_leader`, and sending them again is safe. Members also
+//! serve [`raft_router`] on a port of their own, for each other only.
+//! Creating a mint while serving is not supported on a cluster yet.
 
+pub mod cluster;
 pub mod files;
 pub mod mints;
 
@@ -53,6 +68,7 @@ use anyhow::bail;
 use axum::extract::rejection::JsonRejection;
 use axum::extract::{DefaultBodyLimit, Path as UrlPath, State};
 use axum::http::{HeaderMap, StatusCode, header};
+use axum::middleware;
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
 use axum::{Json, Router};
@@ -63,7 +79,10 @@ use worgl::{
     BurnRequest, CommitError, Error, Kek, KeySet, MintRequest, Note, NoteStatus, Policy, PublicKey,
     RotationReport, Serial, Supply, TransferRequest,
 };
+use worgl_raft::{NodeId, Replica, ReplicaError};
 
+use cluster::{Cluster, RAFT_BODY_LIMIT};
+pub use cluster::{ClusterConfig, Member, is_member, join_cluster};
 pub use mints::{CreateError, CreatedMint, MintSpec, create_mint, init_state};
 use mints::{Mint, Registry};
 
@@ -84,6 +103,8 @@ pub struct AppState {
     mints: Arc<RwLock<Registry>>,
     operator_token: Arc<str>,
     compact_every: u64,
+    /// The cluster this server is a member of, if any.
+    cluster: Option<Arc<Cluster>>,
 }
 
 /// When a mint rotates on its own, as reported by its `info`.
@@ -106,6 +127,45 @@ impl AppState {
     /// `compact_every` is how many logged events trigger a fresh snapshot
     /// of a mint; rotations always do. Must be called within a Tokio runtime.
     pub fn open(dir: &Path, compact_every: u64) -> anyhow::Result<Self> {
+        if is_member(dir) {
+            bail!(
+                "{} is a cluster member's; open it with AppState::open_member",
+                dir.display()
+            );
+        }
+        let (operator_token, kek) = Self::read_state(dir)?;
+        let loaded = mints::load_all(dir, &kek)?;
+        Ok(Self::start(
+            dir,
+            kek,
+            operator_token,
+            compact_every,
+            None,
+            loaded,
+        ))
+    }
+
+    /// Opens the server state of a cluster member in `dir`, made by
+    /// [`init_state`] and [`join_cluster`], as [`open`](Self::open) does, with
+    /// every mint a replica of its group. The group of a mint whose store
+    /// has never joined one is formed once the members are up. Must be
+    /// called within a multi-threaded Tokio runtime.
+    pub async fn open_member(dir: &Path, compact_every: u64) -> anyhow::Result<Self> {
+        let (operator_token, kek) = Self::read_state(dir)?;
+        let cluster = Cluster::open(dir)?;
+        let loaded = mints::load_all_members(dir, &kek, &cluster, compact_every).await?;
+        let state = Self::start(
+            dir,
+            kek,
+            operator_token,
+            compact_every,
+            Some(cluster),
+            loaded,
+        );
+        Ok(state)
+    }
+
+    fn read_state(dir: &Path) -> anyhow::Result<(String, Arc<dyn Kek>)> {
         if dir.join("issuer.key").exists() {
             bail!(
                 "{} holds a single issuer from before mints; run `init` on a new directory \
@@ -121,20 +181,71 @@ impl AppState {
                 token_file.display()
             );
         }
-        let kek = mints::open_kek(dir)?;
+        Ok((operator_token, mints::open_kek(dir)?))
+    }
+
+    fn start(
+        dir: &Path,
+        kek: Arc<dyn Kek>,
+        operator_token: String,
+        compact_every: u64,
+        cluster: Option<Arc<Cluster>>,
+        loaded: Vec<mints::Loaded>,
+    ) -> Self {
         let mut registry = Registry::new();
-        for loaded in mints::load_all(dir, &kek)? {
+        for loaded in loaded {
             let key = *loaded.key();
             tracing::info!(mint = %key, "mint loaded");
             registry.insert(key, Mint::start(loaded, compact_every));
         }
-        Ok(Self {
+        Self {
             dir: dir.into(),
             kek,
             mints: Arc::new(RwLock::new(registry)),
             operator_token: operator_token.into(),
             compact_every,
-        })
+            cluster,
+        }
+    }
+
+    /// The id of the member leading the mint with issuer key `mint`, as far
+    /// as this member knows, or `None` if it knows of none or this server is
+    /// not a cluster member.
+    pub fn leader(&self, mint: &PublicKey) -> Option<NodeId> {
+        self.replica(mint)?.leader()
+    }
+
+    /// Stops the replicas of a cluster member's mints and waits until their
+    /// directories are unlocked. Requests to them fail from then on.
+    pub async fn shutdown(&self) {
+        let replicas: Vec<_> = self
+            .registry()
+            .values()
+            .filter_map(|mint| mint.replica().cloned())
+            .collect();
+        for replica in replicas {
+            if let Err(error) = replica.shutdown().await {
+                tracing::warn!(mint = %replica.public_key(), %error, "stopping a replica failed");
+            }
+        }
+    }
+
+    fn cluster(&self) -> Option<&Arc<Cluster>> {
+        self.cluster.as_ref()
+    }
+
+    /// The replica of the mint with issuer key `key`, if this is a cluster
+    /// member hosting that mint.
+    fn replica(&self, key: &PublicKey) -> Option<Arc<Replica>> {
+        self.registry().get(key)?.replica().cloned()
+    }
+
+    /// The replica of the mint named in a Raft route's path.
+    fn replica_at(&self, path: &str) -> Result<Arc<Replica>, ApiError> {
+        self.mint_at(path)?
+            .replica()
+            .cloned()
+            .ok_or_else(|| ApiError::new(StatusCode::NOT_FOUND, "unknown_mint", "not a replica"))
     }
 
     /// The issuer keys of every mint, in order.
@@ -146,6 +257,15 @@ impl AppState {
 
     /// Creates a mint and starts serving it.
     pub async fn create_mint(&self, spec: MintSpec) -> Result<CreatedMint, ApiError> {
+        if self.cluster.is_some() {
+            return Err(ApiError::new(
+                StatusCode::NOT_IMPLEMENTED,
+                "not_supported",
+                "a cluster cannot create mints while serving yet; create one with \
+                 `worgl-server create-mint` on one member while the members are stopped, \
+                 and copy its directory to the others",
+            ));
+        }
         let dir = PathBuf::from(&*self.dir);
         let kek = self.kek.clone();
         let (created, loaded) = tokio::task::spawn_blocking(move || {
@@ -199,7 +319,7 @@ impl AppState {
 }
 
 /// Accepts the request only if it carries `Authorization: Bearer <token>`.
-fn check_bearer(headers: &HeaderMap, token: &str, which: &str) -> Result<(), ApiError> {
+pub(crate) fn check_bearer(headers: &HeaderMap, token: &str, which: &str) -> Result<(), ApiError> {
     let given = headers
         .get(header::AUTHORIZATION)
         .and_then(|value| value.to_str().ok())
@@ -218,7 +338,7 @@ fn check_bearer(headers: &HeaderMap, token: &str, which: &str) -> Result<(), Api
 
 /// The HTTP routes. See the [crate documentation](crate).
 pub fn router(state: AppState) -> Router {
-    Router::new()
+    let mut router = Router::new()
         .route("/healthz", get(|| async { "ok" }))
         .route("/v1/verify", post(verify))
         .route("/v1/transfer", post(transfer))
@@ -230,7 +350,35 @@ pub fn router(state: AppState) -> Router {
         .route("/v1/mints/{mint}/pause", post(pause))
         .route("/v1/mints/{mint}/resume", post(resume))
         .route("/v1/admin/mints", get(list_mints).post(new_mint))
-        .layer(DefaultBodyLimit::max(BODY_LIMIT))
+        .layer(DefaultBodyLimit::max(BODY_LIMIT));
+    if state.cluster.is_some() {
+        router = router.layer(middleware::from_fn_with_state(
+            state.clone(),
+            cluster::forward,
+        ));
+    }
+    router.with_state(state)
+}
+
+/// The routes cluster members send each other Raft's RPCs on, with
+/// `Authorization: Bearer <cluster token>`. Serve them on a port of their
+/// own that only the members can reach.
+///
+/// | method | path                     | body                                |
+/// |--------|--------------------------|-------------------------------------|
+/// | POST   | `/raft/{mint}/append`    | openraft's `AppendEntriesRequest`   |
+/// | POST   | `/raft/{mint}/vote`      | openraft's `VoteRequest`            |
+/// | POST   | `/raft/{mint}/snapshot`  | a vote, a snapshot's meta and data  |
+pub fn raft_router(state: AppState) -> Router {
+    Router::new()
+        .route("/raft/{mint}/append", post(cluster::append))
+        .route("/raft/{mint}/vote", post(cluster::vote))
+        .route("/raft/{mint}/snapshot", post(cluster::snapshot))
+        .layer(DefaultBodyLimit::max(RAFT_BODY_LIMIT))
+        .layer(middleware::from_fn_with_state(
+            state.clone(),
+            cluster::members_only,
+        ))
         .with_state(state)
 }
 
@@ -271,7 +419,7 @@ async fn keys(
     State(state): State<AppState>,
     UrlPath(mint): UrlPath<String>,
 ) -> Result<Json<KeySet>, ApiError> {
-    Ok(Json(state.mint_at(&mint)?.keys()))
+    Ok(Json(state.mint_at(&mint)?.keys().await?))
 }
 
 #[derive(Deserialize)]
@@ -483,6 +631,23 @@ impl ApiError {
         )
     }
 
+    fn no_leader() -> Self {
+        Self::new(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "no_leader",
+            "no member leading the mint could be reached; send the same request again",
+        )
+    }
+
+    fn timeout() -> Self {
+        Self::new(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "timeout",
+            "the mint's group did not answer in time; the change may still be made, so send \
+             the same request again",
+        )
+    }
+
     /// The HTTP status.
     pub fn status(&self) -> StatusCode {
         self.status
@@ -492,7 +657,10 @@ impl ApiError {
     /// `unauthorized` (a holder's or mint authority's signature),
     /// `unknown_authority`, `admin_unauthorized` (a missing or wrong token),
     /// `unknown_mint`, `paused`, `spent`, `expired`, `unissued`, `frozen`,
-    /// `stale_mint`, `stale_rotation`, `layer_full`, `storage`, `internal`.
+    /// `stale_mint`, `stale_rotation`, `layer_full`, `storage`, `internal`,
+    /// and on a cluster `no_leader` (send the request again), `timeout`
+    /// (the change may still be made; send the same request again) and
+    /// `not_supported`.
     pub fn code(&self) -> &'static str {
         self.code
     }
@@ -532,6 +700,29 @@ impl From<CommitError> for ApiError {
                     StatusCode::INTERNAL_SERVER_ERROR,
                     "storage",
                     "the issuer could not record the change; nothing was applied",
+                )
+            }
+        }
+    }
+}
+
+impl From<ReplicaError> for ApiError {
+    fn from(error: ReplicaError) -> Self {
+        match error {
+            ReplicaError::NotLeader { .. } => Self::no_leader(),
+            ReplicaError::Stale => Self::new(
+                StatusCode::SERVICE_UNAVAILABLE,
+                "no_leader",
+                "the mint's leader changed while the request was carried out; send the same \
+                 request again",
+            ),
+            ReplicaError::Timeout => Self::timeout(),
+            ReplicaError::Stopped(reason) => {
+                tracing::error!(%reason, "a replica has stopped");
+                Self::new(
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    "storage",
+                    "this member's copy of the mint has stopped",
                 )
             }
         }

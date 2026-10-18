@@ -1,19 +1,21 @@
 //! `worgl-server`: create a server's state directory and its mints, serve
-//! them over HTTP, and sign mint requests.
+//! them over HTTP, alone or as one member of a cluster, and sign mint
+//! requests.
 
+use std::collections::BTreeMap;
 use std::fs;
 use std::io::Write;
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
 
-use anyhow::{Context, Result, anyhow};
+use anyhow::{Context, Result, anyhow, bail};
 use clap::{Parser, Subcommand};
 use serde_json::json;
 use tracing_subscriber::EnvFilter;
 use worgl::log::Payload;
 use worgl::{FileLog, LedgerConfig, LogId, MintKey, MintRequest, Policy, PublicKey};
 use worgl_server::files::{read_key, write_secret};
-use worgl_server::{AppState, MintSpec, router};
+use worgl_server::{AppState, ClusterConfig, Member, MintSpec, raft_router, router};
 
 const MINT_KEY_FILE: &str = "mint.key";
 
@@ -34,7 +36,9 @@ enum Command {
     },
     /// Create a mint: an issuer key, an admin token, a mint authority key
     /// and an empty ledger. A running server sees it once restarted; POST
-    /// /v1/admin/mints creates one while serving.
+    /// /v1/admin/mints creates one while serving. On a cluster, create it on
+    /// one member while all are stopped, and copy its directory to the
+    /// others.
     CreateMint {
         /// State directory made by `init`.
         #[arg(long, env = "WORGL_STATE")]
@@ -82,7 +86,25 @@ enum Command {
         #[arg(long)]
         mint: PathBuf,
     },
-    /// Serve every mint in a state directory over HTTP.
+    /// Make a state directory a cluster member's: write its cluster.json and
+    /// create a cluster token unless it has one. Every member starts from a
+    /// copy of one directory, the token, mints and key-encryption key
+    /// included, run with its own --node.
+    JoinCluster {
+        /// State directory made by `init`.
+        #[arg(long, env = "WORGL_STATE")]
+        state: PathBuf,
+        /// This member's id.
+        #[arg(long)]
+        node: u64,
+        /// A member as ID=API,RAFT, where API is the host:port of its public
+        /// API and RAFT that of its Raft port. Give every member, this one
+        /// included.
+        #[arg(long = "member", value_parser = parse_member, required = true)]
+        members: Vec<(u64, Member)>,
+    },
+    /// Serve every mint in a state directory over HTTP. A cluster member
+    /// also serves its Raft port.
     Serve {
         /// State directory made by `init`.
         #[arg(long, env = "WORGL_STATE")]
@@ -90,10 +112,29 @@ enum Command {
         /// Address to listen on.
         #[arg(long, env = "WORGL_LISTEN", default_value = "127.0.0.1:8080")]
         listen: SocketAddr,
+        /// Address a cluster member listens on for the other members' Raft
+        /// requests, if not its Raft address in cluster.json.
+        #[arg(long, env = "WORGL_RAFT_LISTEN")]
+        raft_listen: Option<SocketAddr>,
         /// Write a fresh snapshot of a mint after this many logged events.
         #[arg(long, default_value_t = 100_000)]
         compact_every: u64,
     },
+}
+
+fn parse_member(text: &str) -> Result<(u64, Member), String> {
+    let (id, addresses) = text
+        .split_once('=')
+        .ok_or("expected ID=API,RAFT".to_owned())?;
+    let id = id.parse().map_err(|_| format!("{id} is not a member id"))?;
+    let (api, raft) = addresses
+        .split_once(',')
+        .ok_or("expected ID=API,RAFT".to_owned())?;
+    let member = Member {
+        api: api.to_owned(),
+        raft: raft.to_owned(),
+    };
+    Ok((id, member))
 }
 
 #[tokio::main]
@@ -138,11 +179,35 @@ async fn main() -> Result<()> {
             Ok(())
         }
         Command::ExportLog { mint } => export_log(&mint),
+        Command::JoinCluster {
+            state,
+            node,
+            members,
+        } => {
+            let members: BTreeMap<_, _> = members.into_iter().collect();
+            let config = ClusterConfig { node, members };
+            worgl_server::join_cluster(&state, &config)?;
+            println!("cluster       {}", state.join("cluster.json").display());
+            println!("cluster token {}", state.join("cluster.token").display());
+            Ok(())
+        }
         Command::Serve {
             state,
             listen,
+            raft_listen,
             compact_every,
-        } => serve(&state, listen, compact_every).await,
+        } => {
+            if worgl_server::is_member(&state) {
+                serve_member(&state, listen, raft_listen, compact_every).await
+            } else if raft_listen.is_some() {
+                bail!(
+                    "{} is not a cluster member's, so it has no Raft port",
+                    state.display()
+                )
+            } else {
+                serve(&state, listen, compact_every).await
+            }
+        }
     }
 }
 
@@ -171,6 +236,12 @@ fn create_mint(state: &Path, mut spec: MintSpec) -> Result<()> {
         println!(
             "mint key    {} (the server does not need it; keep it where you mint from)",
             path.display()
+        );
+    }
+    if worgl_server::is_member(state) {
+        println!(
+            "copy {} to every other member before any of them starts",
+            dir.display()
         );
     }
     Ok(())
@@ -217,6 +288,54 @@ async fn serve(state: &Path, listen: SocketAddr, compact_every: u64) -> Result<(
     axum::serve(listener, router(app))
         .with_graceful_shutdown(shutdown_signal())
         .await?;
+    tracing::info!("stopped");
+    Ok(())
+}
+
+/// Serves a cluster member: its public API on `listen`, and its Raft port.
+async fn serve_member(
+    state: &Path,
+    listen: SocketAddr,
+    raft_listen: Option<SocketAddr>,
+    compact_every: u64,
+) -> Result<()> {
+    let config = ClusterConfig::read(state)?;
+    let app = AppState::open_member(state, compact_every)
+        .await
+        .with_context(|| format!("opening {}", state.display()))?;
+    tracing::info!(
+        mints = app.mints().len(),
+        node = config.node,
+        "state loaded"
+    );
+    let raft = match raft_listen {
+        Some(address) => address.to_string(),
+        None => config.members[&config.node].raft.clone(),
+    };
+    let raft_listener = tokio::net::TcpListener::bind(&raft)
+        .await
+        .with_context(|| format!("binding {raft}"))?;
+    let listener = tokio::net::TcpListener::bind(listen)
+        .await
+        .with_context(|| format!("binding {listen}"))?;
+    tracing::info!(%listen, %raft, "serving");
+    let (stop, stopped) = tokio::sync::oneshot::channel::<()>();
+    let members = raft_router(app.clone());
+    let raft = tokio::spawn(async move {
+        axum::serve(raft_listener, members)
+            .with_graceful_shutdown(async {
+                let _ = stopped.await;
+            })
+            .await
+    });
+    axum::serve(listener, router(app.clone()))
+        .with_graceful_shutdown(shutdown_signal())
+        .await?;
+    // Stop the replicas while the Raft port still answers, so the others
+    // hear of it and elect new leaders.
+    app.shutdown().await;
+    let _ = stop.send(());
+    raft.await??;
     tracing::info!("stopped");
     Ok(())
 }
