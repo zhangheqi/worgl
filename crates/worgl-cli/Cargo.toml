@@ -1,0 +1,43 @@
+[package]
+name = "worgl-cli"
+description = "worgl: hold, pay and receive Worgl notes from the command line, in a passphrase-encrypted purse"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+publish = false
+
+[[bin]]
+name = "worgl"
+path = "src/main.rs"
+# Its docs would overwrite the `worgl` library's; `worgl help` documents it.
+doc = false
+
+[dependencies]
+anyhow.workspace = true
+argon2.workspace = true
+base64.workspace = true
+chacha20poly1305.workspace = true
+clap.workspace = true
+getrandom.workspace = true
+hex.workspace = true
+rpassword.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+tokio.workspace = true
+worgl.workspace = true
+worgl-client.workspace = true
+worgl-sdk.workspace = true
+zeroize.workspace = true
+
+[dev-dependencies]
+axum.workspace = true
+hex.workspace = true
+serde_json.workspace = true
+tempfile.workspace = true
+worgl-server.workspace = true
+
+[lints]
+workspace = true
