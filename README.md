@@ -194,21 +194,21 @@ Ed25519 signatures are deterministic.
 keys allowed to mint (`mint_authorities`). Each mint request is signed by one
 of them and carries a sequence number, and the issuer accepts only a number
 above that authority's last, so a copied request cannot mint twice, while
-resending the last request returns the same note. Each such mint is journaled
-with its signature, so the journal shows who authorized every unit of supply.
+resending the last request returns the same note. Each such mint is logged
+with its signature, so the log shows who authorized every unit of supply.
 The server mints no other way: no token can mint. The library's
 `Issuer::mint` remains for code that embeds the issuer directly.
 
 **The issuer is an event-sourced state machine.** Every change is an `Event`
 that the issuer plans without side effects, the store writes and flushes to a
-journal, and only then the issuer applies. Applying is deterministic and
-checked, so a snapshot plus its journal rebuilds the exact same state, and a
-note is never handed out unless the event that created it is on disk. A
-`Batch` shares one journal record and one flush among many events; the server
-puts every request waiting at the moment of a flush into the next one. The
-issuer also keeps the live value of each layer and the value minted,
-destroyed by rotations and burned, so
-`outstanding = minted − destroyed − burned` can be audited at any time.
+log, and only then the issuer applies. Applying is deterministic and checked,
+so a snapshot plus its log rebuilds the exact same state, and a note is never
+handed out unless the event that created it is on disk. A `Batch` shares one
+log entry and one flush among many events; the server puts every request
+waiting at the moment of a flush into the next one. The issuer also keeps the
+live value of each layer and the value minted, destroyed by rotations and
+burned, so `outstanding = minted − destroyed − burned` can be audited at any
+time.
 
 **Rotation is an admin call or a schedule** aligned to multiples of the
 period since the Unix epoch, so restarts do not shift it. Each mint has its
@@ -218,16 +218,22 @@ refreshed. The server records the last scheduled boundary, so a wall clock
 that steps backwards cannot rotate twice in one period. Boundaries missed
 while the server is down, or while the mint is paused, are not made up.
 
-**Storage fails loudly.** The journal is tied to its issuer's key, every
+**Storage fails loudly.** The log is tied to its issuer's key, every
 record is checksummed, and a damaged record is only dropped when nothing
 readable follows it, which is the one place a crash can leave a torn write.
 Damage anywhere else stops the store from opening rather than silently
 losing acknowledged transfers.
 
-**Generation keys live in their own file.** The snapshot and journal hold
+**The log is laid out for replication.** Each entry has an index and the
+term and node of the leader that wrote it, as Raft numbers its log; the
+snapshot records the last entry it holds; and the log can drop a tail that a
+new leader overwrote. A store on its own writes every entry under term 0.
+Stores from before the log convert the first time they are opened.
+
+**Generation keys live in their own file.** The snapshot and log hold
 only public keys and certificates, so they can be copied or audited without
 exposing a secret. The secrets are in `keys.bin` (mode 0600) next to them. A
-rotation writes its new key there before journaling the rotation, and keys of
+rotation writes its new key there before logging the rotation, and keys of
 dropped generations leave the file at the next snapshot. Back `keys.bin` up
 with the rest of the state: without it the live generations' notes cannot be
 signed and the store does not open.
@@ -260,7 +266,7 @@ let bobs_note = issuer.transfer(&request)?.remove(0);
 assert_eq!(issuer.status(&note)?, NoteStatus::Spent);
 ```
 
-For durability, wrap the issuer in `PersistentIssuer`, which journals every
+For durability, wrap the issuer in `PersistentIssuer`, which logs every
 event before applying it. To keep signature checks out of a lock, verify with
 `issuer.verifier()` first and pass the `VerifiedTransfer` in.
 

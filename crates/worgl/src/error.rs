@@ -112,7 +112,7 @@ pub enum SetupError {
 
 /// An event does not fit the issuer's current state, so it was not applied.
 ///
-/// When replaying a journal this means the journal and snapshot disagree.
+/// When replaying a log this means the log and snapshot disagree.
 #[derive(Debug, Clone, PartialEq, Eq, Error)]
 #[error("event does not apply to the current state: {0}")]
 pub struct ApplyError(pub(crate) String);

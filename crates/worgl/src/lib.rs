@@ -39,7 +39,8 @@
 //! - [`policy`]: the rules an operator may change: denominations, inputs
 //!   and outputs per transfer, where new money lands.
 //! - [`issuer`]: ties the above together as an event-sourced state machine.
-//! - [`store`]: crash-safe persistence as a snapshot plus a journal.
+//! - [`log`]: the numbered, append-only log of changes, ready for Raft.
+//! - [`store`]: crash-safe persistence as a snapshot plus a log.
 //!
 //! # Example
 //!
@@ -70,6 +71,7 @@ pub mod issuer;
 pub mod keys;
 pub mod keyset;
 pub mod ledger;
+pub mod log;
 pub mod mint;
 pub mod note;
 mod permutation;
@@ -83,6 +85,7 @@ pub use issuer::{Event, Issuer, NoteStatus, Plan, RotationReport, Supply};
 pub use keys::{GenerationKey, HolderKey, IssuerKey, MintKey, PublicKey, Signature};
 pub use keyset::{KeyCertificate, KeyRing, KeySet};
 pub use ledger::{Ledger, LedgerConfig, Serial};
+pub use log::{FileLog, LogId};
 pub use mint::{MintAuthorization, MintRequest, VerifiedMint};
 pub use note::{Note, NoteError};
 pub use policy::{Denominations, Policy, PolicyError};

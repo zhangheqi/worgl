@@ -79,7 +79,7 @@ enum Command {
         /// Address to listen on.
         #[arg(long, env = "WORGL_LISTEN", default_value = "127.0.0.1:8080")]
         listen: SocketAddr,
-        /// Write a fresh snapshot of a mint after this many journaled events.
+        /// Write a fresh snapshot of a mint after this many logged events.
         #[arg(long, default_value_t = 100_000)]
         compact_every: u64,
     },

@@ -4,15 +4,15 @@
 //! request without changing anything, the caller makes the event durable if
 //! it wants to (see [`store`](crate::store)), and then the issuer *applies*
 //! it. Applying is deterministic and checks the event against the state, so
-//! replaying a journal of events onto the snapshot it started from rebuilds
+//! replaying a log of events onto the snapshot it started from rebuilds
 //! the exact same issuer. [`Issuer::mint`], [`Issuer::transfer`],
 //! [`Issuer::burn`] and [`Issuer::rotate`] do all three steps for in-memory
 //! use.
 //!
-//! A rotation is the one event that needs a secret the journal must not hold:
+//! A rotation is the one event that needs a secret the log must not hold:
 //! the key that signs the new generation's notes. [`Issuer::plan_rotate`]
 //! takes it from the caller and puts it in the issuer's
-//! [`KeyRing`], which a store saves before journaling
+//! [`KeyRing`], which a store saves before logging
 //! the rotation; the event itself carries only the key's certificate.
 //!
 //! Besides the ledger's bits, the issuer keeps a few counters that cost
@@ -79,7 +79,7 @@ pub struct RotationReport {
     /// Their total value.
     pub destroyed_value: u128,
     /// The certificate of the key that signs the new layer's notes. `None`
-    /// only in journals written before generation keys existed, whose new
+    /// only in logs written before generation keys existed, whose new
     /// layers the issuer key signed.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub key: Option<KeyCertificate>,
@@ -120,7 +120,7 @@ pub enum Event {
 }
 
 impl Event {
-    /// The event's binary encoding, as used by the journal in [`store`](crate::store).
+    /// The event's binary encoding, as used by the [`log`](crate::log).
     pub fn to_bytes(&self) -> Vec<u8> {
         let mut w = Writer::default();
         match self {
@@ -489,7 +489,7 @@ impl Issuer {
     }
 
     /// The secrets of the generation keys, to be kept apart from snapshots
-    /// and journals and passed back to [`restore`](Self::restore).
+    /// and logs and passed back to [`restore`](Self::restore).
     pub fn key_ring(&self) -> &KeyRing {
         &self.ring
     }
@@ -674,7 +674,7 @@ impl Issuer {
     ///
     /// The event carries the issuer key's certificate for `next`, and `next`
     /// joins the [`key_ring`](Self::key_ring) at once, since applying the
-    /// event needs it. Save the ring before journaling the event: a journal
+    /// event needs it. Save the ring before logging the event: a log
     /// that names a key nobody kept cannot be replayed.
     pub fn plan_rotate(&mut self, next: GenerationKey) -> Event {
         let mut report = self.rotation();
@@ -842,7 +842,7 @@ impl Issuer {
     /// policy to enforce from now on.
     ///
     /// The ring may hold more keys than the snapshot names, such as those of
-    /// rotations journaled after it, but must hold every key it names.
+    /// rotations logged after it, but must hold every key it names.
     pub fn restore(
         key: IssuerKey,
         ring: KeyRing,
@@ -1162,7 +1162,7 @@ impl Issuer {
 
     /// Erases every secret in the ring that signs no live generation, such
     /// as one left by a rotation that was planned but never applied. Call it
-    /// only once no journaled rotation remains to be replayed.
+    /// only once no logged rotation remains to be replayed.
     pub(crate) fn retire_keys(&mut self) {
         let live = &self.keys;
         self.ring
@@ -1993,7 +1993,7 @@ mod tests {
         let old = i.mint(8, alice.public_key()).unwrap();
         assert_eq!(old.verify(i.keys()), Ok(()));
 
-        // A journal from before generation keys replays its rotations as they were.
+        // A log from before generation keys replays its rotations as they were.
         let legacy = Event::Rotate(i.rotation());
         assert_eq!(Event::from_bytes(&legacy.to_bytes()), Ok(legacy.clone()));
         let mut replayed = i.clone();
