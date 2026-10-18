@@ -17,8 +17,8 @@
 //! response, returns the same note. An authority should send one request at
 //! a time and resend it until it is answered before using the next number.
 //!
-//! The issuer journals each authorization with the note it created, so
-//! anyone holding the journal can check that every mint was signed for
+//! The issuer logs each authorization with the note it created, so
+//! anyone holding the log can check that every mint was signed for
 //! ([`MintAuthorization::verify`]).
 //!
 //! [`Policy::mint_authorities`]: crate::Policy::mint_authorities
@@ -86,7 +86,7 @@ fn message(
     w.finish()
 }
 
-/// Who authorized a mint, as the journal records it.
+/// Who authorized a mint, as the log records it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub struct MintAuthorization {
     /// The authority's public key.
@@ -125,7 +125,7 @@ pub struct VerifiedMint {
 }
 
 impl VerifiedMint {
-    /// The authorization to journal.
+    /// The authorization to log.
     pub fn authorization(&self) -> &MintAuthorization {
         &self.authorization
     }
@@ -203,7 +203,7 @@ mod tests {
     }
 
     #[test]
-    fn a_listed_authority_can_mint_and_the_journal_can_prove_it() {
+    fn a_listed_authority_can_mint_and_the_log_can_prove_it() {
         let f = Fixture::new();
         let request = f.request(1, 8);
         let verified = f.verifier.verify_mint(&request).unwrap();

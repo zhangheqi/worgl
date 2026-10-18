@@ -102,7 +102,7 @@ impl AppState {
     /// Opens the server state in `dir`, made by [`init_state`], and every
     /// mint in it, starting their committers and rotation clocks. Fails if
     /// any mint does not open, rather than serve without it.
-    /// `compact_every` is how many journaled events trigger a fresh snapshot
+    /// `compact_every` is how many logged events trigger a fresh snapshot
     /// of a mint; rotations always do. Must be called within a Tokio runtime.
     pub fn open(dir: &Path, compact_every: u64) -> anyhow::Result<Self> {
         if dir.join("issuer.key").exists() {
@@ -521,7 +521,7 @@ impl From<CommitError> for ApiError {
         match error {
             CommitError::Rejected(error) => error.into(),
             CommitError::Io(error) => {
-                tracing::error!(%error, "journal write failed");
+                tracing::error!(%error, "log write failed");
                 Self::new(
                     StatusCode::INTERNAL_SERVER_ERROR,
                     "storage",

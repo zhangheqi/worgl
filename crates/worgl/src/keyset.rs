@@ -24,7 +24,7 @@
 //! generations, which is all anyone needs to check a note's signature
 //! offline. A [`KeyRing`] holds the secrets, which only the issuer needs; a
 //! [`store`](crate::store) keeps it in a file of its own, never in the
-//! snapshot or the journal.
+//! snapshot or the log.
 //!
 //! Issuers created before generation keys existed signed every note with the
 //! issuer key. Their generations keep verifying under it until they are
@@ -222,7 +222,7 @@ impl KeySet {
 /// The secret halves of an issuer's generation keys.
 ///
 /// It is the one part of an issuer's state that is secret besides the issuer
-/// key, so it is kept apart from snapshots and journals; see
+/// key, so it is kept apart from snapshots and logs; see
 /// [`Issuer::key_ring`](crate::Issuer::key_ring). Its encoding is
 ///
 /// ```text

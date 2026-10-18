@@ -277,7 +277,7 @@ struct Inner {
     verifier: Arc<RwLock<Verifier>>,
     paused: Arc<AtomicBool>,
     compact_every: u64,
-    /// Journal length at which the next snapshot is written.
+    /// Events logged at which the next snapshot is written.
     compact_at: u64,
 }
 
@@ -540,7 +540,7 @@ impl Inner {
             let verifier = self.issuer.issuer().verifier();
             *self.verifier.write().unwrap_or_else(|e| e.into_inner()) = verifier;
             self.compact();
-        } else if self.issuer.journal_len() >= self.compact_at {
+        } else if self.issuer.log_events() >= self.compact_at {
             self.compact();
         }
         results
@@ -553,13 +553,13 @@ impl Inner {
                 tracing::debug!(mint = %self.issuer.public_key(), "wrote a fresh snapshot");
             }
             Err(error) => {
-                // The journal still holds every event, so nothing is lost.
+                // The log still holds every event, so nothing is lost.
                 // Try again after another batch rather than on every request.
-                self.compact_at = self.issuer.journal_len() + self.compact_every;
+                self.compact_at = self.issuer.log_events() + self.compact_every;
                 tracing::error!(
                     mint = %self.issuer.public_key(),
                     %error,
-                    "snapshot failed; the journal keeps growing"
+                    "snapshot failed; the log keeps growing"
                 );
             }
         }
