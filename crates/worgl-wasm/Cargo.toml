@@ -1,0 +1,27 @@
+[package]
+name = "worgl-wasm"
+description = "WebAssembly bindings of worgl-sdk, the core of the TypeScript SDK"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+publish = false
+
+[lib]
+crate-type = ["cdylib", "rlib"]
+
+[dependencies]
+serde.workspace = true
+serde_json.workspace = true
+wasm-bindgen.workspace = true
+worgl.workspace = true
+worgl-sdk.workspace = true
+
+# Browsers and Node give WebAssembly its randomness through crypto.getRandomValues.
+[target.'cfg(target_arch = "wasm32")'.dependencies]
+getrandom = { workspace = true, features = ["wasm_js"] }
+
+[lints]
+workspace = true
