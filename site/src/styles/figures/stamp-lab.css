@@ -27,7 +27,7 @@
 .lab-side { display: flex; flex-direction: column; gap: 22px; }
 .controls { display: flex; flex-wrap: wrap; gap: 8px; }
 .controls .btn { min-height: 42px; padding: 0 16px; font-size: 14.5px; }
-.readout { font-size: 16px; line-height: 1.5; min-height: 6em; border-left: 3px solid var(--pink); padding-left: 14px; }
+.readout { font-size: 16px; line-height: 1.5; min-height: 6em; }
 .counters { display: flex; gap: 22px; }
 .counters div { display: flex; flex-direction: column; gap: 2px; }
 .counters b { font-family: var(--f-serif); font-size: 34px; font-weight: 400; line-height: 1; }

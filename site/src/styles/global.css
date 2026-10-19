@@ -74,10 +74,6 @@ img, svg, canvas { max-width: 100%; }
 .btn-sm { min-height: 38px; padding: 0 14px; font-size: 14px; }
 .btn[disabled] { opacity: .45; cursor: default; box-shadow: none; transform: none; }
 
-/* the status line, near the top of a page */
-.status-top { font-size: 13.5px; line-height: 1.5; border-left: 2px solid var(--pink); padding-left: 12px; }
-.cobalt .status-top { color: var(--on-cobalt-muted); }
-
 /* tables scroll inside their own box */
 .tbl-wrap { overflow-x: auto; min-width: 0; }
 table { border-collapse: collapse; width: 100%; min-width: 440px; font-size: 15.5px; }

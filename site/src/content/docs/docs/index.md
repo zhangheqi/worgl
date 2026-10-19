@@ -40,6 +40,3 @@ code.
   [Note format](note-format/), [Policy fields](policy/),
   [Changelog](changelog/)
 - [Privacy model](privacy/): what the mint, a payer and a payee each see.
-
-Worgl is 0.1. It has not had an independent security review, so don't use
-it to hold anything you can't afford to lose.

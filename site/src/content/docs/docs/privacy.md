@@ -72,5 +72,3 @@ bit.
 
 - **The mint sees lineage.** That is inherent to the design.
 - **No identity checks.** Who may hold or receive notes is out of scope.
-- **Not reviewed.** The design and code have not had an independent
-  security review.
