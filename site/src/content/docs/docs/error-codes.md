@@ -71,3 +71,8 @@ happens twice.
 - The mint remembers the most recent transfers only (65,536 by default, the
   policy's `receipt_capacity`). A transfer sent again after many more have
   passed is refused as `spent` even though it went through.
+- A rotation does not change a transfer's answer while the mint remembers
+  it: a transfer sent again after its inputs' layer was dropped still gets
+  the same notes, until those notes expire in turn. A burn sent again is
+  answered the same while its inputs' layer is live or one of the last
+  `layers − 1` dropped, and refused as `expired` after.

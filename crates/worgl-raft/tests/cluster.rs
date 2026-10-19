@@ -590,6 +590,60 @@ async fn a_group_restarted_whole_restores_what_it_committed() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn every_member_verifies_a_payment_resent_after_its_note_was_dropped() {
+    let mut cluster = Cluster::start().await;
+    let leader = cluster.leader().await;
+    let alice = HolderKey::generate();
+    let note = mint(cluster.replica(leader), 8, &alice).await;
+    let (paid, _) = pay(cluster.replica(leader), note, &alice).await;
+    // The answer is lost, and rotations drop the spent note's generation
+    // before the payer resends.
+    let mut batch = cluster.replica(leader).batch().await.unwrap();
+    for _ in 0..3 {
+        batch.rotate().unwrap();
+    }
+    batch.commit().await.unwrap();
+    assert_eq!(status(cluster.replica(leader), &note), NoteStatus::Expired);
+    assert!(matches!(
+        status(cluster.replica(leader), &paid),
+        NoteStatus::Live { .. }
+    ));
+
+    // One follower restarts from the snapshot it took after the rotations.
+    let rotated = cluster
+        .replica(leader)
+        .raft()
+        .metrics()
+        .borrow()
+        .last_applied;
+    let restarted = (1..=3).find(|&id| id != leader).unwrap();
+    cluster
+        .replica(restarted)
+        .raft()
+        .wait(Some(WAIT))
+        .metrics(|m| m.snapshot >= rotated, "the follower snapshots")
+        .await
+        .unwrap();
+    cluster.stop(restarted).await;
+    cluster.open(restarted).await;
+
+    let output = Output {
+        amount: 8,
+        holder: *paid.holder(),
+    };
+    let request = TransferRequest::single(note, &alice, output).unwrap();
+    for id in 1..=3 {
+        cluster.caught_up(id, leader).await;
+        let verified = cluster.replica(id).verifier().borrow().verify(&request);
+        let mut batch = cluster.replica(leader).batch().await.unwrap();
+        assert_eq!(batch.transfer(&verified.unwrap()).unwrap(), [paid]);
+        assert!(batch.is_empty());
+        batch.commit().await.unwrap();
+    }
+    cluster.shutdown().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_mint_that_ran_alone_carries_on_as_a_group() {
     let key = IssuerKey::generate();
     let issuer = Issuer::new(key.clone(), LEDGER, Policy::cash_like()).unwrap();

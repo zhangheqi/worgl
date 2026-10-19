@@ -70,6 +70,10 @@ State written by an earlier build of 0.1 still opens:
   them.
 - An issuer from before generation keys keeps its existing generations
   signed by the issuer key until those generations are dropped.
+- An issuer restored from a snapshot written before dropped generations'
+  public keys were kept has none for the generations dropped before that
+  snapshot, so a transfer or burn sent again with an input in one of them
+  is still refused as `expired`.
 
 ## Changing the rules
 

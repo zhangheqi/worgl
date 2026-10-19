@@ -70,7 +70,8 @@ the furthest input.
 
 Sending the same request again is safe: the mint remembers recent transfers
 by the hash of their signed message and answers a resent one with the same
-notes.
+notes, even after a rotation has dropped its inputs' layer, until those
+notes expire.
 
 ## Burn
 

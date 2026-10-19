@@ -33,7 +33,9 @@ export const NO_SPACING: Spacing = { minSecs: 0, maxSecs: 0 };
 /**
  * How a purse resends a transfer that failed on the way: a lost connection,
  * a timeout, or a mint that was paused or could not store it. Resending is
- * safe, since the mint answers an identical transfer with identical notes.
+ * safe, since the mint answers an identical transfer with identical notes,
+ * before or after a rotation, for as long as it remembers the transfer (see
+ * {@link Purse.settle}).
  */
 export interface Retry {
   /** Tries in all, the first included. */
@@ -336,9 +338,10 @@ export class Purse {
    * random gaps, and takes in their change. Call it once a payee has had
    * time to submit a payment, or after a restart.
    *
-   * The mint keeps answers for its most recent transfers only: settle
-   * before many more have passed, or a transfer already applied is refused
-   * as `spent` and its change is lost.
+   * The mint keeps the answers to its most recent transfers only, and each
+   * only until the notes it issued expire: settle before many more have
+   * passed and while the change is live, or a transfer already applied is
+   * refused as `spent` or `expired` and its change is lost.
    */
   async settle(spacing: Spacing = DEFAULT_SPACING): Promise<Submitted> {
     const transfers = read(this.#holder.resend(BigInt(spacing.minSecs), BigInt(spacing.maxSecs)));

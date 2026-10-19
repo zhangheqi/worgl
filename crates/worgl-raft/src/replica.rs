@@ -250,8 +250,8 @@ impl Replica {
         *self.issuer().public_key()
     }
 
-    /// A verifier for the issuer's live keys, which changes after each
-    /// rotation this replica applies.
+    /// A verifier for the issuer's keys as they are now, which changes after
+    /// each rotation this replica applies.
     pub fn verifier(&self) -> watch::Receiver<Verifier> {
         self.shared.verifier.subscribe()
     }

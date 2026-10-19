@@ -807,7 +807,7 @@ impl Mint {
         let keys = verifier.keys();
         match note.verify(keys) {
             Ok(()) => {}
-            // A dropped generation's key is erased; the lookup reports it expired.
+            // The live keys omit a dropped generation; the lookup reports it expired.
             Err(NoteError::UnknownGeneration(generation))
                 if note.issuer() == keys.issuer() && generation < keys.oldest() => {}
             Err(error) => return Err(Error::Note { input: 0, error }.into()),

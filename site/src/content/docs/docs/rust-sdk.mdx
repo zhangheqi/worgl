@@ -72,9 +72,10 @@ the answers to the payee, who checks their signatures and keeps them with
 | `plan_refresh(&mint)` | The same plan, for an application with its own scheduler to `submit`. |
 | `prune(&mint)` | Drops notes whose layer the mint has dropped, and returns the value lost. |
 
-The mint keeps answers for its most recent transfers only, so settle before
-many more have passed, or a transfer already applied is refused as `spent`
-and its change is lost.
+The mint keeps the answers to its most recent transfers only, and each only
+until the notes it issued expire, so settle before many more have passed and
+while the change is live, or a transfer already applied is refused as
+`spent` or `expired` and its change is lost.
 
 `Client` errors keep the mint's stable code, such as `spent` or `frozen`, in
 `Error::code`, and `Error::is_transient` says whether trying again later may

@@ -29,7 +29,7 @@ use crate::{NodeId, Request, Response, SnapshotData, TypeConfig, blocking};
 pub(crate) struct Shared {
     /// The issuer as of the last entry applied.
     pub(crate) issuer: RwLock<Issuer>,
-    /// A verifier for the issuer's live keys, replaced after each rotation.
+    /// A verifier for the issuer's keys, replaced after each rotation.
     pub(crate) verifier: watch::Sender<Verifier>,
 }
 
