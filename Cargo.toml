@@ -4,6 +4,7 @@ members = [
     "crates/worgl",
     "crates/worgl-cli",
     "crates/worgl-client",
+    "crates/worgl-faucet",
     "crates/worgl-raft",
     "crates/worgl-sdk",
     "crates/worgl-server",

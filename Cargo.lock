@@ -2871,6 +2871,26 @@ dependencies = [
 ]
 
 [[package]]
+name = "worgl-faucet"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "axum",
+ "clap",
+ "hex",
+ "reqwest",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "tokio",
+ "tracing",
+ "tracing-subscriber",
+ "worgl",
+ "worgl-client",
+ "worgl-server",
+]
+
+[[package]]
 name = "worgl-raft"
 version = "0.1.0"
 dependencies = [
