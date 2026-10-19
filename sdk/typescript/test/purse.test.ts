@@ -177,6 +177,51 @@ describe('purse', () => {
     assert.equal(paid.value, 8n);
   });
 
+  test('a busy answer stretches the next wait only', async () => {
+    // The mint's first two answers to the transfer: busy, asking for a
+    // second's wait, then without a leader, asking for the same. The third
+    // try reaches it.
+    const scripted = [
+      { status: 503, error: 'busy', retryAfter: '1' },
+      { status: 503, error: 'no_leader', retryAfter: '1' },
+    ];
+    const fetch: typeof globalThis.fetch = (input, init) => {
+      const answer = String(input).endsWith('/v1/transfer') ? scripted.shift() : undefined;
+      if (answer === undefined) {
+        return globalThis.fetch(input, init);
+      }
+      const headers = new Headers({ 'content-type': 'application/json' });
+      if (answer.retryAfter !== undefined) {
+        headers.set('retry-after', answer.retryAfter);
+      }
+      const body = JSON.stringify({ error: answer.error, message: 'scripted' });
+      return Promise.resolve(new Response(body, { status: answer.status, headers }));
+    };
+    const client = new Client(server.url, { fetch });
+    const alice = await purse();
+    const bob = await Purse.open(client, { retry: { attempts: 3, firstDelayMs: 10 } });
+    await server.fund(alice, 8n, 8n);
+    const request = await bob.request(server.mint, 8n);
+    const payment = await alice.pay(request, NO_SPACING);
+
+    const started = Date.now();
+    const received = await bob.receive(request, payment);
+    const waited = Date.now() - started;
+    allAnswered(received, 1);
+    // A second as busy asked, then 20 ms: the second's wait does not
+    // double, and no_leader's Retry-After does not stretch it.
+    assert.ok(waited >= 1000 && waited < 1900, `waited ${waited} ms`);
+
+    scripted.push({ status: 503, error: 'busy', retryAfter: '7' });
+    await assert.rejects(client.transfer(payment.transfers[0]!.request), (error: unknown) => {
+      assert.ok(error instanceof MintError);
+      assert.equal(error.code, 'busy');
+      assert.equal(error.retryAfterMs, 7000);
+      assert.ok(isTransient(error));
+      return true;
+    });
+  });
+
   test('nothing is handed out unless it is saved', async () => {
     let failing = false;
     const inner = new MemoryStore();

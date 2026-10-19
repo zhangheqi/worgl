@@ -7,6 +7,15 @@
 //! as they commit. `keys.bin` always holds every key the snapshot on disk
 //! needs: a new snapshot is written between two rewrites of it, the first
 //! adding the new snapshot's keys and the second dropping the old one's.
+//!
+//! The issuer keeps each receipt for at least its policy's
+//! `receipt_min_age_secs` by this replica's monotonic clock (see
+//! [`Issuer::set_clock`]). A receipt counts as made when this replica
+//! applied its entry, and one a restored snapshot holds as made then, so a
+//! replica never counts a receipt older than the leader that planned it did.
+//! A replica holding `receipt_capacity` receipts that leads within
+//! `receipt_min_age_secs` of a restore therefore refuses every new transfer
+//! and burn until that much time has passed.
 
 use std::sync::{Arc, Mutex, RwLock};
 
@@ -17,8 +26,8 @@ use openraft::{
 };
 use tokio::sync::{mpsc, oneshot, watch};
 use worgl::{
-    Event, Issuer, IssuerKey, Kek, KekError, KeyRing, Policy, SealedKey, SnapshotFile, StateFiles,
-    StoreError, Verifier,
+    Clock, Event, Issuer, IssuerKey, Kek, KekError, KeyRing, Policy, SealedKey, SnapshotFile,
+    StateFiles, StoreError, Verifier,
 };
 
 use crate::log_store::{from_id, to_id};
@@ -48,6 +57,8 @@ pub struct StateMachine {
     key: IssuerKey,
     policy: Policy,
     kek: Arc<dyn Kek>,
+    /// What the issuer stamps its receipts by.
+    clock: Clock,
     /// Asks for a snapshot, so the keys of dropped generations leave the
     /// disk soon after a rotation.
     snapshots: mpsc::UnboundedSender<()>,
@@ -79,7 +90,10 @@ impl StateMachine {
     ) -> Result<(Self, Arc<Shared>, oneshot::Receiver<()>), StoreError> {
         let saved = files.keys(&key)?;
         let snapshot = files.snapshot()?;
-        let issuer = Issuer::restore(key.clone(), saved.clone(), &snapshot.issuer, policy.clone())?;
+        let mut issuer =
+            Issuer::restore(key.clone(), saved.clone(), &snapshot.issuer, policy.clone())?;
+        let clock = Clock::monotonic();
+        issuer.set_clock(clock.clone(), 0);
         let applied = snapshot.applied.map(from_id);
         let membership = decode_membership(snapshot.membership.as_ref())?;
         let current = match applied {
@@ -109,6 +123,7 @@ impl StateMachine {
             key,
             policy,
             kek,
+            clock,
             snapshots,
         };
         Ok((machine, shared, on_release))
@@ -274,9 +289,10 @@ impl RaftStateMachine<TypeConfig> for StateMachine {
                 })?;
             ring.insert(key);
         }
-        let restored =
+        let mut restored =
             Issuer::restore(self.key.clone(), ring.clone(), &issuer, self.policy.clone())
                 .map_err(|error| refuse(format!("the snapshot does not restore: {error}")))?;
+        restored.set_clock(self.clock.clone(), 0);
         let file = SnapshotFile {
             applied: meta.last_log_id.as_ref().map(to_id),
             membership: encode_membership(&meta.last_membership)

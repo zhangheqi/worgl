@@ -44,6 +44,7 @@ Errors answer with a status code and a body like:
 | `stale_rotation` | 409 | A scheduled rotation is due no later than the last one logged, which already covered it. |
 | `layer_full` | 503 | The layer the outputs would land in has too few free bits left until the next rotation. |
 | `paused` | 503 | The mint is paused. Its notes keep their places until it resumes. |
+| `busy` | 503 | The mint holds `receipt_capacity` receipts, all younger than `receipt_min_age_secs` or, for a while after a restart, counted so, and takes no new transfer or burn until the oldest may go. The `Retry-After` header says in how many seconds. Nothing was done. |
 
 ## The server
 
@@ -62,15 +63,21 @@ the latest mint request of an authority with the same note, so nothing
 happens twice.
 
 - After `no_leader` or `timeout`, send the same request again.
+- After `busy`, send the same request again once the seconds its
+  `Retry-After` header gives have passed. Both SDKs wait that long before
+  their next try, up to 30 seconds.
 - A creation of a mint (`POST /v1/admin/mints`) answered `no_leader` made
   nothing, so send it again. One answered `timeout` may have made a mint the
   answer never named: list the mints before creating another.
-- `paused`, `layer_full`, `storage` and `internal` may go away later. Both
-  SDKs count them, and any other 5xx status, as worth trying again:
-  `Error::is_transient` in Rust and `isTransient(error)` in TypeScript.
-- The mint remembers the most recent transfers only (65,536 by default, the
-  policy's `receipt_capacity`). A transfer sent again after many more have
-  passed is refused as `spent` even though it went through.
+- `paused`, `busy`, `layer_full`, `storage` and `internal` may go away
+  later. Both SDKs count them, and any other 5xx status, as worth trying
+  again: `Error::is_transient` in Rust and `isTransient(error)` in
+  TypeScript.
+- A transfer or burn sent again is answered as before for at least
+  `receipt_min_age_secs` (128 seconds by default), and while it is among the
+  last `receipt_capacity` (1,048,576 by default) the mint took. One sent
+  again after that is refused as `spent` even though it went through. See
+  [receipt_capacity and receipt_min_age_secs](../policy/#receipt_capacity-and-receipt_min_age_secs).
 - A rotation does not change a transfer's answer while the mint remembers
   it: a transfer sent again after its inputs' layer was dropped still gets
   the same notes, until those notes expire in turn. A burn sent again is
