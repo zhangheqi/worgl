@@ -842,7 +842,8 @@ impl ApiError {
     /// again) and `timeout` (the change may still be made: send the same
     /// note request again, but before rotating again read the mint's info
     /// once it has carried out a change sent after this answer, and list the
-    /// mints before creating another).
+    /// mints before creating another), and on a cluster's Raft port only
+    /// `misdirected` (a Raft request reached the member that sent it).
     pub fn code(&self) -> &'static str {
         self.code
     }

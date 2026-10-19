@@ -34,6 +34,17 @@
 //! member's addresses must be reachable only by the members and a proxy in
 //! front of them, as over WireGuard between their hosts.
 //!
+//! A member dials the others at the addresses its `cluster.json` held when
+//! it started, for every group alike, not at those a group's membership
+//! kept from when it formed. So a member moves to new addresses once every
+//! member's `cluster.json` gives them and every member has restarted;
+//! [`join_cluster`] says which members' addresses it changes. A member's
+//! Raft port refuses, as `421 misdirected`, an RPC that names that member
+//! as its sender, so one whose `cluster.json` gives another member an
+//! address that leads back to it, under whatever spelling, finds that
+//! member unreachable instead of counting its own votes and appends as
+//! that member's.
+//!
 //! A member that does not lead a mint passes the requests for it on to the
 //! leader's [`api`](Member::api) address, `Authorization` headers included,
 //! and relays the answer. If it knows of no leader, or cannot connect to the
@@ -126,7 +137,8 @@ pub const RAFT_BODY_LIMIT: usize = 256 << 20;
 pub struct ClusterConfig {
     /// This member's id.
     pub node: NodeId,
-    /// Every member, this one included, by id.
+    /// Every member, this one included, by id. No two may share an API or a
+    /// Raft address.
     pub members: BTreeMap<NodeId, Member>,
 }
 
@@ -139,8 +151,9 @@ pub struct Member {
     /// headers included, so a private one. Clients reach the API at an
     /// address of their own, such as a proxy's in front of every member.
     pub api: String,
-    /// Its Raft port. The registry's group and each mint's keep the one this
-    /// held when they formed, even if it changes later.
+    /// Its Raft port, where the other members send the RPCs of the
+    /// registry's group and every mint's, whatever address the group formed
+    /// with.
     pub raft: String,
 }
 
@@ -158,14 +171,33 @@ impl ClusterConfig {
         if !self.members.contains_key(&self.node) {
             bail!("the members do not include this one, {}", self.node);
         }
+        // Members dial each other by these addresses, and Raft's RPCs do not
+        // say which member they are for: a member that dialed itself at
+        // another's Raft address would count its own votes and appends as
+        // that member's, and commit alone. Its Raft port refuses them (see
+        // `from_another`) however the address is spelled; this says why,
+        // before it starts, when two are spelled alike.
+        let mut seen = BTreeMap::new();
+        for (&id, member) in &self.members {
+            for (kind, address) in [("API", &member.api), ("Raft", &member.raft)] {
+                if let Some(other) = seen.insert((kind, address), id) {
+                    bail!("members {other} and {id} have the same {kind} address, {address}");
+                }
+            }
+        }
         Ok(())
     }
 }
 
 /// Makes the server state in `state` a cluster member with `config`,
-/// creating a cluster token unless it has one. The other members need a copy
-/// of the token, and of the rest of the directory, before they first start.
-pub fn join_cluster(state: &Path, config: &ClusterConfig) -> Result<()> {
+/// creating a cluster token unless it has one, and returns the ids of the
+/// members whose addresses differ from those in the `cluster.json` it
+/// replaces: none if there was no `cluster.json`, or one that does not
+/// read. The other members need a copy of the token, and of the rest of the
+/// directory, before they first start. Changed addresses take effect once
+/// every member's `cluster.json` gives the same ones and every member has
+/// restarted.
+pub fn join_cluster(state: &Path, config: &ClusterConfig) -> Result<Vec<NodeId>> {
     config.check()?;
     if !state.join(crate::mints::OPERATOR_TOKEN_FILE).exists() {
         bail!("{} holds no server; run `init` first", state.display());
@@ -173,8 +205,19 @@ pub fn join_cluster(state: &Path, config: &ClusterConfig) -> Result<()> {
     if !state.join(TOKEN_FILE).exists() {
         write_secret(&state.join(TOKEN_FILE), &files::random_token()?)?;
     }
+    // A `cluster.json` that does not read is replaced all the same.
+    let before = read_json::<ClusterConfig>(&state.join(CLUSTER_FILE)).ok();
+    let changed = before.map_or_else(Vec::new, |before| {
+        config
+            .members
+            .iter()
+            .filter(|&(id, member)| before.members.get(id).is_some_and(|was| was != member))
+            .map(|(&id, _)| id)
+            .collect()
+    });
     files::write_json(state, CLUSTER_FILE, config)
-        .with_context(|| format!("writing {}", state.join(CLUSTER_FILE).display()))
+        .with_context(|| format!("writing {}", state.join(CLUSTER_FILE).display()))?;
+    Ok(changed)
 }
 
 /// Whether the server state in `state` is a cluster member's.
@@ -473,6 +516,7 @@ pub(crate) async fn append(
     Json(rpc): Json<AppendEntriesRequest<TypeConfig>>,
 ) -> Result<Answer<AppendEntriesResponse<NodeId>, RaftError<NodeId>>, ApiError> {
     let replica = state.replica_at(&mint)?;
+    from_another(&state, &rpc.vote)?;
     Ok(Json(replica.raft().append_entries(rpc).await))
 }
 
@@ -482,6 +526,7 @@ pub(crate) async fn vote(
     Json(rpc): Json<VoteRequest<NodeId>>,
 ) -> Result<Answer<VoteResponse<NodeId>, RaftError<NodeId>>, ApiError> {
     let replica = state.replica_at(&mint)?;
+    from_another(&state, &rpc.vote)?;
     Ok(Json(replica.raft().vote(rpc).await))
 }
 
@@ -492,6 +537,7 @@ pub(crate) async fn snapshot(
 ) -> Result<Answer<SnapshotResponse<NodeId>, Fatal<NodeId>>, ApiError> {
     let replica = state.replica_at(&mint)?;
     let (vote, snapshot) = decode_snapshot(&body)?;
+    from_another(&state, &vote)?;
     Ok(Json(
         replica.raft().install_full_snapshot(vote, snapshot).await,
     ))
@@ -502,6 +548,7 @@ pub(crate) async fn registry_append(
     Json(rpc): Json<AppendEntriesRequest<RegistryConfig>>,
 ) -> Result<Answer<AppendEntriesResponse<NodeId>, RaftError<NodeId>>, ApiError> {
     let registry = state.registry().ok_or_else(not_member)?;
+    from_another(&state, &rpc.vote)?;
     Ok(Json(registry.raft().append_entries(rpc).await))
 }
 
@@ -510,6 +557,7 @@ pub(crate) async fn registry_vote(
     Json(rpc): Json<VoteRequest<NodeId>>,
 ) -> Result<Answer<VoteResponse<NodeId>, RaftError<NodeId>>, ApiError> {
     let registry = state.registry().ok_or_else(not_member)?;
+    from_another(&state, &rpc.vote)?;
     Ok(Json(registry.raft().vote(rpc).await))
 }
 
@@ -519,6 +567,7 @@ pub(crate) async fn registry_snapshot(
 ) -> Result<Answer<SnapshotResponse<NodeId>, Fatal<NodeId>>, ApiError> {
     let registry = state.registry().ok_or_else(not_member)?;
     let (vote, snapshot) = decode_snapshot(&body)?;
+    from_another(&state, &vote)?;
     Ok(Json(
         registry.raft().install_full_snapshot(vote, snapshot).await,
     ))
@@ -530,6 +579,26 @@ fn not_member() -> ApiError {
         "unknown_mint",
         "this server is not a cluster member",
     )
+}
+
+/// Refuses a Raft RPC whose `vote` names this member as its sender, as one
+/// does that this member sent itself, dialing another member at an address
+/// in `cluster.json` that leads back here under another spelling. Answered,
+/// it would count as that member's vote or append and let this member make
+/// a majority alone; refused, that member is unreachable from this one.
+fn from_another(state: &AppState, vote: &Vote<NodeId>) -> Result<(), ApiError> {
+    let node = state.cluster().ok_or_else(not_member)?.node();
+    if vote.leader_id().voted_for() != Some(node) {
+        return Ok(());
+    }
+    Err(ApiError::new(
+        StatusCode::MISDIRECTED_REQUEST,
+        "misdirected",
+        format!(
+            "member {node} sent this Raft request to itself: its cluster.json gives another \
+             member an address that leads back to it"
+        ),
+    ))
 }
 
 /// A snapshot as it crosses the network.
@@ -628,11 +697,21 @@ where
 {
     type Network = Connection<C>;
 
+    /// Dials `target` at its Raft address in `cluster.json`, not at `node`,
+    /// the one the group's membership kept from when it formed, so a member
+    /// that moved is reached where it is now. `node` serves only for a
+    /// member `cluster.json` does not list.
     async fn new_client(&mut self, target: NodeId, node: &BasicNode) -> Connection<C> {
+        let raft = self
+            .cluster
+            .config
+            .members
+            .get(&target)
+            .map_or(&node.addr, |member| &member.raft);
         Connection {
             cluster: self.cluster.clone(),
             target,
-            base: format!("http://{}/{}", node.addr, self.path),
+            base: format!("http://{raft}/{}", self.path),
             config: PhantomData,
         }
     }
