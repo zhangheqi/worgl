@@ -256,6 +256,35 @@ impl Cluster {
         }
     }
 
+    /// Waits until leader `of` counts replica `id` as holding every entry of
+    /// its log.
+    async fn acknowledged(&self, id: NodeId, of: NodeId) {
+        self.replicas[&of]
+            .raft()
+            .wait(Some(WAIT))
+            .metrics(
+                |m| {
+                    let matched = m.replication.as_ref().and_then(|r| r.get(&id));
+                    matched.is_some_and(|log| log.map(|log| log.index) == m.last_log_index)
+                },
+                "the follower holds the leader's log",
+            )
+            .await
+            .unwrap();
+    }
+
+    /// Stops replica `id`, puts the copy of its directory in `backup` back
+    /// in its place, as restoring a backup would, and opens it again.
+    async fn restore(&mut self, id: NodeId, backup: &Path) {
+        self.stop(id).await;
+        let dir = self.dirs[&id].path();
+        for entry in std::fs::read_dir(dir).unwrap() {
+            std::fs::remove_file(entry.unwrap().path()).unwrap();
+        }
+        copy_all(backup, dir);
+        self.open(id).await;
+    }
+
     fn replica(&self, id: NodeId) -> &Replica {
         &self.replicas[&id]
     }
@@ -270,6 +299,16 @@ impl Cluster {
 fn copy_store(from: &Path, to: &Path) {
     for name in ["snapshot.bin", "keys.bin", "log.bin"] {
         std::fs::copy(from.join(name), to.join(name)).unwrap();
+    }
+}
+
+/// Copies every file of a replica's directory, its vote included.
+fn copy_all(from: &Path, to: &Path) {
+    for entry in std::fs::read_dir(from).unwrap() {
+        let entry = entry.unwrap();
+        if entry.file_type().unwrap().is_file() {
+            std::fs::copy(entry.path(), to.join(entry.file_name())).unwrap();
+        }
     }
 }
 
@@ -544,6 +583,79 @@ async fn a_replica_that_fell_behind_catches_up_from_a_snapshot() {
     let notes = sign(cluster.replica(behind));
     assert_eq!(notes, sign(cluster.replica(leader)));
     assert_eq!(notes[0].serial().generation, rotation.created - 1);
+    cluster.shutdown().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_follower_restored_from_an_older_copy_catches_up() {
+    let mut cluster = Cluster::start().await;
+    let leader = cluster.leader().await;
+    let restored = (1..=3).find(|&id| id != leader).unwrap();
+    let alice = HolderKey::generate();
+    mint(cluster.replica(leader), 8, &alice).await;
+    cluster.caught_up(restored, leader).await;
+    cluster.stop(restored).await;
+    let backup = tempfile::tempdir().unwrap();
+    copy_all(cluster.dirs[&restored].path(), backup.path());
+    cluster.open(restored).await;
+
+    // The follower holds a mint the copy lacks when the copy is put back.
+    // The leader finds the follower lacks entries it had counted it as
+    // holding, and sends them again.
+    let mut later = vec![mint(cluster.replica(leader), 4, &alice).await];
+    cluster.acknowledged(restored, leader).await;
+    cluster.restore(restored, backup.path()).await;
+    cluster.caught_up(restored, leader).await;
+
+    // Again once a rotation's snapshot has purged them from the leader's
+    // log: it sends the snapshot instead.
+    let mut batch = cluster.replica(leader).batch().await.unwrap();
+    batch.rotate().unwrap();
+    batch.commit().await.unwrap();
+    let rotated = cluster
+        .replica(leader)
+        .raft()
+        .metrics()
+        .borrow()
+        .last_applied;
+    cluster
+        .replica(leader)
+        .raft()
+        .wait(Some(WAIT))
+        .metrics(|m| m.purged >= rotated, "the log is purged")
+        .await
+        .unwrap();
+    later.push(mint(cluster.replica(leader), 4, &alice).await);
+    cluster.acknowledged(restored, leader).await;
+    cluster.restore(restored, backup.path()).await;
+    cluster.caught_up(restored, leader).await;
+    let metrics = cluster.replica(restored).raft().metrics().borrow().clone();
+    assert!(metrics.snapshot >= rotated, "no snapshot was installed");
+    assert_eq!(
+        cluster.replica(restored).read_local(Issuer::snapshot),
+        cluster.replica(leader).read_local(Issuer::snapshot)
+    );
+
+    // It takes its part again: with the leader gone, nothing commits
+    // without it.
+    cluster.stop(leader).await;
+    let new = cluster.leader().await;
+    later.push(mint(cluster.replica(new), 2, &alice).await);
+    let statuses = cluster
+        .replica(new)
+        .read(|issuer| {
+            later
+                .iter()
+                .map(|note| issuer.status(note).unwrap())
+                .collect::<Vec<_>>()
+        })
+        .await
+        .unwrap();
+    assert!(
+        statuses
+            .iter()
+            .all(|status| matches!(status, NoteStatus::Live { .. }))
+    );
     cluster.shutdown().await;
 }
 
