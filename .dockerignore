@@ -1,0 +1,5 @@
+.git
+target
+**/node_modules
+sdk/typescript/dist
+sdk/typescript/wasm

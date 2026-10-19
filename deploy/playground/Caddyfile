@@ -1,0 +1,30 @@
+# One address for the playground: the faucet at /v1/faucet, the mint's API
+# everywhere else. Caddy gets a certificate for PLAYGROUND_HOST by itself;
+# for localhost it uses its own local authority.
+
+{$PLAYGROUND_HOST} {
+	encode zstd gzip
+
+	handle /v1/faucet {
+		# Caddy replaces X-Forwarded-For with the client's address, which
+		# the faucet counts its limits by.
+		reverse_proxy faucet:8090
+	}
+
+	# Mints are created on the members directly, not from the internet.
+	handle /v1/admin/* {
+		respond "not found" 404
+	}
+
+	handle {
+		reverse_proxy member1:8080 member2:8080 member3:8080 {
+			lb_policy round_robin
+			# A member that does not answer is skipped; any member takes
+			# any request.
+			lb_retries 2
+			health_uri /healthz
+			health_interval 5s
+			fail_duration 30s
+		}
+	}
+}

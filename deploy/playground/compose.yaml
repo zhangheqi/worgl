@@ -1,0 +1,104 @@
+# A playground mint on one machine: three cluster members, a faucet, and
+# Caddy in front for TLS. See README.md.
+
+name: worgl-playground
+
+x-worgl: &worgl
+  image: worgl
+  build:
+    context: ../..
+    dockerfile: deploy/Dockerfile
+  restart: unless-stopped
+  networks: [cluster]
+  environment:
+    RUST_LOG: ${RUST_LOG:-info}
+
+x-member: &member
+  <<: *worgl
+  depends_on:
+    setup:
+      condition: service_completed_successfully
+  # Stop leaders cleanly, so the others take over at once.
+  stop_grace_period: 30s
+
+services:
+  setup:
+    <<: *worgl
+    restart: "no"
+    user: root
+    entrypoint: ["worgl-playground-setup"]
+    command: []
+    environment:
+      WORGL_LAYERS: ${WORGL_LAYERS:-4}
+      WORGL_LAYER_SIZE: ${WORGL_LAYER_SIZE:-4194304}
+      WORGL_ROTATE_EVERY: ${WORGL_ROTATE_EVERY:-28800}
+    volumes:
+      - member1:/members/1
+      - member2:/members/2
+      - member3:/members/3
+      - faucet:/faucet
+
+  member1:
+    <<: *member
+    command: [serve, --state, /state, --listen, "0.0.0.0:8080", --raft-listen, "0.0.0.0:7080"]
+    volumes: [member1:/state]
+
+  member2:
+    <<: *member
+    command: [serve, --state, /state, --listen, "0.0.0.0:8080", --raft-listen, "0.0.0.0:7080"]
+    volumes: [member2:/state]
+
+  member3:
+    <<: *member
+    command: [serve, --state, /state, --listen, "0.0.0.0:8080", --raft-listen, "0.0.0.0:7080"]
+    volumes: [member3:/state]
+
+  faucet:
+    <<: *worgl
+    depends_on:
+      setup:
+        condition: service_completed_successfully
+    entrypoint: ["/bin/sh", "-c"]
+    command:
+      - >-
+        exec worgl-faucet --mint "$$(cat /state/mint)" --key /state/mint.key
+        --server http://member1:8080 --server http://member2:8080 --server http://member3:8080
+        --listen 0.0.0.0:8090 --behind-proxy
+        --amount "$$FAUCET_AMOUNT" --per-address "$$FAUCET_PER_ADDRESS" --per-day "$$FAUCET_PER_DAY"
+    environment:
+      RUST_LOG: ${RUST_LOG:-info}
+      FAUCET_AMOUNT: ${FAUCET_AMOUNT:-64}
+      FAUCET_PER_ADDRESS: ${FAUCET_PER_ADDRESS:-10}
+      FAUCET_PER_DAY: ${FAUCET_PER_DAY:-10000}
+    volumes: [faucet:/state:ro]
+
+  proxy:
+    image: caddy:2.10
+    restart: unless-stopped
+    depends_on: [member1, member2, member3, faucet]
+    environment:
+      PLAYGROUND_HOST: ${PLAYGROUND_HOST:-localhost}
+    ports:
+      - "80:80"
+      - "443:443"
+      - "443:443/udp"
+    networks: [cluster, edge]
+    volumes:
+      - ./Caddyfile:/etc/caddy/Caddyfile:ro
+      - caddy-data:/data
+      - caddy-config:/config
+
+networks:
+  # The members' Raft ports must not reach the internet; nothing on this
+  # network does.
+  cluster:
+    internal: true
+  edge: {}
+
+volumes:
+  member1:
+  member2:
+  member3:
+  faucet:
+  caddy-data:
+  caddy-config:
