@@ -14,6 +14,19 @@
 //! flush each. Reads never see a change before it is on disk. Mints share
 //! nothing but the process, and an idle mint holds no thread.
 //!
+//! If a flush fails, as on a full disk, every change in the batch is
+//! refused, and the mint rereads its state from the disk, which needs
+//! nothing written, so that it answers from what reached the disk, and
+//! takes changes again once the disk takes writes. A mint that cannot
+//! reread its state is ahead of its disk: it refuses changes and answers
+//! reads of its ledger (`verify` and `info`) with `503 storage`, and tries
+//! again at its next request. If its log could not even be cut back after
+//! the failed write, the mint is stopped: it refuses changes and those
+//! reads until the server is restarted. `/healthz` answers `ok` while the
+//! server runs; `/readyz` answers `ok` only while every mint serves: not
+//! while a mint is failing, as it is from a failed flush until a batch
+//! reaches its disk, nor while it is ahead or stopped.
+//!
 //! # API
 //!
 //! All bodies are JSON. Keys and signatures are hex, notes are unpadded
@@ -22,6 +35,7 @@
 //! | method | path                       | token    | body                  | answer                 |
 //! |--------|----------------------------|----------|-----------------------|------------------------|
 //! | GET    | `/healthz`                 |          |                       | `ok`                   |
+//! | GET    | `/readyz`                  |          |                       | `ok`, or 503           |
 //! | POST   | `/v1/verify`               |          | `{"note": …}`         | [`Verified`]           |
 //! | POST   | `/v1/transfer`             |          | [`TransferRequest`]   | `{"notes": [...]}`     |
 //! | POST   | `/v1/burn`                 |          | [`BurnRequest`]       | `{"value": …}`         |
@@ -42,6 +56,11 @@
 //! cannot refresh it; it still verifies notes. Errors answer with a status
 //! code and `{"error": code, "message": text}`, where `code` is one of the
 //! stable strings listed on [`ApiError::code`].
+//!
+//! `/readyz` answers `503` with code `storage` while any mint is failing,
+//! ahead or stopped, as a cluster member's copy of a mint is once it has
+//! stopped, and `mints`, a list of `{"mint", "state"}` naming each such mint
+//! and `failing`, `ahead` or `stopped`.
 //!
 //! # Clusters
 //!
@@ -91,7 +110,7 @@ use worgl_raft::{NodeId, Replica, ReplicaError};
 use cluster::{Cluster, RAFT_BODY_LIMIT};
 pub use cluster::{ClusterConfig, Member, is_member, join_cluster};
 pub use mints::{CreateError, CreatedMint, MintSpec, create_mint, init_state};
-use mints::{Hosted, Mint};
+use mints::{Hosted, Mint, Readiness};
 
 /// Largest request body accepted, in bytes.
 pub const BODY_LIMIT: usize = 64 * 1024;
@@ -490,6 +509,7 @@ pub(crate) fn check_bearer(headers: &HeaderMap, token: &str, which: &str) -> Res
 pub fn router(state: AppState) -> Router {
     let mut router = Router::new()
         .route("/healthz", get(|| async { "ok" }))
+        .route("/readyz", get(readyz))
         .route("/v1/verify", post(verify))
         .route("/v1/transfer", post(transfer))
         .route("/v1/burn", post(burn))
@@ -536,6 +556,46 @@ pub fn raft_router(state: AppState) -> Router {
             cluster::members_only,
         ))
         .with_state(state)
+}
+
+/// A mint that does not serve, as `GET /readyz` names it.
+#[derive(Serialize)]
+struct Unready {
+    mint: PublicKey,
+    state: Readiness,
+}
+
+/// Answer of `GET /readyz` while a mint does not serve: an error body with
+/// every such mint.
+#[derive(Serialize)]
+struct UnreadyBody {
+    error: &'static str,
+    message: &'static str,
+    mints: Vec<Unready>,
+}
+
+/// Answers `ok` while every mint serves, and `503 storage` with the mints
+/// that are failing, ahead or stopped otherwise.
+async fn readyz(State(state): State<AppState>) -> Response {
+    let mut mints: Vec<_> = state
+        .hosted()
+        .iter()
+        .map(|(key, mint)| Unready {
+            mint: *key,
+            state: mint.readiness(),
+        })
+        .filter(|mint| mint.state != Readiness::Serving)
+        .collect();
+    if mints.is_empty() {
+        return "ok".into_response();
+    }
+    mints.sort_unstable_by_key(|mint| mint.mint);
+    let body = UnreadyBody {
+        error: "storage",
+        message: "not every mint is serving",
+        mints,
+    };
+    (StatusCode::SERVICE_UNAVAILABLE, Json(body)).into_response()
 }
 
 /// Answer of `GET /v1/mints/{mint}/info`.

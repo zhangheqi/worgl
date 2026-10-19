@@ -143,3 +143,56 @@ Sign a request with the mint key and post it to the mint:
   [Backups](../backups/).
 - Three servers can run as a cluster, so each mint carries on when one
   fails. See [Running a cluster](../running-a-cluster/).
+
+## Monitoring
+
+`GET /healthz` answers `ok` while the server runs, so it tells whether the
+process is alive. `GET /readyz` answers `ok` only while every mint serves,
+and otherwise `503` with the mints that do not, each `failing`, `ahead` or
+`stopped` (see [Health and readiness](../http-api/#health-and-readiness)).
+A mint is `failing` from a change that did not reach its disk, as on a full
+disk, until a change does. On a cluster member `/readyz` also answers `503`
+once the member's copy of a mint has stopped. Point alerts at it. It
+answers for the whole server, though: one mint that does not serve makes it
+answer `503`, and a load balancer that checks it then sends the server no
+requests for any mint. So check `/readyz` from a load balancer in front of
+cluster members, where another member serves the same mints, and `/healthz`
+in front of a single server, whose failing mint needs a change to come in
+before it serves again.
+
+## When the disk fills up
+
+Every change is written and flushed to the mint's log before it is
+answered. If the write fails, as when the disk is full, the log is cut back
+to where it was, and the change and every other change in the same flush
+are answered `500 storage`: none of them happened, and sending them again
+later is safe. They already took effect in the mint's memory, though, so
+the mint rereads its state from the disk straight away, which needs
+nothing written, and answers reads from what reached the disk. `/readyz`
+names it `failing`. While the disk is still full, every change fails the
+same way; once the disk has room, changes go through again, with no
+restart, and the first that does makes the mint serve again.
+
+If the mint cannot reread its state, as when a file cannot be read, it is
+ahead of its disk: it refuses changes and answers `verify` and `info` with
+`503 storage` rather than with changes that were never written, and
+`/readyz` names it `ahead`. It tries again at its next request, and answers
+those reads again once that succeeds.
+
+If the log could not even be cut back after the failed write, what the file
+holds is unknown. The mint then refuses changes and those reads until the
+server is restarted, `/readyz` names it `stopped`, and the server logs that
+it must be restarted. A restart reads the log again, which may show that
+changes answered `storage` were made after all. Transfers, burns, mint
+requests, pauses and resumes are still safe to send again, since none of
+them is made twice. A rotation on request is not: sent again, it rotates
+once more and drops another layer, with the notes still live in it. So
+before sending it again, check the generation of the last layer in the
+[mint's info](../http-api/#mint-info), which is one higher if the rotation
+was made.
+
+A server restarted while the disk is still full opens all the same.
+Opening compacts each mint's log into a fresh snapshot; if that fails, the
+server logs a warning with the cause and serves from the snapshot and log
+as they are, which hold every change. The next snapshot, once the log holds
+`--compact-every` events or at the next rotation, tries again.

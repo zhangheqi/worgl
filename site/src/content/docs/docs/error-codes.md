@@ -50,7 +50,7 @@ Errors answer with a status code and a body like:
 
 | Code | Status | Meaning |
 |---|---|---|
-| `storage` | 500 | The mint could not record the change, so nothing was applied; or, on a cluster, this member's copy of the mint has stopped. |
+| `storage` | 500 or 503 | With 500: the mint could not record the change, so nothing was applied; but if its log could not even be cut back after the failed write, the change may have been applied. Once the server has been restarted, send a transfer, burn or mint request again, but check the mint's info before sending a rotation again, which would rotate a second time. On a cluster, 500 also means this member's copy of the mint has stopped. With 503: a read of a mint whose last change did not reach its disk and that could not reread its state from the disk, which it tries again at its next request; or, if its log could not be cut back after the failed write, a read before the server is restarted. See [Running a server](../running-a-server/#when-the-disk-fills-up). `GET /readyz` answers 503 `storage` too while any mint is failing, ahead or stopped. |
 | `internal` | 500 | Something else went wrong on the server. |
 | `no_leader` | 503 | On a cluster: no member leading the mint, or the cluster's registry, could be reached, or the leader changed while the request was carried out. Nothing was done. |
 | `timeout` | 503 | On a cluster: the mint's group or the registry did not answer in time. The change may still be made. |

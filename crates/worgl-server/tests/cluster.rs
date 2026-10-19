@@ -602,6 +602,33 @@ async fn a_new_leader_takes_over_from_a_stopped_one() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn readiness_names_a_mint_whose_copy_on_a_member_has_stopped() {
+    let (seed, mint) = seed(None);
+    let cluster = Cluster::from_seed(seed).await;
+    cluster.leader(&mint.key).await;
+    for server in 0..3 {
+        let (status, _) = cluster
+            .call_once(server, Method::GET, "/readyz", None, &Value::Null)
+            .await;
+        assert_eq!(status, StatusCode::OK);
+    }
+
+    // The member's replicas stop, as a storage failure stops one, while its
+    // public port still answers.
+    cluster.servers[0].state().unwrap().shutdown().await;
+    let (status, answer) = cluster
+        .call_once(0, Method::GET, "/readyz", None, &Value::Null)
+        .await;
+    assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE, "{answer}");
+    assert_eq!(answer["error"], "storage");
+    assert_eq!(
+        answer["mints"],
+        json!([{"mint": mint.key, "state": "stopped"}])
+    );
+    cluster.stop().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_mint_that_ran_alone_carries_on_in_a_cluster() {
     let (seed, mint) = seed(None);
     let alice = HolderKey::generate();

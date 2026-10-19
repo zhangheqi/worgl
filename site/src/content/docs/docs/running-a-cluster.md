@@ -47,6 +47,14 @@ cannot reach the leader says so within a few seconds, so clients that still
 reach a cut-off member go elsewhere instead of waiting on it. Only the
 leader makes scheduled rotations.
 
+A member whose copy of a mint stops, as when its disk fails a write,
+answers `500 storage` to the requests for that mint it was carrying out
+then. Until it is restarted, it passes later ones on to the leader it last
+knew of, or answers them `503 no_leader` if that was itself, and its
+`GET /readyz` answers `503` naming the mint `stopped`. Point the load
+balancer's health check at `/readyz` so that it sends requests to the other
+members instead. See [Monitoring](../running-a-server/#monitoring).
+
 A mint, transfer or burn the mint already carried out is answered as it was
 the first time, so after `503 no_leader` or `503 timeout`, send the same
 request again. See [Error codes](../error-codes/).

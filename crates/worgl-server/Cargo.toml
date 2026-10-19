@@ -31,5 +31,9 @@ http-body-util.workspace = true
 tempfile.workspace = true
 tower.workspace = true
 
+# Limits the size of files the tests write, as a full disk would.
+[target.'cfg(unix)'.dev-dependencies]
+rustix.workspace = true
+
 [lints]
 workspace = true
