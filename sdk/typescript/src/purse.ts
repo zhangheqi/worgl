@@ -2,6 +2,7 @@ import { type Client, MintError, isTransient } from './client.ts';
 import {
   Holder,
   type Scheduled,
+  breaksPolicy,
   checkPayment,
   noteIssuer,
   paymentMint,
@@ -9,6 +10,7 @@ import {
   requestAmount,
   requestMint,
   requestNotes,
+  transferMint,
   verifyNotes,
 } from './core.ts';
 import { MemoryStore, type Store } from './store.ts';
@@ -72,7 +74,32 @@ export interface Balance {
   outgoing: bigint;
   /** Asked for and not yet received. */
   expected: bigint;
+  /**
+   * Change of transfers dropped or cancelled, which comes only if the
+   * counterparty hands it over: see {@link Purse.forget}.
+   */
+  unconfirmed: bigint;
 }
+
+/**
+ * What a purse did with a transfer the mint refused.
+ *
+ * - `kept`: nothing. A transfer this purse made stays outgoing, for the next
+ *   {@link Purse.settle}. So it is after a refusal that may pass later, one
+ *   {@link isTransient} accepts or `frozen`, and after one that shows nothing
+ *   about the transfer: `unknown_mint` or `unissued` from a server that is
+ *   not the mint's or lost its state, `spent` or `expired` with another
+ *   status than the mint's 409, or `unauthorized` or `duplicate_input`,
+ *   which the mint never answers to a transfer a holder signed.
+ * - `dropped`: refused as `spent` or `expired`, with the mint's status 409,
+ *   so the note it spends is gone and the purse forgot the transfer
+ *   ({@link Purse.forget}). Change the counterparty hands over later is still
+ *   taken in by {@link Purse.accept}.
+ * - `cancelled`: refused as `policy`, when the policy the mint publishes now
+ *   refuses it too. The purse cancelled it and took its note back
+ *   ({@link Purse.cancel}).
+ */
+export type Outcome = 'kept' | 'dropped' | 'cancelled';
 
 /** A transfer that did not go through, and why. */
 export interface Refused {
@@ -82,12 +109,14 @@ export interface Refused {
   error: unknown;
   /**
    * For a transfer refused as `spent` or `expired` that this purse made or
-   * is paid by, what it may lose: the transfer may have been applied, with
-   * an answer the mint no longer keeps. Only a counterparty that submitted
-   * it can then hand the notes over, for {@link Purse.accept}. `undefined`
-   * otherwise.
+   * is paid by, what it may lose, as it stood before the transfer was
+   * dropped: the transfer may have been applied, with an answer the mint no
+   * longer keeps. Only a counterparty that submitted it can then hand the
+   * notes over, for {@link Purse.accept}. `undefined` otherwise.
    */
   atStake: bigint | undefined;
+  /** What the purse did with the transfer. */
+  outcome: Outcome;
 }
 
 /** What submitting a set of transfers came to. */
@@ -102,7 +131,9 @@ export interface Submitted {
    * The notes in the answers for neither a note this purse holds nor a key
    * it expects: the counterparty's. Hand them over for its
    * {@link Purse.accept}: a payee hands the payer its change, and a payer
-   * that submitted a payment hands the payee its notes.
+   * that submitted a payment hands the payee its notes. The payer's purse
+   * keeps those for the payee too, until {@link Purse.forgetOwed} says they
+   * are handed over.
    */
   theirs: string[];
   /** Transfers the mint refused, or that kept failing on the way. */
@@ -164,6 +195,29 @@ export class Payment {
   }
 }
 
+/**
+ * A payment a purse made and keeps: while one of its transfers is outgoing,
+ * or while it keeps notes owed to the payee.
+ */
+export interface MadePayment {
+  /** The request it answers. */
+  request: PaymentRequest;
+  /**
+   * The payment, to send again to a payee who lost it. A transfer cancelled
+   * or forgotten leaves it, so it is never handed out again; the payment
+   * then no longer pays the whole request, and the payee would refuse it.
+   */
+  payment: Payment;
+  /**
+   * The payee's notes from the mint's answers this purse got itself: each
+   * time it settles, refreshes or submits one of the payment's transfers.
+   * The purse cannot tell whether the payee submitted the payment and has
+   * them already, so it keeps them until they are handed over
+   * ({@link Purse.forgetOwed}) or their layer is dropped ({@link Purse.prune}).
+   */
+  owed: string[];
+}
+
 /** How a {@link Purse} is set up. */
 export interface PurseOptions {
   /** Where it saves itself; in memory by default. */
@@ -190,7 +244,7 @@ export class Purse {
   readonly client: Client;
   /** The store saves go to. */
   readonly store: Store;
-  readonly #holder: Holder;
+  #holder: Holder;
   readonly #retry: Retry;
   #changes: Promise<unknown> = Promise.resolve();
 
@@ -219,6 +273,27 @@ export class Purse {
     return JSON.parse(this.#holder.notes()) as string[];
   }
 
+  /** The transfers this purse made and has not seen answered, as JSON. */
+  outgoing(): string[] {
+    return this.#holder.outgoing();
+  }
+
+  /**
+   * The payments this purse made and keeps: each while one of its transfers
+   * is outgoing, or while it keeps notes owed to the payee.
+   */
+  payments(): MadePayment[] {
+    return this.#holder.payments().map((made) => {
+      const read = {
+        request: PaymentRequest.from(made.request),
+        payment: Payment.from(made.payment),
+        owed: JSON.parse(made.owed) as string[],
+      };
+      made.free();
+      return read;
+    });
+  }
+
   /** Value held at `mint`, from its info. */
   async balance(mint: string): Promise<Balance> {
     const info = await this.client.infoText(mint);
@@ -231,6 +306,7 @@ export class Purse {
         unknown: balance.unknown,
         outgoing: balance.outgoing,
         expected: balance.expected,
+        unconfirmed: balance.unconfirmed,
       };
     } finally {
       balance.free();
@@ -295,28 +371,52 @@ export class Purse {
 
   /**
    * Answers a payment request, after reading the mint's info. The notes
-   * spent and the keys for the change are saved before the payment is
-   * returned. Send it to the payee, who submits it and can hand back the
-   * change for {@link accept}; or {@link settle} later to take it in.
+   * spent, the keys for the change and the payment itself (see
+   * {@link payments}) are saved before the payment is returned. Send it to
+   * the payee, who submits it and can hand back the change for
+   * {@link accept}; or {@link settle} later to take it in. A request for a
+   * note the mint would not make, of an amount outside its denominations, or
+   * to a key this purse has paid already, such as the same request twice, is
+   * refused before anything is signed.
    */
   async pay(request: PaymentRequest, spacing: Spacing = DEFAULT_SPACING): Promise<Payment> {
     const info = await this.client.infoText(request.mint);
-    const json = await this.#change(
-      () =>
-        this.#holder.pay(
-          info,
-          now(),
-          request.json,
-          BigInt(spacing.minSecs),
-          BigInt(spacing.maxSecs),
-        ),
-      (json) => {
-        for (const transfer of Payment.from(json).transfers) {
-          this.#holder.cancel(transfer.request);
-        }
-      },
+    const json = await this.#changeOrRestore(() =>
+      this.#holder.pay(info, now(), request.json, BigInt(spacing.minSecs), BigInt(spacing.maxSecs)),
     );
     return Payment.from(json);
+  }
+
+  /**
+   * Takes back the note of an outgoing transfer the mint never applied,
+   * keeping the keys of its change in case it did, and saves. Resolves to
+   * whether the transfer was outgoing.
+   *
+   * A payee that holds the transfer can still submit it: if the mint applies
+   * it, or already had, the payee's notes and the note taken back claim the
+   * same value, and the mint refuses whichever is spent second.
+   */
+  async cancel(transfer: string): Promise<boolean> {
+    return this.#changeOrRestore(() => this.#holder.cancel(transfer));
+  }
+
+  /**
+   * Drops an outgoing transfer whose note is gone, keeping the keys of its
+   * change so that change handed over later is still taken in, and saves.
+   * Resolves to whether the transfer was outgoing.
+   */
+  async forget(transfer: string): Promise<boolean> {
+    return this.#changeOrRestore(() => this.#holder.forget(transfer));
+  }
+
+  /**
+   * Stops keeping notes owed to payees, once they are handed over, and
+   * saves. The notes of a payment are in {@link payments}: send them where
+   * the payee gets them, then forget them. Resolves to the value it stopped
+   * keeping.
+   */
+  async forgetOwed(notes: string[]): Promise<bigint> {
+    return this.#changeOrRestore(() => this.#holder.forgetOwed(JSON.stringify(notes)));
   }
 
   /**
@@ -362,7 +462,11 @@ export class Purse {
   /**
    * Resends the transfers this purse made and has not seen answered, at
    * random gaps, and takes in their change. Call it once a payee has had
-   * time to submit a payment, or after a restart.
+   * time to submit a payment, or after a restart. The answer to a payment's
+   * transfer keeps the payee's notes for it, in case the payee has not
+   * submitted the payment and the resend carried it out (see
+   * {@link MadePayment.owed}), and a transfer refused for good is dropped or
+   * cancelled (see {@link Refused.outcome}).
    *
    * The mint answers a resent transfer with the same notes only while it
    * keeps its answer, and at the latest until the notes it issued expire
@@ -387,18 +491,11 @@ export class Purse {
   async planRefresh(mint: string): Promise<ScheduledTransfer[]> {
     const info = await this.client.infoText(mint);
     const at = now();
-    const { refreshes, resends } = await this.#change(
-      () => {
-        // Before the refreshes join the outgoing transfers.
-        const resends = read(this.#holder.dueResends(info, at));
-        return { refreshes: read(this.#holder.refresh(info, at)), resends };
-      },
-      ({ refreshes }) => {
-        for (const transfer of refreshes) {
-          this.#holder.cancel(transfer.request);
-        }
-      },
-    );
+    const { refreshes, resends } = await this.#changeOrRestore(() => {
+      // Before the refreshes join the outgoing transfers.
+      const resends = read(this.#holder.dueResends(info, at));
+      return { refreshes: read(this.#holder.refresh(info, at)), resends };
+    });
     return [...refreshes, ...resends].sort((a, b) => a.afterSecs - b.afterSecs);
   }
 
@@ -412,7 +509,11 @@ export class Purse {
     return this.submit(await this.planRefresh(mint));
   }
 
-  /** Drops `mint`'s expired notes and returns the value lost. */
+  /**
+   * Drops `mint`'s expired notes and returns the value lost. It also stops
+   * waiting for unconfirmed change that would sit in a dropped layer, and
+   * stops keeping notes owed to payees once their layer is dropped.
+   */
   async prune(mint: string): Promise<bigint> {
     const info = await this.client.infoText(mint);
     return this.#change(
@@ -423,9 +524,15 @@ export class Purse {
 
   /**
    * Submits each transfer at its time, counted from now, retrying failures
-   * on the way, and records each answer. A refused transfer does not stop
-   * the others; it is listed in {@link Submitted.refused}. Rejects only if a
-   * save fails.
+   * on the way, and records each answer, keeping the payee's notes for it
+   * when the transfer is part of a payment this purse made. A payer that
+   * submits its own payment hands them to the payee from
+   * {@link Submitted.theirs}, then calls {@link forgetOwed} with them. A
+   * refused transfer does not stop the others; it is listed in
+   * {@link Submitted.refused}. One this purse made that the mint refused for
+   * good is dropped or cancelled ({@link Refused.outcome}); the rest stay
+   * outgoing. To confirm a `policy` refusal, the purse reads the mint's info
+   * again. Rejects only if a save fails.
    */
   async submit(transfers: ScheduledTransfer[]): Promise<Submitted> {
     const order = [...transfers].sort((a, b) => a.afterSecs - b.afterSecs);
@@ -437,10 +544,8 @@ export class Purse {
       try {
         notes = await this.#send(transfer.request);
       } catch (error) {
-        const possiblyApplied =
-          error instanceof MintError && (error.code === 'spent' || error.code === 'expired');
-        const atStake = possiblyApplied ? this.#holder.atStake(transfer.request) : undefined;
-        submitted.refused.push({ request: transfer.request, error, atStake });
+        const { atStake, outcome } = await this.#refused(transfer.request, error);
+        submitted.refused.push({ request: transfer.request, error, atStake, outcome });
         continue;
       }
       const { value, theirs } = await this.#change(
@@ -457,6 +562,52 @@ export class Purse {
       submitted.theirs.push(...theirs);
     }
     return submitted;
+  }
+
+  /**
+   * Drops or cancels a transfer the mint refused, when the refusal shows it
+   * can never be applied. A transfer that is not outgoing is left as it is.
+   */
+  async #refused(
+    transfer: string,
+    error: unknown,
+  ): Promise<{ atStake: bigint | undefined; outcome: Outcome }> {
+    const code = error instanceof MintError ? error.code : undefined;
+    if (code === 'spent' || code === 'expired') {
+      // The mint answers both with 409 Conflict. Any other answer, such as a
+      // gateway's, shows nothing about the note.
+      if (!(error instanceof MintError && error.status === 409)) {
+        return { atStake: this.#holder.atStake(transfer), outcome: 'kept' };
+      }
+      return this.#changeOrRestore(() => {
+        // Before the transfer is dropped.
+        const atStake = this.#holder.atStake(transfer);
+        const outcome: Outcome = this.#holder.forget(transfer) ? 'dropped' : 'kept';
+        return { atStake, outcome };
+      });
+    }
+    if (code !== 'policy') {
+      // Anything else may pass later or shows nothing about the transfer:
+      // `unknown_mint` or `unissued` from a server that is not the mint's or
+      // lost its state, or `unauthorized` or `duplicate_input`, which the
+      // mint never answers to a transfer a holder signed, so they come from
+      // another server or version.
+      return { atStake: undefined, outcome: 'kept' };
+    }
+    // The mint checks its policy before its receipts, so a transfer applied
+    // under a looser policy is refused too: its change keys stay. Cancel only
+    // if the policy published now agrees.
+    let cancel: boolean;
+    try {
+      cancel = breaksPolicy(await this.client.infoText(transferMint(transfer)), transfer);
+    } catch {
+      cancel = false;
+    }
+    if (!cancel) {
+      return { atStake: undefined, outcome: 'kept' };
+    }
+    const cancelled = await this.#changeOrRestore(() => this.#holder.cancel(transfer));
+    return { atStake: undefined, outcome: cancelled ? 'cancelled' : 'kept' };
   }
 
   /** Sends one transfer, retrying while the failure is transient. */
@@ -493,6 +644,22 @@ export class Purse {
     const result = this.#changes.then(run, run);
     this.#changes = result.catch(() => {});
     return result;
+  }
+
+  /** Like {@link #change}, but a failed save puts the holder back as it was before `apply`. */
+  async #changeOrRestore<T>(apply: () => T): Promise<T> {
+    let before = '';
+    return this.#change(
+      () => {
+        before = this.#holder.toJson();
+        return apply();
+      },
+      () => {
+        const restored = Holder.fromJson(before);
+        this.#holder.free();
+        this.#holder = restored;
+      },
+    );
   }
 }
 

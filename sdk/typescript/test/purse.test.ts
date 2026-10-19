@@ -2,7 +2,8 @@
 
 import assert from 'node:assert/strict';
 import { mkdtempSync, readdirSync, rmSync, statSync, writeFileSync } from 'node:fs';
-import { createServer } from 'node:net';
+import { createServer as createHttpServer } from 'node:http';
+import { type AddressInfo, createServer } from 'node:net';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { after, before, describe, test } from 'node:test';
@@ -172,20 +173,180 @@ describe('purse', () => {
       assert.ok(refused.error instanceof MintError);
       assert.equal(refused.error.code, 'spent');
       assert.equal(refused.atStake, 5n);
+      // The note is gone either way, so the transfer is dropped; its change
+      // keys stay.
+      assert.equal(refused.outcome, 'dropped');
+      const dropped = await alice.balance(own.mint);
+      assert.deepEqual([dropped.outgoing, dropped.expected, dropped.unconfirmed], [0n, 0n, 5n]);
+      assert.deepEqual(alice.outgoing(), []);
 
-      // A forged note is refused and settles nothing.
+      // A forged note is refused and takes nothing in.
       const genuine = received.theirs[0]!;
       const forged = genuine.slice(0, 190) + (genuine[190] === 'A' ? 'B' : 'A') + genuine.slice(191);
       await assert.rejects(alice.accept([forged]), /signature/);
-      assert.equal((await alice.balance(own.mint)).outgoing, 8n);
+      assert.equal((await alice.balance(own.mint)).unconfirmed, 5n);
 
-      // The change Bob hands back recovers it and settles the transfer.
+      // The change Bob hands back is still taken in.
       assert.equal(await alice.accept(received.theirs), 5n);
       const balance = await alice.balance(own.mint);
-      assert.deepEqual([balance.frozen, balance.outgoing, balance.expected], [5n, 0n, 0n]);
+      assert.deepEqual(
+        [balance.frozen, balance.outgoing, balance.expected, balance.unconfirmed],
+        [5n, 0n, 0n, 0n],
+      );
     } finally {
       await own.stop();
     }
+  });
+
+  test('a request for a note the mint would not make is refused before signing', async () => {
+    const store = new MemoryStore();
+    const [alice, bob] = [await purse(store), await purse()];
+    await server.fund(alice, 8n, 8n);
+    const saved = store.saved;
+
+    const asked = JSON.parse((await bob.request(server.mint, 4n)).json) as {
+      outputs: { amount: number }[];
+    };
+    asked.outputs[0]!.amount = 3;
+    const request = PaymentRequest.from(JSON.stringify(asked));
+    await assert.rejects(alice.pay(request, NO_SPACING), /a note of 3, which is not one of/);
+    // Nothing is parked: no transfer to resend, nothing saved.
+    const balance = await alice.balance(server.mint);
+    assert.deepEqual([balance.spendable, balance.outgoing, balance.expected], [8n, 0n, 0n]);
+    assert.deepEqual(alice.outgoing(), []);
+    assert.deepEqual(alice.payments(), []);
+    assert.equal(store.saved, saved);
+    const settled = await alice.settle(NO_SPACING);
+    assert.deepEqual([settled.answered, settled.refused.length], [0, 0]);
+  });
+
+  test('a transfer another server does not know stays outgoing', async () => {
+    const other = await TestServer.start();
+    try {
+      const store = new MemoryStore();
+      const [alice, bob] = [await purse(store), await purse()];
+      await server.fund(alice, 8n, 8n);
+      const request = await bob.request(server.mint, 5n);
+      await alice.pay(request, NO_SPACING);
+
+      // Pointed at a server that is not the mint's, the purse keeps it.
+      const lost = await Purse.open(other.client(), { store, ...quick });
+      const settled = await lost.settle(NO_SPACING);
+      assert.equal(settled.refused.length, 1);
+      const refused = settled.refused[0]!;
+      assert.ok(refused.error instanceof MintError);
+      assert.equal(refused.error.code, 'unknown_mint');
+      assert.equal(refused.outcome, 'kept');
+      assert.equal(lost.outgoing().length, 1);
+
+      // The mint's own server still answers it.
+      const back = await purse(store);
+      allAnswered(await back.settle(NO_SPACING), 1);
+      assert.equal((await back.balance(server.mint)).frozen, 3n);
+    } finally {
+      await other.stop();
+    }
+  });
+
+  test('a refusal the mint would not give drops or cancels nothing', async () => {
+    const [alice, bob] = [await purse(), await purse()];
+    await server.fund(alice, 8n, 8n);
+    const request = await bob.request(server.mint, 5n);
+    await alice.pay(request, NO_SPACING);
+
+    // The mint answers `spent` and `expired` with 409, and never answers
+    // `unauthorized` or `duplicate_input` to a transfer a holder signed.
+    const answers = [
+      [401, 'spent'],
+      [401, 'expired'],
+      [403, 'unauthorized'],
+      [400, 'duplicate_input'],
+    ] as const;
+    for (const [status, code] of answers) {
+      // As a gateway or a server of another version might answer.
+      const stub = createHttpServer((_, response) => {
+        response.writeHead(status, { 'content-type': 'application/json' });
+        response.end(JSON.stringify({ error: code, message: 'sign in first' }));
+      });
+      await new Promise<void>((resolve) => stub.listen(0, '127.0.0.1', resolve));
+      try {
+        const { port } = stub.address() as AddressInfo;
+        const lost = await Purse.open(new Client(`http://127.0.0.1:${port}`), {
+          store: new MemoryStore(alice.toJson()),
+          ...quick,
+        });
+        const settled = await lost.settle(NO_SPACING);
+        assert.equal(settled.refused.length, 1);
+        const refused = settled.refused[0]!;
+        assert.ok(refused.error instanceof MintError);
+        assert.equal(refused.error.code, code);
+        assert.equal(refused.outcome, 'kept', code);
+        assert.deepEqual([lost.outgoing().length, lost.notes().length], [1, 0], code);
+      } finally {
+        await new Promise((resolve) => stub.close(resolve));
+      }
+    }
+
+    // The mint's own server still answers it.
+    allAnswered(await alice.settle(NO_SPACING), 1);
+    assert.equal((await alice.balance(server.mint)).frozen, 3n);
+  });
+
+  test('a transfer the policy now refuses is cancelled', async () => {
+    const own = await TestServer.start();
+    try {
+      const open = () => Purse.open(own.client(), quick);
+      const [alice, bob] = [await open(), await open()];
+      await own.fund(alice, 8n, 8n);
+      const request = await bob.request(own.mint, 5n);
+      const payment = await alice.pay(request, NO_SPACING);
+
+      // The operator allows one output per transfer from now on.
+      await own.restart({ max_outputs: 1 });
+      const settled = await alice.settle(NO_SPACING);
+      assert.equal(settled.refused.length, 1);
+      const refused = settled.refused[0]!;
+      assert.ok(refused.error instanceof MintError);
+      assert.equal(refused.error.code, 'policy');
+      assert.equal(refused.outcome, 'cancelled');
+      // The note is back; the change keys stay in case the transfer went
+      // through under the old policy.
+      const balance = await alice.balance(own.mint);
+      assert.deepEqual([balance.spendable, balance.outgoing, balance.unconfirmed], [8n, 0n, 3n]);
+      assert.equal(alice.notes().length, 1);
+      assert.deepEqual(alice.payments(), []);
+      // Bob's submission is refused the same way.
+      const received = await bob.receive(request, payment);
+      assert.equal(received.refused[0]?.outcome, 'kept');
+    } finally {
+      await own.stop();
+    }
+  });
+
+  test('a settle that carries out a payment keeps the payee\'s notes', async () => {
+    const [alice, bob] = [await purse(), await purse()];
+    await server.fund(alice, 8n, 8n);
+    const request = await bob.request(server.mint, 5n);
+    const payment = await alice.pay(request, NO_SPACING);
+    const made = alice.payments();
+    assert.equal(made.length, 1);
+    assert.equal(made[0]!.request.json, request.json);
+    assert.equal(made[0]!.payment.json, payment.json);
+    assert.deepEqual(made[0]!.owed, []);
+
+    // Bob never submits; Alice's settle carries the payment out.
+    const settled = await alice.settle(NO_SPACING);
+    allAnswered(settled, 1);
+    assert.equal(settled.value, 3n);
+    const owed = alice.payments()[0]!.owed;
+    assert.deepEqual(owed, settled.theirs);
+    assert.equal(owed.length, request.notes.length);
+
+    // Handed to Bob, who keeps them, and then no longer kept by Alice.
+    assert.equal(await bob.accept(owed), 5n);
+    assert.equal(await alice.forgetOwed(owed), 5n);
+    assert.deepEqual(alice.payments(), []);
+    assert.equal(await alice.forgetOwed(owed), 0n);
   });
 
   test('a payment for another request is not submitted', async () => {

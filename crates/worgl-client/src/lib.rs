@@ -42,12 +42,18 @@
 //!
 //! Without the change from Bob, Alice would [`settle`](Purse::settle):
 //! resend her transfers, which the mint answers with the same notes while
-//! it keeps its answers.
+//! it keeps its answers. If Bob had not submitted the payment, her resend
+//! carries it out. She cannot tell, so she keeps his notes from every
+//! answer for him (see [`Holder::payments`](worgl_sdk::Holder::payments))
+//! until she hands them over ([`Purse::forget_owed`]) or
+//! [prunes](Purse::prune) them once they expire. A transfer the mint
+//! refuses for good is dropped or cancelled ([`Refused::outcome`]).
 //!
 //! Either side may submit a payment. When the payer does, with
 //! [`Purse::submit`], it hands the payee's notes from the answers,
 //! [`Submitted::theirs`], to the payee, who takes them in with
-//! [`Purse::accept`].
+//! [`Purse::accept`], and then stops keeping them with
+//! [`Purse::forget_owed`].
 //!
 //! Requests run on Tokio. TLS is rustls with the platform's certificate
 //! roots.
@@ -59,5 +65,5 @@ mod store;
 
 pub use client::{Client, FaucetInfo, Info, Verified};
 pub use error::{Error, Refusal};
-pub use purse::{MAX_DELAY_SECS, Purse, Refused, Retry, Submitted};
+pub use purse::{MAX_DELAY_SECS, Outcome, Purse, Refused, Retry, Submitted};
 pub use store::{FileLock, FileStore, Locked, MemoryStore, Store};

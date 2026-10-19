@@ -80,7 +80,8 @@ pub struct Submitted {
     /// key it expects: the counterparty's (see [`Holder::theirs`]). Hand
     /// them over for its [`Purse::accept`]: a payee hands the payer its
     /// change, and a payer that submitted a payment hands the payee its
-    /// notes.
+    /// notes. The payer's purse keeps those for the payee too, until
+    /// [`forget_owed`](Purse::forget_owed) says they are handed over.
     pub theirs: Vec<Note>,
     /// Transfers the mint refused, or that kept failing on the way.
     pub refused: Vec<Refused>,
@@ -96,11 +97,37 @@ pub struct Refused {
     /// not.
     pub error: Error,
     /// For a transfer refused as `spent` or `expired` that this purse made
-    /// or is paid by, what it may lose ([`Holder::at_stake`]): the transfer
-    /// may have been applied, with an answer the mint no longer keeps. Only
-    /// a counterparty that submitted it can then hand the notes over, for
+    /// or is paid by, what it may lose ([`Holder::at_stake`]), as it stood
+    /// before the transfer was dropped: the transfer may have been applied,
+    /// with an answer the mint no longer keeps. Only a counterparty that
+    /// submitted it can then hand the notes over, for
     /// [`accept`](Purse::accept). `None` otherwise.
     pub at_stake: Option<u128>,
+    /// What the purse did with the transfer.
+    pub outcome: Outcome,
+}
+
+/// What a purse did with a transfer the mint refused.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Outcome {
+    /// Nothing: a transfer this purse made stays outgoing, for the next
+    /// [`settle`](Purse::settle). So it is after a refusal that may pass
+    /// later, one [`Error::is_transient`] accepts or `frozen`, and after one
+    /// that shows nothing about the transfer: `unknown_mint` or `unissued`
+    /// from a server that is not the mint's or lost its state, `spent` or
+    /// `expired` with another status than the mint's 409, or `unauthorized`
+    /// or `duplicate_input`, which the mint never answers to a transfer a
+    /// holder signed.
+    Kept,
+    /// Refused as `spent` or `expired`, with the mint's status 409: the note
+    /// it spends is gone, so the purse [forgot](Holder::forget) the
+    /// transfer. Change the counterparty hands over later is still taken in
+    /// by [`accept`](Purse::accept).
+    Dropped,
+    /// Refused as `policy`, when the policy the mint publishes now refuses
+    /// it too: the purse [cancelled](Holder::cancel) the transfer and took
+    /// its note back.
+    Cancelled,
 }
 
 impl Purse<FileStore> {
@@ -211,20 +238,42 @@ impl<S: Store> Purse<S> {
     }
 
     /// Answers a payment request, after reading the mint's info. The notes
-    /// spent and the keys for the change are saved before the payment is
-    /// returned. Send it to the payee, who submits it and can hand back the
-    /// change for [`accept`](Self::accept); or [`settle`](Self::settle)
-    /// later to take it in.
+    /// spent, the keys for the change and the payment itself (see
+    /// [`Holder::payments`]) are saved before the payment is returned. Send
+    /// it to the payee, who submits it and can hand back the change for
+    /// [`accept`](Self::accept); or [`settle`](Self::settle) later to take it
+    /// in. A request for a note the mint would not make, or to a key this
+    /// purse has paid already, is refused before anything is signed (see
+    /// [`Holder::pay`]).
     pub async fn pay(&self, request: &PaymentRequest, spacing: Spacing) -> Result<Payment, Error> {
         let view = self.client.view(&request.mint).await?;
-        self.change(
-            |holder| Ok(holder.pay(&view, request, spacing)?),
-            |holder, payment| {
-                for transfer in &payment.transfers {
-                    holder.cancel(&transfer.request);
-                }
-            },
-        )
+        self.change_or_restore(|holder| Ok(holder.pay(&view, request, spacing)?))
+    }
+
+    /// Takes back the note of an outgoing transfer the mint never applied,
+    /// keeping the keys of its change in case it did, and saves (see
+    /// [`Holder::cancel`]). Returns whether the transfer was outgoing.
+    ///
+    /// A payee that holds the transfer can still submit it: if the mint
+    /// applies it, or already had, the payee's notes and the note taken back
+    /// claim the same value, and the mint refuses whichever is spent second.
+    pub fn cancel(&self, request: &TransferRequest) -> Result<bool, Error> {
+        self.change_or_restore(|holder| Ok(holder.cancel(request)))
+    }
+
+    /// Drops an outgoing transfer whose note is gone, keeping the keys of its
+    /// change so that change handed over later is still taken in, and saves
+    /// (see [`Holder::forget`]). Returns whether the transfer was outgoing.
+    pub fn forget(&self, request: &TransferRequest) -> Result<bool, Error> {
+        self.change_or_restore(|holder| Ok(holder.forget(request)))
+    }
+
+    /// Stops keeping notes owed to payees, once they are handed over, and
+    /// saves (see [`Holder::forget_owed`]). The notes of a payment are in
+    /// [`Holder::payments`]: write them where the payee gets them, then
+    /// forget them. Returns the value it stopped keeping.
+    pub fn forget_owed(&self, notes: &[Note]) -> Result<u128, Error> {
+        self.change_or_restore(|holder| Ok(holder.forget_owed(notes)))
     }
 
     /// Takes a payment for `request`: checks that it pays what was asked,
@@ -266,7 +315,11 @@ impl<S: Store> Purse<S> {
     /// Resends the transfers this purse made and has not seen answered, at
     /// random gaps of `spacing`, and takes in their change. Call it once a
     /// payee has had time to submit a payment, or after a restart. Planned
-    /// refreshes still waiting for their time are resent too.
+    /// refreshes still waiting for their time are resent too. The answer to
+    /// a payment's transfer keeps the payee's notes for it, in case the payee
+    /// has not submitted the payment and the resend carried it out (see
+    /// [`MadePayment::owed`](worgl_sdk::MadePayment::owed)), and a transfer
+    /// refused for good is dropped or cancelled (see [`Refused::outcome`]).
     ///
     /// The mint answers a resent transfer with the same notes only while it
     /// keeps its answer, and at the latest until the notes it issued expire
@@ -291,18 +344,11 @@ impl<S: Store> Purse<S> {
     pub async fn plan_refresh(&self, mint: &PublicKey) -> Result<Vec<ScheduledTransfer>, Error> {
         let view = self.client.view(mint).await?;
         let now = unix_now();
-        let (mut transfers, resends) = self.change(
-            |holder| {
-                // Before the refreshes join the outgoing transfers.
-                let resends = holder.due_resends(&view, now);
-                Ok((holder.refresh(&view, now), resends))
-            },
-            |holder, (refreshes, _)| {
-                for transfer in refreshes {
-                    holder.cancel(&transfer.request);
-                }
-            },
-        )?;
+        let (mut transfers, resends) = self.change_or_restore(|holder| {
+            // Before the refreshes join the outgoing transfers.
+            let resends = holder.due_resends(&view, now);
+            Ok((holder.refresh(&view, now), resends))
+        })?;
         transfers.extend(resends);
         transfers.sort_by_key(|t| t.after_secs);
         Ok(transfers)
@@ -320,7 +366,9 @@ impl<S: Store> Purse<S> {
     }
 
     /// Drops `mint`'s notes whose layer was dropped, after reading its info,
-    /// and returns the value lost.
+    /// and returns the value lost. It also stops waiting for unconfirmed
+    /// change that would sit in a dropped layer, and stops keeping notes
+    /// owed to payees once their layer is dropped (see [`Holder::prune`]).
     pub async fn prune(&self, mint: &PublicKey) -> Result<u128, Error> {
         let view = self.client.view(mint).await?;
         self.change(|holder| Ok(holder.prune(&view)), |_, _| {})
@@ -328,10 +376,18 @@ impl<S: Store> Purse<S> {
 
     /// Submits each transfer at its time, counted from now, retrying
     /// failures on the way, and records each answer: the transfer stops
-    /// being outgoing and the notes for this purse are taken in.
+    /// being outgoing and the notes for this purse are taken in, and the
+    /// payee's notes are kept for it when the transfer is part of a payment
+    /// this purse made (see [`Holder::settle`]). A payer that submits its own
+    /// payment hands them to the payee from [`Submitted::theirs`], then
+    /// calls [`forget_owed`](Self::forget_owed) with them, as `worgl submit`
+    /// does.
     ///
     /// A refused transfer does not stop the others; it is listed in
-    /// [`Submitted::refused`]. The call fails only if a save does.
+    /// [`Submitted::refused`]. One this purse made that the mint refused for
+    /// good is dropped or cancelled ([`Refused::outcome`]); the rest stay
+    /// outgoing. To confirm a `policy` refusal, the purse reads the mint's
+    /// info again. The call fails only if a save does.
     pub async fn submit(&self, transfers: &[ScheduledTransfer]) -> Result<Submitted, Error> {
         let mut order: Vec<&ScheduledTransfer> = transfers.iter().collect();
         order.sort_by_key(|transfer| transfer.after_secs);
@@ -355,19 +411,77 @@ impl<S: Store> Purse<S> {
                     submitted.theirs.extend(theirs);
                 }
                 Err(error) => {
-                    let at_stake = match error.code() {
-                        Some("spent" | "expired") => self.lock().at_stake(&transfer.request),
-                        _ => None,
-                    };
+                    let (at_stake, outcome) = self.refused(&transfer.request, &error).await?;
                     submitted.refused.push(Refused {
                         request: transfer.request.clone(),
                         error,
                         at_stake,
+                        outcome,
                     });
                 }
             }
         }
         Ok(submitted)
+    }
+
+    /// Drops or cancels a transfer the mint refused, when the refusal shows
+    /// it can never be applied, and returns what is at stake on it and what
+    /// was done. A transfer that is not outgoing is left as it is.
+    async fn refused(
+        &self,
+        request: &TransferRequest,
+        error: &Error,
+    ) -> Result<(Option<u128>, Outcome), Error> {
+        let cancel = match error.code() {
+            Some("spent" | "expired") => {
+                // The mint answers both with 409 Conflict. Any other answer,
+                // such as a gateway's, shows nothing about the note.
+                if !matches!(error, Error::Refused(refusal) if refusal.status == 409) {
+                    return Ok((self.lock().at_stake(request), Outcome::Kept));
+                }
+                return self.change_or_restore(|holder| {
+                    // Before the transfer is dropped.
+                    let at_stake = holder.at_stake(request);
+                    let outcome = if holder.forget(request) {
+                        Outcome::Dropped
+                    } else {
+                        Outcome::Kept
+                    };
+                    Ok((at_stake, outcome))
+                });
+            }
+            // The mint checks its policy before its receipts, so a transfer
+            // applied under a looser policy is refused too: its change keys
+            // stay. Cancel only if the policy published now agrees.
+            Some("policy") => match request.inputs.first() {
+                Some(spend) => match self.client.view(spend.note.issuer()).await {
+                    Ok(view) => {
+                        let inputs: Vec<u64> =
+                            request.inputs.iter().map(|s| s.note.amount()).collect();
+                        let outputs: Vec<u64> = request.outputs.iter().map(|o| o.amount).collect();
+                        view.policy.check_transfer(&inputs, &outputs).is_err()
+                    }
+                    Err(_) => false,
+                },
+                None => false,
+            },
+            // Anything else may pass later or shows nothing about the
+            // transfer: `unknown_mint` or `unissued` from a server that is
+            // not the mint's or lost its state, or `unauthorized` or
+            // `duplicate_input`, which the mint never answers to a transfer
+            // a holder signed, so they come from another server or version.
+            _ => false,
+        };
+        if !cancel {
+            return Ok((None, Outcome::Kept));
+        }
+        let cancelled = self.change_or_restore(|holder| Ok(holder.cancel(request)))?;
+        let outcome = if cancelled {
+            Outcome::Cancelled
+        } else {
+            Outcome::Kept
+        };
+        Ok((None, outcome))
     }
 
     /// Sends one transfer, retrying while the failure is transient.
@@ -384,6 +498,22 @@ impl<S: Store> Purse<S> {
                 result => return result,
             }
         }
+    }
+
+    /// Like [`change`](Self::change), but a failed save puts the holder back
+    /// as it was before `apply`.
+    fn change_or_restore<T>(
+        &self,
+        apply: impl FnOnce(&mut Holder) -> Result<T, Error>,
+    ) -> Result<T, Error> {
+        let (value, _) = self.change(
+            |holder| {
+                let before = holder.clone();
+                Ok((apply(holder)?, before))
+            },
+            |holder, (_, before)| *holder = before.clone(),
+        )?;
+        Ok(value)
     }
 
     /// Changes the holder as saved now and saves it, holding the store's

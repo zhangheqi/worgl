@@ -78,13 +78,7 @@ impl Setup {
     }
 
     async fn worgl_with(&self, purse: &str, passphrase: &str, args: &[&str]) -> Run {
-        let mut command = Command::new(env!("CARGO_BIN_EXE_worgl"));
-        command
-            .current_dir(self.dir.path())
-            .env("WORGL_SERVER", &self.url)
-            .env("WORGL_PURSE", purse)
-            .env("WORGL_PASSPHRASE", passphrase)
-            .args(args);
+        let mut command = self.command(purse, passphrase, args);
         let output = tokio::task::spawn_blocking(move || command.output())
             .await
             .unwrap()
@@ -94,6 +88,18 @@ impl Setup {
             stdout: String::from_utf8(output.stdout).unwrap(),
             stderr: String::from_utf8(output.stderr).unwrap(),
         }
+    }
+
+    /// `worgl` with `purse` and `passphrase`, to run in the directory.
+    fn command(&self, purse: &str, passphrase: &str, args: &[&str]) -> Command {
+        let mut command = Command::new(env!("CARGO_BIN_EXE_worgl"));
+        command
+            .current_dir(self.dir.path())
+            .env("WORGL_SERVER", &self.url)
+            .env("WORGL_PURSE", purse)
+            .env("WORGL_PASSPHRASE", passphrase)
+            .args(args);
+        command
     }
 
     /// Runs `worgl` and expects it to succeed.
@@ -287,6 +293,66 @@ async fn the_payer_can_submit_and_hand_the_notes_over() {
     }
     let accepted = setup.ok("bob.worgl", &["accept", "notes.json"]).await;
     assert!(accepted.stderr.contains("Kept 6"), "{}", accepted.stderr);
+    // Handed over, so Alice keeps nothing for Bob.
+    let outgoing = setup.ok("alice.worgl", &["outgoing"]).await;
+    assert_eq!(outgoing.stdout, "");
+    assert!(
+        outgoing.stderr.contains("Nothing is outgoing."),
+        "{}",
+        outgoing.stderr
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn the_payees_notes_stay_kept_when_submit_cannot_write_them() {
+    let setup = Setup::start().await;
+    let mint = setup.mint.to_string();
+    setup.ok("alice.worgl", &["init"]).await;
+    setup.ok("bob.worgl", &["init"]).await;
+    setup.mint_into("alice.worgl", 8).await;
+    setup
+        .ok("bob.worgl", &["request", &mint, "6", "-o", "request.json"])
+        .await;
+    let pay = [
+        "pay",
+        "request.json",
+        "--spacing",
+        "0..0",
+        "-o",
+        "payment.json",
+    ];
+    let id = paid_id(&setup.ok("alice.worgl", &pay).await);
+
+    let lost = setup
+        .worgl(
+            "alice.worgl",
+            &["submit", "payment.json", "-o", "missing/notes.json"],
+        )
+        .await;
+    assert!(!lost.ok);
+    assert!(
+        lost.stderr.contains(&format!(
+            "the payee's notes are kept in the purse; write them with `worgl export {id} \
+             --notes -o FILE`"
+        )),
+        "{}",
+        lost.stderr
+    );
+    let exported = setup
+        .ok(
+            "alice.worgl",
+            &["export", &id, "--notes", "-o", "notes.json"],
+        )
+        .await;
+    assert!(
+        exported.stderr.contains(&format!(
+            "Wrote 2 note(s) worth 6 for the payee of payment {id}"
+        )),
+        "{}",
+        exported.stderr
+    );
+    let accepted = setup.ok("bob.worgl", &["accept", "notes.json"]).await;
+    assert_eq!(accepted.stderr.trim(), "Kept 6.");
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -339,16 +405,25 @@ async fn the_payee_hands_back_the_change() {
         received.stderr
     );
 
-    // Too late to settle: the mint no longer has the answer.
+    // Too late to settle: the mint no longer has the answer. A copy of
+    // Alice's purse, made first, takes the change too late, below.
     setup.traffic(3).await;
+    fs::copy(setup.path("alice.worgl"), setup.path("late.worgl")).unwrap();
     let settled = setup
-        .worgl("alice.worgl", &["settle", "--spacing", "0..0"])
+        .ok("alice.worgl", &["settle", "--spacing", "0..0"])
         .await;
-    assert!(!settled.ok);
     assert!(
         settled
             .stderr
             .contains("possibly applied: the mint no longer has its answer, 5 may be lost"),
+        "{}",
+        settled.stderr
+    );
+    assert!(
+        settled.stderr.contains(
+            "dropped: the note it spends is gone either way; its change is still kept if \
+             handed back"
+        ),
         "{}",
         settled.stderr
     );
@@ -362,15 +437,17 @@ async fn the_payee_hands_back_the_change() {
         "{}",
         settled.stderr
     );
+    let alice = setup.balance("alice.worgl").await;
+    assert!(alice.contains("outgoing   0"), "{alice}");
+    assert!(alice.contains("unconfirmed 5"), "{alice}");
 
-    // The change Bob sent back settles it. A copy of Alice's purse takes it
-    // too late, below.
-    fs::copy(setup.path("alice.worgl"), setup.path("late.worgl")).unwrap();
+    // The change Bob sent back is still taken in.
     let accepted = setup.ok("alice.worgl", &["accept", "change.json"]).await;
     assert_eq!(accepted.stderr.trim(), "Kept 5.");
     let alice = setup.balance("alice.worgl").await;
     assert!(alice.contains("frozen     5"), "{alice}");
     assert!(alice.contains("outgoing   0"), "{alice}");
+    assert!(!alice.contains("unconfirmed"), "{alice}");
     let nothing = setup.ok("alice.worgl", &["settle"]).await;
     assert!(
         nothing.stderr.contains("Nothing to settle"),
@@ -398,6 +475,431 @@ async fn the_payee_hands_back_the_change() {
     setup.ok("carol.worgl", &["init"]).await;
     let carol = setup.ok("carol.worgl", &["accept", "change.json"]).await;
     assert_eq!(carol.stderr.trim(), "Kept 0.");
+}
+
+/// The payment id `worgl pay` printed.
+fn paid_id(paid: &Run) -> String {
+    let (_, rest) = paid.stderr.split_once(", payment ").unwrap();
+    rest[..12].to_owned()
+}
+
+/// The transfer ids `worgl outgoing` printed.
+fn transfer_ids(outgoing: &Run) -> Vec<String> {
+    outgoing
+        .stdout
+        .lines()
+        .filter_map(|line| line.trim().strip_prefix("transfer "))
+        .map(|rest| rest.split(' ').next().unwrap().to_owned())
+        .collect()
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_payment_settled_too_late_is_dropped() {
+    let setup = Setup::start().await;
+    let mint = setup.mint.to_string();
+    setup.ok("alice.worgl", &["init"]).await;
+    setup.ok("bob.worgl", &["init"]).await;
+    setup.mint_into("alice.worgl", 8).await;
+    setup
+        .ok("bob.worgl", &["request", &mint, "5", "-o", "request.json"])
+        .await;
+    let pay = [
+        "pay",
+        "request.json",
+        "--spacing",
+        "0..0",
+        "-o",
+        "payment.json",
+    ];
+    setup.ok("alice.worgl", &pay).await;
+
+    // Bob never submits, and the note it spends expires.
+    for _ in 0..3 {
+        setup.rotate().await;
+    }
+    let settled = setup
+        .ok("alice.worgl", &["settle", "--spacing", "0..0"])
+        .await;
+    assert!(settled.stderr.contains("expired"), "{}", settled.stderr);
+    assert!(settled.stderr.contains("dropped: "), "{}", settled.stderr);
+    let again = setup
+        .ok("alice.worgl", &["settle", "--spacing", "0..0"])
+        .await;
+    assert!(
+        again.stderr.contains("Nothing to settle."),
+        "{}",
+        again.stderr
+    );
+    let alice = setup.balance("alice.worgl").await;
+    assert!(alice.contains("outgoing   0"), "{alice}");
+    assert!(alice.contains("unconfirmed 3"), "{alice}");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_request_is_paid_once() {
+    let setup = Setup::start().await;
+    let mint = setup.mint.to_string();
+    setup.ok("alice.worgl", &["init"]).await;
+    setup.ok("bob.worgl", &["init"]).await;
+    setup.mint_into("alice.worgl", 8).await;
+    setup.mint_into("alice.worgl", 8).await;
+    setup
+        .ok("bob.worgl", &["request", &mint, "3", "-o", "request.json"])
+        .await;
+
+    // The payment cannot be written, but it is made and saved.
+    let pay = |out: &'static str| ["pay", "request.json", "--spacing", "0..0", "-o", out];
+    let lost = setup
+        .worgl("alice.worgl", &pay("missing/payment.json"))
+        .await;
+    assert!(!lost.ok);
+    assert!(
+        lost.stderr
+            .contains("the payment is recorded in the purse; write it again with `worgl export "),
+        "{}",
+        lost.stderr
+    );
+    let twice = setup.worgl("alice.worgl", &pay("payment.json")).await;
+    assert!(!twice.ok);
+    assert!(
+        twice.stderr.contains("has paid already"),
+        "{}",
+        twice.stderr
+    );
+    let (_, kept) = twice.stderr.split_once("error: payment ").unwrap();
+    let id = &kept[..12];
+    assert!(
+        twice.stderr.contains(&format!(
+            "payment {id} pays this request already; `worgl export {id} -o FILE` writes it again"
+        )),
+        "{}",
+        twice.stderr
+    );
+    assert!(!setup.path("payment.json").exists());
+    let alice = setup.balance("alice.worgl").await;
+    assert!(alice.contains("spendable  8"), "{alice}");
+    assert!(alice.contains("outgoing   8"), "{alice}");
+
+    // `outgoing` names it, and `export` writes it again.
+    let outgoing = setup.ok("alice.worgl", &["outgoing"]).await.stdout;
+    let line = outgoing
+        .lines()
+        .find(|line| line.starts_with("  payment "))
+        .unwrap();
+    assert!(
+        line.ends_with("pays 3, 1 of 1 transfer(s) outgoing"),
+        "{outgoing}"
+    );
+    assert_eq!(&line["  payment ".len()..][..12], id);
+    let exported = setup
+        .ok("alice.worgl", &["export", &id[..6], "-o", "payment.json"])
+        .await;
+    assert!(
+        exported
+            .stderr
+            .contains(&format!("Wrote payment {id} again")),
+        "{}",
+        exported.stderr
+    );
+    let received = setup
+        .ok("bob.worgl", &["receive", "request.json", "payment.json"])
+        .await;
+    assert!(
+        received.stderr.contains("Received 3"),
+        "{}",
+        received.stderr
+    );
+    // Nothing kept for Bob: he submitted it himself.
+    let missing = setup.worgl("alice.worgl", &["export", id, "--notes"]).await;
+    assert!(!missing.ok);
+    assert!(
+        missing.stderr.contains("no notes are kept for the payee"),
+        "{}",
+        missing.stderr
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_transfer_is_cancelled_or_forgotten() {
+    let setup = Setup::start().await;
+    let mint = setup.mint.to_string();
+    setup.ok("alice.worgl", &["init"]).await;
+    setup.ok("bob.worgl", &["init"]).await;
+    setup.mint_into("alice.worgl", 8).await;
+    setup.mint_into("alice.worgl", 8).await;
+    for name in ["first", "second"] {
+        let request = format!("{name}.json");
+        setup
+            .ok("bob.worgl", &["request", &mint, "3", "-o", &request])
+            .await;
+        let pay = ["pay", &request, "--spacing", "0..0"];
+        setup.ok("alice.worgl", &pay).await;
+    }
+    let ids = transfer_ids(&setup.ok("alice.worgl", &["outgoing"]).await);
+    let [first, second] = &ids[..] else {
+        panic!("{ids:?}")
+    };
+
+    let cancelled = setup.ok("alice.worgl", &["cancel", first]).await;
+    assert_eq!(
+        cancelled.stderr.trim(),
+        format!("Cancelled transfer {first}: its note of 8 is back in the purse.")
+    );
+    let alice = setup.balance("alice.worgl").await;
+    assert!(alice.contains("spendable  8"), "{alice}");
+    assert!(alice.contains("outgoing   8"), "{alice}");
+    assert!(alice.contains("unconfirmed 5"), "{alice}");
+
+    let forgotten = setup.ok("alice.worgl", &["forget", &second[..4]]).await;
+    assert!(
+        forgotten
+            .stderr
+            .starts_with(&format!("Dropped transfer {second} and its note of 8.")),
+        "{}",
+        forgotten.stderr
+    );
+    let alice = setup.balance("alice.worgl").await;
+    assert!(alice.contains("spendable  8"), "{alice}");
+    assert!(alice.contains("outgoing   0"), "{alice}");
+    assert!(alice.contains("unconfirmed 10"), "{alice}");
+    let nothing = setup.ok("alice.worgl", &["outgoing"]).await;
+    assert!(
+        nothing.stderr.contains("Nothing is outgoing."),
+        "{}",
+        nothing.stderr
+    );
+    let again = setup.worgl("alice.worgl", &["cancel", first]).await;
+    assert!(!again.ok);
+    assert!(
+        again.stderr.contains("`worgl outgoing` lists them"),
+        "{}",
+        again.stderr
+    );
+
+    // Its help says why a payee's transfer is not to be cancelled.
+    let help = setup.ok("alice.worgl", &["cancel", "--help"]).await.stdout;
+    assert!(help.contains("claim the same value"), "{help}");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_payment_is_not_exported_once_a_transfer_of_it_is_cancelled() {
+    let setup = Setup::start().await;
+    let mint = setup.mint.to_string();
+    setup.ok("alice.worgl", &["init"]).await;
+    setup.ok("bob.worgl", &["init"]).await;
+    setup.mint_into("alice.worgl", 4).await;
+    setup.mint_into("alice.worgl", 4).await;
+    setup
+        .ok("bob.worgl", &["request", &mint, "6", "-o", "request.json"])
+        .await;
+    let pay = ["pay", "request.json", "--spacing", "0..0"];
+    let id = paid_id(&setup.ok("alice.worgl", &pay).await);
+    let ids = transfer_ids(&setup.ok("alice.worgl", &["outgoing"]).await);
+    let [first, second] = &ids[..] else {
+        panic!("{ids:?}")
+    };
+
+    // Exported whole, the payment would hand the cancelled transfer out again.
+    setup.ok("alice.worgl", &["cancel", first]).await;
+    let outgoing = setup.ok("alice.worgl", &["outgoing"]).await;
+    assert_eq!(transfer_ids(&outgoing), std::slice::from_ref(second));
+    // Still named as `pay` named it, and not whole.
+    let line = outgoing
+        .stdout
+        .lines()
+        .find(|line| line.starts_with("  payment "))
+        .unwrap();
+    assert!(
+        line.starts_with(&format!("  payment {id}  pays ")),
+        "{line}"
+    );
+    assert!(
+        line.ends_with(" of 6, the rest cancelled or dropped, 1 of 1 transfer(s) outgoing"),
+        "{line}"
+    );
+    // By its id, or the id of a transfer still in it.
+    for name in [&id, second] {
+        let export = ["export", name, "-o", "payment.json"];
+        let refused = setup.worgl("alice.worgl", &export).await;
+        assert!(!refused.ok);
+        assert!(
+            refused.stderr.contains(&format!(
+                "payment {id} no longer pays its whole request, since a transfer of it was \
+                 cancelled"
+            )),
+            "{}",
+            refused.stderr
+        );
+    }
+    assert!(!setup.path("payment.json").exists());
+}
+
+/// Writes `-o` through links, as a shell's `/dev/stdout` is one to
+/// `/proc/self/fd/1`, and keeps the permissions of a file it replaces.
+#[cfg(target_os = "linux")]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn output_goes_through_links_and_keeps_permissions() {
+    use std::os::unix::fs::{PermissionsExt, symlink};
+
+    let setup = Setup::start().await;
+    let mint = setup.mint.to_string();
+    setup.ok("bob.worgl", &["init"]).await;
+    let request = |name: &str| -> PaymentRequest {
+        serde_json::from_str(&fs::read_to_string(setup.path(name)).unwrap()).unwrap()
+    };
+    let is_link = |name: &str| {
+        fs::symlink_metadata(setup.path(name))
+            .unwrap()
+            .file_type()
+            .is_symlink()
+    };
+
+    // Standard output sent to a file, and `-o` naming a link to it.
+    symlink("/proc/self/fd/1", setup.path("stdout")).unwrap();
+    let mut command = setup.command(
+        "bob.worgl",
+        PASSPHRASE,
+        &["request", &mint, "5", "-o", "stdout"],
+    );
+    command.stdout(fs::File::create(setup.path("real.json")).unwrap());
+    let status = tokio::task::spawn_blocking(move || command.status())
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(status.success());
+    assert_eq!(request("real.json").amount(), 5);
+    assert!(is_link("stdout"));
+
+    // A link to a file: the file is written, and the link stays.
+    fs::write(setup.path("target.json"), "old\n").unwrap();
+    symlink("target.json", setup.path("link.json")).unwrap();
+    setup
+        .ok("bob.worgl", &["request", &mint, "3", "-o", "link.json"])
+        .await;
+    assert!(is_link("link.json"));
+    assert_eq!(request("target.json").amount(), 3);
+
+    // A file replaced keeps its permissions.
+    fs::set_permissions(setup.path("target.json"), fs::Permissions::from_mode(0o640)).unwrap();
+    setup
+        .ok("bob.worgl", &["request", &mint, "6", "-o", "target.json"])
+        .await;
+    assert_eq!(request("target.json").amount(), 6);
+    let mode = fs::metadata(setup.path("target.json"))
+        .unwrap()
+        .permissions()
+        .mode();
+    assert_eq!(mode & 0o777, 0o640);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn settling_fails_while_a_refused_transfer_is_kept() {
+    let setup = Setup::start().await;
+    let mint = setup.mint.to_string();
+    setup.ok("alice.worgl", &["init"]).await;
+    setup.ok("bob.worgl", &["init"]).await;
+    setup.mint_into("alice.worgl", 8).await;
+    setup
+        .ok("bob.worgl", &["request", &mint, "3", "-o", "request.json"])
+        .await;
+    let pay = ["pay", "request.json", "--spacing", "0..0"];
+    setup.ok("alice.worgl", &pay).await;
+    let settle = ["settle", "--spacing", "0..0"];
+    let ids = transfer_ids(&setup.ok("alice.worgl", &["outgoing"]).await);
+
+    // A server that is not the mint's proves nothing: kept, not retried.
+    let other = Setup::start().await;
+    let alice = setup.path("alice.worgl");
+    let lost = other.worgl(alice.to_str().unwrap(), &settle).await;
+    assert!(!lost.ok);
+    assert!(
+        lost.stderr
+            .contains(&format!("transfer {} refused: the mint refused: ", ids[0])),
+        "{}",
+        lost.stderr
+    );
+    assert!(lost.stderr.contains("unknown_mint"), "{}", lost.stderr);
+    assert!(
+        lost.stderr
+            .contains("1 transfer(s) refused and kept outgoing"),
+        "{}",
+        lost.stderr
+    );
+    assert!(!lost.stderr.contains("try again later"), "{}", lost.stderr);
+
+    // A paused mint may pass later.
+    let client = Client::new(&setup.url).unwrap();
+    client.pause(&setup.mint, &setup.token).await.unwrap();
+    let paused = setup.worgl("alice.worgl", &settle).await;
+    assert!(!paused.ok);
+    assert!(
+        paused
+            .stderr
+            .contains("1 transfer(s) did not go through; try again later"),
+        "{}",
+        paused.stderr
+    );
+    client.resume(&setup.mint, &setup.token).await.unwrap();
+    let settled = setup.ok("alice.worgl", &settle).await;
+    assert!(settled.stderr.contains("Took in 5"), "{}", settled.stderr);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn the_payees_notes_from_a_settle_are_exported_once() {
+    let setup = Setup::start().await;
+    let mint = setup.mint.to_string();
+    setup.ok("alice.worgl", &["init"]).await;
+    setup.ok("bob.worgl", &["init"]).await;
+    setup.mint_into("alice.worgl", 8).await;
+    setup
+        .ok("bob.worgl", &["request", &mint, "5", "-o", "request.json"])
+        .await;
+    let pay = ["pay", "request.json", "--spacing", "0..0"];
+    let id = paid_id(&setup.ok("alice.worgl", &pay).await);
+
+    // Bob never submits; Alice's settle carries the payment out.
+    let settled = setup
+        .ok("alice.worgl", &["settle", "--spacing", "0..0"])
+        .await;
+    assert!(settled.stderr.contains("Took in 3"), "{}", settled.stderr);
+    assert!(
+        settled.stderr.contains("Kept 2 note(s) for payees"),
+        "{}",
+        settled.stderr
+    );
+    let outgoing = setup.ok("alice.worgl", &["outgoing"]).await.stdout;
+    assert!(
+        outgoing.contains(&format!(
+            "  payment {id}  pays 5, 0 of 1 transfer(s) outgoing, 2 note(s) worth 5 kept for \
+             the payee"
+        )),
+        "{outgoing}"
+    );
+
+    let exported = setup
+        .ok(
+            "alice.worgl",
+            &["export", &id, "--notes", "-o", "notes.json"],
+        )
+        .await;
+    assert!(
+        exported.stderr.contains(&format!(
+            "Wrote 2 note(s) worth 5 for the payee of payment {id}"
+        )),
+        "{}",
+        exported.stderr
+    );
+    let accepted = setup.ok("bob.worgl", &["accept", "notes.json"]).await;
+    assert_eq!(accepted.stderr.trim(), "Kept 5.");
+    let again = setup
+        .worgl("alice.worgl", &["export", &id, "--notes"])
+        .await;
+    assert!(!again.ok);
+    assert!(
+        again.stderr.contains("no payment kept has the id"),
+        "{}",
+        again.stderr
+    );
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -468,9 +970,10 @@ async fn refreshing_resends_a_payment_before_its_note_dies() {
         refreshed.stderr
     );
     assert!(
-        refreshed
-            .stderr
-            .contains("Resent a payment the payee may not have submitted yet"),
+        refreshed.stderr.contains(
+            "Kept 2 note(s) for payees from the mint's answers, in case a payee has not \
+             submitted its payment"
+        ),
         "{}",
         refreshed.stderr
     );
