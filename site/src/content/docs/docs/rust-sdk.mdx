@@ -46,7 +46,10 @@ before handing out anything that depends on it.
 `Purse::open` keeps the purse in a JSON file. The file holds every note's
 secret key, and the notes are bearer, so keep it private and encrypted at
 rest. Implement `Store` to keep it elsewhere; the `worgl` command keeps its
-purse encrypted under a passphrase this way.
+purse encrypted under a passphrase this way. Several processes can share
+the file: before each change a purse locks it and reads it again, so none
+saves over another's change. A `Store` of your own does the same by
+implementing `lock`.
 
 When the payer submits instead, with `Purse::submit`, it hands the notes from
 the answers to the payee, who checks their signatures and keeps them with

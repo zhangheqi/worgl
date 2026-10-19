@@ -11,7 +11,7 @@ use worgl_sdk::{Balance, Holder, Payment, PaymentRequest, ScheduledTransfer, Spa
 
 use crate::client::{Client, unix_now};
 use crate::error::Error;
-use crate::store::{FileStore, Store};
+use crate::store::{FileStore, Locked, Store};
 
 /// Longest wait honored before submitting a transfer, in seconds: a year.
 /// Later times are submitted at this delay.
@@ -29,6 +29,13 @@ pub const MAX_DELAY_SECS: u64 = 365 * 24 * 60 * 60;
 /// Methods take `&self`, so one purse can be shared between tasks; a
 /// refresh waiting for its schedule does not block payments. The holder is
 /// locked only while it changes, never across a request.
+///
+/// Several processes can share one store too. Before each change the purse
+/// takes the store's [lock](Store::lock) and reads the holder saved there,
+/// makes the change to that, and saves before letting go, so a note
+/// another process took in meanwhile is kept, not saved over. Reads such as
+/// [`holder`](Self::holder) show the holder as this purse last read or
+/// saved it.
 #[derive(Debug)]
 pub struct Purse<S: Store = FileStore> {
     client: Client,
@@ -328,14 +335,20 @@ impl<S: Store> Purse<S> {
         }
     }
 
-    /// Changes the holder and saves it. If the save fails, `undo` takes the
-    /// change back and the save's error is returned.
+    /// Changes the holder as saved now and saves it, holding the store's
+    /// lock throughout. If the save fails, `undo` takes the change back and
+    /// the save's error is returned.
     fn change<T>(
         &self,
         apply: impl FnOnce(&mut Holder) -> Result<T, Error>,
         undo: impl FnOnce(&mut Holder, &T),
     ) -> Result<T, Error> {
         let mut holder = self.lock();
+        // Held until the save is done.
+        let locked = self.store.lock()?;
+        if let Some(saved) = locked.as_ref().and_then(Locked::saved) {
+            *holder = Holder::from_json(saved)?;
+        }
         let value = apply(&mut holder)?;
         if let Err(error) = self.store.save(&holder.to_json()) {
             undo(&mut holder, &value);

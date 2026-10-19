@@ -343,3 +343,19 @@ async fn the_playground_faucet_fills_a_purse() {
     assert!(run.stderr.contains("asking the faucet"), "{}", run.stderr);
     assert!(setup.balance("alice.worgl").await.contains("expected   0 "));
 }
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn commands_at_once_on_one_purse_keep_every_note() {
+    let setup = Setup::start().await;
+    let faucet = setup.faucet().await;
+    setup.ok("alice.worgl", &["init"]).await;
+    let args = ["playground", "--faucet", &faucet];
+    tokio::join!(
+        setup.ok("alice.worgl", &args),
+        setup.ok("alice.worgl", &args),
+        setup.ok("alice.worgl", &args),
+        setup.ok("alice.worgl", &args),
+    );
+    let balance = setup.balance("alice.worgl").await;
+    assert!(balance.contains("spendable  256\n"), "{balance}");
+}

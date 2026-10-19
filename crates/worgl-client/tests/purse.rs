@@ -375,11 +375,12 @@ async fn a_purse_reopens_from_its_file() {
 
     let alice = Purse::open(server.client(), &path).unwrap();
     assert_eq!(alice.balance(&server.mint).await.unwrap().spendable, 8);
-    let files: Vec<_> = std::fs::read_dir(dir.path())
+    let mut files: Vec<_> = std::fs::read_dir(dir.path())
         .unwrap()
         .map(|entry| entry.unwrap().file_name())
         .collect();
-    assert_eq!(files, ["alice.json"]);
+    files.sort();
+    assert_eq!(files, [".alice.json.lock", "alice.json"]);
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
@@ -392,4 +393,27 @@ async fn a_purse_reopens_from_its_file() {
         Purse::open(server.client(), &path),
         Err(Error::Load(_))
     ));
+}
+
+#[tokio::test]
+async fn purses_on_one_file_keep_each_others_changes() {
+    let server = Server::start().await;
+    let alice = server.purse();
+    server.fund(&alice, 8, 4).await;
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("bob.json");
+
+    // Two processes open Bob's purse, and each changes it after the other.
+    let bob = Purse::open(server.client(), &path).unwrap();
+    let also_bob = Purse::open(server.client(), &path).unwrap();
+    let first = bob.request(&server.mint, 4).await.unwrap();
+    let second = also_bob.request(&server.mint, 4).await.unwrap();
+    let first_paid = alice.pay(&first, NOW).await.unwrap();
+    let second_paid = alice.pay(&second, NOW).await.unwrap();
+    all_answered(&bob.receive(&first, &first_paid).await.unwrap(), 1);
+    all_answered(&also_bob.receive(&second, &second_paid).await.unwrap(), 1);
+
+    let reopened = Purse::open(server.client(), &path).unwrap();
+    let balance = reopened.balance(&server.mint).await.unwrap();
+    assert_eq!((balance.frozen, balance.expected), (8, 0));
 }

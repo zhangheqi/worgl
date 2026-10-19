@@ -55,4 +55,4 @@ mod store;
 pub use client::{Client, FaucetInfo, Info, Verified};
 pub use error::{Error, Refusal};
 pub use purse::{MAX_DELAY_SECS, Purse, Refused, Retry, Submitted};
-pub use store::{FileStore, MemoryStore, Store};
+pub use store::{FileLock, FileStore, Locked, MemoryStore, Store};

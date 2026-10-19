@@ -73,6 +73,14 @@ that belong together, picked at random in that range. It defaults to
 `2..60`. Closer spacing lets the mint guess the notes had one owner; see the
 [Privacy model](../privacy/).
 
+## Several commands at once
+
+Commands can run on one purse at the same time, such as a `refresh` waiting
+in the background while you pay and receive. Each change locks the purse,
+reads it again and saves before unlocking, so no command saves over a note
+another one took in. The lock is a file beside the purse,
+`.purse.worgl.lock`.
+
 ## Keeping notes alive
 
 A note left alone dies when its layer is dropped. Run `worgl refresh MINT`
