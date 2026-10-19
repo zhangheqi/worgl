@@ -32,13 +32,17 @@
 //!
 //! A member that does not lead a mint passes the requests for it on to the
 //! leader's public API and relays the answer. If it knows of no leader, or
-//! cannot reach the one it knows of, it answers `503 no_leader`; if the
-//! leader does not answer, `503 timeout`. Either way the client sends the
-//! same request again: a mint, transfer or burn the mint already carried
-//! out is answered as it was the first time. A request to create a mint goes
-//! to the registry's leader the same way, but is not answered as before if
-//! sent again: after a `503 timeout`, list the mints before creating
-//! another.
+//! cannot connect to the one it knows of within a second, it answers `503
+//! no_leader`; if the leader does not answer, or the connection to it goes
+//! three seconds without a sign of life, `503 timeout`. A leader cut off
+//! from the other members answers `503 no_leader` too once its lease lapses
+//! (see [`worgl_raft::default_config`]), and gives up waiting on requests it
+//! took before as `503 timeout`, so no client waits on a member that cannot
+//! reach the others. Either way the client sends the same request again: a
+//! mint, transfer or burn the mint already carried out is answered as it
+//! was the first time. A request to create a mint goes to the registry's
+//! leader the same way, but is not answered as before if sent again: after
+//! a `503 timeout`, list the mints before creating another.
 
 use std::collections::BTreeMap;
 use std::future::Future;
@@ -89,6 +93,17 @@ const FORWARDED: HeaderName = HeaderName::from_static("x-worgl-forwarded-by");
 /// How long a member waits for the leader to answer a request it passed on:
 /// longer than the leader waits for its group.
 const FORWARD_TIMEOUT: Duration = Duration::from_secs(30);
+
+/// How long a member tries to connect to the leader before it answers
+/// `503 no_leader`.
+const FORWARD_CONNECT_TIMEOUT: Duration = Duration::from_secs(1);
+
+/// About how long a connection to the leader may go without a sign of life
+/// before a member gives the request up as `503 timeout`, as when the
+/// network between them is cut. A sign of life is an acknowledgement of
+/// what the member sent or of a keepalive probe; probes go a second apart,
+/// so a connection waiting on a slow answer stays alive.
+const FORWARD_SILENCE: Duration = Duration::from_secs(3);
 
 /// How long a member other than the first waits for the first to form a new
 /// mint's group before forming it itself.
@@ -158,7 +173,10 @@ pub fn is_member(state: &Path) -> bool {
 pub(crate) struct Cluster {
     config: ClusterConfig,
     token: String,
+    /// For Raft's RPCs, which openraft bounds itself.
     client: reqwest::Client,
+    /// For requests passed on to a leader.
+    forwarder: reqwest::Client,
 }
 
 impl Cluster {
@@ -174,10 +192,19 @@ impl Cluster {
         let client = reqwest::Client::builder()
             .build()
             .context("building the HTTP client")?;
+        let forwarder = reqwest::Client::builder()
+            .connect_timeout(FORWARD_CONNECT_TIMEOUT)
+            .tcp_keepalive(FORWARD_SILENCE / 3)
+            .tcp_keepalive_interval(FORWARD_SILENCE / 3)
+            .tcp_keepalive_retries(3);
+        #[cfg(any(target_os = "android", target_os = "fuchsia", target_os = "linux"))]
+        let forwarder = forwarder.tcp_user_timeout(FORWARD_SILENCE);
+        let forwarder = forwarder.build().context("building the HTTP client")?;
         Ok(Arc::new(Self {
             config,
             token,
             client,
+            forwarder,
         }))
     }
 
@@ -246,7 +273,7 @@ impl Cluster {
     async fn relay(&self, api: &str, parts: &Parts, body: Bytes) -> reqwest::Result<Response> {
         let path = parts.uri.path_and_query().map_or("/", |path| path.as_str());
         let mut request = self
-            .client
+            .forwarder
             .request(parts.method.clone(), format!("http://{api}{path}"))
             .timeout(FORWARD_TIMEOUT)
             .header(FORWARDED, self.node())

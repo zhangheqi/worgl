@@ -481,8 +481,11 @@ Any member takes any request, and one that does not lead the mint passes it on
 to the one that does. A read is answered once the leader confirms it still
 leads, so no answer is older than one already given. When a leader fails, the
 others elect a new one within a few seconds. Until then, requests are answered
-`503 no_leader`, and sending the same request again is safe. Only the leader
-makes scheduled rotations.
+`503 no_leader`, and sending the same request again is safe. A leader cut off
+from the other members stops taking requests after two seconds without hearing
+from them, and a member that cannot reach the leader says so within a few
+seconds, so clients that still reach a cut-off member go elsewhere instead of
+waiting on it. Only the leader makes scheduled rotations.
 
 With the members running, `POST /v1/admin/mints` to any of them creates a mint
 on all three. It goes to the member leading the cluster's registry, a Raft
@@ -519,6 +522,13 @@ cargo test --workspace          # unit, property and HTTP tests
 cargo clippy --workspace --all-targets -- -D warnings
 cargo fmt --all --check
 ```
+
+`cargo test -p worgl-raft --test simulation` runs a mint's three-replica group
+through seeded faults on a simulated clock: replicas cut off, split apart,
+crashed and restarted, messages lost and delayed. Afterwards it checks that
+the replicas agree, that every answered change is there, that no note was
+spent twice and that supply balances. It runs 32 seeds by default; set
+`WORGL_SIM_SEEDS=1000` for more, or `WORGL_SIM_SEED=<n>` to repeat one.
 
 The minimum supported Rust version is 1.89. CI runs all of the above plus the
 docs and the example on every push and pull request, and the TypeScript SDK's
