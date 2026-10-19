@@ -2,8 +2,15 @@
 // Four layers of a tiny mint as stamp sheets: scripts/stamp-lab.ts.
 // The wrapper uses display: contents, so the sheets and the controls sit in the parent's grid.
 import '../../styles/figures/stamp-lab.css';
+
+interface Props {
+  /** Clicking selects a note to follow instead of transferring it. */
+  select?: boolean;
+  id?: string;
+}
+const { select = false, id } = Astro.props;
 ---
-<div class="stamp-lab" data-stamp-lab>
+<div class="stamp-lab" data-stamp-lab data-select={select ? '' : undefined} id={id}>
   <div class="sheets" data-part="sheets" aria-label="Four layers of a small mint, oldest first"></div>
   <div class="lab-side">
     <div class="controls">
@@ -13,6 +20,7 @@ import '../../styles/figures/stamp-lab.css';
       <button class="btn" type="button" data-do="rotate">Rotate</button>
       <button class="btn" type="button" data-do="reset" aria-label="Reset the layers">Reset</button>
     </div>
+    {select && <p class="note-read label" data-part="note"></p>}
     <p class="readout" data-part="readout" aria-live="polite">Four layers, oldest at the top. Click a note to transfer it, or use the buttons.</p>
     <div class="counters"><div><b data-part="rotations">0</b><span class="label muted">Rotations</span></div><div><b data-part="expired">0</b><span class="label muted">Value expired</span></div></div>
     <div class="formula" role="img" aria-label="A note in layer k of n can make n minus 1 minus k more hops now, and dies in rotation k plus 1 if left alone.">
