@@ -1,0 +1,19 @@
+---
+import Page from '../layouts/Page.astro';
+import { REPO, page } from '../lib/links';
+---
+<Page title="Not found" description="This page doesn't exist.">
+  <section class="band cobalt missing" data-tone="cobalt">
+    <div class="wrap">
+      <p class="label">404 · No such page</p>
+      <h1 class="display">Nothing is <em>here.</em></h1>
+      <p class="lede">The page you asked for doesn't exist, or it has moved.</p>
+      <div class="ctas"><a class="btn btn-solid-paper" href={page()}>Home</a><a class="btn" href={page('docs/')}>Docs</a><a class="btn" href={REPO}>The repository</a></div>
+    </div>
+  </section>
+</Page>
+
+<style>
+  .missing > .wrap { display: flex; flex-direction: column; gap: 28px; min-height: 60vh; justify-content: center; }
+  .ctas { display: flex; flex-wrap: wrap; gap: 12px; }
+</style>

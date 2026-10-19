@@ -1,0 +1,119 @@
+/*
+ * Two inks: full-width bands alternate cobalt and paper, each holding a
+ * 12-column grid on a 1320px measure. Pink is a third, spot ink, used only
+ * for whatever just changed. Night is the Wörgl 1932 band.
+ */
+:root {
+  --paper: #F3F3EF; --paper-2: #E8E8E1; --ink: #11144A; --muted: #4E5470; --accent-text: #1D35D6;
+  --rule: rgba(17, 20, 74, .16); --rule-strong: rgba(17, 20, 74, .4); --code-bg: #E5E6EE;
+  --cobalt: #1D35D6; --cobalt-deep: #1428A8; --on-cobalt: #F3F3EF; --on-cobalt-muted: rgba(243, 243, 239, .8); --rule-cobalt: rgba(243, 243, 239, .28);
+  --pink: #FF4FA3; --on-pink: #11144A;
+  /* text on a surface that stays light in both themes, such as the field's tooltip */
+  --ink-print: #11144A; --muted-print: #4E5470;
+  --night: #0B0D1F; --on-night: #F3F3EF; --on-night-muted: rgba(243, 243, 239, .72); --rule-night: rgba(243, 243, 239, .16);
+  --hdr-bg: var(--cobalt); --hdr-fg: var(--on-cobalt); --hdr-rule: transparent;
+  --f-serif: "Instrument Serif", "Iowan Old Style", Georgia, serif;
+  --f-sans: "Instrument Sans Variable", "Helvetica Neue", Arial, sans-serif;
+  --f-mono: "Martian Mono Variable", ui-monospace, "SFMono-Regular", Menlo, monospace;
+  --measure: 1320px;
+}
+@media (prefers-color-scheme: dark) {
+  :root:not([data-theme="light"]) {
+    --paper: #0C0E1E; --paper-2: #14172E; --ink: #E7E8F4; --muted: #A1A6C2; --accent-text: #8EA0FF;
+    --rule: rgba(231, 232, 244, .14); --rule-strong: rgba(231, 232, 244, .36); --code-bg: #151938; --night: #05060E;
+    color-scheme: dark;
+  }
+}
+:root[data-theme="dark"] {
+  --paper: #0C0E1E; --paper-2: #14172E; --ink: #E7E8F4; --muted: #A1A6C2; --accent-text: #8EA0FF;
+  --rule: rgba(231, 232, 244, .14); --rule-strong: rgba(231, 232, 244, .36); --code-bg: #151938; --night: #05060E;
+  color-scheme: dark;
+}
+:root.hdr-paper { --hdr-bg: var(--paper); --hdr-fg: var(--ink); --hdr-rule: var(--rule); }
+:root.hdr-night { --hdr-bg: var(--night); --hdr-fg: var(--on-night); --hdr-rule: var(--rule-night); }
+
+*, *::before, *::after { box-sizing: border-box; }
+html { -webkit-text-size-adjust: 100%; text-size-adjust: 100%; }
+body { margin: 0; background: var(--paper); color: var(--ink); font-family: var(--f-sans); font-size: 17px; line-height: 1.55; -webkit-font-smoothing: antialiased; }
+/* paints the phone's top inset in the header's colour */
+body::before { content: ""; position: fixed; inset: 0 0 auto; height: env(safe-area-inset-top, 0px); z-index: 60; background: var(--hdr-bg); }
+/* a fine print grain over everything; scripts/grain.ts draws it */
+body::after { content: ""; position: fixed; inset: 0; pointer-events: none; z-index: 90; background-image: var(--grain, none); background-size: 180px 180px; opacity: .5; }
+::selection { background: var(--pink); color: var(--on-pink); }
+a { color: inherit; text-decoration-thickness: 1px; text-underline-offset: .2em; }
+a:hover { text-decoration-color: var(--pink); text-decoration-thickness: 2px; }
+:focus-visible { outline: 2px solid currentColor; outline-offset: 3px; }
+button { font: inherit; color: inherit; }
+p { margin: 0; }
+h1, h2, h3 { margin: 0; font-weight: 400; }
+em { font-style: italic; }
+img, svg, canvas { max-width: 100%; }
+[hidden] { display: none !important; }
+.sr-only { position: absolute; width: 1px; height: 1px; padding: 0; margin: -1px; overflow: hidden; clip: rect(0 0 0 0); white-space: nowrap; border: 0; }
+.skip { position: absolute; left: 12px; top: -60px; z-index: 100; background: var(--pink); color: var(--on-pink); padding: 10px 14px; font-weight: 600; }
+.skip:focus { top: calc(env(safe-area-inset-top, 0px) + 12px); }
+
+/* layout */
+.wrap {
+  width: 100%; max-width: calc(var(--measure) + 112px); margin-inline: auto;
+  padding-left: max(clamp(16px, 4vw, 56px), env(safe-area-inset-left, 0px));
+  padding-right: max(clamp(16px, 4vw, 56px), env(safe-area-inset-right, 0px));
+}
+.band { position: relative; overflow-x: clip; }
+.band > .wrap { padding-block: clamp(72px, 10vw, 148px); }
+.cobalt { background: var(--cobalt); color: var(--on-cobalt); }
+.paper { background: var(--paper); color: var(--ink); }
+.night { background: var(--night); color: var(--on-night); }
+/* a stamp's perforated edge where two bands meet */
+.edge::after {
+  content: ""; position: absolute; left: 0; right: 0; bottom: -6px; height: 12px; z-index: 3; pointer-events: none;
+  background: radial-gradient(circle, var(--edge) 4.6px, transparent 5.2px) 3px 0 / 14px 12px repeat-x;
+}
+.edge-paper { --edge: var(--paper); }
+.edge-cobalt { --edge: var(--cobalt); }
+.edge-night { --edge: var(--night); }
+.grid { display: grid; grid-template-columns: repeat(12, minmax(0, 1fr)); column-gap: 24px; row-gap: 40px; }
+.grid > * { min-width: 0; }
+
+/* type */
+.label { font-family: var(--f-mono); font-size: 11.5px; line-height: 1.4; letter-spacing: .08em; text-transform: uppercase; font-stretch: 87.5%; font-weight: 500; }
+.display { font-family: var(--f-serif); font-size: clamp(50px, 7.4vw, 118px); line-height: .9; letter-spacing: -.022em; text-wrap: balance; }
+.h2 { font-family: var(--f-serif); font-size: clamp(44px, 6vw, 92px); line-height: .94; letter-spacing: -.02em; text-wrap: balance; }
+.h3 { font-family: var(--f-serif); font-size: clamp(26px, 2.4vw, 34px); line-height: 1.08; letter-spacing: -.01em; text-wrap: balance; }
+.lede { font-size: clamp(18px, 1.45vw, 21px); line-height: 1.5; max-width: 34em; }
+.body { max-width: 36em; }
+.muted { color: var(--muted); }
+.cobalt .muted { color: var(--on-cobalt-muted); }
+.night .muted { color: var(--on-night-muted); }
+.fig-link { font-family: var(--f-mono); font-size: 10.5px; letter-spacing: .06em; text-transform: uppercase; font-stretch: 87.5%; color: var(--accent-text); }
+.cobalt .fig-link { color: var(--on-cobalt); }
+
+/* section head: number, hairline, name, registration mark */
+.sec-head { display: flex; align-items: center; gap: 14px; margin-bottom: clamp(28px, 4vw, 48px); }
+.sec-head .rule { flex: 1; height: 1px; background: currentColor; opacity: .28; }
+.reg { width: 14px; height: 14px; flex: none; opacity: .7; }
+
+/* buttons: square, with a pink misregistration on hover */
+.btn { display: inline-flex; align-items: center; gap: 10px; min-height: 46px; padding: 0 20px; border: 1.5px solid currentColor; background: transparent; font-family: var(--f-sans); font-size: 15.5px; font-weight: 600; text-decoration: none; cursor: pointer; transition: box-shadow .18s ease, transform .18s ease; }
+.btn:hover { box-shadow: 4px 4px 0 var(--pink); transform: translate(-2px, -2px); text-decoration: none; }
+.btn:active { box-shadow: 1px 1px 0 var(--pink); transform: translate(0, 0); }
+.btn-solid-paper { background: var(--on-cobalt); color: var(--cobalt); border-color: var(--on-cobalt); }
+.btn-solid { background: var(--cobalt); color: var(--on-cobalt); border-color: var(--cobalt); }
+.btn-sm { min-height: 38px; padding: 0 14px; font-size: 14px; }
+.btn[disabled] { opacity: .45; cursor: default; box-shadow: none; transform: none; }
+
+/* the status line, near the top of a page */
+.status-top { font-size: 13.5px; line-height: 1.5; border-left: 2px solid var(--pink); padding-left: 12px; }
+.cobalt .status-top { color: var(--on-cobalt-muted); }
+
+/* tables scroll inside their own box */
+.tbl-wrap { overflow-x: auto; min-width: 0; }
+table { border-collapse: collapse; width: 100%; min-width: 440px; font-size: 15.5px; }
+th { text-align: left; font-weight: 500; }
+th, td { padding: 12px 14px 12px 0; border-bottom: 1px solid var(--rule); vertical-align: top; }
+td.n { font-family: var(--f-mono); font-size: 13.5px; font-stretch: 87.5%; }
+td .sub { display: block; font-size: 13.5px; line-height: 1.45; color: var(--muted); margin-top: 4px; max-width: 30em; }
+
+@media (prefers-reduced-motion: reduce) {
+  *, *::before, *::after { animation-duration: .001s !important; animation-iteration-count: 1 !important; transition-duration: .001s !important; transition-delay: 0s !important; }
+}

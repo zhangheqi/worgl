@@ -1,0 +1,10 @@
+/* The lineage tree, drawn on cobalt. */
+.lineage-frame { position: relative; border: 1px solid var(--rule-cobalt); padding: 18px 14px 10px; }
+.lineage-frame svg { display: block; width: 100%; height: auto; overflow: visible; }
+.lineage-frame .lab { font-family: var(--f-mono); font-size: 9.5px; letter-spacing: .08em; fill: var(--on-cobalt-muted); }
+.lineage-frame .edge-l { fill: none; stroke: rgba(243, 243, 239, .34); stroke-width: 1.2; transition: stroke .25s, stroke-width .25s; }
+.lineage-frame .edge-l.on { stroke: var(--pink); stroke-width: 2.2; }
+.lineage-frame .nd rect { fill: transparent; stroke: rgba(243, 243, 239, .55); stroke-width: 1; transition: fill .25s, stroke .25s; }
+.lineage-frame .nd text { font-family: var(--f-mono); font-size: 10px; fill: var(--on-cobalt); transition: fill .25s; }
+.lineage-frame .nd.on rect { fill: var(--pink); stroke: var(--pink); }
+.lineage-frame .nd.on text { fill: var(--on-pink); }

@@ -1,0 +1,34 @@
+/* Layers as stamp sheets: the oldest is about to be torn off, the last is frozen. */
+.sheets { display: flex; flex-direction: column; gap: 12px; }
+.sheet { position: relative; padding: 12px 14px 14px; border: 2px dotted var(--rule-strong); background: var(--paper-2); transform-origin: 12% 0%; }
+.sheet-head { display: flex; justify-content: space-between; gap: 8px 16px; flex-wrap: wrap; margin-bottom: 10px; }
+.sheet-head .label { font-size: 10.5px; }
+.sheet.frozen { background: repeating-linear-gradient(135deg, transparent 0 7px, var(--rule) 7px 8px), var(--paper-2); }
+.cells { display: grid; grid-template-columns: repeat(24, minmax(0, 1fr)); gap: 4px; }
+.cells .c { aspect-ratio: 1; display: grid; place-items: center; font-family: var(--f-mono); font-size: 11px; font-stretch: 75%; position: relative; line-height: 1; padding: 0; border: 0; min-width: 0; }
+.c.u::before { content: ""; width: 3px; height: 3px; background: var(--rule-strong); }
+.c.l { background: var(--cobalt); color: var(--on-cobalt); cursor: pointer; }
+.c.l:hover { box-shadow: 3px 3px 0 var(--pink); }
+.frozen .c.l { background: color-mix(in srgb, var(--cobalt) 45%, var(--paper)); color: var(--ink); cursor: not-allowed; }
+.c.s { background: linear-gradient(135deg, transparent calc(50% - .75px), var(--rule-strong) calc(50% - .75px) calc(50% + .75px), transparent calc(50% + .75px)); box-shadow: inset 0 0 0 1px var(--rule); }
+.dying .c.l::after { content: ""; position: absolute; top: 2px; right: 2px; width: 5px; height: 5px; background: var(--pink); }
+.c.fl { animation: cfl 1s ease-out; }
+@keyframes cfl { 0% { background: var(--pink); color: var(--on-pink); box-shadow: 0 0 0 4px var(--pink); } 100% {} }
+.c.fs { animation: cfs .9s ease-out; }
+@keyframes cfs { 0% { box-shadow: inset 0 0 0 1px var(--rule), 0 0 0 0 var(--pink); } 35% { box-shadow: inset 0 0 0 1px var(--rule), 0 0 0 4px var(--pink); } 100% { box-shadow: inset 0 0 0 1px var(--rule), 0 0 0 6px transparent; } }
+.c.shake { animation: shake .45s ease; }
+@keyframes shake { 0%, 100% { transform: none; } 20% { transform: translateX(-3px); } 40% { transform: translateX(3px); } 60% { transform: translateX(-2px); } 80% { transform: translateX(2px); } }
+.sheet.tear { animation: tear .7s cubic-bezier(.5, 0, .75, 0) forwards; }
+@keyframes tear { to { transform: translateY(-26px) rotate(-4deg); opacity: 0; } }
+.sheet.arrive { animation: arrive .6s cubic-bezier(.2, .8, .2, 1); }
+@keyframes arrive { from { transform: translateY(16px); opacity: 0; } to { transform: none; opacity: 1; } }
+.lab-side { display: flex; flex-direction: column; gap: 22px; }
+.controls { display: flex; flex-wrap: wrap; gap: 8px; }
+.controls .btn { min-height: 42px; padding: 0 16px; font-size: 14.5px; }
+.readout { font-size: 16px; line-height: 1.5; min-height: 6em; border-left: 3px solid var(--pink); padding-left: 14px; }
+.counters { display: flex; gap: 22px; }
+.counters div { display: flex; flex-direction: column; gap: 2px; }
+.counters b { font-family: var(--f-serif); font-size: 34px; font-weight: 400; line-height: 1; }
+.formula { border: 1.5px solid var(--ink); padding: 16px 18px; display: flex; flex-direction: column; gap: 6px; font-family: var(--f-mono); font-size: 13px; line-height: 1.7; font-stretch: 87.5%; }
+.formula .k { color: var(--accent-text); font-weight: 600; }
+@media (max-width: 560px) { .cells { grid-template-columns: repeat(12, minmax(0, 1fr)); gap: 3px; } .cells .c { font-size: 10px; } .sheet { padding: 10px 10px 12px; } }

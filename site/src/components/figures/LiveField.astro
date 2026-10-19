@@ -1,0 +1,34 @@
+---
+// A simulated mint running in the page: scripts/field.ts. The slot is the caption.
+import '../../styles/figures/field.css';
+---
+<div class="live-field" data-live-field>
+  <div class="field-wrap" data-part="wrap">
+    <canvas class="field" data-part="canvas" role="img" aria-label="A simulated mint: four layers of bits, oldest at the top. Lit bits are live notes, dim ones are spent. New notes appear at each layer's last-used line, and every rotation drops the top layer and the notes still in it."></canvas>
+    <div class="field-tip" data-part="tip" hidden></div>
+  </div>
+  <div class="wrap hud" data-part="hud">
+    <div class="cap">
+      <p><slot /></p>
+      <p class="hud-msg" data-part="msg">Every lit square is a live note. The pale line in each layer is its last-used bit.</p>
+      <p class="sr-only" aria-live="polite" data-part="live"></p>
+    </div>
+    <div>
+      <div class="stats4">
+        <div><b data-part="transfers">0</b><span class="label">Transfers</span></div>
+        <div><b data-part="live-notes">0</b><span class="label">Live notes</span></div>
+        <div><b data-part="expired">0</b><span class="label">Expired</span></div>
+        <div><b data-part="next-rotation">12 s</b><span class="label">Next rotation</span></div>
+      </div>
+      <div class="hud-act">
+        <button class="btn btn-sm" type="button" data-part="spend">Spend a note</button>
+        <span class="chip" data-part="chip" data-state="moving">Moving</span>
+      </div>
+    </div>
+  </div>
+</div>
+
+<script>
+  import { mountField } from '../../scripts/field';
+  document.querySelectorAll<HTMLElement>('[data-live-field]').forEach(mountField);
+</script>

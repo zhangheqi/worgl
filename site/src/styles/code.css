@@ -1,0 +1,18 @@
+/* Code: tabbed samples and the terminal box. */
+.codebox { min-width: 0; display: flex; flex-direction: column; }
+.tabs { display: flex; gap: 0; border-bottom: 1.5px solid var(--ink); overflow-x: auto; }
+.tabs button { border: 0; background: transparent; padding: 10px 16px; font-family: var(--f-mono); font-size: 12px; letter-spacing: .06em; text-transform: uppercase; font-stretch: 87.5%; cursor: pointer; color: var(--muted); border-bottom: 3px solid transparent; margin-bottom: -1.5px; }
+.tabs button[aria-selected="true"] { color: var(--ink); border-bottom-color: var(--pink); }
+.panel { background: var(--code-bg); overflow-x: auto; }
+.panel pre { margin: 0; padding: 20px 22px; font-family: var(--f-mono); font-size: 12.5px; line-height: 1.75; font-stretch: 87.5%; color: var(--ink); }
+.panel .c { color: var(--muted); }
+.panel .s { color: var(--accent-text); }
+.panel .k { font-weight: 600; }
+.term-box { background: var(--cobalt-deep); color: var(--on-cobalt); min-width: 0; }
+.term-bar { display: flex; align-items: center; justify-content: space-between; gap: 12px; padding: 8px 10px 8px 18px; border-bottom: 1px solid var(--rule-cobalt); }
+.term-bar .label { font-size: 10px; opacity: .75; }
+.term { color: var(--on-cobalt); padding: 14px 18px 16px; font-family: var(--f-mono); font-size: 12.5px; line-height: 1.75; overflow-x: auto; margin: 0; font-stretch: 87.5%; }
+.term .c { color: var(--on-cobalt-muted); }
+.term .p { opacity: .6; user-select: none; }
+.copy { border: 1px solid var(--rule-cobalt); background: transparent; color: var(--on-cobalt); font-family: var(--f-mono); font-size: 10px; letter-spacing: .06em; text-transform: uppercase; padding: 4px 8px; cursor: pointer; }
+.copy:hover { border-color: var(--on-cobalt); }

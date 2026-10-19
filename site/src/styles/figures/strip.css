@@ -1,0 +1,8 @@
+/* A strip of months, each stamped 1% in pink. */
+.strip { display: grid; grid-template-columns: repeat(7, minmax(0, 1fr)); gap: 8px; }
+.month { aspect-ratio: 3 / 4; border: 1px solid var(--rule-night); display: flex; flex-direction: column; justify-content: space-between; padding: 6px; position: relative; min-width: 0; }
+.month .label { font-size: 9.5px; opacity: .75; }
+.month .st { position: absolute; inset: 22% 12% 14%; display: grid; place-items: center; border: 2px solid var(--pink); color: var(--pink); font-family: var(--f-mono); font-weight: 600; font-size: clamp(12px, 1.3vw, 17px); transform: rotate(var(--rot, -4deg)) scale(1.6); opacity: 0; transition: transform .32s cubic-bezier(.3, 1.6, .5, 1), opacity .2s; }
+.month.stamped .st { opacity: .95; transform: rotate(var(--rot, -4deg)) scale(1); }
+.month.void { border-style: dashed; }
+.month.void .st { border: 0; color: var(--on-night-muted); opacity: 1; transform: none; font-size: 10px; letter-spacing: .06em; font-weight: 500; text-transform: uppercase; }

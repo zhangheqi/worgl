@@ -1,0 +1,52 @@
+---
+import BitLogo from './BitLogo.astro';
+import { REPO, page } from '../lib/links';
+
+const nav = [
+  { href: page('how-it-works/'), label: 'How it works' },
+  { href: page('docs/'), label: 'Docs' },
+  { href: page('open-source/'), label: 'Open source' },
+  { href: page('cloud/'), label: 'Cloud', tag: 'not yet' },
+];
+const here = Astro.url.pathname;
+---
+<header class="site">
+  <div class="wrap">
+    <a class="mark" href={page()} aria-label="Worgl, home"><BitLogo /><span class="label">v0.1</span></a>
+    <button class="menu-btn label" type="button" aria-expanded="false" aria-controls="site-nav">Menu</button>
+    <nav class="nav" id="site-nav" aria-label="Main">
+      {nav.map((n) => (
+        <a href={n.href} aria-current={here.startsWith(n.href) ? 'page' : undefined}>
+          {n.label}{n.tag && <span class="label nav-tag">{n.tag}</span>}
+        </a>
+      ))}
+    </nav>
+    <a class="btn gh" href={REPO}>GitHub</a>
+  </div>
+</header>
+
+<style>
+  .site { position: sticky; top: env(safe-area-inset-top, 0px); z-index: 50; background: var(--hdr-bg); color: var(--hdr-fg); box-shadow: 0 1px 0 var(--hdr-rule); transition: background-color .35s ease, color .35s ease, box-shadow .35s ease; }
+  .wrap { position: relative; display: flex; align-items: center; gap: 28px; min-height: 64px; }
+  .mark { display: inline-flex; align-items: center; gap: 12px; text-decoration: none; }
+  .mark :global(.logo) { display: block; flex: none; }
+  .mark .label { opacity: .7; font-size: 10.5px; margin-top: -2px; }
+  .nav { display: flex; gap: 26px; margin-left: auto; }
+  .nav a { font-size: 15px; text-decoration: none; opacity: .88; }
+  .nav a:hover, .nav a[aria-current="page"] { opacity: 1; text-decoration: underline; text-decoration-color: var(--pink); }
+  .nav-tag { font-size: 9px; border: 1px solid currentColor; padding: 1px 5px; margin-left: 6px; vertical-align: 2px; opacity: .8; }
+  .gh { min-height: 38px; padding: 0 14px; font-size: 14px; }
+  .menu-btn { display: none; margin-left: auto; border: 1px solid currentColor; background: transparent; padding: 9px 12px; cursor: pointer; }
+  @media (max-width: 760px) {
+    .wrap { gap: 12px; }
+    .menu-btn { display: inline-flex; }
+    .nav { display: none; position: absolute; top: 100%; left: 0; right: 0; flex-direction: column; gap: 0; margin: 0; background: var(--hdr-bg); box-shadow: 0 1px 0 var(--hdr-rule), 0 12px 24px rgba(11, 13, 31, .18);
+      padding: 4px max(16px, env(safe-area-inset-right, 0px)) 12px max(16px, env(safe-area-inset-left, 0px)); }
+    .nav.open { display: flex; }
+    .nav a { padding: 12px 0; border-top: 1px solid currentColor; border-top-color: color-mix(in srgb, currentColor 18%, transparent); font-size: 17px; }
+  }
+</style>
+
+<script>
+  import '../scripts/header';
+</script>

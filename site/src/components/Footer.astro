@@ -1,0 +1,34 @@
+---
+import { REPO, TS_SDK, CRATES, page } from '../lib/links';
+---
+<footer class="band cobalt foot" data-tone="cobalt">
+  <div class="wrap">
+    <canvas class="mosaic" data-wordmark role="img" aria-label="The word worgl, set in bits. Leave it idle and it erodes; move the pointer over it to print it again."></canvas>
+    <div class="foot-cols">
+      <div><span class="label">Worgl</span><p>Named for Wörgl, the Austrian town whose 1932 scrip cost 1% a month to hold, so nobody sat on it. <a href={page('why-worgl/')}>Why Worgl</a></p></div>
+      <div><span class="label">Learn</span><a href={page('how-it-works/')}>How it works</a><a href={page('docs/')}>Docs</a><a href={page('cloud/')}>Worgl Cloud</a></div>
+      <div><span class="label">Code</span><a href={REPO}>Repository</a><a href={page('open-source/')}>Open source</a><a href={TS_SDK}>TypeScript SDK</a><a href={CRATES}>Crates</a></div>
+      <div><span class="label">Colophon</span><p>Two inks, cobalt and paper, with pink for whatever just changed. Set in Instrument Serif, Instrument Sans and Martian Mono; the wordmark is drawn in bits. No cookies, no analytics.</p></div>
+    </div>
+    <p class="status"><span>v0.1</span><span>Not yet independently security reviewed. Don't use it to hold anything you can't afford to lose.</span><span>MIT or Apache-2.0</span></p>
+  </div>
+</footer>
+
+<style>
+  .foot > .wrap { padding-block: clamp(56px, 7vw, 96px) 32px; display: flex; flex-direction: column; gap: 40px; }
+  .mosaic { display: block; width: 100%; height: 220px; cursor: crosshair; }
+  .foot-cols { display: grid; grid-template-columns: repeat(4, minmax(0, 1fr)); gap: 28px; }
+  .foot-cols > div { display: flex; flex-direction: column; gap: 8px; min-width: 0; }
+  .foot-cols .label { opacity: .72; margin-bottom: 4px; }
+  .foot-cols > div > a { text-decoration: none; font-size: 15.5px; }
+  .foot-cols > div > a:hover { text-decoration: underline; text-decoration-color: var(--pink); }
+  .foot-cols p { font-size: 14.5px; color: var(--on-cobalt-muted); }
+  .status { display: flex; flex-wrap: wrap; gap: 8px 22px; border-top: 1px solid var(--rule-cobalt); padding-top: 18px; font-family: var(--f-mono); font-size: 11px; letter-spacing: .04em; font-stretch: 87.5%; color: var(--on-cobalt-muted); }
+  @media (max-width: 860px) { .foot-cols { grid-template-columns: repeat(2, minmax(0, 1fr)); } }
+  @media (max-width: 480px) { .foot-cols { grid-template-columns: 1fr; } }
+</style>
+
+<script>
+  import { mountWordmark } from '../scripts/wordmark';
+  document.querySelectorAll<HTMLCanvasElement>('canvas[data-wordmark]').forEach(mountWordmark);
+</script>
