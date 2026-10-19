@@ -5,7 +5,9 @@
 //! it wants to (see [`store`](crate::store)), and then the issuer *applies*
 //! it. Applying is deterministic and checks the event against the state, so
 //! replaying a log of events onto the snapshot it started from rebuilds
-//! the exact same issuer. [`Issuer::mint`], [`Issuer::transfer`],
+//! the exact same issuer. [`Issuer::check`] makes the same checks without
+//! applying, so a store can refuse an event before it logs one that would
+//! not replay. [`Issuer::mint`], [`Issuer::transfer`],
 //! [`Issuer::burn`] and [`Issuer::rotate`] do all three steps for in-memory
 //! use.
 //!
@@ -686,7 +688,8 @@ impl Issuer {
     }
 
     /// Plans a verified transfer against the ledger: every input must be
-    /// live and outside the last layer, and the layer one past the furthest
+    /// live and outside the last layer, no layer may hold less live value
+    /// than the inputs spend from it, and the layer one past the furthest
     /// input must have room for every output.
     ///
     /// The transfer's shape is checked against this issuer's policy again,
@@ -707,15 +710,21 @@ impl Issuer {
         }
         let last = self.ledger.last_position();
         let mut furthest = 0;
+        let mut drawn = Vec::with_capacity(transfer.inputs.len());
         for note in &transfer.inputs {
             let serial = note.serial();
-            match self.ledger.status(serial) {
+            let position = match self.ledger.status(serial) {
                 Status::Live { position } if position == last => return Err(Error::Frozen(serial)),
-                Status::Live { position } => furthest = furthest.max(position),
+                Status::Live { position } => position,
                 Status::Spent => return Err(Error::Spent(serial)),
                 Status::Expired => return Err(Error::Expired(serial)),
                 Status::Unissued => return Err(Error::Unissued(serial)),
-            }
+            };
+            furthest = furthest.max(position);
+            drawn.push((position, note.amount()));
+        }
+        if let Some(position) = self.overdrawn(&drawn) {
+            return Err(Error::Overdrawn { position });
         }
         let position = furthest + 1;
         let issued = (0..transfer.outputs.len() as u32)
@@ -736,7 +745,8 @@ impl Issuer {
         }))
     }
 
-    /// Plans a verified burn against the ledger: every input must be live.
+    /// Plans a verified burn against the ledger: every input must be live,
+    /// and no layer may hold less live value than the inputs burn from it.
     /// Notes frozen in the last layer can be burned, since nothing moves.
     pub fn plan_burn(&self, burn: &VerifiedBurn) -> Result<Plan, Error> {
         self.check_running()?;
@@ -750,14 +760,18 @@ impl Issuer {
         if self.receipts.issued.contains_key(&burn.id) {
             return Ok(Plan::Replay(Vec::new()));
         }
+        let mut drawn = Vec::with_capacity(burn.inputs.len());
         for note in &burn.inputs {
             let serial = note.serial();
             match self.ledger.status(serial) {
-                Status::Live { .. } => {}
+                Status::Live { position } => drawn.push((position, note.amount())),
                 Status::Spent => return Err(Error::Spent(serial)),
                 Status::Expired => return Err(Error::Expired(serial)),
                 Status::Unissued => return Err(Error::Unissued(serial)),
             }
+        }
+        if let Some(position) = self.overdrawn(&drawn) {
+            return Err(Error::Overdrawn { position });
         }
         Ok(Plan::Apply(Event::Burn {
             id: burn.id,
@@ -810,7 +824,9 @@ impl Issuer {
     /// Plans pausing the issuer, or resuming it if `paused` is false. `None`
     /// if it already is.
     pub fn plan_pause(&self, paused: bool) -> Option<Event> {
-        (paused != self.paused).then_some(if paused { Event::Pause } else { Event::Resume })
+        let event = if paused { Event::Pause } else { Event::Resume };
+        // Planned exactly when it applies.
+        self.check(&event).is_ok().then_some(event)
     }
 
     fn check_running(&self) -> Result<(), Error> {
@@ -836,8 +852,10 @@ impl Issuer {
         }
     }
 
-    /// Applies an event, or changes nothing and explains why it does not fit.
-    pub fn apply(&mut self, event: &Event) -> Result<(), ApplyError> {
+    /// Checks, changing nothing, that an event fits the current state.
+    /// [`apply`](Self::apply) makes this same check first, so an event that
+    /// passes applies for as long as the state stays as it is.
+    pub fn check(&self, event: &Event) -> Result<(), ApplyError> {
         match event {
             Event::Pause | Event::Resume => {
                 let paused = matches!(event, Event::Pause);
@@ -847,17 +865,35 @@ impl Issuer {
                         if paused { "paused" } else { "running" }
                     )));
                 }
-                self.paused = paused;
+                Ok(())
             }
-            _ if self.paused => return Err(ApplyError("the issuer is paused".into())),
-            Event::Mint(issued) => self.apply_mint(issued)?,
-            Event::Transfer { id, spent, issued } => self.apply_transfer(*id, spent, issued)?,
-            Event::Rotate(report) => self.apply_rotate(report)?,
-            Event::Burn { id, spent } => self.apply_burn(*id, spent)?,
+            _ if self.paused => Err(ApplyError("the issuer is paused".into())),
+            Event::Mint(issued) => self.check_issued(std::slice::from_ref(issued)),
+            Event::Transfer { spent, issued, .. } => self.check_transfer(spent, issued),
+            Event::Rotate(report) => self.check_rotate(report),
+            Event::Burn { spent, .. } => self.check_burn(spent),
             Event::AuthorizedMint {
                 authorization,
                 issued,
-            } => self.apply_authorized_mint(authorization, issued)?,
+            } => self.check_authorized_mint(authorization, issued),
+        }
+    }
+
+    /// Applies an event, or changes nothing and explains why it does not
+    /// fit, as [`check`](Self::check) finds.
+    pub fn apply(&mut self, event: &Event) -> Result<(), ApplyError> {
+        self.check(event)?;
+        match event {
+            Event::Pause => self.paused = true,
+            Event::Resume => self.paused = false,
+            Event::Mint(issued) => self.apply_mint(issued),
+            Event::Transfer { id, spent, issued } => self.apply_transfer(*id, spent, issued),
+            Event::Rotate(report) => self.apply_rotate(report),
+            Event::Burn { id, spent } => self.apply_burn(*id, spent),
+            Event::AuthorizedMint {
+                authorization,
+                issued,
+            } => self.apply_authorized_mint(authorization, issued),
         }
         self.sequence += 1;
         Ok(())
@@ -880,7 +916,7 @@ impl Issuer {
     /// Mints a note in memory: plan, apply and sign in one step.
     pub fn mint(&mut self, amount: u64, holder: PublicKey) -> Result<Note, Error> {
         let event = self.plan_mint(amount, holder)?;
-        self.apply(&event).expect("a freshly planned event applies");
+        self.apply(&event)?;
         Ok(self.notes(&event).remove(0))
     }
 
@@ -890,7 +926,7 @@ impl Issuer {
         match self.plan_transfer(&verified)? {
             Plan::Replay(notes) => Ok(notes),
             Plan::Apply(event) => {
-                self.apply(&event).expect("a freshly planned event applies");
+                self.apply(&event)?;
                 Ok(self.notes(&event))
             }
         }
@@ -902,7 +938,7 @@ impl Issuer {
     pub fn burn(&mut self, request: &BurnRequest) -> Result<u128, Error> {
         let verified = self.verifier().verify_burn(request)?;
         if let Plan::Apply(event) = self.plan_burn(&verified)? {
-            self.apply(&event).expect("a freshly planned event applies");
+            self.apply(&event)?;
         }
         Ok(verified.value())
     }
@@ -914,7 +950,7 @@ impl Issuer {
         let mut notes = match self.plan_authorized_mint(&verified)? {
             Plan::Replay(notes) => notes,
             Plan::Apply(event) => {
-                self.apply(&event).expect("a freshly planned event applies");
+                self.apply(&event)?;
                 self.notes(&event)
             }
         };
@@ -928,7 +964,7 @@ impl Issuer {
     /// If the system random number generator fails.
     pub fn rotate(&mut self) -> Result<RotationReport, Error> {
         let event = self.plan_rotate(GenerationKey::generate())?;
-        self.apply(&event).expect("a freshly planned event applies");
+        self.apply(&event)?;
         match event {
             Event::Rotate(report) => Ok(report),
             _ => unreachable!("plan_rotate plans a rotation"),
@@ -1151,15 +1187,14 @@ impl Issuer {
             .collect()
     }
 
-    fn apply_mint(&mut self, issued: &Issued) -> Result<(), ApplyError> {
-        let position = self.check_issued(std::slice::from_ref(issued))?;
-        self.allocate(position, issued);
+    /// Mints a note [`check`](Self::check) accepted.
+    fn apply_mint(&mut self, issued: &Issued) {
+        self.allocate(std::slice::from_ref(issued));
         self.minted += u128::from(issued.amount);
-        Ok(())
     }
 
-    fn apply_authorized_mint(
-        &mut self,
+    fn check_authorized_mint(
+        &self,
         authorization: &MintAuthorization,
         issued: &Issued,
     ) -> Result<(), ApplyError> {
@@ -1171,19 +1206,17 @@ impl Issuer {
                 authorization.sequence, last.sequence
             )));
         }
-        self.apply_mint(issued)?;
-        self.authorities
-            .insert(authorization.authority, (*authorization, *issued));
-        Ok(())
+        self.check_issued(std::slice::from_ref(issued))
     }
 
-    fn apply_transfer(
-        &mut self,
-        id: TransferId,
-        spent: &[Spent],
-        issued: &[Issued],
-    ) -> Result<(), ApplyError> {
-        // Check everything first so a misfit event leaves the state untouched.
+    /// Mints at an authority's request [`check`](Self::check) accepted.
+    fn apply_authorized_mint(&mut self, authorization: &MintAuthorization, issued: &Issued) {
+        self.apply_mint(issued);
+        self.authorities
+            .insert(authorization.authority, (*authorization, *issued));
+    }
+
+    fn check_transfer(&self, spent: &[Spent], issued: &[Issued]) -> Result<(), ApplyError> {
         if spent.is_empty() || issued.is_empty() {
             return Err(ApplyError(
                 "a transfer spends and issues at least one note".into(),
@@ -1197,57 +1230,71 @@ impl Issuer {
                 "spends {total_in} but issues {total_out}"
             )));
         }
-        let position = self.check_issued(issued)?;
-
-        self.spend(spent);
-        for i in issued {
-            self.allocate(position, i);
-        }
-        let capacity = self.policy.receipt_capacity as usize;
-        self.receipts.insert(capacity, id, issued.to_vec());
-        Ok(())
+        self.check_issued(issued)
     }
 
-    fn apply_burn(&mut self, id: TransferId, spent: &[Spent]) -> Result<(), ApplyError> {
+    /// Carries out a transfer [`check`](Self::check) accepted.
+    fn apply_transfer(&mut self, id: TransferId, spent: &[Spent], issued: &[Issued]) {
+        self.spend(spent);
+        self.allocate(issued);
+        let capacity = self.policy.receipt_capacity as usize;
+        self.receipts.insert(capacity, id, issued.to_vec());
+    }
+
+    fn check_burn(&self, spent: &[Spent]) -> Result<(), ApplyError> {
         if spent.is_empty() {
             return Err(ApplyError("a burn spends at least one note".into()));
         }
-        self.check_spent(spent)?;
+        self.check_spent(spent)
+    }
+
+    /// Carries out a burn [`check`](Self::check) accepted.
+    fn apply_burn(&mut self, id: TransferId, spent: &[Spent]) {
         self.spend(spent);
         self.burned += spent.iter().map(|s| u128::from(s.amount)).sum::<u128>();
         let capacity = self.policy.receipt_capacity as usize;
         self.receipts.insert(capacity, id, Vec::new());
-        Ok(())
     }
 
     /// Checks that every spent note is live, appears once, and that its
     /// layer holds at least the value spent from it.
     fn check_spent(&self, spent: &[Spent]) -> Result<(), ApplyError> {
-        let mut drained: Vec<(u32, u128)> = Vec::new();
+        let mut drawn = Vec::with_capacity(spent.len());
         let mut serials = Vec::with_capacity(spent.len());
         for s in spent {
             let Status::Live { position } = self.ledger.status(s.serial) else {
                 return Err(ApplyError(format!("note {} is not live", s.serial)));
             };
-            match drained.iter_mut().find(|(p, _)| *p == position) {
-                Some((_, total)) => *total += u128::from(s.amount),
-                None => drained.push((position, u128::from(s.amount))),
-            }
+            drawn.push((position, s.amount));
             serials.push(s.serial);
         }
         serials.sort_unstable();
         if serials.windows(2).any(|pair| pair[0] == pair[1]) {
             return Err(ApplyError("a note is spent twice".into()));
         }
-        if let Some((position, _)) = drained
-            .iter()
-            .find(|(position, total)| self.value[*position as usize] < *total)
-        {
+        if let Some(position) = self.overdrawn(&drawn) {
             return Err(ApplyError(format!(
                 "layer {position} holds less value than is spent"
             )));
         }
         Ok(())
+    }
+
+    /// The position of a layer that holds less live value than `drawn`
+    /// takes from it, if any. Each of `drawn` is a live note's position and
+    /// amount. Planning a spend and applying it both ask this, so they agree.
+    fn overdrawn(&self, drawn: &[(u32, u64)]) -> Option<u32> {
+        let mut totals: Vec<(u32, u128)> = Vec::new();
+        for &(position, amount) in drawn {
+            match totals.iter_mut().find(|(p, _)| *p == position) {
+                Some((_, total)) => *total += u128::from(amount),
+                None => totals.push((position, u128::from(amount))),
+            }
+        }
+        totals
+            .into_iter()
+            .find(|&(position, total)| self.value[position as usize] < total)
+            .map(|(position, _)| position)
     }
 
     /// Clears the bits of notes [`check_spent`](Self::check_spent) accepted.
@@ -1261,7 +1308,7 @@ impl Issuer {
         }
     }
 
-    fn apply_rotate(&mut self, report: &RotationReport) -> Result<(), ApplyError> {
+    fn check_rotate(&self, report: &RotationReport) -> Result<(), ApplyError> {
         let expected = RotationReport {
             key: report.key,
             due: report.due,
@@ -1311,6 +1358,11 @@ impl Issuer {
             }
             None => {}
         }
+        Ok(())
+    }
+
+    /// Rotates as [`check`](Self::check) accepted.
+    fn apply_rotate(&mut self, report: &RotationReport) {
         self.ledger.rotate();
         self.value.remove(0);
         self.value.push(0);
@@ -1331,7 +1383,6 @@ impl Issuer {
         if report.due.is_some() {
             self.last_due = report.due;
         }
-        Ok(())
     }
 
     /// Makes this an issuer from before generation keys, whose own key signs
@@ -1352,9 +1403,8 @@ impl Issuer {
             .retain(|public| live.certificates().iter().any(|c| &c.key == public));
     }
 
-    /// Checks that `issued` are exactly the next allocations of one layer and
-    /// returns that layer's position.
-    fn check_issued(&self, issued: &[Issued]) -> Result<u32, ApplyError> {
+    /// Checks that `issued` are exactly the next allocations of one layer.
+    fn check_issued(&self, issued: &[Issued]) -> Result<(), ApplyError> {
         let generation = issued[0].serial.generation;
         let position = self
             .ledger
@@ -1371,13 +1421,20 @@ impl Issuer {
                 )));
             }
         }
-        Ok(position)
+        Ok(())
     }
 
-    fn allocate(&mut self, position: u32, issued: &Issued) {
-        let serial = self.ledger.allocate(position).expect("checked free above");
-        debug_assert_eq!(serial, issued.serial);
-        self.value[position as usize] += u128::from(issued.amount);
+    /// Sets the bits of notes [`check_issued`](Self::check_issued) accepted.
+    fn allocate(&mut self, issued: &[Issued]) {
+        let position = self
+            .ledger
+            .position(issued[0].serial.generation)
+            .expect("checked in the ledger");
+        for i in issued {
+            let serial = self.ledger.allocate(position).expect("checked free");
+            debug_assert_eq!(serial, i.serial);
+            self.value[position as usize] += u128::from(i.amount);
+        }
     }
 }
 
@@ -1852,6 +1909,59 @@ mod tests {
         pay(&mut i, note, &carol).unwrap();
         let late = BurnRequest::single(note, &carol).unwrap();
         assert_eq!(i.burn(&late), Err(Error::Spent(note.serial())));
+    }
+
+    #[test]
+    fn planning_refuses_to_take_more_from_a_layer_than_it_holds() {
+        // Two issuers restored from one snapshot hand out the same serials
+        // under the same keys, as a mint and a restored copy of it do.
+        let original = issuer(4, Policy::flexible());
+        let restore = || {
+            Issuer::restore(
+                original.key.clone(),
+                original.key_ring().clone(),
+                &original.snapshot(),
+                Policy::flexible(),
+            )
+            .unwrap()
+        };
+        let (mut first, mut second) = (restore(), restore());
+        let (alice, bob) = (HolderKey::generate(), HolderKey::generate());
+        let alices = [32, 8].map(|amount| first.mint(amount, alice.public_key()).unwrap());
+        let bobs = [4, 32].map(|amount| second.mint(amount, bob.public_key()).unwrap());
+        assert_eq!(alices.map(|n| n.serial()), bobs.map(|n| n.serial()));
+        let position = second.mint_position();
+        assert_eq!(second.layers()[position as usize].value, 36);
+        let overdrawn = Error::Overdrawn { position };
+
+        // Each of Alice's notes is worth less than the layer holds, but not
+        // both together.
+        let both = [(alices[0], &alice), (alices[1], &alice)];
+        let output = Output {
+            amount: 40,
+            holder: alice.public_key(),
+        };
+        let transfer = TransferRequest::sign(&both, vec![output]).unwrap();
+        let burn = BurnRequest::sign(&both).unwrap();
+        let before = second.snapshot();
+        let verified = second.verifier().verify(&transfer).unwrap();
+        assert_eq!(second.plan_transfer(&verified).unwrap_err(), overdrawn);
+        let verified = second.verifier().verify_burn(&burn).unwrap();
+        assert_eq!(second.plan_burn(&verified).unwrap_err(), overdrawn);
+        assert_eq!(second.transfer(&transfer).unwrap_err(), overdrawn);
+        assert_eq!(second.burn(&burn).unwrap_err(), overdrawn);
+        assert_eq!(second.snapshot(), before);
+
+        // Alice's 32 alone fits, so it spends and Bob's 4 on its serial is
+        // refused as spent. That leaves the layer 4, less than Bob's own 32.
+        pay(&mut second, alices[0], &alice).unwrap();
+        assert_eq!(
+            pay(&mut second, bobs[0], &bob).unwrap_err(),
+            Error::Spent(bobs[0].serial())
+        );
+        assert_eq!(pay(&mut second, bobs[1], &bob).unwrap_err(), overdrawn);
+        let burn = BurnRequest::single(bobs[1], &bob).unwrap();
+        assert_eq!(second.burn(&burn).unwrap_err(), overdrawn);
     }
 
     #[test]

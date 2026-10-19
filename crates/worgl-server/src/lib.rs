@@ -830,11 +830,11 @@ impl ApiError {
     /// One of: `malformed`, `policy`, `invalid_note`, `duplicate_input`,
     /// `unauthorized` (a holder's or mint authority's signature),
     /// `unknown_authority`, `admin_unauthorized` (a missing or wrong token),
-    /// `unknown_mint`, `paused`, `spent`, `expired`, `unissued`, `frozen`,
-    /// `stale_mint`, `stale_rotation`, `layer_full`, `storage`, `internal`,
-    /// and on a cluster `no_leader` (nothing was done; send the request
-    /// again) and `timeout` (the change may still be made: send the same
-    /// note request again, but list the mints before creating another).
+    /// `unknown_mint`, `paused`, `spent`, `expired`, `unissued`, `overdrawn`,
+    /// `frozen`, `stale_mint`, `stale_rotation`, `layer_full`, `storage`,
+    /// `internal`, and on a cluster `no_leader` (nothing was done; send the
+    /// request again) and `timeout` (the change may still be made: send the
+    /// same note request again, but list the mints before creating another).
     pub fn code(&self) -> &'static str {
         self.code
     }
@@ -856,8 +856,10 @@ impl From<Error> for ApiError {
             Error::Spent(_) => (StatusCode::CONFLICT, "spent"),
             Error::Expired(_) => (StatusCode::CONFLICT, "expired"),
             Error::Unissued(_) => (StatusCode::CONFLICT, "unissued"),
+            Error::Overdrawn { .. } => (StatusCode::CONFLICT, "overdrawn"),
             Error::Frozen(_) => (StatusCode::CONFLICT, "frozen"),
             Error::LayerFull { .. } => (StatusCode::SERVICE_UNAVAILABLE, "layer_full"),
+            Error::Misfit(_) => return Self::internal(&error.to_string()),
             _ => (StatusCode::BAD_REQUEST, "malformed"),
         };
         Self::new(status, code, error.to_string())
