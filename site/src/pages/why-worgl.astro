@@ -1,0 +1,71 @@
+---
+import Page from '../layouts/Page.astro';
+import SectionHead from '../components/SectionHead.astro';
+import BitLogo from '../components/BitLogo.astro';
+import '../styles/figures/strip.css';
+import '../styles/pages.css';
+
+const WIKIPEDIA = 'https://en.wikipedia.org/wiki/W%C3%B6rgl';
+const P2P = 'https://wiki.p2pfoundation.net/Worgl_Shillings';
+---
+<Page title="Why Worgl" description="Named for Wörgl, the Austrian town whose 1932 scrip cost 1% a month to hold, so nobody sat on it.">
+  <section class="band night page-hero why-hero edge edge-paper" data-tone="night">
+    <div class="wrap grid">
+      <p class="eyebrow label"><span>Why Worgl</span><span>The name</span></p>
+      <h1>Why <em>Worgl.</em></h1>
+      <div class="story">
+        <p>In July 1932, deep in the Depression, the Tyrolean town of Wörgl began paying for public works in notes of its own.</p>
+        <p>Its mayor, Michael Unterguggenberger, followed the economist Silvio Gesell: at the end of every month, whoever held a note had to buy a stamp worth 1% of its value to keep it valid.</p>
+        <p>Nobody wanted to be holding one when the month ran out, so the notes kept moving, and the town built houses, a reservoir, a ski jump and a bridge with them. Austria's central bank shut the scheme down in September 1933.</p>
+      </div>
+      <div class="strip-wrap">
+        <div class="strip" data-strip></div>
+        <p class="strip-cap">One stamp a month until the scheme ended. An illustration, not a replica of the note.</p>
+      </div>
+      <p class="drop">Worgl keeps the idea and drops the <em>stamp.</em></p>
+    </div>
+  </section>
+
+  <section class="band paper then-now" data-tone="paper">
+    <div class="wrap">
+      <SectionHead num="01" name="The stamp and the layer" />
+      <div class="grid">
+        <h2 class="h2 sec-intro">A token that sits still <em>expires.</em></h2>
+        <p class="body muted sec-aside">A token that sits still does not lose 1% a month; it expires when its layer is dropped. A token that keeps moving lives on.</p>
+        <div class="compare">
+          <div class="corner" aria-hidden="true"></div>
+          <div class="head">Wörgl, 1932<small>Stamp scrip</small></div>
+          <div class="head">Worgl<small>Layers of bits</small></div>
+
+          <div class="row">Sitting still costs</div>
+          <div><p>1% of the note's value at the end of every month</p></div>
+          <div><p>The whole token, when its layer is dropped</p></div>
+
+          <div class="row">Kept valid by</div>
+          <div><p>A stamp bought at the town hall and stuck on the note</p></div>
+          <div><p>A transfer one layer on, even to a fresh key of your own</p></div>
+
+          <div class="row">So holders</div>
+          <div><p>Spent their notes before the month ran out</p></div>
+          <div><p>Move their tokens, or refresh them, before the layer goes</p></div>
+        </div>
+
+        <div class="spelling">
+          <div class="spelling-art" aria-hidden="true">
+            <span class="from">W<span class="uml">ö</span>rgl</span>
+            <span class="arrow">→</span>
+            <span class="to"><BitLogo /></span>
+          </div>
+          <p>We spell it worgl, without the umlaut, so it types anywhere.</p>
+        </div>
+
+        <p class="why-sources">Sources: <a href={WIKIPEDIA}>Wörgl on Wikipedia</a>, for the start on 31 July 1932, the mayor, Gesell, the projects and the central bank's ending; and <a href={P2P}>Wörgl Shillings on the P2P Foundation wiki</a>, for the 1% monthly stamp, bought at the town hall. The two disagree on the end date, 1 or 15 September 1933, so this page says only September 1933.</p>
+      </div>
+    </div>
+  </section>
+</Page>
+
+<script>
+  import { mountStrip } from '../scripts/stamp-strip';
+  document.querySelectorAll<HTMLElement>('[data-strip]').forEach(mountStrip);
+</script>

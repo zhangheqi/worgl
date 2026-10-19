@@ -39,6 +39,20 @@ export interface NoteState {
   live: { position: number; hopsLeft: number; expiresAfterRotations: number } | undefined;
 }
 
+/** What a playground faucet hands out. */
+export interface FaucetInfo {
+  /** The mint its notes come from, in hex. */
+  mint: string;
+  /** The value of each note. */
+  amount: bigint;
+  /** Notes one client address may get in any hour. */
+  perAddressPerHour: number;
+  /** Notes the faucet hands out in a day, UTC. */
+  perDay: number;
+  /** Notes left to hand out today. */
+  leftToday: number;
+}
+
 /** An error answer from a mint. */
 export class MintError extends Error {
   /** The HTTP status. */
@@ -166,6 +180,45 @@ export class Client {
     const answer = JSON.parse(await this.#send('POST', `/v1/mints/${mint}/mint`, request)) as {
       note: string;
     };
+    return answer.note;
+  }
+
+  /**
+   * `GET /v1/faucet`, from a playground faucet: its mint and limits. The
+   * faucet is `worgl-faucet`, at this client's URL, which may be its mint's
+   * server with the faucet behind the same proxy.
+   */
+  async faucet(): Promise<FaucetInfo> {
+    const text = await this.#send('GET', '/v1/faucet');
+    const about = JSON.parse(text) as {
+      mint: string;
+      per_address_per_hour: number;
+      per_day: number;
+      left_today: number;
+    };
+    // JSON.parse would round an amount above 2^53; read its digits.
+    const amount = /"amount"\s*:\s*(\d+)/.exec(text)?.[1];
+    if (amount === undefined) {
+      throw new MintError(200, 'http', `the faucet's answer has no amount: ${text.slice(0, 512)}`);
+    }
+    return {
+      mint: about.mint,
+      amount: BigInt(amount),
+      perAddressPerHour: about.per_address_per_hour,
+      perDay: about.per_day,
+      leftToday: about.left_today,
+    };
+  }
+
+  /**
+   * `POST /v1/faucet`: a note of the faucet's mint, bound to `holder`. Past
+   * the faucet's limits it rejects with a {@link MintError} of status 429 and
+   * code `rate_limited` or `exhausted`.
+   */
+  async askFaucet(holder: string): Promise<string> {
+    const answer = JSON.parse(
+      await this.#send('POST', '/v1/faucet', JSON.stringify({ holder })),
+    ) as { note: string };
     return answer.note;
   }
 

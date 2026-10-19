@@ -37,6 +37,7 @@ axum.workspace = true
 hex.workspace = true
 serde_json.workspace = true
 tempfile.workspace = true
+worgl-faucet.workspace = true
 worgl-server.workspace = true
 
 [lints]

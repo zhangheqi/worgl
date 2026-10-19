@@ -36,6 +36,7 @@ Or build it in a clone with `cargo build --release -p worgl-cli`, as the
 
 ```sh
 worgl init                                     # each side, once
+worgl playground --faucet $FAUCET              # a note from a playground faucet; prints its mint
 worgl mint $MINT 8 --authority-key mint.key    # as a mint authority, for testing
 worgl request $MINT 5 -o request.json          # payee → send request.json
 worgl pay request.json -o payment.json         # payer → send payment.json
@@ -62,6 +63,7 @@ worgl refresh $MINT                            # once per rotation period
 | `settle` | Sends the transfers not yet seen answered again and takes in their change. |
 | `refresh MINT` | Pays the notes that die at the next rotation back to the purse, each at a random moment before it. Waits until the last is done. `--now` submits them all at once: faster, but the mint can then tell the notes belong together. |
 | `prune MINT` | Drops notes whose layer the mint has dropped. |
+| `playground` | Asks a playground [faucet](../running-a-faucet/) for a note and keeps it, then prints the faucet's mint. `--faucet URL` (or `WORGL_FAUCET`) names the faucet when it is not at the server's URL. |
 | `mint MINT AMOUNT` | Mints notes into the purse, signing as one of the mint's authorities with `--authority-key FILE`. `--sequence N` sets the first sequence number, above every one this key has used; it defaults to the time in microseconds. `--at-most N` mints notes no larger than N. |
 
 ## Spacing

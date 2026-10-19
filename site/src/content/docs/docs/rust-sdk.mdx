@@ -50,7 +50,8 @@ purse encrypted under a passphrase this way.
 
 When the payer submits instead, with `Purse::submit`, it hands the notes from
 the answers to the payee, who checks their signatures and keeps them with
-`Purse::accept`.
+`Purse::accept`. `Purse::take_from_faucet` asks a playground
+[faucet](../running-a-faucet/) for a note, to a fresh key like any other.
 
 ## What else a purse does
 

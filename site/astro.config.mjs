@@ -84,6 +84,7 @@ export default defineConfig({
           items: [
             { label: 'Running a server', slug: 'docs/running-a-server' },
             { label: 'Running a cluster', slug: 'docs/running-a-cluster' },
+            { label: 'Running a faucet', slug: 'docs/running-a-faucet' },
             { label: 'Mint authorities and keys', slug: 'docs/keys' },
             { label: 'Pausing a mint', slug: 'docs/pausing' },
             { label: 'Backups', slug: 'docs/backups' },

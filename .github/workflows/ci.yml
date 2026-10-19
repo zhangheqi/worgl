@@ -94,8 +94,29 @@ jobs:
           node-version: 22
           cache: npm
           cache-dependency-path: sdk/typescript/package-lock.json
-      - run: cargo build --package worgl-server --locked
+      - run: cargo build --package worgl-server --package worgl-faucet --locked
       - run: npm ci
       - run: npm run build
       - run: npm run check
       - run: npm test
+
+  playground:
+    name: playground deploy
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: deploy/playground
+    steps:
+      - uses: actions/checkout@v5
+      - run: docker compose build
+      - run: docker compose up -d
+      - name: Ask the faucet for a note through the proxy
+        run: |
+          for _ in $(seq 60); do curl -skf https://localhost/healthz && break; sleep 1; done
+          mint=$(docker compose exec -T faucet cat /state/mint)
+          curl -skf https://localhost/v1/faucet | grep -q "$mint"
+          curl -skf -H 'content-type: application/json' -d "{\"holder\": \"$mint\"}" \
+            https://localhost/v1/faucet | grep -q '"note"'
+          curl -skf "https://localhost/v1/mints/$mint/info" | grep -q '"minted":64'
+      - if: failure()
+        run: docker compose logs

@@ -17,7 +17,10 @@ Nothing here is tagged or published yet.
   mint a Raft group of the three, and mints can be created while it runs.
 - New crates: `worgl-sdk` (the holder's side), `worgl-client` (typed HTTP
   calls and a purse), `worgl-wasm` with the TypeScript SDK, `worgl-cli` (a
-  command-line purse in a passphrase-encrypted file) and `worgl-raft`.
+  command-line purse in a passphrase-encrypted file), `worgl-raft` and
+  `worgl-faucet` (hands out notes of a playground mint, within limits). The
+  SDKs and `worgl playground` take a note from a faucet, and
+  `deploy/playground` runs a playground mint with Docker Compose.
 
 ## 0.1.0
 

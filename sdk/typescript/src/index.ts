@@ -23,7 +23,15 @@
  * @module
  */
 
-export { Client, type ClientOptions, type MintInfo, MintError, type NoteState, isTransient } from './client.ts';
+export {
+  Client,
+  type ClientOptions,
+  type FaucetInfo,
+  type MintInfo,
+  MintError,
+  type NoteState,
+  isTransient,
+} from './client.ts';
 export {
   type Balance,
   DEFAULT_RETRY,

@@ -141,6 +141,13 @@ enum Command {
         /// The mint's issuer key.
         mint: PublicKey,
     },
+    /// Ask a playground faucet for a note and keep it. Prints the faucet's
+    /// mint, for `balance` and `request`.
+    Playground {
+        /// The faucet, if not at the server's URL.
+        #[arg(long, env = "WORGL_FAUCET")]
+        faucet: Option<String>,
+    },
     /// Mint notes into the purse, signing as one of the mint's authorities.
     Mint {
         /// The mint's issuer key.
@@ -174,6 +181,10 @@ async fn main() -> ExitCode {
 
 async fn run(cli: Cli) -> Result<()> {
     let client = Client::new(&cli.server)?;
+    let faucet = match &cli.command {
+        Command::Playground { faucet: Some(url) } => Client::new(url)?,
+        _ => client.clone(),
+    };
     match cli.command {
         Command::Init => {
             let passphrase = new_passphrase(&cli.purse)?;
@@ -279,6 +290,15 @@ async fn run(cli: Cli) -> Result<()> {
         Command::Prune { mint } => {
             let lost = purse.prune(&mint).await?;
             eprintln!("Dropped {lost} in expired notes.");
+            Ok(())
+        }
+        Command::Playground { .. } => {
+            let (mint, value) = purse
+                .take_from_faucet(&faucet)
+                .await
+                .context("asking the faucet")?;
+            println!("{mint}");
+            eprintln!("Kept {value} from the faucet. `worgl notes` shows when it expires.");
             Ok(())
         }
         Command::Mint {

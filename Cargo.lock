@@ -2849,6 +2849,7 @@ dependencies = [
  "tokio",
  "worgl",
  "worgl-client",
+ "worgl-faucet",
  "worgl-sdk",
  "worgl-server",
  "zeroize",
@@ -2866,7 +2867,28 @@ dependencies = [
  "thiserror 2.0.21",
  "tokio",
  "worgl",
+ "worgl-faucet",
  "worgl-sdk",
+ "worgl-server",
+]
+
+[[package]]
+name = "worgl-faucet"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "axum",
+ "clap",
+ "hex",
+ "reqwest",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "tokio",
+ "tracing",
+ "tracing-subscriber",
+ "worgl",
+ "worgl-client",
  "worgl-server",
 ]
 

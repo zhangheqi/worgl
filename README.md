@@ -35,6 +35,7 @@ the source of the website's docs pages.
   [Embedding the library](site/src/content/docs/docs/embedding.mdx)
 - **Operate:** [Running a server](site/src/content/docs/docs/running-a-server.md) ·
   [Running a cluster](site/src/content/docs/docs/running-a-cluster.md) ·
+  [Running a faucet](site/src/content/docs/docs/running-a-faucet.md) ·
   [Mint authorities and keys](site/src/content/docs/docs/keys.md) ·
   [Pausing a mint](site/src/content/docs/docs/pausing.md) ·
   [Backups](site/src/content/docs/docs/backups.md) ·
@@ -48,7 +49,7 @@ the source of the website's docs pages.
 
 ## The workspace
 
-Seven crates and a TypeScript package. Nothing is published on crates.io or
+Eight crates and a TypeScript package. Nothing is published on crates.io or
 npm yet; depend on them from git.
 
 - [`worgl`](crates/worgl): the library. Ledger, note format, transfer
@@ -66,6 +67,8 @@ npm yet; depend on them from git.
   for every route, and a purse that runs a holder over HTTP and saves it.
 - [`worgl-cli`](crates/worgl-cli): `worgl`, a command line purse on
   `worgl-client`, kept in a passphrase-encrypted file.
+- [`worgl-faucet`](crates/worgl-faucet): hands out notes of a playground
+  mint to anyone who asks, within limits per address and per day.
 - [`worgl-wasm`](crates/worgl-wasm): `worgl-sdk` compiled to WebAssembly.
 - [`sdk/typescript`](sdk/typescript): the TypeScript SDK, a client and purse
   like `worgl-client`'s on top of `worgl-wasm`, for Node and browsers.
@@ -186,7 +189,7 @@ tests against a real server:
 ```sh
 rustup target add wasm32-unknown-unknown
 cargo install wasm-bindgen-cli --version 0.2.129 --locked  # the version Cargo.lock pins
-cargo build -p worgl-server
+cargo build -p worgl-server -p worgl-faucet
 cd sdk/typescript && npm ci && npm run build && npm run check && npm test
 ```
 

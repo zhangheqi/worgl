@@ -67,6 +67,9 @@ run purses against a real server.
 - When the payer submits instead (`purse.submit(payment.transfers)`), it
   hands `submitted.notes` to the payee, who checks their signatures against
   the mint's keys and keeps them with `purse.accept(notes)`.
+- `purse.takeFromFaucet(new Client(faucetUrl))` asks a playground
+  [faucet](../running-a-faucet/) for a note, to a fresh key like any other,
+  and keeps it.
 
 ## Client and errors
 
@@ -88,7 +91,7 @@ The tests run against a real server on a local port, so build the server
 first:
 
 ```sh
-cargo build -p worgl-server   # from the repository root
+cargo build -p worgl-server -p worgl-faucet   # from the repository root
 cd sdk/typescript
 npm run check   # type-checks the package and its tests
 npm test

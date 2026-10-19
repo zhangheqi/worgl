@@ -236,6 +236,54 @@ describe('refresh', () => {
   });
 });
 
+describe('faucet', () => {
+  let playground: TestServer;
+  let faucet: Client;
+  before(async () => {
+    playground = await TestServer.start();
+    faucet = await playground.startFaucet();
+  });
+  after(async () => {
+    await playground.stop();
+  });
+
+  test('reads what the faucet hands out', async () => {
+    const about = await faucet.faucet();
+    assert.equal(about.mint, playground.mint);
+    assert.equal(about.amount, 64n);
+    assert.equal(about.perAddressPerHour, 3);
+    assert.equal(about.perDay, 10_000);
+    assert.equal(about.leftToday, 10_000);
+  });
+
+  test('a purse keeps the notes the faucet hands out', async () => {
+    const purse = await Purse.open(playground.client(), quick);
+    for (let i = 0; i < 2; i += 1) {
+      assert.deepEqual(await purse.takeFromFaucet(faucet), { mint: playground.mint, value: 64n });
+    }
+    const balance = await purse.balance(playground.mint);
+    assert.equal(balance.spendable, 128n);
+    assert.equal(balance.expected, 0n);
+    assert.equal(purse.notes().length, 2);
+  });
+
+  test('a refusal leaves nothing expected', async () => {
+    const purse = await Purse.open(playground.client(), quick);
+    // The address had two of its three notes above.
+    await purse.takeFromFaucet(faucet);
+    await assert.rejects(purse.takeFromFaucet(faucet), (error: unknown) => {
+      assert.ok(error instanceof MintError);
+      assert.equal(error.status, 429);
+      assert.equal(error.code, 'rate_limited');
+      assert.equal(isTransient(error), false);
+      return true;
+    });
+    const balance = await purse.balance(playground.mint);
+    assert.equal(balance.spendable, 64n);
+    assert.equal(balance.expected, 0n);
+  });
+});
+
 describe('file store', () => {
   test('reopens a purse, owner-readable only', async () => {
     const dir = mkdtempSync(join(tmpdir(), 'worgl-store-'));

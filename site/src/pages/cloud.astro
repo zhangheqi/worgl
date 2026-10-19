@@ -1,0 +1,77 @@
+---
+import Page from '../layouts/Page.astro';
+import SectionHead from '../components/SectionHead.astro';
+import { DISCUSSIONS, REPO } from '../lib/links';
+import '../styles/pages.css';
+
+const RUN_SERVER = `${REPO}#running-the-server`;
+---
+<Page title="Worgl Cloud" description="Worgl Cloud will run your mints for you, on the same open-source server you can run yourself. It is not available yet.">
+  <section class="band paper cloud-hero edge edge-cobalt" data-tone="paper">
+    <div class="wrap">
+      <div class="bigstamp-edge">
+        <div class="bigstamp">
+          <span class="overprint" aria-hidden="true">Not available yet</span>
+          <div class="corner"><span class="label">Worgl Cloud</span><span class="label">Hosted mints</span></div>
+          <h1>Worgl <em>Cloud.</em></h1>
+          <span class="label na tag">Not available yet</span>
+          <p class="intro">Worgl Cloud will run your mints for you. You create a mint for each kind of token, mint to your own systems with your own authority key, and your holders use the SDKs. It runs the same open-source server you can run yourself.</p>
+          <div class="act">
+            <p>There is no waitlist and no form. Questions and ideas go to GitHub Discussions, in public.</p>
+            <div class="ctas"><a class="btn btn-solid-paper" href={DISCUSSIONS}>Tell us what you'd build</a></div>
+          </div>
+        </div>
+      </div>
+    </div>
+  </section>
+
+  <section class="band cobalt promises edge edge-paper" id="promises" data-tone="cobalt">
+    <div class="wrap">
+      <SectionHead num="01" name="Promises" />
+      <div class="grid">
+        <h2 class="h2">What it will <em>promise.</em></h2>
+        <p class="body sec-aside">Four commitments, made before the service exists, so you can hold it to them.</p>
+        <ol class="promise-list">
+          <li><h3>Worgl never mints</h3><p>Worgl never mints, holds or redeems value. Only your authority key can mint.</p></li>
+          <li><h3>One note per transfer</h3><p>Every hosted mint takes one note per transfer, so no transfer reveals that two notes share an owner.</p></li>
+          <li><h3>Supply, not lineage</h3><p>You see supply and usage, never per-note events. Lineage is kept only until the next snapshot, plus seven days of backups.</p></li>
+          <li><h3>Three zones</h3><p>Every mint is replicated across three zones, and no acknowledged transfer is lost when a server fails.</p></li>
+        </ol>
+      </div>
+    </div>
+  </section>
+
+  <section class="band paper stages edge edge-cobalt" id="where-it-stands" data-tone="paper">
+    <div class="wrap">
+      <SectionHead num="02" name="Where it stands" />
+      <div class="grid">
+        <h2 class="h2 sec-intro">Three steps, no <em>dates.</em></h2>
+        <p class="body muted sec-aside">Each step starts when the one before it has done what it says, not on a calendar.</p>
+        <ol class="stage-row">
+          <li class="now">
+            <span class="stage-box" aria-hidden="true">1</span>
+            <span class="label">In progress</span>
+            <h3>Private alpha</h3>
+            <p>Replication is built and tested against seeded faults. No one's mint runs on it until failover drills on the hosted servers lose nothing.</p>
+          </li>
+          <li>
+            <span class="stage-box" aria-hidden="true">2</span>
+            <span class="label">Next</span>
+            <h3>Beta</h3>
+            <p>Free, with capacity quotas. Pricing is published before anyone is billed.</p>
+          </li>
+          <li>
+            <span class="stage-box" aria-hidden="true">3</span>
+            <span class="label">Then</span>
+            <h3>General availability</h3>
+            <p>An availability target, prices and a bug bounty, after an independent security review.</p>
+          </li>
+        </ol>
+        <div class="self-host">
+          <p class="lede">Until then, the server Worgl Cloud will run is yours to run today, alone or as a three-member cluster.</p>
+          <div class="ctas"><a class="btn btn-solid" href={RUN_SERVER}>Run the server</a><a class="btn" href={DISCUSSIONS}>Tell us what you'd build</a></div>
+        </div>
+      </div>
+    </div>
+  </section>
+</Page>

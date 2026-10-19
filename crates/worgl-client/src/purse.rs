@@ -157,6 +157,29 @@ impl<S: Store> Purse<S> {
         )
     }
 
+    /// Asks a playground faucet for a note and keeps it. The faucet's mint
+    /// must be on this purse's server; the faucet may share its URL. The
+    /// note goes to a fresh key, saved before the faucet is asked, as for
+    /// any payment request. Returns the faucet's mint and the value kept.
+    pub async fn take_from_faucet(&self, faucet: &Client) -> Result<(PublicKey, u128), Error> {
+        let about = faucet.faucet().await?;
+        let request = self
+            .request_at_most(&about.mint, about.amount, about.amount)
+            .await?;
+        let [output] = request.outputs.as_slice() else {
+            self.withdraw(&request)?;
+            return Err(Error::FaucetAmount(about.amount));
+        };
+        let taken = match faucet.ask_faucet(&output.holder).await {
+            Ok(note) => self.accept(&[note]).await,
+            Err(error) => Err(error),
+        };
+        if taken.is_err() {
+            self.withdraw(&request)?;
+        }
+        Ok((about.mint, taken?))
+    }
+
     /// Stops expecting the notes of a request that will not be paid.
     pub fn withdraw(&self, request: &PaymentRequest) -> Result<(), Error> {
         self.change(

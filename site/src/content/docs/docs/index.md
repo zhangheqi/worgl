@@ -29,7 +29,8 @@ code.
 
 ## Operate
 
-- [Running a server](running-a-server/), [Running a cluster](running-a-cluster/)
+- [Running a server](running-a-server/), [Running a cluster](running-a-cluster/),
+  [Running a faucet](running-a-faucet/)
 - [Mint authorities and keys](keys/), [Pausing a mint](pausing/),
   [Backups](backups/), [Exporting a log for audit](audit/)
 

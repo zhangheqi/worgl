@@ -1,0 +1,173 @@
+---
+import Page from '../layouts/Page.astro';
+import SectionHead from '../components/SectionHead.astro';
+import StampLab from '../components/figures/StampLab.astro';
+import { README, REPO, page } from '../lib/links';
+import '../styles/figures/lineage.css';
+import '../styles/how.css';
+
+const LIFECYCLE = `${REPO}/blob/main/crates/worgl/examples/lifecycle.rs`;
+---
+<Page title="How it works" description="How Worgl works: notes and bits, layers, rotation and expiry, what the issuer can see, minting, keys and durability.">
+  <section class="band cobalt hiw-hero edge edge-paper" data-tone="cobalt">
+    <div class="wrap grid">
+      <p class="eyebrow label"><span>How it works</span><span>v0.1</span></p>
+      <h1 class="display">How Worgl <em>works.</em></h1>
+      <p class="lede">A mint issues signed notes and remembers one bit for each. Everything else follows from three rules:</p>
+      <ol class="three">
+        <li><span class="num" aria-hidden="true">I</span><p>A transfer moves value one layer on.</p></li>
+        <li><span class="num" aria-hidden="true">II</span><p>The last layer cannot move until the next rotation.</p></li>
+        <li><span class="num" aria-hidden="true">III</span><p>Every rotation drops the oldest layer.</p></li>
+      </ol>
+    </div>
+  </section>
+
+  <section class="band paper hiw-story edge edge-cobalt" data-tone="paper">
+    <div class="wrap">
+      <div class="story-grid">
+        <div class="chapters">
+          <article class="chapter" id="notes-and-bits" data-focus="bits">
+            <SectionHead num="01" name="Notes and bits" />
+            <h2 class="h2">Notes and <em>bits.</em></h2>
+            <p>A note is 149 signed bytes: version, issuer key, serial, amount, holder key and the issuer's signature. Its holder keeps it. The mint keeps one bit for it, 1 while it is live and 0 once it is spent.</p>
+            <p>The serial names the bit, so checking a note is one lookup and spending it clears one bit. A spent note's bit is already 0, so it cannot be spent twice.</p>
+            <button class="btn btn-sm try" type="button" data-lab="transfer">Spend the note you're following</button>
+          </article>
+
+          <article class="chapter" id="layers" data-focus="layers">
+            <SectionHead num="02" name="Layers" />
+            <h2 class="h2">Layers, oldest <em>first.</em></h2>
+            <p>The bits are split into layers, oldest first. A newly minted note lands in the second-to-last layer. A transfer spends its input and issues the new notes one layer further on. A note in the last layer is frozen until the next rotation.</p>
+            <p class="muted">Click any note in the diagram to follow it. The dark line above the buttons reads it the way a holder's SDK would.</p>
+            <button class="btn btn-sm try" type="button" data-lab="mint">Mint a note</button>
+          </article>
+
+          <article class="chapter" id="rotation" data-focus="rotation">
+            <SectionHead num="03" name="Rotation and expiry" />
+            <h2 class="h2">Rotation and <em>expiry.</em></h2>
+            <p>At every rotation the mint drops the oldest layer, wipes it, and reuses it as the new last layer under a fresh signing key. Notes still in the dropped layer die. Notes that were frozen can move again.</p>
+            <div class="formula">
+              <span>a note in layer <span class="k">k</span> of <span class="k">n</span></span>
+              <span>· can make <span class="k">n − 1 − k</span> more hops now</span>
+              <span>· dies in rotation <span class="k">k + 1</span> from now if left alone</span>
+            </div>
+            <p>So one setting, the rotation period, sets both limits. With 4 layers rotated daily, a note moves at most once a day once it reaches the last layer, and a note left alone dies within 4 days. Three example settings:</p>
+            <div class="tbl-wrap">
+              <table>
+                <thead><tr><th class="label" scope="col">Use</th><th class="label" scope="col">Period</th><th class="label" scope="col">Layers</th><th class="label" scope="col">Idle tokens die after</th></tr></thead>
+                <tbody>
+                  <tr><td>Metered quota</td><td class="n">1 minute</td><td class="n">60</td><td>about an hour</td></tr>
+                  <tr><td>Agent credits</td><td class="n">1 hour</td><td class="n">168</td><td>about a week</td></tr>
+                  <tr><td>Reward points</td><td class="n">1 day</td><td class="n">30</td><td>about a month</td></tr>
+                </tbody>
+              </table>
+            </div>
+            <button class="btn btn-sm try" type="button" data-lab="rotate">Rotate</button>
+          </article>
+
+          <article class="chapter" id="keeping-a-note-alive" data-focus="refresh">
+            <SectionHead num="04" name="Keeping a note alive" />
+            <h2 class="h2">Keeping a note <em>alive.</em></h2>
+            <p>A holder keeps a note alive by paying it to a fresh key of its own before its layer is dropped. The SDKs do this for you, each note at a random moment before the rotation.</p>
+            <button class="btn btn-sm try" type="button" data-lab="refresh">Refresh the oldest layer</button>
+          </article>
+        </div>
+
+        <div class="lab-col" aria-label="A small mint to try the rules on">
+          <p class="label lab-cap"><span>A mint of four layers</span><span>48 bits each</span></p>
+          <StampLab select id="lab" />
+        </div>
+      </div>
+    </div>
+  </section>
+
+  <section class="band cobalt hiw-privacy edge edge-paper" id="privacy" data-tone="cobalt">
+    <div class="wrap">
+      <SectionHead num="05" name="Privacy, precisely" />
+      <div class="grid">
+        <h2 class="h2">Privacy, <em>precisely.</em></h2>
+        <p class="lede intro">The mint sees every transfer's input die and its outputs appear, so it can follow each note's lineage, along with amounts and timing. It never learns who holds a note, and it cannot tell that two unrelated notes share an owner, as long as holders keep three rules. The SDKs keep them by default:</p>
+        <figure class="lineage">
+          <div class="lineage-frame"><svg data-lineage aria-hidden="true"></svg></div>
+          <figcaption>What the mint can draw: every box is a note under its own one-time key, and one lineage is traced in pink. Nothing here says which boxes share a holder.</figcaption>
+        </figure>
+        <ol class="rules">
+          <li><h3>A fresh one-time key for every note received</h3></li>
+          <li><h3>One note per transfer, never two spent together</h3><p>Spending two at once would tell the mint they had one owner, the way blockchain analysis links addresses.</p></li>
+          <li><h3>Transfers spread out in time</h3><p>So a burst does not read as one payment.</p></li>
+        </ol>
+        <p class="compare">This is weaker than blind-signature schemes such as Chaum's, Cashu or GNU Taler, where the issuer cannot link a note to the one it replaced, and stronger than any account system. Blind signatures cannot work here, because the mint must choose each serial: the serial names the bit. <a class="fig-link" href={README.privacy}>README</a></p>
+      </div>
+    </div>
+  </section>
+
+  <section class="band paper hiw-more" data-tone="paper">
+    <div class="wrap">
+      <div class="more-grid">
+        <article id="supply">
+          <SectionHead num="06" name="Minting, burning and supply" />
+          <h2 class="h3">Minting, burning and <em>supply.</em></h2>
+          <p>Only a mint authority listed in the mint's policy can mint, by signing each request with a rising sequence number, so a copied request cannot mint twice. Holders can burn notes to take them out of circulation at once. The mint counts value minted, destroyed by rotations and burned, so outstanding supply can be audited at any time.</p>
+          <figure class="ledger" aria-label="Outstanding equals minted minus destroyed minus burned.">
+            <div><span class="label">Outstanding</span><b>=</b></div>
+            <div><span class="label">Minted</span><b>−</b></div>
+            <div><span class="label">Destroyed by rotations</span><b>−</b></div>
+            <div><span class="label">Burned</span></div>
+          </figure>
+        </article>
+
+        <article id="keys">
+          <SectionHead num="07" name="Keys" />
+          <h2 class="h3"><em>Keys.</em></h2>
+          <p>Each generation of notes is signed by its own key, certified by the mint's issuer key and erased when its layer is dropped. A leaked generation key forges notes for at most as many rotations as there are layers. Anyone with the issuer key can check a note offline against the published certificates.</p>
+          <figure class="keys" aria-label="Four generation keys, each certified by the issuer key. The oldest is erased at the next rotation.">
+            <div class="issuer label">Issuer key</div>
+            <ol>
+              <li class="gone"><span class="label">gen 1289</span><span>erased next rotation</span></li>
+              <li><span class="label">gen 1290</span><span>certified</span></li>
+              <li><span class="label">gen 1291</span><span>certified</span></li>
+              <li class="new"><span class="label">gen 1292</span><span>made at the last rotation</span></li>
+            </ol>
+          </figure>
+        </article>
+
+        <article id="durability">
+          <SectionHead num="08" name="Durability and replication" />
+          <h2 class="h3">Durability and <em>replication.</em></h2>
+          <p>Every change is written and flushed to a log before it is applied, and one flush covers a whole batch of transfers. Three servers can run as a cluster: each mint is a Raft group of the three, a transfer is answered once two of them hold it on disk, and if the leader fails another takes over within a few seconds. <a class="fig-link" href={README.cluster}>README</a></p>
+          <figure class="quorum" aria-label="A transfer is answered once two of the three members hold it on disk.">
+            <div class="m on"><span class="label">Member 1 · leader</span><span>on disk</span></div>
+            <div class="m on"><span class="label">Member 2</span><span>on disk</span></div>
+            <div class="m"><span class="label">Member 3</span><span>catching up</span></div>
+            <p class="label ans">2 of 3 → answered</p>
+          </figure>
+        </article>
+      </div>
+      <div class="closing-links">
+        <a class="btn btn-solid" href={page('docs/')}>Read the docs</a>
+        <a class="btn" href={LIFECYCLE}>Run the lifecycle example</a>
+      </div>
+    </div>
+  </section>
+</Page>
+
+<script>
+  import { mountLineage } from '../scripts/lineage';
+  document.querySelectorAll<SVGSVGElement>('svg[data-lineage]').forEach(mountLineage);
+
+  // The chapters point at the diagram: the one in view sets what it highlights,
+  // and its button presses the diagram's matching button.
+  const lab = document.getElementById('lab');
+  if (lab) {
+    const chapters = Array.from(document.querySelectorAll<HTMLElement>('.chapter[data-focus]'));
+    const io = new IntersectionObserver((es) => {
+      for (const e of es) if (e.isIntersecting) lab.dataset.focus = (e.target as HTMLElement).dataset.focus;
+    }, { rootMargin: '-45% 0px -45% 0px' });
+    chapters.forEach((c) => io.observe(c));
+    document.querySelectorAll<HTMLButtonElement>('[data-lab]').forEach((b) => b.addEventListener('click', () => {
+      const r = lab.querySelector('.sheets')?.getBoundingClientRect();
+      if (r && (r.top < 0 || r.bottom > innerHeight)) lab.querySelector('.sheets')?.scrollIntoView({ block: 'center', behavior: matchMedia('(prefers-reduced-motion: reduce)').matches ? 'auto' : 'smooth' });
+      lab.dispatchEvent(new CustomEvent('lab-do', { detail: b.dataset.lab }));
+    }));
+  }
+</script>
