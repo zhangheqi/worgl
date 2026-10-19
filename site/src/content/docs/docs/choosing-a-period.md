@@ -44,14 +44,29 @@ next rotation.
 
 ## Layer size
 
-A layer hands out each of its bits once per generation, so `layer_size` caps
-how many notes can land in one layer per period. When a layer runs out it
-refuses with `layer_full` until the next rotation.
+A layer hands out each of its bits once per generation, so `layer_size`
+caps how many notes can enter one generation, minted into it or moved into
+it, over its whole life. A generation opens as the last layer and takes
+notes until it reaches the first, about `n − 1` periods, or through the
+first too if `mint_layer` is 0. Once its bits run out it refuses with
+`layer_full` for the rest of that life. Mints are refused for as long as it
+is the mint layer, so one that fills before it gets there, as the last layer
+for instance, refuses every mint for the whole period it later spends as the
+mint layer. Notes in the layer just before a full one cannot be paid or
+refreshed on their own, since the hop would land in the full one, and so
+expire with their layer.
 
-Every hop moves value to a strictly newer generation, so a unit of value
-lands in any generation at most once. While the outstanding value, counted
-in the smallest amount, stays at or below `layer_size`, `layer_full` cannot
-happen. The property tests check both the bound and the guarantee.
+Spending or burning a note gives no bit back: a cleared bit means spent, so
+handing it out again would bring the note back. A burn lowers the
+outstanding value, but the bits its value took on the way stay used. Every
+hop moves value to a strictly newer generation, so a unit of value lands in
+any generation at most once. While the outstanding value plus the value
+burned from layers not yet dropped, counted in the smallest amount, stays at
+or below `layer_size`, `layer_full` cannot happen. The property tests check
+both the bound and this guarantee.
+
+To see how close a mint is, compare each layer's `issued` with its
+`capacity` in [`GET /v1/mints/{mint}/info`](../http-api/#mint-info).
 
 ## What it costs
 

@@ -63,7 +63,10 @@ SDK defaults pointed at it keep working.
   the mint during an incident with `POST /v1/mints/<mint>/pause` and that
   token; the proxy passes it through.
 - `docker compose exec member1 worgl-server export-log --mint /state/mints/<mint>`
-  prints the mint's log. Every member's should match.
+  prints what member1's log of the mint still holds. Each member purges its
+  own log after a snapshot, so two members' exports can start at different
+  entries; an entry with the same index and term is the same on both. See
+  [When the log is purged](../../site/src/content/docs/docs/audit.md#when-the-log-is-purged).
 - Back up one of the `member*` volumes: each holds the whole mint, its keys
   and the key-encryption key. Back up the `faucet` volume too, since only it
   holds the mint authority key; without that key nothing can mint.

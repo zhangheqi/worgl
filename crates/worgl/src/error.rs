@@ -58,7 +58,7 @@ pub enum Error {
     #[error("note {0} is in the last layer and cannot move until the next rotation")]
     Frozen(Serial),
     /// The layer the outputs would land in has too few free bits left.
-    #[error("layer {position} is full until the next rotation")]
+    #[error("layer {position} has too few free bits left until a rotation drops it")]
     LayerFull {
         /// Position of the full layer.
         position: u32,

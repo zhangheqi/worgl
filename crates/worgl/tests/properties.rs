@@ -1,13 +1,13 @@
 //! Property tests: the ledger against a naive model, and the issuer's
-//! invariants over random histories of mints, transfers and rotations.
+//! invariants over random histories of mints, transfers, burns and rotations.
 
-use std::collections::{BTreeSet, VecDeque};
+use std::collections::{BTreeMap, BTreeSet, VecDeque};
 
 use proptest::prelude::*;
 use worgl::ledger::Status;
 use worgl::{
-    Denominations, Error, Event, GenerationKey, HolderKey, Issuer, IssuerKey, Ledger, LedgerConfig,
-    Note, Output, Plan, Policy, Serial, TransferRequest,
+    BurnRequest, Denominations, Error, Event, GenerationKey, HolderKey, Issuer, IssuerKey, Ledger,
+    LedgerConfig, Note, Output, Plan, Policy, Serial, TransferRequest,
 };
 
 #[derive(Debug, Clone)]
@@ -149,6 +149,8 @@ enum IssuerOp {
         k: usize,
         j: usize,
     },
+    /// Burn the wallet's k-th note.
+    Burn(usize),
     Rotate,
 }
 
@@ -157,6 +159,7 @@ fn issuer_op() -> impl Strategy<Value = IssuerOp> {
         3 => any::<u8>().prop_map(IssuerOp::Mint),
         6 => (any::<usize>(), 1u8..4).prop_map(|(k, parts)| IssuerOp::Transfer { k, parts }),
         2 => (any::<usize>(), any::<usize>()).prop_map(|(k, j)| IssuerOp::Merge { k, j }),
+        1 => any::<usize>().prop_map(IssuerOp::Burn),
         1 => Just(IssuerOp::Rotate),
     ]
 }
@@ -167,6 +170,33 @@ fn crowding_op() -> impl Strategy<Value = IssuerOp> {
         2 => any::<u8>().prop_map(IssuerOp::Mint),
         12 => (any::<usize>(), 1u8..17).prop_map(|(k, parts)| IssuerOp::Transfer { k, parts }),
         2 => (any::<usize>(), any::<usize>()).prop_map(|(k, j)| IssuerOp::Merge { k, j }),
+        1 => any::<usize>().prop_map(IssuerOp::Burn),
+        1 => Just(IssuerOp::Rotate),
+    ]
+}
+
+/// Notes of 1, minted and burned over a hundred or so operations between
+/// rotations, so that layers run out of bits while little value is
+/// outstanding.
+fn burning_op() -> impl Strategy<Value = IssuerOp> {
+    prop_oneof![
+        60 => Just(IssuerOp::Mint(0)),
+        40 => any::<usize>().prop_map(IssuerOp::Burn),
+        10 => any::<usize>().prop_map(|k| IssuerOp::Transfer { k, parts: 1 }),
+        1 => Just(IssuerOp::Rotate),
+    ]
+}
+
+/// Notes of 8 under the flexible policy, split up to eight ways and merged,
+/// so that transfers and merges fill layers too: the last layer fills from
+/// the notes split into it, and the notes just before a full layer cannot
+/// move.
+fn filling_op() -> impl Strategy<Value = IssuerOp> {
+    prop_oneof![
+        60 => Just(IssuerOp::Mint(7)),
+        20 => any::<usize>().prop_map(IssuerOp::Burn),
+        60 => (any::<usize>(), 2u8..9).prop_map(|(k, parts)| IssuerOp::Transfer { k, parts }),
+        40 => (any::<usize>(), any::<usize>()).prop_map(|(k, j)| IssuerOp::Merge { k, j }),
         1 => Just(IssuerOp::Rotate),
     ]
 }
@@ -209,15 +239,20 @@ fn split(amount: u64, parts: u8, policy: &Policy) -> Vec<u64> {
 
 /// Every unit of value lands in a given generation at most once, since each
 /// hop moves it to a strictly newer one, and it stays live in that generation
-/// or a newer one until the generation is dropped. So no layer can have handed
-/// out more bits than the value now live in it and the layers after it.
-fn layers_are_bounded_by_value(issuer: &Issuer) -> Result<(), TestCaseError> {
+/// or a newer one until it is burned or the generation is dropped. So no
+/// layer can have handed out more bits than the value now live in it and the
+/// layers after it plus the value `burned` from them, keyed by generation: a
+/// burn lowers the outstanding value but gives no bit back.
+fn layers_are_bounded_by_value(
+    issuer: &Issuer,
+    burned: &BTreeMap<u64, u128>,
+) -> Result<(), TestCaseError> {
     let mut later = 0u128;
     for layer in issuer.layers().iter().rev() {
-        later += layer.value;
+        later += layer.value + burned.get(&layer.generation).copied().unwrap_or(0);
         prop_assert!(
             u128::from(layer.issued) <= later,
-            "layer {} handed out {} bits but only {} value is live from it on",
+            "layer {} handed out {} bits but only {} value is live or burned from it on",
             layer.position,
             layer.issued,
             later
@@ -226,10 +261,31 @@ fn layers_are_bounded_by_value(issuer: &Issuer) -> Result<(), TestCaseError> {
     Ok(())
 }
 
-/// Runs a random history. With `supply_cap`, mints that would push the
-/// outstanding value past it are skipped, and no layer may ever be full: the
-/// cap equals the layer size, so by [`layers_are_bounded_by_value`] there is
-/// always a free bit.
+/// A layer refuses `notes` new notes only once the notes that `entered` its
+/// generation, minted or moved into it, leave fewer bits than that free.
+fn layer_is_used_up(
+    issuer: &Issuer,
+    entered: &BTreeMap<u64, u32>,
+    position: u32,
+    notes: usize,
+) -> Result<(), TestCaseError> {
+    let generation = issuer.ledger().generation_at(position).unwrap();
+    let entered = entered.get(&generation).copied().unwrap_or(0);
+    let size = issuer.ledger().config().layer_size;
+    prop_assert!(
+        entered as usize + notes > size as usize,
+        "layer {position} refused {notes} notes after {entered} of {size} entered its generation"
+    );
+    Ok(())
+}
+
+/// Runs a random history. A layer may refuse notes only once the notes that
+/// entered its generation leave too few bits free, and never while the
+/// outstanding value plus the value burned from live generations, with any
+/// value being minted, is within the layer size: by
+/// [`layers_are_bounded_by_value`] that sum bounds every layer's bits. With
+/// `supply_cap`, mints that would push the sum past it are skipped; the cap
+/// equals the layer size, so no layer may ever be full.
 fn run_history(
     policy: Policy,
     ops: Vec<IssuerOp>,
@@ -251,11 +307,23 @@ fn run_history(
     let mut wallet: Vec<(Note, HolderKey)> = Vec::new();
     let mut spent: Vec<(Note, HolderKey)> = Vec::new();
     let mut events: Vec<Event> = Vec::new();
+    // Notes that entered each generation, and value burned from each.
+    let mut entered: BTreeMap<u64, u32> = BTreeMap::new();
+    let mut burned: BTreeMap<u64, u128> = BTreeMap::new();
+    let size = u128::from(config.layer_size);
 
     for op in ops {
+        // The outstanding value and the value burned from live generations,
+        // which bound every layer's bits.
+        let oldest = issuer.ledger().oldest_generation();
+        let used =
+            issuer.supply().outstanding + burned.range(oldest..).map(|(_, v)| v).sum::<u128>();
         let mut commit = |issuer: &mut Issuer, event: Event| {
             issuer.apply(&event).unwrap();
             let notes = issuer.notes(&event);
+            for note in &notes {
+                *entered.entry(note.serial().generation).or_default() += 1;
+            }
             events.push(event);
             notes
         };
@@ -266,7 +334,7 @@ fn run_history(
                     _ => u64::from(exp) + 1,
                 };
                 if let Some(cap) = supply_cap
-                    && issuer.supply().outstanding + u128::from(amount) > cap
+                    && used + u128::from(amount) > cap
                 {
                     continue;
                 }
@@ -276,10 +344,14 @@ fn run_history(
                         let note = commit(&mut issuer, event).remove(0);
                         wallet.push((note, holder));
                     }
-                    Err(error) => prop_assert!(
-                        supply_cap.is_none(),
-                        "a capped supply was refused a mint: {error}"
-                    ),
+                    Err(Error::LayerFull { position }) => {
+                        layer_is_used_up(&issuer, &entered, position, 1)?;
+                        prop_assert!(
+                            used + u128::from(amount) > size,
+                            "a mint of {amount} was refused with {used} outstanding or burned"
+                        );
+                    }
+                    Err(error) => prop_assert!(false, "a mint was refused: {error}"),
                 }
             }
             IssuerOp::Transfer { k, parts } if !wallet.is_empty() => {
@@ -311,10 +383,15 @@ fn run_history(
                         spent.push((note, holder));
                     }
                     Ok(Plan::Replay(_)) => prop_assert!(false, "fresh outputs never replay"),
-                    Err(Error::LayerFull { position }) if supply_cap.is_some() => {
-                        prop_assert!(false, "layer {position} filled under a capped supply")
+                    Err(Error::LayerFull { position }) => {
+                        layer_is_used_up(&issuer, &entered, position, outputs.len())?;
+                        prop_assert!(
+                            used > size,
+                            "layer {position} filled with {used} outstanding or burned"
+                        );
+                        wallet.push((note, holder));
                     }
-                    // Frozen in the last layer, or the next layer is full.
+                    // Frozen in the last layer.
                     Err(_) => wallet.push((note, holder)),
                 }
             }
@@ -346,13 +423,32 @@ fn run_history(
                         spent.push((a, ka));
                         spent.push((b, kb));
                     }
-                    Err(Error::LayerFull { position }) if supply_cap.is_some() => {
-                        prop_assert!(false, "layer {position} filled under a capped supply")
+                    Err(Error::LayerFull { position }) => {
+                        layer_is_used_up(&issuer, &entered, position, 1)?;
+                        prop_assert!(
+                            used > size,
+                            "layer {position} filled with {used} outstanding or burned"
+                        );
                     }
                     _ => {}
                 }
             }
-            IssuerOp::Transfer { .. } | IssuerOp::Merge { .. } => {}
+            IssuerOp::Burn(k) if !wallet.is_empty() => {
+                let (note, holder) = wallet.remove(k % wallet.len());
+                let request = BurnRequest::single(note, &holder).unwrap();
+                let verified = issuer.verifier().verify_burn(&request).unwrap();
+                match issuer.plan_burn(&verified) {
+                    Ok(Plan::Apply(event)) => {
+                        commit(&mut issuer, event);
+                        *burned.entry(note.serial().generation).or_default() +=
+                            u128::from(note.amount());
+                        spent.push((note, holder));
+                    }
+                    Ok(Plan::Replay(_)) => prop_assert!(false, "a fresh burn never replays"),
+                    Err(error) => prop_assert!(false, "a live note was refused a burn: {error}"),
+                }
+            }
+            IssuerOp::Transfer { .. } | IssuerOp::Merge { .. } | IssuerOp::Burn(_) => {}
             IssuerOp::Rotate => {
                 let next = GenerationKey::generate();
                 ring.insert(next.clone());
@@ -363,15 +459,26 @@ fn run_history(
             }
         }
 
-        // Value is conserved: what is live is what was minted minus what expired.
+        // Value is conserved: what is live is what was minted minus what
+        // expired or was burned.
         let supply = issuer.supply();
-        prop_assert_eq!(supply.outstanding, supply.minted - supply.destroyed);
+        prop_assert_eq!(supply.burned, burned.values().sum::<u128>());
+        prop_assert_eq!(
+            supply.outstanding,
+            supply.minted - supply.destroyed - supply.burned
+        );
         let held: u128 = wallet.iter().map(|(n, _)| u128::from(n.amount())).sum();
         prop_assert_eq!(held, supply.outstanding);
         for (note, _) in &wallet {
             prop_assert!(issuer.ledger().is_live(note.serial()));
         }
-        layers_are_bounded_by_value(&issuer)?;
+        // A layer has handed out a bit for every note that entered its
+        // generation: spending or burning a note gives none back.
+        for layer in issuer.layers() {
+            let notes = entered.get(&layer.generation).copied().unwrap_or(0);
+            prop_assert_eq!(layer.issued, notes);
+        }
+        layers_are_bounded_by_value(&issuer, &burned)?;
     }
 
     // No spent note can be spent again.
@@ -423,6 +530,25 @@ proptest! {
         ops in prop::collection::vec(crowding_op(), 1..400),
     ) {
         run_history(Policy::flexible(), ops, Some(64))?;
+    }
+}
+
+proptest! {
+    #![proptest_config(ProptestConfig::with_cases(32))]
+
+    #[test]
+    fn burning_gives_no_bits_back(ops in prop::collection::vec(burning_op(), 1..300)) {
+        run_history(Policy::cash_like(), ops, None)?;
+    }
+}
+
+proptest! {
+    #![proptest_config(ProptestConfig::with_cases(8))]
+
+    // At least 150 operations, so that a layer fills and a rotation follows.
+    #[test]
+    fn splits_and_merges_fill_layers_too(ops in prop::collection::vec(filling_op(), 150..300)) {
+        run_history(Policy::flexible(), ops, None)?;
     }
 }
 

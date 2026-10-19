@@ -42,7 +42,7 @@ Errors answer with a status code and a body like:
 | `unissued` | 409 | The mint signed this note but its ledger has no record of it, which only happens if the mint's state was lost or rolled back. |
 | `stale_mint` | 409 | A mint request reuses a sequence number, or goes below one, that its authority already used. |
 | `stale_rotation` | 409 | A scheduled rotation is due no later than the last one logged, which already covered it. |
-| `layer_full` | 503 | The layer the outputs would land in has too few free bits left until the next rotation. |
+| `layer_full` | 503 | The layer the outputs would land in has too few free bits left, and gets none back until a rotation drops it. |
 | `paused` | 503 | The mint is paused. Its notes keep their places until it resumes. |
 
 ## The server
@@ -68,6 +68,11 @@ happens twice.
 - `paused`, `layer_full`, `storage` and `internal` may go away later. Both
   SDKs count them, and any other 5xx status, as worth trying again:
   `Error::is_transient` in Rust and `isTransient(error)` in TypeScript.
+  `layer_full` on a transfer is the exception, though both SDKs still count
+  it as transient and a purse retries it like the others: sent again
+  unchanged, its outputs would land in the same full generation after every
+  rotation, so it is refused every time. See
+  [Layer size](../choosing-a-period/#layer-size).
 - The mint remembers the most recent transfers only (65,536 by default, the
   policy's `receipt_capacity`). A transfer sent again after many more have
   passed is refused as `spent` even though it went through.
