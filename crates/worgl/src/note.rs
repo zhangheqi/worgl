@@ -1,4 +1,4 @@
-//! Banknotes.
+//! Notes, the tokens an issuer signs.
 //!
 //! A note is a fixed 149-byte record signed by the issuer:
 //!
@@ -56,7 +56,7 @@ pub enum NoteError {
     BadSignature,
 }
 
-/// A banknote: an issuer-signed claim that `amount` belongs to whoever holds
+/// A note: an issuer-signed claim that `amount` belongs to whoever holds
 /// the secret half of `holder`. See the [module documentation](self).
 #[derive(Clone, Copy, PartialEq, Eq, Hash)]
 pub struct Note {

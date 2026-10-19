@@ -7,7 +7,7 @@ rust-version.workspace = true
 license.workspace = true
 repository.workspace = true
 authors.workspace = true
-keywords = ["ecash", "token", "client", "sdk"]
+keywords = ["token", "credits", "client", "sdk"]
 categories = ["cryptography", "web-programming::http-client"]
 
 [dependencies]
