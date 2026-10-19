@@ -15,13 +15,14 @@ const parts = [
   { name: 'worgl-sdk', path: 'crates/worgl-sdk', lang: 'Rust', d: "The holder's side: requests, pays, receives and refreshes notes while keeping the privacy rules." },
   { name: 'worgl-client', path: 'crates/worgl-client', lang: 'Rust', d: 'Typed calls for every route, and a purse that saves itself.' },
   { name: 'worgl-cli', path: 'crates/worgl-cli', lang: 'Rust', d: '`worgl`, a command-line purse in a passphrase-encrypted file.' },
+  { name: 'worgl-faucet', path: 'crates/worgl-faucet', lang: 'Rust', d: 'Hands out notes of a playground mint to anyone who asks, within limits per address and per day.' },
   { name: 'worgl-wasm', path: 'crates/worgl-wasm', lang: 'Rust', d: '`worgl-sdk` compiled to WebAssembly.' },
   { name: 'TypeScript SDK', path: 'sdk/typescript', lang: 'TypeScript', d: 'A client and purse on the same core, for Node and browsers.' },
 ];
 // Each stamp carries its number in bits.
 const bits = (n: number) => [8, 4, 2, 1].map((b) => (n & b) !== 0);
 
-const checks = ['rustfmt', 'clippy', 'tests on Linux', 'tests on macOS', 'Rust 1.89', 'docs', 'lifecycle example', 'TypeScript SDK'];
+const checks = ['rustfmt', 'clippy', 'tests on Linux', 'tests on macOS', 'Rust 1.89', 'docs', 'lifecycle example', 'TypeScript SDK', 'playground deploy'];
 ---
 <Page title="Open source" description="The ledger, the server, replication, the SDKs and the command line, in one repository under MIT or Apache-2.0.">
   <section class="band cobalt page-hero edge edge-paper" data-tone="cobalt">
@@ -43,7 +44,7 @@ const checks = ['rustfmt', 'clippy', 'tests on Linux', 'tests on macOS', 'Rust 1
     <div class="wrap">
       <SectionHead num="01" name="Components" />
       <div class="grid">
-        <h2 class="h2 sec-intro">Seven crates and a <em>package.</em></h2>
+        <h2 class="h2 sec-intro">Eight crates and a <em>package.</em></h2>
         <p class="body muted sec-aside">One Rust workspace and a TypeScript package, built and tested together. Each stamp opens its folder on GitHub.</p>
         <div class="sheet-wrap">
           <ul class="stamps">
@@ -114,7 +115,7 @@ const checks = ['rustfmt', 'clippy', 'tests on Linux', 'tests on macOS', 'Rust 1
         <div class="ci">
           <div class="ci-head">
             <h3 class="h3">Contributing</h3>
-            <p>CI runs rustfmt, clippy, the tests on Linux and macOS, the minimum Rust version (1.89), the docs, the lifecycle example and the TypeScript SDK against a real server on every pull request. Commit messages follow Conventional Commits. <a class="fig-link" href={CI}>CI workflow</a></p>
+            <p>CI runs rustfmt, clippy, the tests on Linux and macOS, the minimum Rust version (1.89), the docs, the lifecycle example, the TypeScript SDK against a real server and the playground deploy on every pull request. Commit messages follow Conventional Commits. <a class="fig-link" href={CI}>CI workflow</a></p>
           </div>
           <ul class="checks" aria-label="What CI checks on every pull request">
             {checks.map((c) => <li>{c}</li>)}
