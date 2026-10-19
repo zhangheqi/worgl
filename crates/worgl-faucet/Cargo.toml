@@ -1,0 +1,31 @@
+[package]
+name = "worgl-faucet"
+description = "Hands out notes of a playground mint to anyone who asks, within limits"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+publish = false
+
+[dependencies]
+anyhow.workspace = true
+axum.workspace = true
+clap.workspace = true
+hex.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+tokio.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
+worgl.workspace = true
+worgl-client.workspace = true
+
+[dev-dependencies]
+reqwest.workspace = true
+tempfile.workspace = true
+worgl-server.workspace = true
+
+[lints]
+workspace = true

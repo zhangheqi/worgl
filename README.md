@@ -19,7 +19,7 @@ It is a primitive for autonomous systems that pay each other in credits,
 quotas or any other unit, rather than a cash product. Identity checks and
 regulation are out of scope.
 
-The workspace has seven crates and a TypeScript package:
+The workspace has eight crates and a TypeScript package:
 
 - [`worgl`](crates/worgl): the library. Ledger, note format, transfer
   protocol, policy, issuer state machine and crash-safe storage.
@@ -36,6 +36,8 @@ The workspace has seven crates and a TypeScript package:
   for every route, and a purse that runs a holder over HTTP and saves it.
 - [`worgl-cli`](crates/worgl-cli): `worgl`, a command line purse on
   `worgl-client`, kept in a passphrase-encrypted file.
+- [`worgl-faucet`](crates/worgl-faucet): hands out notes of a playground
+  mint to anyone who asks, within limits per address and per day.
 - [`worgl-wasm`](crates/worgl-wasm): `worgl-sdk` compiled to WebAssembly.
 - [`sdk/typescript`](sdk/typescript): the TypeScript SDK, a client and purse
   like `worgl-client`'s on top of `worgl-wasm`, for Node and browsers.
@@ -503,6 +505,35 @@ and read its admin token from `admin.token` in its directory on any member.
 The Raft port speaks plain HTTP and checks only the cluster token, so keep it
 on a network that only the members can reach. The members are fixed once the
 cluster starts.
+
+### Running a faucet
+
+A faucet hands out notes of one mint to anyone who asks, so people can try
+Worgl without a mint of their own. It is one of the mint's authorities, like
+any service that mints: it signs a mint request for each note and sends it to
+the server, which changes nothing for it.
+
+```sh
+./target/release/worgl-faucet --mint <mint> --key ./server/mints/<mint>/mint.key \
+    --server http://10.0.0.1:8080 --server http://10.0.0.2:8080 --server http://10.0.0.3:8080 \
+    --listen 127.0.0.1:8090
+curl -sd '{"holder": "<holder public key>"}' -H 'content-type: application/json' \
+    http://127.0.0.1:8090/v1/faucet
+```
+
+Each note is worth 64, each client address gets 10 an hour (IPv6 by its /64),
+and the faucet hands out 10,000 a day; `--amount`, `--per-address` and
+`--per-day` change them. Past a limit it answers `429` with `Retry-After`.
+`GET /v1/faucet` shows the mint, the limits and the notes left today. Behind a
+reverse proxy, pass `--behind-proxy` so clients are counted by the address the
+proxy appends to `X-Forwarded-For`. A mint request with no clear answer goes
+again, unchanged, to the next server given. Run one faucet per mint key: it
+numbers its requests by the clock and keeps no state of its own.
+
+A playground mint should let untouched notes expire within about a day rather
+than be wiped, so its issuer key never changes: with 4 layers and
+`--rotate-every 28800`, a note nobody moves dies 16 to 24 hours after it was
+minted.
 
 ## Not covered yet
 
