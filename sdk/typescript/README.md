@@ -36,6 +36,8 @@ The other side reads what it is sent with `PaymentRequest.from(json)` and
 - When the payer submits instead (`purse.submit(payment.transfers)`), it
   hands `submitted.notes` to the payee, who checks their signatures against
   the mint's keys and keeps them with `purse.accept(notes)`.
+- `purse.takeFromFaucet(new Client(faucetUrl))` asks a playground faucet
+  (`worgl-faucet`) for a note, to a fresh key like any other, and keeps it.
 - `Client` makes one call per route and rejects with a `MintError` carrying
   the mint's code (`spent`, `frozen`, `paused`…); `isTransient(error)` says
   whether trying again may work.
@@ -53,7 +55,7 @@ Node 22.18 or later, or a browser with top-level `await`.
 ```sh
 rustup target add wasm32-unknown-unknown
 cargo install wasm-bindgen-cli --version 0.2.129 --locked  # the version Cargo.lock pins
-cargo build -p worgl-server   # the tests run against it
+cargo build -p worgl-server -p worgl-faucet   # the tests run against them
 npm ci
 npm run build   # compiles the Rust core to wasm/ and the package to dist/
 npm run check   # type-checks the package and its tests

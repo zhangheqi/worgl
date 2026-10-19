@@ -72,6 +72,21 @@ impl Info {
     }
 }
 
+/// What a playground faucet hands out, from `GET /v1/faucet`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct FaucetInfo {
+    /// The mint its notes come from.
+    pub mint: PublicKey,
+    /// The value of each note.
+    pub amount: u64,
+    /// Notes one client address may get in any hour.
+    pub per_address_per_hour: u32,
+    /// Notes the faucet hands out in a day, UTC.
+    pub per_day: u32,
+    /// Notes left to hand out today.
+    pub left_today: u32,
+}
+
 /// The mint's answer about a genuine note.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Verified {
@@ -92,6 +107,11 @@ struct NoteRef<'a> {
 #[derive(Deserialize)]
 struct NoteBody {
     note: Note,
+}
+
+#[derive(Serialize)]
+struct HolderRef<'a> {
+    holder: &'a PublicKey,
 }
 
 #[derive(Deserialize)]
@@ -190,6 +210,23 @@ impl Client {
     /// of the mint's authorities.
     pub async fn mint(&self, mint: &PublicKey, request: &MintRequest) -> Result<Note, Error> {
         let request = self.mint_route(Method::POST, mint, "mint").json(request);
+        Ok(self.send::<NoteBody>(request).await?.note)
+    }
+
+    /// `GET /v1/faucet`, from a playground faucet: its mint and limits. The
+    /// faucet is `worgl-faucet`, at this client's URL, which may be its
+    /// mint's server with the faucet behind the same proxy.
+    pub async fn faucet(&self) -> Result<FaucetInfo, Error> {
+        self.send(self.route(Method::GET, "/v1/faucet")).await
+    }
+
+    /// `POST /v1/faucet`: a note of the faucet's mint, bound to `holder`.
+    /// Past the faucet's limits it answers `429` with the code
+    /// `rate_limited` or `exhausted`.
+    pub async fn ask_faucet(&self, holder: &PublicKey) -> Result<Note, Error> {
+        let request = self
+            .route(Method::POST, "/v1/faucet")
+            .json(&HolderRef { holder });
         Ok(self.send::<NoteBody>(request).await?.note)
     }
 

@@ -342,7 +342,8 @@ alice.settle(Spacing::default()).await?;                    // later: her change
 
 When the payer submits instead (`Purse::submit`), it hands the notes from the
 answers to the payee, who checks their signatures and keeps them with
-`Purse::accept`.
+`Purse::accept`. `Purse::take_from_faucet` asks a playground
+[faucet](#running-a-faucet) for a note, to a fresh key like any other.
 
 ## The command line
 
@@ -355,6 +356,7 @@ exchange.
 
 ```sh
 worgl init                                     # each side, once
+worgl playground --faucet $FAUCET              # a note from a playground faucet; prints its mint
 worgl mint $MINT 8 --authority-key mint.key    # as a mint authority, for testing
 worgl request $MINT 5 -o request.json          # payee → send request.json
 worgl pay request.json -o payment.json         # payer → send payment.json
@@ -530,6 +532,9 @@ proxy appends to `X-Forwarded-For`. A mint request with no clear answer goes
 again, unchanged, to the next server given. Run one faucet per mint key: it
 numbers its requests by the clock and keeps no state of its own.
 
+`worgl playground` asks the faucet at `--faucet`, or at the server's URL when
+a proxy serves both on one address, and keeps the note.
+
 A playground mint should let untouched notes expire within about a day rather
 than be wiped, so its issuer key never changes: with 4 layers and
 `--rotate-every 28800`, a note nobody moves dies 16 to 24 hours after it was
@@ -568,7 +573,7 @@ tests against a real server:
 ```sh
 rustup target add wasm32-unknown-unknown
 cargo install wasm-bindgen-cli --version 0.2.129 --locked  # the version Cargo.lock pins
-cargo build -p worgl-server
+cargo build -p worgl-server -p worgl-faucet
 cd sdk/typescript && npm ci && npm run build && npm run check && npm test
 ```
 

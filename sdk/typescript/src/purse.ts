@@ -243,6 +243,31 @@ export class Purse {
     return PaymentRequest.from(json);
   }
 
+  /**
+   * Asks a playground faucet for a note and keeps it. The faucet's mint must
+   * be on this purse's server; the faucet may share its URL. The note goes to
+   * a fresh key, saved before the faucet is asked, as for any payment
+   * request. Resolves to the faucet's mint and the value kept.
+   */
+  async takeFromFaucet(faucet: Client): Promise<{ mint: string; value: bigint }> {
+    const about = await faucet.faucet();
+    const request = await this.requestAtMost(about.mint, about.amount, about.amount);
+    const [output, ...rest] = request.notes;
+    if (output === undefined || rest.length > 0) {
+      await this.withdraw(request);
+      throw new Error(
+        `the faucet hands out notes of ${about.amount}, which its mint cannot make as one note`,
+      );
+    }
+    try {
+      const note = await faucet.askFaucet(output.holder);
+      return { mint: about.mint, value: await this.accept([note]) };
+    } catch (error) {
+      await this.withdraw(request);
+      throw error;
+    }
+  }
+
   /** Stops expecting the notes of a request that will not be paid. */
   async withdraw(request: PaymentRequest): Promise<void> {
     await this.#change(

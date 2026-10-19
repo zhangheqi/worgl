@@ -4,8 +4,9 @@
 //!
 //! - [`Client`] makes one typed call per route of `worgl-server`: mint info
 //!   and keys, verify, transfer, burn, mint, and the mint admin's rotate,
-//!   pause and resume. Errors keep the mint's stable code, such as `spent`
-//!   or `frozen`, in [`Error::code`].
+//!   pause and resume, and the two routes of a playground faucet. Errors
+//!   keep the mint's stable code, such as `spent` or `frozen`, in
+//!   [`Error::code`].
 //! - [`Purse`] puts a [`worgl_sdk::Holder`] on top: it reads mint info by
 //!   itself, submits transfers at the random times the holder gives them,
 //!   retries what failed on the way, and saves the holder to a [`Store`]
@@ -51,7 +52,7 @@ mod error;
 mod purse;
 mod store;
 
-pub use client::{Client, Info, Verified};
+pub use client::{Client, FaucetInfo, Info, Verified};
 pub use error::{Error, Refusal};
 pub use purse::{MAX_DELAY_SECS, Purse, Refused, Retry, Submitted};
 pub use store::{FileStore, MemoryStore, Store};
