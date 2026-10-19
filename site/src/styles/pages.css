@@ -119,9 +119,9 @@ a.stamp-cell:hover { box-shadow: 4px 4px 0 var(--pink); transform: translate(-2p
 .bigstamp .intro { grid-column: 1 / span 6; font-size: clamp(18px, 1.5vw, 21px); line-height: 1.5; color: var(--on-cobalt); }
 .bigstamp .act { grid-column: 8 / span 5; align-self: end; display: flex; flex-direction: column; gap: 18px; }
 .bigstamp .act p { color: var(--on-cobalt-muted); font-size: 15.5px; }
-.overprint { position: absolute; z-index: 0 !important; left: 50%; top: 52%; transform: translate(-50%, -50%) rotate(-14deg); white-space: nowrap; font-family: var(--f-mono); font-weight: 700; font-stretch: 112.5%; text-transform: uppercase; letter-spacing: .14em; font-size: clamp(26px, 4.6vw, 72px); color: transparent; -webkit-text-stroke: 1.5px var(--pink); opacity: .5; pointer-events: none; user-select: none; }
-/* on a phone the overprint would run through the copy; the tag already says it */
-@media (max-width: 640px) { .overprint { display: none; } }
+.overprint { position: absolute; z-index: 0 !important; left: 63.5%; top: 40%; transform: translate(-50%, -50%) rotate(-14deg); white-space: nowrap; font-family: var(--f-mono); font-weight: 700; font-stretch: 112.5%; text-transform: uppercase; letter-spacing: .14em; font-size: clamp(26px, 3.4vw, 54px); color: transparent; -webkit-text-stroke: 1.5px var(--pink); opacity: .5; pointer-events: none; user-select: none; }
+/* where the copy stacks, the overprint would run through it; the tag already says it */
+@media (max-width: 1000px) { .overprint { display: none; } }
 @media (max-width: 1000px) { .bigstamp h1, .bigstamp .intro, .bigstamp .act { grid-column: 1 / -1; } }
 
 /* the four promises, on cobalt */
