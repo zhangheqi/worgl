@@ -1620,6 +1620,38 @@ mod tests {
     }
 
     #[test]
+    fn another_issuers_note_sharing_a_serial_is_foreign_not_a_duplicate() {
+        let mut ours = issuer(4, Policy::flexible());
+        let mut theirs = issuer(4, Policy::flexible());
+        let alice = HolderKey::generate();
+        let mine = ours.mint(8, alice.public_key()).unwrap();
+        // Their mint layer hands out each of its indexes once, so one of
+        // their notes has the serial of ours.
+        let foreign = (0..64)
+            .map(|_| theirs.mint(8, alice.public_key()).unwrap())
+            .find(|note| note.serial() == mine.serial())
+            .unwrap();
+
+        let inputs = [(mine, &alice), (foreign, &alice)];
+        let output = Output {
+            amount: 16,
+            holder: HolderKey::generate().public_key(),
+        };
+        let transfer = TransferRequest::sign(&inputs, vec![output]).unwrap();
+        let burn = BurnRequest::sign(&inputs).unwrap();
+        let wrong_issuer = |input| Error::Note {
+            input,
+            error: NoteError::WrongIssuer,
+        };
+        assert_eq!(ours.verifier().verify(&transfer), Err(wrong_issuer(1)));
+        assert_eq!(ours.verifier().verify_burn(&burn), Err(wrong_issuer(1)));
+        assert_eq!(ours.transfer(&transfer), Err(wrong_issuer(1)));
+        assert_eq!(ours.burn(&burn), Err(wrong_issuer(1)));
+        // To their issuer, ours is the foreign note.
+        assert_eq!(theirs.transfer(&transfer), Err(wrong_issuer(0)));
+    }
+
+    #[test]
     fn misfit_events_change_nothing() {
         let mut i = issuer(4, Policy::cash_like());
         let key = HolderKey::generate();

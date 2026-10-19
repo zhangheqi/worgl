@@ -293,10 +293,14 @@ impl Verifier {
     }
 
     fn check_inputs(&self, inputs: &[Spend], message: &[u8]) -> Result<(), Error> {
-        let mut sorted = serials(inputs);
-        sorted.sort_unstable();
-        if let Some(pair) = sorted.windows(2).find(|pair| pair[0] == pair[1]) {
-            return Err(Error::DuplicateInput(pair[0]));
+        // A note is its issuer and its serial, so a duplicate matches on both.
+        let mut notes: Vec<(&PublicKey, Serial)> = inputs
+            .iter()
+            .map(|spend| (spend.note.issuer(), spend.note.serial()))
+            .collect();
+        notes.sort_unstable();
+        if let Some(pair) = notes.windows(2).find(|pair| pair[0] == pair[1]) {
+            return Err(Error::DuplicateInput(pair[0].1));
         }
         for (input, spend) in inputs.iter().enumerate() {
             let note = &spend.note;
