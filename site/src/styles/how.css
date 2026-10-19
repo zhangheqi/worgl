@@ -31,7 +31,7 @@
 .lab-col { position: sticky; top: calc(env(safe-area-inset-top, 0px) + 84px); display: flex; flex-direction: column; gap: 12px; }
 .lab-cap { display: flex; justify-content: space-between; gap: 12px; color: var(--muted); }
 .lab-col .lab-side { display: grid; grid-template-columns: minmax(0, 1fr) auto; gap: 12px 20px; align-items: start; margin-top: 2px; }
-.lab-col .controls, .lab-col .note-read, .lab-col .readout { grid-column: 1 / -1; }
+.lab-col .controls, .lab-col .readout { grid-column: 1 / -1; }
 .lab-col .readout { min-height: 4.6em; font-size: 15px; }
 .lab-col .counters { grid-column: 1 / -1; }
 .lab-col .formula { display: none; }
