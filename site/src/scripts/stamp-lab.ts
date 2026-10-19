@@ -3,8 +3,8 @@
  * refresh and rotate by hand. A rotation tears off the top sheet.
  *
  * By default clicking a note transfers it. With data-select on the root,
- * clicking selects a note instead, the buttons act on it, and an optional
- * data-part="note" element follows it. Other parts of the page can press the
+ * clicking selects a note instead and the buttons act on it. Hovering or
+ * focusing a note reads it in a tip. Other parts of the page can press the
  * buttons by dispatching a "lab-do" event with the action's name as detail.
  */
 import { isReduced } from './motion';
@@ -17,10 +17,10 @@ export function mountStampLab(root: HTMLElement) {
   const part = <T extends Element>(name: string) => root.querySelector<T>(`[data-part="${name}"]`)!;
   const host = part<HTMLElement>('sheets'), out = part<HTMLElement>('readout');
   const cRot = part<HTMLElement>('rotations'), cExp = part<HTMLElement>('expired');
-  const noteOut = root.querySelector<HTMLElement>('[data-part="note"]');
+  const tip = part<HTMLElement>('tip');
   const selectMode = root.hasAttribute('data-select');
   let L: Sheet[] = [], gen = 1, rot = 0, expired = 0, busy = false;
-  let sel: { gen: number; i: number } | null = null;
+  let sel: { gen: number; i: number } | null = null, tipFor: { gen: number; i: number } | null = null, rendering = false;
   const fx = new Map<string, string>();
   const sheet = (k: number) => L[k]!;
   const nl = (): Sheet => ({ gen: gen++, cells: [] });
@@ -32,15 +32,26 @@ export function mountStampLab(root: HTMLElement) {
     const k = sel ? L.findIndex((x) => x.gen === sel!.gen) : -1;
     return k < 0 || !sel ? null : { k, i: sel.i, c: sheet(k).cells[sel.i]! };
   };
-  function showNote() {
-    if (!noteOut) return;
-    const s = selected();
-    if (!s) { noteOut.textContent = 'No note selected. Click one to follow it.'; return; }
-    const { k, i, c } = s, h = N - 1 - k;
-    noteOut.textContent = !c.live ? `Note ${sheet(k).gen}:${i} · spent` :
-      `Note ${sheet(k).gen}:${i} · worth ${c.a} · layer ${k} of ${N} · ` +
-      (h === 0 ? 'frozen until the next rotation' : `${h} ${h === 1 ? 'hop' : 'hops'} left now`) +
-      ` · ${k === 0 ? 'dies at the next rotation' : `dies in ${k + 1} rotations`} if left alone`;
+  // The tip reads a live note the way a holder's SDK would, and follows it
+  // across re-renders until the note is spent or the pointer leaves.
+  function showTip() {
+    const k = tipFor ? L.findIndex((x) => x.gen === tipFor!.gen) : -1;
+    const el = k < 0 ? null : host.querySelector<HTMLElement>(`.c.l[data-k="${k}"][data-i="${tipFor!.i}"]`);
+    if (!el) { tip.hidden = true; return; }
+    const c = sheet(k).cells[tipFor!.i]!, h = N - 1 - k;
+    tip.innerHTML = `<b>Note ${sheet(k).gen}:${tipFor!.i} · worth ${c.a}</b>` +
+      `<span>Layer ${k} of ${N} · ${h === 0 ? 'frozen until the next rotation' : `${h} ${h === 1 ? 'hop' : 'hops'} left now`}</span>` +
+      `<span>${k === 0 ? 'Dies at the next rotation' : `Dies in ${k + 1} rotations`} if left alone</span>`;
+    tip.hidden = false;
+    const r = el.getBoundingClientRect(), tw = tip.offsetWidth, th = tip.offsetHeight;
+    let x = r.left + r.width / 2 - tw / 2, y = r.top - th - 10;
+    x = Math.max(8, Math.min(x, window.innerWidth - tw - 8));
+    if (y < 72) y = r.bottom + 10;
+    tip.style.transform = `translate(${Math.round(x)}px,${Math.round(y)}px)`;
+  }
+  function tipOn(el: HTMLElement | null) {
+    tipFor = el ? { gen: sheet(Number(el.dataset.k)).gen, i: Number(el.dataset.i) } : null;
+    showTip();
   }
 
   function reset() {
@@ -56,6 +67,7 @@ export function mountStampLab(root: HTMLElement) {
     say(selectMode ? 'Four layers, oldest at the top. Click a note to follow it, then use the buttons.' : 'Four layers, oldest at the top. Click a note to transfer it, or use the buttons.');
   }
   function render(arrive = false) {
+    rendering = true;
     host.innerHTML = L.map((layer, k) => {
       const cls = `sheet${k === N - 1 ? ' frozen' : ''}${k === 0 ? ' dying' : ''}${arrive && k === N - 1 ? ' arrive' : ''}`;
       let cells = '';
@@ -70,10 +82,11 @@ export function mountStampLab(root: HTMLElement) {
       }
       return `<div class="${cls}"><div class="sheet-head"><span class="label">Layer ${k} · gen ${layer.gen}</span><span class="label muted">${hopsTxt(k)} · ${diesTxt(k)}</span></div><div class="cells">${cells}</div></div>`;
     }).join('');
+    rendering = false;
     fx.clear();
     cRot.textContent = String(rot);
     cExp.textContent = String(expired);
-    showNote();
+    showTip();
   }
   function move(k: number, i: number, quiet = false) {
     const c = sheet(k).cells[i];
@@ -150,6 +163,16 @@ export function mountStampLab(root: HTMLElement) {
   };
   root.querySelectorAll<HTMLElement>('[data-do]').forEach((b) => b.addEventListener('click', () => act[b.dataset.do ?? '']?.()));
   root.addEventListener('lab-do', (e) => act[(e as CustomEvent<string>).detail]?.());
+  const cellOf = (t: EventTarget | null) => (t instanceof Element ? t.closest<HTMLElement>('.c.l') : null);
+  host.addEventListener('pointerover', (e) => { if (e.pointerType === 'mouse') tipOn(cellOf(e.target)); });
+  host.addEventListener('pointerout', (e) => { if (e.pointerType === 'mouse' && !cellOf(e.relatedTarget)) tipOn(null); });
+  host.addEventListener('focusin', (e) => tipOn(cellOf(e.target)));
+  // A re-render removes the focused note, which is not the reader leaving it.
+  host.addEventListener('focusout', (e) => { if (!rendering && !cellOf(e.relatedTarget)) tipOn(null); });
+  // On touch, a tap shows the tip for the note tapped; scrolling or tapping elsewhere hides it.
+  host.addEventListener('pointerdown', (e) => { if (e.pointerType !== 'mouse') tipOn(cellOf(e.target)); });
+  document.addEventListener('pointerdown', (e) => { if (!host.contains(e.target as Node)) tipOn(null); });
+  window.addEventListener('scroll', () => { if (tipFor) tipOn(null); }, { passive: true });
   host.addEventListener('click', (e) => {
     const c = (e.target as Element).closest<HTMLElement>('.c.l');
     if (!c) return;

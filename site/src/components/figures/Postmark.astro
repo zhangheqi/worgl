@@ -1,0 +1,61 @@
+---
+// A postmark in pink: the wordmark in bits between two bars, CI's runners
+// round the ring, and wavy cancellation lines. It lands when it scrolls in.
+import '../../styles/figures/postmark.css';
+import { wordBitmap } from '../../scripts/word';
+
+const C = 105, R = 100, INNER = 74, TEXT = 82;
+const RING = 'TESTED ON EVERY PULL REQUEST · LINUX · MACOS · RUST 1.89 · ';
+
+const bm = wordBitmap();
+const cell = 3.5, wordW = bm.w * cell, wordH = bm.h * cell;
+let word = '';
+for (let y = 0; y < bm.h; y++) for (let x = 0; x < bm.w; x++) if (bm.at(x, y)) word += `M${(C - wordW / 2 + x * cell).toFixed(1)} ${(C - wordH / 2 + 2 + y * cell).toFixed(1)}h${cell - .7}v${cell - .7}h-${cell - .7}z`;
+
+// the bars run across the inner ring, above and below the word
+const bar = (dy: number) => { const half = Math.sqrt(INNER * INNER - dy * dy); return `M${(C - half).toFixed(1)} ${C + dy}H${(C + half).toFixed(1)}`; };
+
+// five waves, each stopping just short of the outer ring
+const waves = [-44, -22, 0, 22, 44].map((dy) => {
+  const end = C - Math.sqrt(R * R - dy * dy) - 8;
+  let d = `M-196 ${C + dy}`;
+  for (let x = -196; x + 18 <= end; x += 18) d += 'q4.5 -5.5 9 0t9 0';
+  return d;
+}).join('');
+---
+<svg class="postmark" viewBox="-200 0 410 210" role="img" aria-label="Postmark: tested on every pull request, on Linux and macOS, and on Rust 1.89" data-postmark>
+  <defs>
+    <filter id="postmark-ink" x="-4%" y="-4%" width="108%" height="108%">
+      <feTurbulence type="fractalNoise" baseFrequency=".9" numOctaves="2" seed="7" result="speck" />
+      <feColorMatrix in="speck" type="matrix" values="0 0 0 0 0  0 0 0 0 0  0 0 0 0 0  0 0 0 -8 6.1" result="holes" />
+      <feComposite in="SourceGraphic" in2="holes" operator="in" result="inked" />
+      <feTurbulence type="fractalNoise" baseFrequency=".035" numOctaves="2" seed="3" result="warp" />
+      <feDisplacementMap in="inked" in2="warp" scale="1.6" xChannelSelector="R" yChannelSelector="G" />
+    </filter>
+    <path id="postmark-ring" d={`M${C - TEXT} ${C}a${TEXT} ${TEXT} 0 1 1 ${TEXT * 2} 0a${TEXT} ${TEXT} 0 1 1 -${TEXT * 2} 0`} />
+  </defs>
+  <g filter="url(#postmark-ink)">
+    <path class="waves" d={waves} />
+    <circle cx={C} cy={C} r={R} class="ring" />
+    <circle cx={C} cy={C} r={INNER} class="ring thin" />
+    <text class="ring-text"><textPath href="#postmark-ring" textLength={(2 * Math.PI * TEXT - 6).toFixed(0)} lengthAdjust="spacing">{RING}</textPath></text>
+    <path class="bars" d={bar(-24) + bar(24)} />
+    <path class="word" d={word} />
+    <text class="small" x={C} y={C - 37} text-anchor="middle">CI</text>
+    <text class="small" x={C} y={C + 47} text-anchor="middle">EVERY CHANGE</text>
+  </g>
+</svg>
+
+<script>
+  import { isReduced } from '../../scripts/motion';
+  for (const pm of document.querySelectorAll<SVGElement>('[data-postmark]')) {
+    if (isReduced()) continue;
+    pm.classList.add('armed');
+    const io = new IntersectionObserver((es) => {
+      if (!es.some((e) => e.isIntersecting)) return;
+      io.disconnect();
+      setTimeout(() => pm.classList.add('landed'), 160);
+    }, { threshold: .6 });
+    io.observe(pm);
+  }
+</script>
