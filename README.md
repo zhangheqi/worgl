@@ -520,6 +520,13 @@ cargo clippy --workspace --all-targets -- -D warnings
 cargo fmt --all --check
 ```
 
+`cargo test -p worgl-raft --test simulation` runs a mint's three-replica group
+through seeded faults on a simulated clock: replicas cut off, split apart,
+crashed and restarted, messages lost and delayed. Afterwards it checks that
+the replicas agree, that every answered change is there, that no note was
+spent twice and that supply balances. It runs 32 seeds by default; set
+`WORGL_SIM_SEEDS=1000` for more, or `WORGL_SIM_SEED=<n>` to repeat one.
+
 The minimum supported Rust version is 1.89. CI runs all of the above plus the
 docs and the example on every push and pull request, and the TypeScript SDK's
 tests against a real server:
