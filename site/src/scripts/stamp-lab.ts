@@ -1,6 +1,11 @@
 /*
  * Four layers of a tiny mint as stamp sheets, to mint into, transfer,
  * refresh and rotate by hand. A rotation tears off the top sheet.
+ *
+ * By default clicking a note transfers it. With data-select on the root,
+ * clicking selects a note instead, the buttons act on it, and an optional
+ * data-part="note" element follows it. Other parts of the page can press the
+ * buttons by dispatching a "lab-do" event with the action's name as detail.
  */
 import { isReduced } from './motion';
 
@@ -12,7 +17,10 @@ export function mountStampLab(root: HTMLElement) {
   const part = <T extends Element>(name: string) => root.querySelector<T>(`[data-part="${name}"]`)!;
   const host = part<HTMLElement>('sheets'), out = part<HTMLElement>('readout');
   const cRot = part<HTMLElement>('rotations'), cExp = part<HTMLElement>('expired');
+  const noteOut = root.querySelector<HTMLElement>('[data-part="note"]');
+  const selectMode = root.hasAttribute('data-select');
   let L: Sheet[] = [], gen = 1, rot = 0, expired = 0, busy = false;
+  let sel: { gen: number; i: number } | null = null;
   const fx = new Map<string, string>();
   const sheet = (k: number) => L[k]!;
   const nl = (): Sheet => ({ gen: gen++, cells: [] });
@@ -20,6 +28,20 @@ export function mountStampLab(root: HTMLElement) {
   const diesTxt = (k: number) => (k === 0 ? 'dies at the next rotation' : `dies in ${k + 1} rotations`);
   const say = (t: string) => { out.textContent = t; };
   const seed = (layer: Sheet, list: Array<[number, number]>) => { for (const [a, live] of list) layer.cells.push({ a, live: !!live }); };
+  const selected = () => {
+    const k = sel ? L.findIndex((x) => x.gen === sel!.gen) : -1;
+    return k < 0 || !sel ? null : { k, i: sel.i, c: sheet(k).cells[sel.i]! };
+  };
+  function showNote() {
+    if (!noteOut) return;
+    const s = selected();
+    if (!s) { noteOut.textContent = 'No note selected. Click one to follow it.'; return; }
+    const { k, i, c } = s, h = N - 1 - k;
+    noteOut.textContent = !c.live ? `Note ${sheet(k).gen}:${i} · spent` :
+      `Note ${sheet(k).gen}:${i} · worth ${c.a} · layer ${k} of ${N} · ` +
+      (h === 0 ? 'frozen until the next rotation' : `${h} ${h === 1 ? 'hop' : 'hops'} left now`) +
+      ` · ${k === 0 ? 'dies at the next rotation' : `dies in ${k + 1} rotations`} if left alone`;
+  }
 
   function reset() {
     gen = 1; rot = 0; expired = 0;
@@ -28,9 +50,10 @@ export function mountStampLab(root: HTMLElement) {
     seed(sheet(1), [[8, 0], [2, 1], [4, 0], [8, 1], [1, 1], [2, 0], [4, 0]]);
     seed(sheet(2), [[8, 1], [8, 0], [4, 1], [2, 1], [8, 1]]);
     seed(sheet(3), [[4, 1], [8, 1]]);
+    sel = selectMode ? { gen: sheet(2).gen, i: 2 } : null;
     fx.clear();
     render();
-    say('Four layers, oldest at the top. Click a note to transfer it, or use the buttons.');
+    say(selectMode ? 'Four layers, oldest at the top. Click a note to follow it, then use the buttons.' : 'Four layers, oldest at the top. Click a note to transfer it, or use the buttons.');
   }
   function render(arrive = false) {
     host.innerHTML = L.map((layer, k) => {
@@ -39,7 +62,10 @@ export function mountStampLab(root: HTMLElement) {
       for (let i = 0; i < CAP; i++) {
         const c = layer.cells[i], f = fx.get(`${layer.gen}:${i}`) ?? '';
         if (!c) cells += '<span class="c u"></span>';
-        else if (c.live) cells += `<button type="button" class="c l ${f}" data-k="${k}" data-i="${i}" aria-label="Note worth ${c.a} in layer ${k}">${c.a}</button>`;
+        else if (c.live) {
+          const on = sel && sel.gen === layer.gen && sel.i === i ? ' sel' : '';
+          cells += `<button type="button" class="c l${on} ${f}" data-k="${k}" data-i="${i}" aria-label="Note worth ${c.a} in layer ${k}"${selectMode ? ` aria-pressed="${!!on}"` : ''}>${c.a}</button>`;
+        }
         else cells += `<span class="c s ${f}"></span>`;
       }
       return `<div class="${cls}"><div class="sheet-head"><span class="label">Layer ${k} · gen ${layer.gen}</span><span class="label muted">${hopsTxt(k)} · ${diesTxt(k)}</span></div><div class="cells">${cells}</div></div>`;
@@ -47,6 +73,7 @@ export function mountStampLab(root: HTMLElement) {
     fx.clear();
     cRot.textContent = String(rot);
     cExp.textContent = String(expired);
+    showNote();
   }
   function move(k: number, i: number, quiet = false) {
     const c = sheet(k).cells[i];
@@ -63,6 +90,8 @@ export function mountStampLab(root: HTMLElement) {
     fx.set(`${sheet(k).gen}:${i}`, 'fs');
     next.cells.push({ a: c.a, live: true });
     fx.set(`${next.gen}:${next.cells.length - 1}`, 'fl');
+    // The selection follows the value to its new note.
+    if (sel && sel.gen === sheet(k).gen && sel.i === i) sel = { gen: next.gen, i: next.cells.length - 1 };
     if (!quiet) {
       const n = k + 1;
       say(`Transferred ${c.a} from layer ${k} to layer ${n}, under a fresh key. ` +
@@ -76,10 +105,13 @@ export function mountStampLab(root: HTMLElement) {
       if (layer.cells.length >= CAP) return say(`Layer ${k} is full until the next rotation.`);
       layer.cells.push({ a: 8, live: true });
       fx.set(`${layer.gen}:${layer.cells.length - 1}`, 'fl');
+      if (selectMode) sel = { gen: layer.gen, i: layer.cells.length - 1 };
       render();
       say(`Minted 8 into layer ${k}, the second-to-last: one hop right away, and it dies in ${k + 1} rotations if left alone.`);
     },
     transfer() {
+      const s = selected();
+      if (selectMode && s && s.c.live) { move(s.k, s.i); render(); return; }
       for (let k = 0; k < N - 1; k++) {
         const i = sheet(k).cells.findIndex((c) => c.live);
         if (i >= 0) { move(k, i); render(); return; }
@@ -99,13 +131,15 @@ export function mountStampLab(root: HTMLElement) {
       busy = true;
       const done = () => {
         const d = L.shift()!, dead = d.cells.filter((c) => c.live), v = dead.reduce((s, c) => s + c.a, 0);
+        const lost = sel?.gen === d.gen && d.cells[sel.i]?.live;
+        if (sel?.gen === d.gen) sel = null;
         expired += v; rot++;
         L.push(nl());
         render(true);
         busy = false;
         say(`Rotation ${rot}: generation ${d.gen} dropped. ` +
           (dead.length ? `${dead.length} ${dead.length === 1 ? 'idle note' : 'idle notes'} worth ${v} expired with it.` : 'Nothing was left in it, so nothing expired.') +
-          ' The frozen layer can move again.');
+          ' The frozen layer can move again.' + (lost ? ' The note you were following expired with it.' : ''));
       };
       const first = host.firstElementChild;
       if (isReduced() || !first) return done();
@@ -115,10 +149,18 @@ export function mountStampLab(root: HTMLElement) {
     reset,
   };
   root.querySelectorAll<HTMLElement>('[data-do]').forEach((b) => b.addEventListener('click', () => act[b.dataset.do ?? '']?.()));
+  root.addEventListener('lab-do', (e) => act[(e as CustomEvent<string>).detail]?.());
   host.addEventListener('click', (e) => {
     const c = (e.target as Element).closest<HTMLElement>('.c.l');
     if (!c) return;
-    if (move(Number(c.dataset.k), Number(c.dataset.i))) render();
+    const k = Number(c.dataset.k), i = Number(c.dataset.i);
+    if (selectMode) {
+      sel = { gen: sheet(k).gen, i };
+      render();
+      say(k === N - 1 ? 'Selected a frozen note. Rotate to thaw it, then transfer it.' : 'Selected. Transfer moves it one layer on; Rotate shows what happens if it sits still.');
+      return;
+    }
+    if (move(k, i)) render();
   });
   reset();
 }
