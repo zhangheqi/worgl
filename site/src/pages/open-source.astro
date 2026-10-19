@@ -1,0 +1,135 @@
+---
+import Page from '../layouts/Page.astro';
+import SectionHead from '../components/SectionHead.astro';
+import { REPO, page } from '../lib/links';
+import '../styles/code.css';
+import '../styles/pages.css';
+
+const SECURITY = `${REPO}/security/advisories/new`;
+const CI = `${REPO}/blob/main/.github/workflows/ci.yml`;
+
+const parts = [
+  { name: 'worgl', path: 'crates/worgl', lang: 'Rust', d: 'The library: ledger, note format, transfer protocol, policy, issuer state machine and crash-safe storage.' },
+  { name: 'worgl-server', path: 'crates/worgl-server', lang: 'Rust', d: 'An HTTP server that hosts many mints side by side, alone or as a three-member cluster.' },
+  { name: 'worgl-raft', path: 'crates/worgl-raft', lang: 'Rust', d: "Raft replication for each mint, plus a registry of the cluster's mints." },
+  { name: 'worgl-sdk', path: 'crates/worgl-sdk', lang: 'Rust', d: "The holder's side: requests, pays, receives and refreshes notes while keeping the privacy rules." },
+  { name: 'worgl-client', path: 'crates/worgl-client', lang: 'Rust', d: 'Typed calls for every route, and a purse that saves itself.' },
+  { name: 'worgl-cli', path: 'crates/worgl-cli', lang: 'Rust', d: '`worgl`, a command-line purse in a passphrase-encrypted file.' },
+  { name: 'worgl-wasm', path: 'crates/worgl-wasm', lang: 'Rust', d: '`worgl-sdk` compiled to WebAssembly.' },
+  { name: 'TypeScript SDK', path: 'sdk/typescript', lang: 'TypeScript', d: 'A client and purse on the same core, for Node and browsers.' },
+];
+// Each stamp carries its number in bits.
+const bits = (n: number) => [8, 4, 2, 1].map((b) => (n & b) !== 0);
+
+const checks = ['rustfmt', 'clippy', 'tests on Linux', 'tests on macOS', 'Rust 1.89', 'docs', 'lifecycle example', 'TypeScript SDK'];
+---
+<Page title="Open source" description="The ledger, the server, replication, the SDKs and the command line, in one repository under MIT or Apache-2.0.">
+  <section class="band cobalt page-hero edge edge-paper" data-tone="cobalt">
+    <div class="wrap grid">
+      <p class="eyebrow label"><span>Open source</span><span>MIT or Apache-2.0</span><span>v0.1</span></p>
+      <h1 class="display">Everything that touches a token is <em>public.</em></h1>
+      <div class="side">
+        <p class="lede">The ledger, the server, replication, the SDKs and the command line live in one repository, under MIT or Apache-2.0 at your option.</p>
+        <div class="ctas">
+          <a class="btn btn-solid-paper" href={REPO}>Read the code</a>
+          <a class="btn" href={page('docs/')}>Docs</a>
+        </div>
+        <p class="status-top">0.1. Not yet independently security reviewed. Don't use it to hold anything you can't afford to lose.</p>
+      </div>
+    </div>
+  </section>
+
+  <section class="band paper edge edge-cobalt" id="components" data-tone="paper">
+    <div class="wrap">
+      <SectionHead num="01" name="Components" />
+      <div class="grid">
+        <h2 class="h2 sec-intro">Seven crates and a <em>package.</em></h2>
+        <p class="body muted sec-aside">One Rust workspace and a TypeScript package, built and tested together. Each stamp opens its folder on GitHub.</p>
+        <div class="sheet-wrap">
+          <ul class="stamps">
+            {parts.map((p, i) => (
+              <li>
+                <a class={`stamp-cell${i === 0 ? ' core' : ''}`} href={`${REPO}/tree/main/${p.path}`}>
+                  <span class="top">
+                    <span class="label">{String(i + 1).padStart(2, '0')} · {p.lang}</span>
+                    <span class="glyph" aria-hidden="true">{bits(i + 1).map((on) => <i class={on ? 'on' : undefined} />)}</span>
+                  </span>
+                  <code class="name">{p.name}</code>
+                  <p>{p.d.split('`').map((s, j) => (j % 2 ? <code>{s}</code> : s))}</p>
+                  <span class="path">{p.path}/</span>
+                </a>
+              </li>
+            ))}
+          </ul>
+        </div>
+        <div class="sheet-foot">
+          <span class="label">One workspace · version 0.1.0 · Rust 1.89 or later</span>
+          <span class="label">MIT or Apache-2.0, at your option</span>
+        </div>
+      </div>
+    </div>
+  </section>
+
+  <section class="band cobalt get edge edge-paper" id="getting-it" data-tone="cobalt">
+    <div class="wrap">
+      <SectionHead num="02" name="Getting it" />
+      <div class="grid">
+        <h2 class="h2">Build it from the <em>source.</em></h2>
+        <div class="sec-aside"><p class="body">Nothing is on crates.io or npm yet. Depend on the crates from git, and build the TypeScript package from <code>sdk/typescript</code>.</p></div>
+        <div class="term-box">
+          <div class="term-bar"><span class="label">From the repository</span><button class="copy" type="button" data-copy="#get-it">Copy</button></div>
+          <pre class="term" id="get-it" data-text={'cargo add --git https://github.com/zhangheqi/worgl worgl-client\ngit clone https://github.com/zhangheqi/worgl\ncd worgl/sdk/typescript && npm ci && npm run build'}><span class="c"># Rust: depend on a crate straight from git</span>
+<span class="p">$ </span>cargo add --git https://github.com/zhangheqi/worgl worgl-client
+
+<span class="c"># TypeScript: build the package. It needs the wasm32 target</span>
+<span class="c"># and wasm-bindgen-cli; sdk/typescript/README.md has the steps.</span>
+<span class="p">$ </span>git clone https://github.com/zhangheqi/worgl
+<span class="p">$ </span>cd worgl/sdk/typescript &amp;&amp; npm ci &amp;&amp; npm run build</pre>
+        </div>
+        <div class="registries">
+          <div><b>From git</b><span class="label">Available now</span></div>
+          <div><b>crates.io</b><span class="label na">Not available yet</span></div>
+          <div><b>npm</b><span class="label na">Not available yet</span></div>
+        </div>
+      </div>
+    </div>
+  </section>
+
+  <section class="band paper maturity edge edge-cobalt" id="maturity" data-tone="paper">
+    <div class="wrap">
+      <SectionHead num="03" name="Maturity" />
+      <div class="grid">
+        <h2 class="h2">Tested on every change. Not yet <em>reviewed.</em></h2>
+        <div class="notice-wrap">
+          <div class="notice">
+            <span class="label">Status</span>
+            <p>0.1. Not yet independently security reviewed. Cluster members are fixed once the cluster starts, and they talk to each other without TLS, so keep that port on a private network.</p>
+          </div>
+        </div>
+        <div class="security">
+          <h3 class="h3">Security</h3>
+          <p>Report a vulnerability privately through GitHub, not in a public issue.</p>
+          <div><a class="btn btn-sm" href={SECURITY}>Report a vulnerability</a></div>
+        </div>
+        <div class="ci">
+          <div class="ci-head">
+            <h3 class="h3">Contributing</h3>
+            <p>CI runs rustfmt, clippy, the tests on Linux and macOS, the minimum Rust version (1.89), the docs, the lifecycle example and the TypeScript SDK against a real server on every pull request. Commit messages follow Conventional Commits. <a class="fig-link" href={CI}>CI workflow</a></p>
+          </div>
+          <ul class="checks" aria-label="What CI checks on every pull request">
+            {checks.map((c) => <li>{c}</li>)}
+          </ul>
+        </div>
+      </div>
+    </div>
+  </section>
+</Page>
+
+<script>
+  import { mountCopy } from '../scripts/tabs';
+  document.querySelectorAll<HTMLButtonElement>('button[data-copy]').forEach(mountCopy);
+</script>
+
+<style>
+  .get code { font-family: var(--f-mono); font-size: .86em; font-stretch: 87.5%; }
+</style>
