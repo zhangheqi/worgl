@@ -47,11 +47,17 @@ const bob = await Purse.open(client, { store: new FileStore('bob.json') });
 const request = await bob.request(mint, 5n);          // Bob sends request.json to Alice
 const payment = await alice.pay(request);             // Alice sends payment.json to Bob
 const received = await bob.receive(request, payment); // checks, submits at its times, keeps
-await alice.settle();                                 // later: Alice takes in her change
+await alice.accept(received.theirs);                  // Bob sends Alice her change, she keeps it
 ```
 
 The other side reads what it is sent with `PaymentRequest.from(json)` and
-`Payment.from(json)`. For a fuller worked example, the SDK's tests in
+`Payment.from(json)`. `received.theirs` holds the notes of the mint's answers
+that are not Bob's: Alice's change. Keeping it with `accept` also settles
+Alice's transfer. Without it, `alice.settle()` sends her transfers again, and
+the mint answers with the same notes while it keeps its answers (see
+[Error codes](../error-codes/)).
+
+For a fuller worked example, the SDK's tests in
 [`sdk/typescript/test/purse.test.ts`](https://github.com/zhangheqi/worgl/blob/main/sdk/typescript/test/purse.test.ts)
 run purses against a real server.
 
@@ -62,11 +68,17 @@ run purses against a real server.
   after every change, before handing out anything that depends on it. If a
   save fails, the change is undone and the call rejects.
 - `purse.refresh(mint)` pays the notes about to expire back to the purse,
-  each at a random moment before the next rotation. `planRefresh` and
-  `submit` split it for applications with their own scheduler.
+  each at a random moment before the next rotation, and resends the
+  outgoing transfers that must land before it. `planRefresh` and `submit`
+  split it for applications with their own scheduler.
 - When the payer submits instead (`purse.submit(payment.transfers)`), it
-  hands `submitted.notes` to the payee, who checks their signatures against
-  the mint's keys and keeps them with `purse.accept(notes)`.
+  hands `submitted.theirs`, the payee's notes, to the payee, who checks their
+  signatures against the mint's keys and keeps them with
+  `purse.accept(notes)`.
+- A transfer refused as `spent` or `expired` that the purse has something
+  in carries `atStake` in `submitted.refused`: it may have been applied,
+  with an answer the mint no longer keeps, and that much may be lost unless
+  the other side hands the notes over.
 - `purse.takeFromFaucet(new Client(faucetUrl))` asks a playground
   [faucet](../running-a-faucet/) for a note, to a fresh key like any other,
   and keeps it.

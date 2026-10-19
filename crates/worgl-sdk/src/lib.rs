@@ -26,11 +26,14 @@
 //! 2. The payer calls [`Holder::pay`] and returns the [`Payment`]: signed
 //!    transfers, each spending one of its notes, with a time to submit each.
 //! 3. The payee checks it with [`PaymentRequest::check`], submits each
-//!    transfer at its time, and takes the new notes in with
-//!    [`Holder::absorb`].
-//! 4. The payer gets the same answers, from the payee or by resending its
-//!    outgoing transfers at the times [`Holder::resend`] gives, and records
-//!    them with [`Holder::settle`], which takes in its change.
+//!    transfer at its time, takes the new notes in with [`Holder::absorb`],
+//!    and hands the rest of the answers, [`Holder::theirs`], back to the
+//!    payer: its change.
+//! 4. The payer checks their signatures and takes them in with
+//!    [`Holder::take_answers`], which settles the transfers they answer.
+//!    Without them, it resends its outgoing transfers at the times
+//!    [`Holder::resend`] gives and records each answer with
+//!    [`Holder::settle`], which works while the mint keeps its answers.
 //!
 //! ```
 //! use worgl::{Issuer, IssuerKey, LedgerConfig, Policy};
@@ -62,12 +65,18 @@
 //! for transfer in &payment.transfers {
 //!     let answer = mint.transfer(&transfer.request)?;
 //!     bob.absorb(&answer);
-//!     alice.settle(&transfer.request, &answer);
+//!     // Bob hands Alice the rest, her change; she checks it and keeps it.
+//!     let change = bob.theirs(&answer);
+//!     for note in &change {
+//!         note.verify(mint.keys())?;
+//!     }
+//!     alice.take_answers(&change);
 //! }
 //!
 //! // Bob's 5 is frozen until the next rotation; Alice has 3 in change.
 //! assert_eq!(bob.balance(&view(&mint)?).frozen, 5);
 //! assert_eq!(alice.balance(&view(&mint)?).frozen, 3);
+//! assert_eq!(alice.outgoing().count(), 0);
 //! # Ok::<(), Box<dyn std::error::Error>>(())
 //! ```
 //!
@@ -81,6 +90,8 @@ mod mint;
 mod payment;
 mod random;
 
-pub use holder::{Balance, Holder, LoadError, MAX_REQUESTED_NOTES, PayError, RequestError};
+pub use holder::{
+    Balance, Holder, LoadError, MAX_REQUESTED_NOTES, PayError, REFRESH_MARGIN_SECS, RequestError,
+};
 pub use mint::{MintInfo, MintView, NoLayers, NoteState, Schedule};
 pub use payment::{CheckError, Payment, PaymentRequest, ScheduledTransfer, Spacing};

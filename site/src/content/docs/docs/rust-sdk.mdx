@@ -51,10 +51,14 @@ the file: before each change a purse locks it and reads it again, so none
 saves over another's change. A `Store` of your own does the same by
 implementing `lock`.
 
-When the payer submits instead, with `Purse::submit`, it hands the notes from
-the answers to the payee, who checks their signatures and keeps them with
-`Purse::accept`. `Purse::take_from_faucet` asks a playground
-[faucet](../running-a-faucet/) for a note, to a fresh key like any other.
+The mint's answers to a payment hold notes for both sides, and
+`Submitted::theirs` lists the other side's. The payee hands them back to the
+payer: they are the payer's change, which `Purse::accept` checks against the
+mint's keys, keeps, and uses to settle the payer's transfer. When the payer
+submits instead, with `Purse::submit`, it hands `theirs` to the payee, who
+keeps its notes with `Purse::accept` the same way.
+`Purse::take_from_faucet` asks a playground [faucet](../running-a-faucet/)
+for a note, to a fresh key like any other.
 
 ## What else a purse does
 
@@ -65,17 +69,20 @@ the answers to the payee, who checks their signatures and keeps them with
 | `pay(&request, spacing)` | Answers a request with a `Payment` of signed transfers. |
 | `receive(&request, &payment)` | Checks a payment, submits each transfer at its time and keeps the notes. |
 | `settle(spacing)` | Sends the transfers not yet seen answered again, and takes in the change. |
-| `submit(&transfers)` / `accept(&notes)` | The payer submits; the payee keeps what it is handed. |
+| `submit(&transfers)` / `accept(&notes)` | One side submits; the other keeps what it is handed, and settles the transfers it answers. |
 | `withdraw(&request)` | Stops expecting the notes of a request that will not be paid. |
 | `balance(&mint)` | What the purse holds at a mint, by what it can do now. |
-| `refresh(&mint)` | Pays the notes that die at the next rotation back to the purse, each at a random moment before it. Returns once the last is done, which may be most of a period away. |
+| `refresh(&mint)` | Pays the notes that die at the next rotation back to the purse, each at a random moment before it, and resends the transfers not yet seen answered that must land before it. Returns once the last is done, which may be most of a period away. |
 | `plan_refresh(&mint)` | The same plan, for an application with its own scheduler to `submit`. |
 | `prune(&mint)` | Drops notes whose layer the mint has dropped, and returns the value lost. |
 
-The mint keeps the answers to its most recent transfers only, and each only
-until the notes it issued expire, so settle before many more have passed and
-while the change is live, or a transfer already applied is refused as
-`spent` or `expired` and its change is lost.
+A resent transfer gets the same notes only while the mint keeps its answer
+(see [Error codes](../error-codes/)), and at the latest until those notes
+expire. After that, a transfer already applied is refused as `spent` or
+`expired`, and `Refused::at_stake` says it was possibly applied and what may
+be lost: the change can then only come from the counterparty, for
+`accept`. `refresh` resends the transfers whose spent note dies at the next
+rotation, or died at the last one.
 
 `Client` errors keep the mint's stable code, such as `spent` or `frozen`, in
 `Error::code`, and `Error::is_transient` says whether trying again later may
@@ -96,16 +103,20 @@ in place of the server. CI runs it.
 1. The payee calls `Holder::request` and sends the `PaymentRequest`.
 2. The payer calls `Holder::pay` and returns the `Payment`.
 3. The payee checks it with `PaymentRequest::check`, submits each transfer at
-   its time and takes the new notes in with `Holder::absorb`.
-4. The payer gets the same answers, from the payee or by resending its
-   outgoing transfers at the times `Holder::resend` gives, and records them
-   with `Holder::settle`, which takes in its change.
+   its time, takes the new notes in with `Holder::absorb`, and hands the
+   rest of the answers, `Holder::theirs`, back to the payer: its change.
+4. The payer checks their signatures and takes them in with
+   `Holder::take_answers`, which settles the transfers they answer. Without
+   them, it resends its outgoing transfers at the times `Holder::resend`
+   gives and records each answer with `Holder::settle`, which works while
+   the mint keeps its answers.
 
 A `MintView`, read from a mint's info, tells the holder which notes can move
 now, which are frozen until the next rotation and which die at it, and
 follows the rotation schedule without asking again. `Holder::refresh` keeps
-notes alive by paying the ones about to expire to the holder itself. The
-holder saves to JSON with its secret keys.
+notes alive by paying the ones about to expire to the holder itself, and
+`Holder::due_resends` gives the outgoing transfers to resend before the next
+rotation. The holder saves to JSON with its secret keys.
 
 ## Reference
 
