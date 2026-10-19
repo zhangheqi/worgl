@@ -1,0 +1,17 @@
+---
+// The docs' top-left corner: the bit wordmark back to Home, and "Docs" back to the docs' first page.
+import BitLogo from '../BitLogo.astro';
+import { page } from '../../lib/links';
+---
+<span class="docs-title">
+  <a class="docs-mark" href={page()} aria-label="Worgl, home"><BitLogo /></a>
+  <a class="docs-name label" href={page('docs/')}>Docs</a>
+</span>
+
+<style>
+  .docs-title { display: inline-flex; align-items: center; gap: 14px; min-width: 0; }
+  .docs-mark { display: inline-flex; color: var(--sl-color-white); }
+  .docs-mark :global(.logo) { display: block; flex: none; width: 92px; height: auto; }
+  .docs-name { color: var(--sl-color-gray-2); text-decoration: none; padding: 3px 0; border-bottom: 2px solid transparent; }
+  .docs-name:hover { color: var(--sl-color-white); border-bottom-color: var(--pink); }
+</style>

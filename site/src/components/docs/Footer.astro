@@ -1,0 +1,15 @@
+---
+// Starlight's footer, then the status line every page of the site carries.
+import Default from '@astrojs/starlight/components/Footer.astro';
+---
+<Default><slot /></Default>
+<p class="docs-status label">
+  <span>v0.1</span>
+  <span>Not yet independently security reviewed. Don't use it to hold anything you can't afford to lose.</span>
+  <span>MIT or Apache-2.0</span>
+</p>
+
+<style>
+  .docs-status { display: flex; flex-wrap: wrap; gap: 6px 20px; margin-top: 2.5rem; padding-top: 1rem; border-top: 1px solid var(--rule); color: var(--sl-color-gray-3); font-size: 10.5px; letter-spacing: .04em; text-transform: none; }
+  .docs-status span:first-child { color: var(--sl-color-white); }
+</style>

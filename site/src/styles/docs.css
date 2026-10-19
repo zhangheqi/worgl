@@ -1,0 +1,159 @@
+/*
+ * The docs in the site's inks. Starlight's colours are mapped onto the
+ * tokens: paper and ink for the page, cobalt for links and the logo's
+ * accents, pink only for hover and the current page. Unlayered, so these
+ * rules win over Starlight's own layers.
+ */
+@import './tokens.css';
+
+:root {
+  --sl-font: var(--f-sans);
+  --sl-font-mono: var(--f-mono);
+  --sl-text-body: 1.0625rem;
+  --sl-text-h1: clamp(2.75rem, 4.4vw, 3.75rem);
+  --sl-text-h2: 2.25rem;
+  --sl-text-h3: 1.625rem;
+  --sl-text-h4: 1.125rem;
+  --sl-line-height: 1.65;
+  --sl-line-height-headings: 1.06;
+  --sl-content-width: 46rem;
+  --sl-nav-height: 4rem;
+
+  --sl-color-white: var(--ink);
+  --sl-color-black: var(--paper);
+  --sl-color-text: var(--sl-color-gray-2);
+  --sl-color-text-invert: var(--paper);
+  --sl-color-bg: var(--paper);
+  --sl-color-bg-nav: var(--paper);
+  --sl-color-bg-sidebar: var(--paper);
+  --sl-color-bg-inline-code: var(--code-bg);
+  --sl-color-hairline: var(--rule);
+  --sl-color-hairline-light: var(--rule);
+  --sl-color-hairline-shade: var(--rule);
+  --sl-color-accent: var(--cobalt);
+  --sl-color-text-accent: var(--accent-text);
+  --sl-color-bg-accent: var(--cobalt);
+}
+:root[data-theme='light'] {
+  --sl-color-gray-1: #1E2156;
+  --sl-color-gray-2: #2B2E62;
+  --sl-color-gray-3: #4E5470;
+  --sl-color-gray-4: #7E8199;
+  --sl-color-gray-5: #BFC0CA;
+  --sl-color-gray-6: #E8E8E1;
+  --sl-color-gray-7: #EEEEE8;
+  --sl-color-accent-low: #DCE1FB;
+  --sl-color-accent-high: #1428A8;
+  --sl-color-blue-low: #DCE1FB;
+  --sl-color-blue: #1D35D6;
+  --sl-color-blue-high: #1428A8;
+  --sl-color-purple-low: #DCE1FB;
+  --sl-color-purple: #1D35D6;
+  --sl-color-purple-high: #1428A8;
+  --sl-color-backdrop-overlay: rgba(17, 20, 74, .4);
+}
+:root[data-theme='dark'] {
+  --sl-color-gray-1: #D6D8EA;
+  --sl-color-gray-2: #C3C6DC;
+  --sl-color-gray-3: #A1A6C2;
+  --sl-color-gray-4: #6D7293;
+  --sl-color-gray-5: #3A3F63;
+  --sl-color-gray-6: #1C2040;
+  --sl-color-accent-low: #18205A;
+  --sl-color-accent-high: #C9D1FF;
+  --sl-color-blue-low: #18205A;
+  --sl-color-blue: #8EA0FF;
+  --sl-color-blue-high: #C9D1FF;
+  --sl-color-purple-low: #18205A;
+  --sl-color-purple: #8EA0FF;
+  --sl-color-purple-high: #C9D1FF;
+  --sl-color-backdrop-overlay: rgba(5, 6, 14, .66);
+}
+
+::selection { background: var(--pink); color: var(--on-pink); }
+:focus-visible { outline: 2px solid currentColor; outline-offset: 3px; }
+.label { font-family: var(--f-mono); font-size: 11.5px; line-height: 1.4; letter-spacing: .08em; text-transform: uppercase; font-stretch: 87.5%; font-weight: 500; }
+
+/* headings in the serif, as on the designed pages */
+h1#_top,
+.sl-markdown-content :is(h1, h2, h3) {
+  font-family: var(--f-serif);
+  font-weight: 400;
+  letter-spacing: -.012em;
+  color: var(--sl-color-white);
+  text-wrap: balance;
+}
+h1#_top { letter-spacing: -.02em; line-height: .98; margin-top: .5rem; }
+.sl-markdown-content h2 { margin-top: 2.6rem; }
+.sl-markdown-content h4 { font-weight: 600; }
+
+/* links: cobalt, a pink underline on hover */
+.sl-markdown-content a:not(:where(.not-content *)) { color: var(--sl-color-text-accent); text-decoration-thickness: 1px; text-underline-offset: .2em; }
+.sl-markdown-content a:not(:where(.not-content *)):hover { color: var(--sl-color-text-accent); text-decoration-color: var(--pink); text-decoration-thickness: 2px; }
+
+/* inline code and code blocks */
+.sl-markdown-content code:not(:where(.not-content *)) { font-size: .82em; font-stretch: 87.5%; padding: .12em .35em; border-radius: 0; }
+.expressive-code pre, .expressive-code code { font-stretch: 87.5%; }
+
+/* tables scroll inside their own box */
+.sl-markdown-content table:not(:where(.not-content *)) { font-size: .9375rem; }
+.sl-markdown-content :is(th, td):not(:where(.not-content *)) { border-color: var(--rule); }
+.sl-markdown-content th:not(:where(.not-content *)) { font-weight: 600; background: transparent; }
+
+/* the top bar: paper, with a hairline, like the designed pages' paper bar */
+.header { border-bottom-color: var(--rule); }
+site-search button[data-open-modal] { border-radius: 0; border-color: var(--rule-strong); background: transparent; }
+site-search button[data-open-modal]:hover { border-color: var(--sl-color-white); }
+site-search dialog { border-radius: 0; }
+
+/* the sidebar: group names as labels, the current page marked in pink */
+.sidebar-content summary .large { font-family: var(--f-mono); font-size: 11.5px; letter-spacing: .08em; text-transform: uppercase; font-stretch: 87.5%; font-weight: 500; color: var(--sl-color-gray-3); }
+.sidebar-content a.large { font-size: var(--sl-text-sm); font-weight: 600; color: var(--sl-color-white); }
+.sidebar-content a { border-radius: 0; }
+.sidebar-content a:hover { color: var(--sl-color-white); text-decoration: underline; text-decoration-color: var(--pink); text-underline-offset: .25em; }
+.sidebar-content a[aria-current='page'],
+.sidebar-content a[aria-current='page']:hover,
+.sidebar-content a[aria-current='page']:focus {
+  color: var(--sl-color-white);
+  background: transparent;
+  font-weight: 600;
+  text-decoration: none;
+  box-shadow: inset 3px 0 0 var(--pink);
+}
+.sidebar-content ul ul li { border-inline-start-color: var(--rule); }
+
+/* heading anchors: quiet until wanted */
+.sl-markdown-content .sl-heading-wrapper { --sl-anchor-icon-size: .5em; }
+.sl-markdown-content .sl-anchor-link:not(:where(.not-content *)) { color: var(--sl-color-gray-4); text-decoration: none; }
+.sl-markdown-content .sl-anchor-link:not(:where(.not-content *)):hover { color: var(--pink); }
+
+/* phone controls: square, flat */
+.sl-menu-button { border-radius: 0; box-shadow: none; border: 1.5px solid var(--sl-color-white); background-color: var(--paper); color: var(--sl-color-white); }
+.sl-menu-button:has(~ :popover-open) { background-color: var(--paper); border-color: var(--pink); }
+mobile-starlight-toc .toggle { border-radius: 0; border-color: var(--rule-strong); }
+mobile-starlight-toc details[open] .toggle { border-color: var(--pink); }
+
+/* on this page: the section in view marked in pink */
+starlight-toc h2, mobile-starlight-toc h2 { font-family: var(--f-mono); font-size: 11.5px; letter-spacing: .08em; text-transform: uppercase; font-stretch: 87.5%; font-weight: 500; color: var(--sl-color-gray-3); }
+starlight-toc a[aria-current='true'],
+mobile-starlight-toc a[aria-current='true'] { color: var(--sl-color-white); box-shadow: inset 2px 0 0 var(--pink); }
+starlight-toc a:hover, mobile-starlight-toc a:hover { color: var(--sl-color-white); }
+mobile-starlight-toc a[aria-current='true'] { box-shadow: none; }
+
+/* previous and next: square, with the buttons' pink misregistration */
+.pagination-links a { border-radius: 0; border-color: var(--rule-strong); box-shadow: none; transition: box-shadow .18s ease, transform .18s ease; }
+.pagination-links a:hover { border-color: var(--sl-color-white); box-shadow: 4px 4px 0 var(--pink); transform: translate(-2px, -2px); }
+.pagination-links a .link-title { font-family: var(--f-serif); font-size: 1.5rem; font-weight: 400; }
+
+/* the changelog page shows CHANGELOG.md, whose own title the page already has */
+.changelog > h1:first-child { display: none; }
+
+/* asides: square */
+.starlight-aside { border-radius: 0; }
+
+/* the theme menu */
+starlight-theme-select select { border-radius: 0; }
+
+@media (prefers-reduced-motion: reduce) {
+  .pagination-links a, .pagination-links a:hover { transition: none; transform: none; }
+}
