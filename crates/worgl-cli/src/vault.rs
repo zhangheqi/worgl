@@ -4,6 +4,10 @@
 //! then the holder, sealed with XChaCha20-Poly1305 under a fresh random
 //! nonce on every save. The parameters are authenticated with it, so they
 //! cannot be weakened without the passphrase.
+//!
+//! Several `worgl` commands can run on one purse at once: each change locks
+//! the file, decrypts what is saved now, changes that and saves it before
+//! unlocking.
 
 use std::fs;
 use std::io;
@@ -16,7 +20,7 @@ use base64::engine::general_purpose::STANDARD;
 use chacha20poly1305::aead::{Aead, KeyInit, Payload};
 use chacha20poly1305::{Key, XChaCha20Poly1305, XNonce};
 use serde::{Deserialize, Serialize};
-use worgl_client::{FileStore, Store};
+use worgl_client::{FileStore, Locked, Store};
 use worgl_sdk::Holder;
 use zeroize::Zeroizing;
 
@@ -66,6 +70,9 @@ impl Vault {
     /// Creates a purse file holding an empty holder. Fails if the file
     /// exists.
     pub(crate) fn create(path: &Path, passphrase: &str) -> Result<Self> {
+        let _lock = FileStore::new(path)
+            .lock_file()
+            .with_context(|| format!("locking {}", path.display()))?;
         if path.exists() {
             bail!("{} already exists", path.display());
         }
@@ -101,15 +108,17 @@ impl Vault {
             }
             Err(error) => return Err(error).with_context(|| format!("reading {}", path.display())),
         };
-        let sealed: Sealed = serde_json::from_str(&text)
-            .with_context(|| format!("{} is not a purse file", path.display()))?;
-        if sealed.header.format != FORMAT || sealed.header.version != VERSION {
-            bail!(
-                "{} is a purse file of a format this version cannot read",
-                path.display()
-            );
-        }
-        let vault = Self::unlock(path, sealed.header, passphrase)?;
+        let sealed = parse(path, &text)?;
+        let vault = Self::unlock(path, sealed.header.clone(), passphrase)?;
+        let json = vault.unseal(&sealed)?;
+        let holder = Holder::from_json(&json).context("the purse's contents are damaged")?;
+        Ok((vault, holder))
+    }
+
+    /// Decrypts the holder's JSON. The header must be the one this vault
+    /// was unlocked with, or the decryption fails.
+    fn unseal(&self, sealed: &Sealed) -> Result<Zeroizing<String>> {
+        let path = self.file.path();
         let mut nonce = [0u8; 24];
         hex::decode_to_slice(&sealed.nonce, &mut nonce).context("the purse's nonce is damaged")?;
         let ciphertext = STANDARD
@@ -117,17 +126,15 @@ impl Vault {
             .context("the purse's contents are damaged")?;
         let payload = Payload {
             msg: &ciphertext,
-            aad: &vault.aad,
+            aad: &self.aad,
         };
         let plain = Zeroizing::new(
-            vault
-                .cipher
+            self.cipher
                 .decrypt(&XNonce::from(nonce), payload)
                 .map_err(|_| anyhow!("wrong passphrase, or {} is damaged", path.display()))?,
         );
         let json = std::str::from_utf8(&plain).context("the purse's contents are damaged")?;
-        let holder = Holder::from_json(json).context("the purse's contents are damaged")?;
-        Ok((vault, holder))
+        Ok(Zeroizing::new(json.to_owned()))
     }
 
     /// Derives the key for `header` from the passphrase.
@@ -174,4 +181,27 @@ impl Store for Vault {
         let text = serde_json::to_string_pretty(&sealed).map_err(io::Error::other)?;
         self.file.save(&text)
     }
+
+    fn lock(&self) -> io::Result<Option<Locked>> {
+        let lock = self.file.lock_file()?;
+        let path = self.file.path();
+        let text = fs::read_to_string(path)?;
+        let json = parse(path, &text)
+            .and_then(|sealed| self.unseal(&sealed))
+            .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, format!("{error:#}")))?;
+        Ok(Some(Locked::new(Some(json.to_string()), lock)))
+    }
+}
+
+/// Reads a sealed purse file's JSON.
+fn parse(path: &Path, text: &str) -> Result<Sealed> {
+    let sealed: Sealed = serde_json::from_str(text)
+        .with_context(|| format!("{} is not a purse file", path.display()))?;
+    if sealed.header.format != FORMAT || sealed.header.version != VERSION {
+        bail!(
+            "{} is a purse file of a format this version cannot read",
+            path.display()
+        );
+    }
+    Ok(sealed)
 }
