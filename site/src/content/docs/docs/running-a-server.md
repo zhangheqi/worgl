@@ -57,7 +57,9 @@ In it:
 
 A mint is built in a hidden directory and renamed into place when complete,
 so a crash never leaves one half made. The server refuses to start if any
-mint fails to open, or if a token is shorter than 32 characters.
+mint fails to open, or if a token is shorter than 32 characters. Tokens
+are read once, not reloaded; to replace one, see
+[Replacing a token](../keys/#replacing-a-token).
 
 ### State from earlier builds
 

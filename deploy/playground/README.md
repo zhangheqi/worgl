@@ -36,11 +36,14 @@ worgl playground        # keeps a note and prints the mint
 - **faucet** hands out notes of 64, 10 an hour per address and 10,000 a
   day, counting clients by the address Caddy forwards. It keeps its counts
   in memory, so they start again when it restarts.
-- **proxy** is Caddy. It refuses `/v1/admin/*`, which only the operator
-  needs, and spreads the rest over the members.
+- **proxy** is Caddy. It refuses `/v1/admin/*` and the mint's `rotate`,
+  `pause` and `resume`, which only the operator needs, and spreads the rest
+  over the members.
 
 The members and the faucet are on an internal network with no route to the
-internet, so the Raft ports are reachable only by them and Caddy.
+internet, so the members' Raft and API ports, which carry the cluster token
+and the requests members pass on to each other, are reachable only by them
+and Caddy.
 
 Settings, as environment variables for `docker compose up`:
 
@@ -59,15 +62,42 @@ SDK defaults pointed at it keep working.
 ## Operating it
 
 - `docker compose exec member1 cat /state/operator.token` shows the operator
-  token, and `/state/mints/<mint>/admin.token` the mint's admin token. Pause
-  the mint during an incident with `POST /v1/mints/<mint>/pause` and that
-  token; the proxy passes it through.
+  token, and `/state/mints/<mint>/admin.token` the mint's admin token.
 - `docker compose exec member1 worgl-server export-log --mint /state/mints/<mint>`
   prints the mint's log. Every member's should match.
 - Back up one of the `member*` volumes: each holds the whole mint, its keys
   and the key-encryption key. Back up the `faucet` volume too, since only it
   holds the mint authority key; without that key nothing can mint.
 - `docker compose down -v` deletes the mint for good, with every note.
+
+The proxy refuses the routes the admin token opens, so rotate, pause or
+resume the mint from inside a member. The image has no curl, so this speaks
+HTTP through bash, and the token never reaches the host or the proxy:
+
+```sh
+mint=$(docker compose exec -T faucet cat /state/mint)
+docker compose exec -T member1 bash -c '
+  exec 3<>/dev/tcp/127.0.0.1/8080
+  printf "%s\r\n" "POST /v1/mints/$1/$2 HTTP/1.1" "Host: member1" \
+    "Authorization: Bearer $(cat "/state/mints/$1/admin.token")" \
+    "Content-Length: 0" "Connection: close" "" >&3
+  cat <&3' bash "$mint" pause    # or resume, or rotate
+```
+
+Any member will do, since one that does not lead the mint passes the request
+on; use `member2` or `member3` if `member1` is down. A pause or resume can be
+sent again unchanged. A rotation cannot: one answered `503 timeout` may
+still be made, though the answer says to send the same request again, so
+check as
+[Sending a request again](../../site/src/content/docs/docs/error-codes.md#sending-a-request-again)
+says before sending it again, to any member.
+
+Pause the mint this way during an incident. If the admin token itself may
+have leaked, pause at once all the same, then write the same new token into
+`/state/mints/<mint>/admin.token` on all three members and restart them, as
+[Replacing a token](../../site/src/content/docs/docs/keys.md#replacing-a-token)
+says. The pause survives the restart, and after it the old token can no
+longer resume the mint.
 
 The three members share one machine here, so the cluster survives a member
 process failing, not the machine. Spread them over three machines for that,

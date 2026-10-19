@@ -151,9 +151,12 @@ a new one within a few seconds; until then, requests are answered
 `503 no_leader`, and sending the same request again is safe. A leader cut off
 from the other members stops taking requests after two seconds without
 hearing from them, and a member that cannot reach the leader says so within a
-few seconds.
+few seconds. Clients need one address that covers all three, such as a proxy
+in front of them. The members talk to each other in plain HTTP, tokens
+included, so they need a private network between them.
 
-How to start one, create mints on it and what its limits are:
+How to start one, keep it private, point clients at it, create mints on it
+and what its limits are:
 [Running a cluster](site/src/content/docs/docs/running-a-cluster.md).
 
 ## Not covered yet
@@ -162,8 +165,9 @@ How to start one, create mints on it and what its limits are:
 - **No backing.** A mint authority decides what to mint; there is no deposit
   or redemption into anything else.
 - **Clusters are fixed and their members talk in the clear.** Members cannot
-  be added or removed, and the Raft port has no TLS. The issuer key itself
-  never rotates: a new one is a new mint.
+  be added or removed, and they send each other Raft's messages and clients'
+  requests, tokens included, without TLS. The issuer key itself never
+  rotates: a new one is a new mint.
 - **No SDK for other languages yet.** Rust and TypeScript have one, and
   the `worgl` command covers scripts; others call the HTTP API directly.
 
