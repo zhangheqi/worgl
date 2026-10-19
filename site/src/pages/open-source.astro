@@ -1,6 +1,7 @@
 ---
 import Page from '../layouts/Page.astro';
 import SectionHead from '../components/SectionHead.astro';
+import Postmark from '../components/figures/Postmark.astro';
 import { REPO, page } from '../lib/links';
 import '../styles/code.css';
 import '../styles/pages.css';
@@ -21,6 +22,14 @@ const parts = [
 ];
 // Each stamp carries its number in bits.
 const bits = (n: number) => [8, 4, 2, 1].map((b) => (n & b) !== 0);
+
+// What the tests hold the code to, each linked to the test that checks it.
+const holds = [
+  { claim: ['Pay a note twice at once, and ', 'one payment wins.'], file: 'crates/worgl-server/tests/http.rs' },
+  { claim: ['Alter any byte of a note, and ', 'it is refused.'], file: 'crates/worgl/tests/properties.rs' },
+  { claim: ['A payment moves its exact amount, ', 'or nothing.'], file: 'crates/worgl-sdk/tests/payments.rs' },
+  { claim: ['Stop the leader, and ', 'another takes over.'], file: 'crates/worgl-server/tests/cluster.rs' },
+];
 
 const checks = ['rustfmt', 'clippy', 'tests on Linux', 'tests on macOS', 'Rust 1.89', 'docs', 'lifecycle example', 'TypeScript SDK', 'playground deploy'];
 ---
@@ -100,16 +109,25 @@ const checks = ['rustfmt', 'clippy', 'tests on Linux', 'tests on macOS', 'Rust 1
       <SectionHead num="03" name="Maturity" />
       <div class="grid">
         <h2 class="h2">Tested on every <em>change.</em></h2>
-        <div class="notice-wrap">
-          <div class="notice">
-            <span class="label">Status</span>
-            <p>Version 0.1. Cluster members are fixed once the cluster starts, and they talk to each other without TLS, so keep that port on a private network.</p>
-          </div>
+        <div class="holds">
+          <p class="label holds-head"><span>What the tests hold it to</span><span>Each links to its test</span></p>
+          <ol>
+            {holds.map((h, i) => (
+              <li>
+                <span class="label n">{String(i + 1).padStart(2, '0')}</span>
+                <span class="claim">{h.claim[0]}<em>{h.claim[1]}</em></span>
+                <a class="src" href={`${REPO}/blob/main/${h.file}`}>{h.file}</a>
+              </li>
+            ))}
+          </ol>
         </div>
-        <div class="security">
-          <h3 class="h3">Security</h3>
-          <p>Report a vulnerability privately through GitHub, not in a public issue.</p>
-          <div><a class="btn btn-sm" href={SECURITY}>Report a vulnerability</a></div>
+        <div class="maturity-side">
+          <div class="postmark-slot"><Postmark /></div>
+          <div class="security">
+            <h3 class="h3">Security</h3>
+            <p>Report a vulnerability privately through GitHub, not in a public issue.</p>
+            <div><a class="btn btn-sm" href={SECURITY}>Report a vulnerability</a></div>
+          </div>
         </div>
         <div class="ci">
           <div class="ci-head">
