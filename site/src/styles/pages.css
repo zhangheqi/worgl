@@ -23,15 +23,15 @@
 /* the components as a sheet of stamps, perforated where they meet */
 .sheet-wrap { grid-column: 1 / -1; background: var(--paper-2); padding: clamp(10px, 1.6vw, 18px); position: relative; }
 .sheet-wrap::after { content: ""; position: absolute; inset: 0; pointer-events: none; box-shadow: inset 0 0 0 1px var(--rule); }
-.stamps { list-style: none; margin: 0; padding: 0; display: grid; grid-template-columns: repeat(4, minmax(0, 1fr)); gap: 0; }
+.stamps { list-style: none; margin: 0; padding: 0; display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 0; }
 .stamps > li { min-width: 0; padding: clamp(6px, .8vw, 10px); position: relative; }
 /* perforation between stamps: a row of holes along each cell's right and bottom edge */
 .stamps > li::after { content: ""; position: absolute; right: -4px; top: 0; bottom: 0; width: 8px; z-index: 1;
   background: radial-gradient(circle, var(--paper) 2.4px, transparent 2.9px) 0 2px / 8px 9px repeat-y; }
 .stamps > li::before { content: ""; position: absolute; left: 0; right: 0; bottom: -4px; height: 8px; z-index: 1;
   background: radial-gradient(circle, var(--paper) 2.4px, transparent 2.9px) 2px 0 / 9px 8px repeat-x; }
-.stamps > li:nth-child(4n)::after { display: none; }
-.stamps > li:nth-last-child(-n + 4)::before { display: none; }
+.stamps > li:nth-child(3n)::after { display: none; }
+.stamps > li:nth-last-child(-n + 3)::before { display: none; }
 .stamp-cell { height: 100%; min-height: 236px; display: flex; flex-direction: column; gap: 12px; padding: 16px 16px 14px; background: var(--paper); color: var(--ink); text-decoration: none; position: relative; transition: box-shadow .18s ease, transform .18s ease; }
 .stamp-cell::before { content: ""; position: absolute; inset: 6px; border: 1px solid var(--rule); pointer-events: none; }
 a.stamp-cell:hover { box-shadow: 4px 4px 0 var(--pink); transform: translate(-2px, -2px); }
@@ -53,10 +53,13 @@ a.stamp-cell:hover { box-shadow: 4px 4px 0 var(--pink); transform: translate(-2p
 .stamp-cell.core .path { color: var(--on-cobalt); }
 @media (max-width: 1000px) {
   .stamps { grid-template-columns: repeat(2, minmax(0, 1fr)); }
-  .stamps > li:nth-child(4n)::after { display: block; }
+  .stamps > li:nth-child(3n)::after { display: block; }
   .stamps > li:nth-child(2n)::after { display: none; }
-  .stamps > li:nth-last-child(-n + 4)::before { display: block; }
+  .stamps > li:nth-last-child(-n + 3)::before { display: block; }
   .stamps > li:nth-last-child(-n + 2)::before { display: none; }
+  /* an odd stamp out spans the last row */
+  .stamps > li:last-child:nth-child(odd) { grid-column: 1 / -1; }
+  .stamps > li:last-child:nth-child(odd)::after { display: none; }
 }
 @media (max-width: 560px) {
   .stamps { grid-template-columns: 1fr; }
@@ -90,7 +93,7 @@ a.stamp-cell:hover { box-shadow: 4px 4px 0 var(--pink); transform: translate(-2p
 .ci { grid-column: 1 / -1; display: flex; flex-direction: column; gap: 18px; border-top: 1px solid var(--rule-strong); padding-top: 28px; }
 .ci-head { display: grid; grid-template-columns: minmax(0, 4fr) minmax(0, 8fr); gap: 24px; }
 .ci-head p { color: var(--muted); max-width: 40em; }
-.checks { list-style: none; margin: 0; padding: 0; display: grid; grid-template-columns: repeat(4, minmax(0, 1fr)); gap: 8px; }
+.checks { list-style: none; margin: 0; padding: 0; display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 8px; }
 .checks li { display: flex; align-items: center; gap: 10px; padding: 12px 14px; border: 1px solid var(--rule); font-family: var(--f-mono); font-size: 12px; font-stretch: 87.5%; letter-spacing: .02em; min-width: 0; }
 .checks li::before { content: ""; flex: none; width: 10px; height: 10px; background: var(--cobalt); }
 @media (max-width: 1000px) { .maturity .h2, .notice-wrap, .security, .ci-head { grid-column: 1 / -1; } .ci-head { grid-template-columns: 1fr; } .checks { grid-template-columns: repeat(2, minmax(0, 1fr)); } }
