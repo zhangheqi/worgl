@@ -243,14 +243,25 @@ impl Debug for Registry {
     }
 }
 
-fn lock(dir: &Path) -> Result<File, StoreError> {
+/// The directory's lock, held until it is dropped.
+struct Lock(File);
+
+impl Drop for Lock {
+    fn drop(&mut self) {
+        // A child that another thread is starting holds a copy of the file,
+        // and so the lock, until it execs. Unlocking ends it for every copy.
+        let _ = self.0.unlock();
+    }
+}
+
+fn lock(dir: &Path) -> Result<Lock, StoreError> {
     let file = OpenOptions::new()
         .create(true)
         .truncate(false)
         .write(true)
         .open(dir.join(LOCK))?;
     match file.try_lock() {
-        Ok(()) => Ok(file),
+        Ok(()) => Ok(Lock(file)),
         Err(TryLockError::WouldBlock) => Err(StoreError::Locked),
         Err(TryLockError::Error(error)) => Err(error.into()),
     }
@@ -450,11 +461,11 @@ struct Machine {
     state: State,
     records: watch::Sender<Records>,
     /// The directory's lock, and whoever waits for its release.
-    _lock: (File, oneshot::Sender<()>),
+    _lock: (Lock, oneshot::Sender<()>),
 }
 
 impl Machine {
-    fn open(dir: &Path, lock: File, released: oneshot::Sender<()>) -> Result<Self, StoreError> {
+    fn open(dir: &Path, lock: Lock, released: oneshot::Sender<()>) -> Result<Self, StoreError> {
         let state: State = read_json(dir, SNAPSHOT)?.unwrap_or_default();
         let (records, _) = watch::channel(state.records.clone());
         Ok(Self {

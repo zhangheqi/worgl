@@ -59,8 +59,6 @@ use std::fs::{self, File, OpenOptions, TryLockError};
 use std::io::{self, Write};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use std::thread;
-use std::time::{Duration, Instant};
 
 use sha2::{Digest, Sha256};
 use thiserror::Error;
@@ -152,7 +150,7 @@ pub enum StoreError {
 #[derive(Debug)]
 pub struct StateFiles {
     dir: PathBuf,
-    _lock: File,
+    _lock: Lock,
 }
 
 /// What `snapshot.bin` holds.
@@ -226,7 +224,7 @@ pub struct FileStore {
     events: u64,
     /// What `keys.bin` holds.
     keys: KeyRing,
-    _lock: File,
+    _lock: Lock,
 }
 
 impl FileStore {
@@ -517,30 +515,30 @@ fn unseal_keys(
     Ok(any)
 }
 
-/// How long opening a store waits for its lock before counting the store as
-/// in use.
-const LOCK_WAIT: Duration = Duration::from_secs(1);
+/// A store's lock, held until it is dropped.
+#[derive(Debug)]
+struct Lock(File);
 
-fn lock(dir: &Path) -> Result<File, StoreError> {
+impl Drop for Lock {
+    fn drop(&mut self) {
+        // A child that another thread of this process is starting shares
+        // every open file until it execs, and a lock lasts until every copy
+        // of its file is closed. Unlocking ends it for all copies at once, so
+        // the store can be opened again straight away.
+        let _ = self.0.unlock();
+    }
+}
+
+fn lock(dir: &Path) -> Result<Lock, StoreError> {
     let file = OpenOptions::new()
         .create(true)
         .truncate(false)
         .write(true)
         .open(dir.join(LOCK))?;
-    // A child that another thread of this process is starting shares every
-    // open file, and so this lock, until it execs. A store closed and opened
-    // again meanwhile finds its own lock held for that moment, so a held
-    // lock is tried again for a short while.
-    let deadline = Instant::now() + LOCK_WAIT;
-    loop {
-        match file.try_lock() {
-            Ok(()) => return Ok(file),
-            Err(TryLockError::WouldBlock) if Instant::now() < deadline => {
-                thread::sleep(Duration::from_millis(10));
-            }
-            Err(TryLockError::WouldBlock) => return Err(StoreError::Locked),
-            Err(TryLockError::Error(error)) => return Err(error.into()),
-        }
+    match file.try_lock() {
+        Ok(()) => Ok(Lock(file)),
+        Err(TryLockError::WouldBlock) => Err(StoreError::Locked),
+        Err(TryLockError::Error(error)) => Err(error.into()),
     }
 }
 
@@ -1498,6 +1496,17 @@ mod tests {
             FileStore::open(dir.path(), key, Policy::cash_like()),
             Err(StoreError::Locked)
         ));
+    }
+
+    #[test]
+    fn a_closed_store_opens_again_while_a_copy_of_its_lock_file_is_open() {
+        // As a child that another thread is starting holds one until it execs.
+        let dir = tempfile::tempdir().unwrap();
+        let (key, p) = fresh(dir.path());
+        let copy = p.store._lock.0.try_clone().unwrap();
+        drop(p);
+        PersistentIssuer::open(dir.path(), key, Policy::cash_like()).unwrap();
+        drop(copy);
     }
 
     #[test]
