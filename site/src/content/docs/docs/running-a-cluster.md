@@ -82,8 +82,52 @@ Beside what any server's state directory holds (see
 `cluster.token`; and `registry/`, its copy of the cluster's registry. Each
 mint's directory also holds `vote.json`, the replica's Raft vote.
 
+## Changing the rules
+
+Each member reads a mint's `policy.json` and `mint.json`, its rules and
+rotation period, from its own directory when it starts serving the mint.
+Nothing replicates or compares them. The member leading the mint checks
+requests against its own policy and makes scheduled rotations on its own
+period, and the others apply what it logs, so the rules in force are those
+of whichever member leads. `GET /v1/mints/<mint>/info` on any member shows
+the leader's.
+
+Editing one member is therefore not enough: its rules hold only while it
+leads, and the lead moves, for instance when the leader restarts. A mint
+authority key removed from one member's policy goes on minting whenever a
+member that still lists it leads.
+
+To change a mint's rules:
+
+1. [Pause the mint](../pausing/). The pause is replicated, so the mint
+   refuses mints, transfers, burns and rotations while the members
+   disagree.
+2. Make the same edit to `policy.json`, and to `mint.json` if the period
+   changes, on every member. Compare the files, for instance with
+   `sha256sum`, to be sure they match.
+3. Restart the members one at a time, so that two are always up for the
+   cluster's other mints.
+4. Check that `info` shows the new policy and period, then resume the mint.
+
+A member that has no directory for a mint, because it was stopped or cut
+off from the others when the mint was created, writes one from the
+registry's record once it has the record, and serves the mint straight
+away. It gets the policy and period the mint was created with, not later
+edits. So if a member has no `mints/<mint>/` when you change the rules, keep
+the mint paused until it has written one, make the edit there too, restart
+it, and only then resume.
+
+`receipt_capacity` must match too, though the members apply the same log.
+Each member remembers as many recent transfers and burns as its own policy
+says, and the leader answers a resent one from what it remembers, so with
+different values one leader can answer a resend as before and another with
+`spent`. See
+[Sending a request again](../error-codes/#sending-a-request-again).
+
 ## Limits
 
+- A mint's rules are not replicated: each member keeps its own `policy.json`
+  and `mint.json`. See [Changing the rules](#changing-the-rules).
 - The Raft port speaks plain HTTP and checks only the cluster token, so keep
   it on a network that only the members can reach.
 - The members are fixed once the cluster starts: members cannot be added or

@@ -52,6 +52,16 @@ it minting. The mint keeps its sequence number, so adding it back cannot
 replay its old requests. A request from a key the policy does not list is
 refused with `unknown_authority`.
 
+On a cluster, each member reads its own `policy.json`, and the member
+leading the mint checks requests against its own list. Editing one member
+does not stop a key: it mints again whenever a member that still lists it
+leads. To remove a leaked key, pause the mint, which stops all minting on
+every member at once, make the same edit on every member, restart them one
+at a time, then resume. A member that has no directory for the mint yet
+writes one from the cluster's registry, listing the keys the mint was
+created with, so keep the mint paused until it has and make the edit there
+too. See [Running a cluster](../running-a-cluster/#changing-the-rules).
+
 ## The issuer key
 
 A mint's issuer key is its identity: every note names it, and it names the

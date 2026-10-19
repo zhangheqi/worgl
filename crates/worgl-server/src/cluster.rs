@@ -26,6 +26,18 @@
 //! the mint's group and answers once the group has a leader, or after a
 //! while if it has none yet.
 //!
+//! A mint's `policy.json` and `mint.json` are not replicated. Each member
+//! reads its own when it starts serving the mint, and nothing compares them:
+//! the leader checks requests against its policy and makes scheduled
+//! rotations on its period, and the others apply what it logs. Each member
+//! also remembers as many recent transfers and burns as its own
+//! [`receipt_capacity`](worgl::Policy::receipt_capacity) says, and the
+//! leader answers a resent one from what it remembers. The rules in force
+//! are therefore the leader's: change them alike on every member and
+//! restart each in turn, with the mint paused meanwhile. A member that
+//! writes a mint's directory from the registry gets the policy and period
+//! the mint was created with, not later edits.
+//!
 //! Members send each other Raft's RPCs as HTTP requests to their Raft ports,
 //! with the cluster token. Nothing on that port is encrypted yet, so it must
 //! be reachable by the members only.

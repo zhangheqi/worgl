@@ -151,10 +151,12 @@ a new one within a few seconds; until then, requests are answered
 `503 no_leader`, and sending the same request again is safe. A leader cut off
 from the other members stops taking requests after two seconds without
 hearing from them, and a member that cannot reach the leader says so within a
-few seconds.
+few seconds. A mint's policy and rotation period are not replicated: each
+member reads its own files, and the member leading the mint applies its own,
+so change them identically on every member with the mint paused.
 
-How to start one, create mints on it and what its limits are:
-[Running a cluster](site/src/content/docs/docs/running-a-cluster.md).
+How to start one, create mints on it, change their rules and what its limits
+are: [Running a cluster](site/src/content/docs/docs/running-a-cluster.md).
 
 ## Not covered yet
 
