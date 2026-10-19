@@ -57,11 +57,27 @@ In it:
 
 A mint is built in a hidden directory and renamed into place when complete,
 so a crash never leaves one half made. The server refuses to start if any
-mint fails to open, or if a token is shorter than 32 characters.
+mint fails to open, if `kek.key` is missing, or if a token is shorter than
+32 characters.
 
 ### State from earlier builds
 
-State written by an earlier build of 0.1 still opens:
+A state directory that only builds from before the key-encryption key made
+and served has no `kek.key`, and the server refuses it with
+`…/kek.key is missing`.
+Nothing in such a directory is sealed, so a new key opens it. Give it one,
+as 64 hex digits readable by the server's user only:
+
+```sh
+(umask 077; openssl rand -hex 32 > ./server/kek.key)
+```
+
+Do this only for a single server's directory that never had a `kek.key`.
+A directory that lost its key needs the old one back from a backup, and a
+cluster member's must match the other members' (see
+[Backups](../backups/)).
+
+With a `kek.key`, state written by an earlier build of 0.1 still opens:
 
 - A store from before the log, a snapshot plus a journal, converts to the
   log the first time it is opened.

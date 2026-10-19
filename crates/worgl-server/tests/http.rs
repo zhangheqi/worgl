@@ -757,11 +757,11 @@ async fn the_state_directory_keeps_a_private_kek() {
     assert_eq!(fs::read_to_string(&path).unwrap(), kek);
     server.mint(8, &HolderKey::generate()).await;
 
-    // A state directory from before KEKs gets one when it opens.
+    // Without it the state directory does not open, and no new key is made.
     fs::remove_file(&path).unwrap();
-    let server = server.restart().await;
-    assert!(path.exists());
-    server.mint(8, &HolderKey::generate()).await;
+    let error = AppState::open(server.dir.path(), 1000).err().unwrap();
+    assert!(error.to_string().contains("kek.key is missing"), "{error}");
+    assert!(!path.exists());
 }
 
 #[tokio::test]

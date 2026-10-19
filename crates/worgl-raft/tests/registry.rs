@@ -295,3 +295,31 @@ async fn a_new_leader_carries_on_and_an_open_registry_is_locked() {
         "{error}"
     );
 }
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_leader_that_restarts_alone_adds_nothing() {
+    let mut cluster = Cluster::start().await;
+    let leader = cluster.leader().await;
+    for id in 1..=3 {
+        cluster.stop(id).await;
+    }
+
+    // It takes up its term as leader again, but no majority confirms it, so
+    // nothing reaches its log to commit once the others are back.
+    cluster.open(leader).await;
+    assert_eq!(cluster.leader().await, leader);
+    let error = cluster.members[&leader]
+        .insert(mint(), json!(1))
+        .await
+        .unwrap_err();
+    assert_eq!(error, ReplicaError::Timeout);
+    for id in (1..=3).filter(|&id| id != leader) {
+        cluster.open(id).await;
+    }
+    let mint = mint();
+    assert!(cluster.insert(mint, json!(2)).await);
+    let expected = Records::from([(mint, json!(2))]);
+    for id in 1..=3 {
+        cluster.holds(id, &expected).await;
+    }
+}

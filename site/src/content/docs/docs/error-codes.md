@@ -53,6 +53,8 @@ Errors answer with a status code and a body like:
 | `internal` | 500 | Something else went wrong on the server. |
 | `no_leader` | 503 | On a cluster: no member leading the mint, or the cluster's registry, could be reached, or the leader changed while the request was carried out. Nothing was done. |
 | `timeout` | 503 | On a cluster: the mint's group or the registry did not answer in time. The change may still be made. |
+| `kek_mismatch` | 403 | Only on a cluster member's Raft port, which clients never use: the member that sent the Raft request holds another `kek.key`. See [Running a cluster](../running-a-cluster/#the-key-encryption-key). |
+| `kek_unavailable` | 503 | Only on a cluster member's Raft port: the member could not use its own key-encryption key to check the sender's. The sender tries again later. |
 
 ## Sending a request again
 
