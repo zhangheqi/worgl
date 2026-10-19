@@ -1,0 +1,31 @@
+/*
+ * Two inks: full-width bands alternate cobalt and paper, each holding a
+ * 12-column grid on a 1320px measure. Pink is a third, spot ink, used only
+ * for whatever just changed. Night is the Wörgl 1932 band.
+ */
+:root {
+  --paper: #F3F3EF; --paper-2: #E8E8E1; --ink: #11144A; --muted: #4E5470; --accent-text: #1D35D6;
+  --rule: rgba(17, 20, 74, .16); --rule-strong: rgba(17, 20, 74, .4); --code-bg: #E5E6EE;
+  --cobalt: #1D35D6; --cobalt-deep: #1428A8; --on-cobalt: #F3F3EF; --on-cobalt-muted: rgba(243, 243, 239, .8); --rule-cobalt: rgba(243, 243, 239, .28);
+  --pink: #FF4FA3; --on-pink: #11144A;
+  /* text on a surface that stays light in both themes, such as the field's tooltip */
+  --ink-print: #11144A; --muted-print: #4E5470;
+  --night: #0B0D1F; --on-night: #F3F3EF; --on-night-muted: rgba(243, 243, 239, .72); --rule-night: rgba(243, 243, 239, .16);
+  --hdr-bg: var(--cobalt); --hdr-fg: var(--on-cobalt); --hdr-rule: transparent;
+  --f-serif: "Instrument Serif", "Iowan Old Style", Georgia, serif;
+  --f-sans: "Instrument Sans Variable", "Helvetica Neue", Arial, sans-serif;
+  --f-mono: "Martian Mono Variable", ui-monospace, "SFMono-Regular", Menlo, monospace;
+  --measure: 1320px;
+}
+@media (prefers-color-scheme: dark) {
+  :root:not([data-theme="light"]) {
+    --paper: #0C0E1E; --paper-2: #14172E; --ink: #E7E8F4; --muted: #A1A6C2; --accent-text: #8EA0FF;
+    --rule: rgba(231, 232, 244, .14); --rule-strong: rgba(231, 232, 244, .36); --code-bg: #151938; --night: #05060E;
+    color-scheme: dark;
+  }
+}
+:root[data-theme="dark"] {
+  --paper: #0C0E1E; --paper-2: #14172E; --ink: #E7E8F4; --muted: #A1A6C2; --accent-text: #8EA0FF;
+  --rule: rgba(231, 232, 244, .14); --rule-strong: rgba(231, 232, 244, .36); --code-bg: #151938; --night: #05060E;
+  color-scheme: dark;
+}

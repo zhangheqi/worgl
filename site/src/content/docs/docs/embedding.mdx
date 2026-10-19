@@ -1,0 +1,84 @@
+---
+title: Embedding the library
+description: Run the issuer inside your own Rust program with the worgl crate, in memory or on disk.
+---
+
+import { Code } from '@astrojs/starlight/components';
+import { rustDocExample } from '../../../lib/samples';
+import worglDocs from '../../../../../crates/worgl/src/lib.rs?raw';
+import lifecycle from '../../../../../crates/worgl/examples/lifecycle.rs?raw';
+
+export const example = rustDocExample(worglDocs, '# Example');
+
+The `worgl` crate is the issuer itself: ledger, note format, transfer
+protocol, policy, issuer state machine and crash-safe storage. The server is
+built on it. Embed it when your program should be the mint, rather than talk
+to one over HTTP.
+
+```sh
+cargo add --git https://github.com/zhangheqi/worgl worgl
+```
+
+## A mint and a transfer
+
+<Code code={example} lang="rust" />
+
+This is the example in the crate's documentation, which CI runs. `Issuer`
+keeps no accounts and stores no notes. `HolderKey::generate` makes the
+one-time key a note is bound to, and `TransferRequest` is what its holder
+signs to move it.
+
+## A note's whole life
+
+`cargo run --example lifecycle` walks through a note's whole life: mint,
+split, pay, freeze in the last layer, rotate, replay refused, idle notes
+expiring and refreshed notes living on. CI runs it on every push and pull
+request.
+
+<Code code={lifecycle} lang="rust" title="crates/worgl/examples/lifecycle.rs" />
+
+## Keeping it on disk
+
+`Issuer` lives in memory. For durability, wrap it in `PersistentIssuer`,
+which logs every event before applying it. Each change is an `Event` that
+the issuer plans without side effects, the store writes and flushes to a
+log, and only then the issuer applies. Applying is deterministic and
+checked, so a snapshot plus its log rebuilds the exact same state, and a note
+is never handed out unless the event that created it is on disk.
+
+A store is a directory holding `snapshot.bin`, `log.bin`, `keys.bin` (the
+generation keys' secrets, readable by its owner only) and `lock`, which
+stops two processes from writing the same store. See [Backups](../backups/).
+
+- `PersistentIssuer::create(dir, issuer)` makes a store for a new issuer;
+  `PersistentIssuer::open(dir, key, policy)` opens one.
+- `batch()` starts a group commit: each change takes effect in memory as it
+  is made, and all of them reach the disk in one log entry and one flush.
+  Nothing a batch returns may be handed out before it commits. The server
+  puts every request waiting at the moment of a flush into one batch.
+- `compact()` writes a fresh snapshot and purges the log up to it. Call it
+  after rotations or whenever `log_events()` grows large.
+
+If a flush fails, the issuer is ahead of its log and refuses all further
+changes until it is reopened, which restores exactly what reached the disk.
+
+## Checking signatures outside a lock
+
+To keep signature checks out of a lock, verify with `issuer.verifier()`
+first and pass the `VerifiedTransfer` in. A verifier is bound to the
+issuer's keys and policy as they are when you get it; a rotation adds a key,
+so get a new one after each.
+
+## Minting
+
+`Issuer::mint` mints directly, for code that embeds the issuer. A server
+should take signed mint requests instead: `Issuer::authorized_mint` accepts
+a `MintRequest` signed by a key the policy lists in `mint_authorities`, and
+logs the signature with the note. See
+[Mint authorities and keys](../keys/).
+
+## Reference
+
+The [Rust API reference](../../api/rust/worgl/) documents every module:
+`ledger`, `note`, `keyset`, `transfer`, `policy`, `issuer`, `log`, `kek` and
+`store`.

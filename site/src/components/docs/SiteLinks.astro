@@ -1,0 +1,32 @@
+---
+// Stands in for Starlight's social icons: the site's own pages, then GitHub.
+// It renders in the header on wide screens and in the menu on phones.
+import { REPO, page } from '../../lib/links';
+
+const links = [
+  { href: page('how-it-works/'), label: 'How it works' },
+  { href: page('open-source/'), label: 'Open source' },
+  { href: page('cloud/'), label: 'Cloud', tag: 'not yet' },
+];
+---
+<nav class="site-links" aria-label="Site">
+  {links.map((l) => (
+    <a class="site-link" href={l.href}>
+      {l.label}{l.tag && <span class="label tag">{l.tag}</span>}
+    </a>
+  ))}
+  <a class="site-link gh" href={REPO}>GitHub</a>
+</nav>
+
+<style>
+  .site-links { display: flex; flex-wrap: wrap; align-items: center; gap: 6px 22px; }
+  .site-link { color: var(--sl-color-gray-2); font-size: var(--sl-text-sm); text-decoration: none; white-space: nowrap; padding: 3px 0; border-bottom: 2px solid transparent; }
+  .site-link:hover { color: var(--sl-color-white); border-bottom-color: var(--pink); }
+  .tag { font-size: 9px; border: 1px solid currentColor; padding: 1px 5px; margin-left: 6px; vertical-align: 2px; opacity: .8; }
+  .gh { color: var(--sl-color-white); font-weight: 600; border: 1.5px solid currentColor; padding: 5px 12px; }
+  .gh:hover { border-color: currentColor; box-shadow: 3px 3px 0 var(--pink); }
+  /* In the header, between the phone menu and a wide screen, only GitHub fits beside the search. */
+  @media (max-width: 71.99rem) {
+    :global(.header) .site-link:not(.gh) { display: none; }
+  }
+</style>

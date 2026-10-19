@@ -1,11 +1,26 @@
 name: Site
 
+# The docs import samples from crates/ and show CHANGELOG.md, and the deploy
+# publishes the Rust API reference, so changes there rebuild the site too.
 on:
   push:
     branches: [main]
-    paths: ['site/**', '.github/workflows/site.yml']
+    paths:
+      - 'site/**'
+      - '.github/workflows/site.yml'
+      - 'CHANGELOG.md'
+      - 'crates/**'
+      - 'Cargo.toml'
+      - 'Cargo.lock'
   pull_request:
-    paths: ['site/**', '.github/workflows/site.yml']
+    paths:
+      - 'site/**'
+      - '.github/workflows/site.yml'
+      - 'CHANGELOG.md'
+      - 'crates/worgl/src/lib.rs'
+      - 'crates/worgl/examples/lifecycle.rs'
+      - 'crates/worgl-sdk/src/lib.rs'
+      - 'crates/worgl-client/src/lib.rs'
   workflow_dispatch:
 
 permissions:
@@ -80,6 +95,8 @@ jobs:
           node-version: 22
           cache: npm
           cache-dependency-path: site/package-lock.json
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
       - id: configure
         uses: actions/configure-pages@v5
       - run: npm ci
@@ -87,6 +104,14 @@ jobs:
         env:
           SITE_URL: ${{ steps.configure.outputs.origin }}
           SITE_BASE: ${{ steps.configure.outputs.base_path }}
+      # Nothing is on docs.rs, so the site carries the Rust API reference at
+      # api/rust/, where the docs' sidebar links.
+      - name: build the Rust API reference
+        working-directory: .
+        run: cargo doc --workspace --no-deps --all-features --locked
+      - run: |
+          mkdir -p dist/api
+          cp -R ../target/doc dist/api/rust
       - uses: actions/upload-pages-artifact@v4
         with:
           path: site/dist

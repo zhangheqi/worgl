@@ -1,0 +1,108 @@
+---
+title: Rust SDK
+description: worgl-sdk, the holder's side that keeps the privacy rules, and worgl-client, which runs it against a server and saves it.
+---
+
+import { Code } from '@astrojs/starlight/components';
+import { rustDocExample } from '../../../lib/samples';
+import clientDocs from '../../../../../crates/worgl-client/src/lib.rs?raw';
+import sdkDocs from '../../../../../crates/worgl-sdk/src/lib.rs?raw';
+
+export const purseExample = rustDocExample(clientDocs, '# A payment');
+export const holderExample = rustDocExample(sdkDocs, '# A payment');
+
+Two crates hold notes for a Rust program:
+
+- `worgl-client` talks to a server. `Client` makes one typed call per
+  route, and `Purse` runs a holder over HTTP and saves it after every change.
+  Most programs need only this.
+- `worgl-sdk` is the holder's side with no networking and no files: a note
+  store that requests, pays, receives and refreshes notes while keeping the
+  privacy rules. It runs anywhere, WebAssembly included.
+
+## Add them
+
+Nothing is on crates.io yet. Depend on the crates from git:
+
+```sh
+cargo add --git https://github.com/zhangheqi/worgl worgl worgl-sdk worgl-client
+cargo add tokio --features macros,rt-multi-thread
+```
+
+`worgl-client` runs its requests on Tokio, over rustls with the platform's
+certificate roots. `worgl` brings the shared types, such as `PublicKey` for a
+mint's key and `Note`.
+
+## A payment with a purse
+
+<Code code={purseExample} lang="rust" />
+
+This is the example in `worgl-client`'s crate documentation, which CI
+compiles. A `Purse` wraps a holder, a `Client` and a `Store`. It reads mint
+info by itself, submits each transfer at its time, retries what fails on the
+way (a resent transfer gets the same answer), and saves after every change,
+before handing out anything that depends on it.
+
+`Purse::open` keeps the purse in a JSON file. The file holds every note's
+secret key, and the notes are bearer, so keep it private and encrypted at
+rest. Implement `Store` to keep it elsewhere; the `worgl` command keeps its
+purse encrypted under a passphrase this way.
+
+When the payer submits instead, with `Purse::submit`, it hands the notes from
+the answers to the payee, who checks their signatures and keeps them with
+`Purse::accept`.
+
+## What else a purse does
+
+| Call | What it does |
+|---|---|
+| `request(&mint, amount)` | Asks to be paid: a `PaymentRequest` of fresh keys to send the payer. |
+| `request_at_most(&mint, amount, largest)` | The same, in notes no larger than `largest`. |
+| `pay(&request, spacing)` | Answers a request with a `Payment` of signed transfers. |
+| `receive(&request, &payment)` | Checks a payment, submits each transfer at its time and keeps the notes. |
+| `settle(spacing)` | Sends the transfers not yet seen answered again, and takes in the change. |
+| `submit(&transfers)` / `accept(&notes)` | The payer submits; the payee keeps what it is handed. |
+| `withdraw(&request)` | Stops expecting the notes of a request that will not be paid. |
+| `balance(&mint)` | What the purse holds at a mint, by what it can do now. |
+| `refresh(&mint)` | Pays the notes that die at the next rotation back to the purse, each at a random moment before it. Returns once the last is done, which may be most of a period away. |
+| `plan_refresh(&mint)` | The same plan, for an application with its own scheduler to `submit`. |
+| `prune(&mint)` | Drops notes whose layer the mint has dropped, and returns the value lost. |
+
+The mint keeps answers for its most recent transfers only, so settle before
+many more have passed, or a transfer already applied is refused as `spent`
+and its change is lost.
+
+`Client` errors keep the mint's stable code, such as `spent` or `frozen`, in
+`Error::code`, and `Error::is_transient` says whether trying again later may
+work. See [Error codes](../error-codes/).
+
+`Spacing` sets the seconds between transfers that belong together, as a
+range the purse picks from at random. `Spacing::default()` spreads them; a
+closer spacing lets the mint guess the notes had one owner. See the
+[Privacy model](../privacy/).
+
+## The holder on its own
+
+<Code code={holderExample} lang="rust" />
+
+This example, from `worgl-sdk`'s crate documentation, runs a mint in memory
+in place of the server. CI runs it.
+
+1. The payee calls `Holder::request` and sends the `PaymentRequest`.
+2. The payer calls `Holder::pay` and returns the `Payment`.
+3. The payee checks it with `PaymentRequest::check`, submits each transfer at
+   its time and takes the new notes in with `Holder::absorb`.
+4. The payer gets the same answers, from the payee or by resending its
+   outgoing transfers at the times `Holder::resend` gives, and records them
+   with `Holder::settle`, which takes in its change.
+
+A `MintView`, read from a mint's info, tells the holder which notes can move
+now, which are frozen until the next rotation and which die at it, and
+follows the rotation schedule without asking again. `Holder::refresh` keeps
+notes alive by paying the ones about to expire to the holder itself. The
+holder saves to JSON with its secret keys.
+
+## Reference
+
+The [Rust API reference](../../api/rust/worgl_client/) documents every type
+and call, built from the same crates by `cargo doc`.
