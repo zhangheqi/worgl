@@ -1,6 +1,7 @@
-//! Centralized, account-free e-cash with one bit of issuer state per note.
+//! The core of a Worgl issuer: tokens that cost one bit to track, need no
+//! accounts, and expire if they sit still.
 //!
-//! An issuer signs banknotes with Ed25519 and tracks each one with a single
+//! An issuer signs notes with Ed25519 and tracks each one with a single
 //! bit in a layered bit array: 1 while the note is live, 0 once it is spent.
 //! A transfer clears the input notes' bits and issues new notes to the
 //! receivers, so a note can never be spent twice. There are no accounts and
@@ -24,10 +25,11 @@
 //! for every note and never spend two notes in one transfer. The default
 //! [`Policy::cash_like`] enforces the second rule; see [`policy`].
 //!
-//! This is weaker than blind-signature e-cash, where the issuer cannot link a
-//! note to the one it replaced, and stronger than any account system. Blind
-//! signatures are incompatible with the design: the issuer must choose each
-//! note's serial, because the serial names the note's bit.
+//! This is weaker than blind-signature schemes (Chaum's, Cashu, GNU Taler),
+//! where the issuer cannot link a note to the one it replaced, and stronger
+//! than any account system. Blind signatures are incompatible with the
+//! design: the issuer must choose each note's serial, because the serial
+//! names the note's bit.
 //!
 //! # Layout
 //!

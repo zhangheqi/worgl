@@ -1,6 +1,6 @@
 [package]
 name = "worgl"
-description = "Centralized, account-free e-cash: an issuer that tracks every note with one bit in a layered bitmap"
+description = "The core of a Worgl issuer: tokens that cost one bit each in a layered bitmap, need no accounts, and expire if they sit still"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
@@ -8,7 +8,7 @@ license.workspace = true
 repository.workspace = true
 authors.workspace = true
 readme = "../../README.md"
-keywords = ["ecash", "token", "bitmap", "ed25519", "ledger"]
+keywords = ["token", "issuer", "bitmap", "ed25519", "ledger"]
 categories = ["cryptography", "data-structures"]
 
 [dependencies]
