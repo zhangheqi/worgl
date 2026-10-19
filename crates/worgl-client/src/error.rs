@@ -36,6 +36,10 @@ pub enum Error {
     /// A payment could not be made.
     #[error(transparent)]
     Pay(#[from] PayError),
+    /// A playground faucet hands out notes of an amount its mint cannot
+    /// make as one note.
+    #[error("the faucet hands out notes of {0}, which its mint cannot make as one note")]
+    FaucetAmount(u64),
     /// A payment does not pay what was asked.
     #[error(transparent)]
     Check(#[from] CheckError),

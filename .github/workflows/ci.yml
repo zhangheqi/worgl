@@ -94,7 +94,7 @@ jobs:
           node-version: 22
           cache: npm
           cache-dependency-path: sdk/typescript/package-lock.json
-      - run: cargo build --package worgl-server --locked
+      - run: cargo build --package worgl-server --package worgl-faucet --locked
       - run: npm ci
       - run: npm run build
       - run: npm run check

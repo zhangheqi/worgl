@@ -1,5 +1,6 @@
-// Runs a real worgl-server with one mint for the tests. Build it first with
-// `cargo build -p worgl-server`, or point WORGL_SERVER at the binary.
+// Runs a real worgl-server with one mint for the tests, and a faucet for it.
+// Build them first with `cargo build -p worgl-server -p worgl-faucet`, or
+// point WORGL_SERVER and WORGL_FAUCET_BINARY at the binaries.
 
 import { type ChildProcess, execFileSync, spawn } from 'node:child_process';
 import { mkdtempSync, readFileSync, rmSync } from 'node:fs';
@@ -13,6 +14,9 @@ import { Client, type Purse } from '../src/index.ts';
 const binary =
   process.env.WORGL_SERVER ??
   fileURLToPath(new URL('../../../target/debug/worgl-server', import.meta.url));
+const faucetBinary =
+  process.env.WORGL_FAUCET_BINARY ??
+  fileURLToPath(new URL('../../../target/debug/worgl-faucet', import.meta.url));
 
 export class TestServer {
   readonly url: string;
@@ -21,6 +25,7 @@ export class TestServer {
   readonly #mintKey: string;
   readonly #dir: string;
   readonly #process: ChildProcess;
+  #faucet: ChildProcess | undefined;
   #sequence = 0;
 
   private constructor(url: string, mint: string, token: string, mintKey: string, dir: string, child: ChildProcess) {
@@ -58,21 +63,33 @@ export class TestServer {
       stdio: 'ignore',
     });
     const url = `http://127.0.0.1:${port}`;
-    for (let tries = 0; ; tries += 1) {
-      try {
-        if ((await fetch(`${url}/healthz`)).ok) {
-          break;
-        }
-      } catch {
-        // Not listening yet.
-      }
-      if (tries > 200) {
-        child.kill();
-        throw new Error('worgl-server did not start');
-      }
-      await new Promise((resolve) => setTimeout(resolve, 25));
-    }
+    await healthy(url, child, 'worgl-server');
     return new TestServer(url, mint, token, mintKey, dir, child);
+  }
+
+  /**
+   * Serves a faucet for the mint, signing with its authority key, and
+   * returns a client for it. It hands out notes of 64, 3 an hour per address.
+   * Its sequence numbers are far above {@link mintTo}'s, which the mint then
+   * refuses, so give a faucet a server of its own.
+   */
+  async startFaucet(): Promise<Client> {
+    const port = await freePort();
+    const child = spawn(
+      faucetBinary,
+      [
+        '--mint', this.mint,
+        '--key', this.#mintKey,
+        '--server', this.url,
+        '--listen', `127.0.0.1:${port}`,
+        '--per-address', '3',
+      ],
+      { stdio: 'ignore' },
+    );
+    this.#faucet = child;
+    const url = `http://127.0.0.1:${port}`;
+    await healthy(url, child, 'worgl-faucet');
+    return new Client(url);
   }
 
   client(): Client {
@@ -114,10 +131,32 @@ export class TestServer {
   }
 
   async stop(): Promise<void> {
-    const exited = new Promise((resolve) => this.#process.once('exit', resolve));
-    this.#process.kill();
-    await exited;
+    for (const child of [this.#faucet, this.#process]) {
+      if (child !== undefined && child.exitCode === null) {
+        const exited = new Promise((resolve) => child.once('exit', resolve));
+        child.kill();
+        await exited;
+      }
+    }
     rmSync(this.#dir, { recursive: true, force: true });
+  }
+}
+
+/** Waits until `url` answers its health check. */
+async function healthy(url: string, child: ChildProcess, name: string): Promise<void> {
+  for (let tries = 0; ; tries += 1) {
+    try {
+      if ((await fetch(`${url}/healthz`)).ok) {
+        return;
+      }
+    } catch {
+      // Not listening yet.
+    }
+    if (tries > 200) {
+      child.kill();
+      throw new Error(`${name} did not start`);
+    }
+    await new Promise((resolve) => setTimeout(resolve, 25));
   }
 }
 

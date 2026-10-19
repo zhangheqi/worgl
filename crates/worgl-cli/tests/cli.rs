@@ -1,6 +1,7 @@
 //! The `worgl` binary against a real server on a local port.
 
 use std::fs;
+use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::process::Command;
 
@@ -106,6 +107,26 @@ impl Setup {
             "{}",
             run.stderr
         );
+    }
+
+    /// Serves a faucet for the mint, signing with the authority key, and
+    /// returns its URL.
+    async fn faucet(&self) -> String {
+        let text = fs::read_to_string(self.path("authority.key")).unwrap();
+        let mut secret = [0u8; 32];
+        hex::decode_to_slice(text.trim(), &mut secret).unwrap();
+        let faucet = worgl_faucet::Faucet::new(worgl_faucet::Config {
+            servers: vec![Client::new(&self.url).unwrap()],
+            mint: self.mint,
+            authority: MintKey::from_secret_bytes(&secret),
+            limits: worgl_faucet::Limits::default(),
+            behind_proxy: false,
+        });
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("http://{}", listener.local_addr().unwrap());
+        let app = worgl_faucet::router(faucet).into_make_service_with_connect_info::<SocketAddr>();
+        tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        url
     }
 
     async fn rotate(&self) {
@@ -297,4 +318,28 @@ async fn errors_carry_the_mint_code() {
         .worgl("alice.worgl", &["pay", "-", "--spacing", "9..1"])
         .await;
     assert!(bad.stderr.contains("9 is above 1"), "{}", bad.stderr);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn the_playground_faucet_fills_a_purse() {
+    let setup = Setup::start().await;
+    let faucet = setup.faucet().await;
+    setup.ok("alice.worgl", &["init"]).await;
+    let run = setup
+        .ok("alice.worgl", &["playground", "--faucet", &faucet])
+        .await;
+    assert_eq!(run.stdout.trim(), setup.mint.to_string());
+    assert!(run.stderr.contains("Kept 64"), "{}", run.stderr);
+    assert!(
+        setup
+            .balance("alice.worgl")
+            .await
+            .contains("spendable  64\n")
+    );
+
+    // Without --faucet it asks the server's URL, which here has none.
+    let run = setup.worgl("alice.worgl", &["playground"]).await;
+    assert!(!run.ok);
+    assert!(run.stderr.contains("asking the faucet"), "{}", run.stderr);
+    assert!(setup.balance("alice.worgl").await.contains("expected   0 "));
 }

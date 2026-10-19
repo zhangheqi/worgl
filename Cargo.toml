@@ -22,6 +22,7 @@ authors = ["The Worgl contributors"]
 [workspace.dependencies]
 worgl = { path = "crates/worgl", version = "0.1.0" }
 worgl-client = { path = "crates/worgl-client", version = "0.1.0" }
+worgl-faucet = { path = "crates/worgl-faucet" }
 worgl-raft = { path = "crates/worgl-raft" }
 worgl-sdk = { path = "crates/worgl-sdk", version = "0.1.0" }
 worgl-server = { path = "crates/worgl-server" }

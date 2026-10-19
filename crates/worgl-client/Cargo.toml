@@ -22,6 +22,7 @@ worgl-sdk.workspace = true
 [dev-dependencies]
 axum.workspace = true
 tempfile.workspace = true
+worgl-faucet.workspace = true
 worgl-server.workspace = true
 
 [lints]
