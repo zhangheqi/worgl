@@ -533,7 +533,8 @@ numbers its requests by the clock and keeps no state of its own.
 A playground mint should let untouched notes expire within about a day rather
 than be wiped, so its issuer key never changes: with 4 layers and
 `--rotate-every 28800`, a note nobody moves dies 16 to 24 hours after it was
-minted.
+minted. [`deploy/playground`](deploy/playground) runs one with Docker Compose:
+three members, the faucet and a TLS proxy on one machine, on one address.
 
 ## Not covered yet
 
