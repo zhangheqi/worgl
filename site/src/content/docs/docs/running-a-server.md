@@ -59,6 +59,18 @@ A mint is built in a hidden directory and renamed into place when complete,
 so a crash never leaves one half made. The server refuses to start if any
 mint fails to open, or if a token is shorter than 32 characters.
 
+### State from earlier builds
+
+State written by an earlier build of 0.1 still opens:
+
+- A store from before the log, a snapshot plus a journal, converts to the
+  log the first time it is opened.
+- An issuer restored from a snapshot written before serial indexes were
+  scrambled keeps using bits as indexes, because its notes already carry
+  them.
+- An issuer from before generation keys keeps its existing generations
+  signed by the issuer key until those generations are dropped.
+
 ## Changing the rules
 
 Edit a mint's `policy.json` and restart to change its rules. Missing fields
