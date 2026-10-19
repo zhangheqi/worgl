@@ -21,7 +21,9 @@ use worgl_sdk::{
 /// The notes one holder owns, with their keys; see [`worgl_sdk::Holder`].
 ///
 /// Methods that need to know a mint's state take its `info` as the server
-/// returned it and the current Unix time in seconds.
+/// returned it, whose layers they go by whatever the time. Those that plan
+/// transfers before the mint's next rotation take the Unix time in seconds
+/// to plan from too, by the mint's clock: see [`worgl_sdk::Holder::refresh`].
 #[wasm_bindgen]
 #[derive(Debug, Default)]
 pub struct Holder {
@@ -50,8 +52,8 @@ impl Holder {
     }
 
     /// A payment request for `amount`, one fresh key per note.
-    pub fn request(&mut self, info: &str, now: u64, amount: u64) -> Result<String, JsError> {
-        let view = view(info, now)?;
+    pub fn request(&mut self, info: &str, amount: u64) -> Result<String, JsError> {
+        let view = view(info)?;
         Ok(json(&self.inner.request(&view, amount).map_err(error)?))
     }
 
@@ -60,11 +62,10 @@ impl Holder {
     pub fn request_at_most(
         &mut self,
         info: &str,
-        now: u64,
         amount: u64,
         largest: u64,
     ) -> Result<String, JsError> {
-        let view = view(info, now)?;
+        let view = view(info)?;
         let request = self
             .inner
             .request_at_most(&view, amount, largest)
@@ -83,12 +84,11 @@ impl Holder {
     pub fn pay(
         &mut self,
         info: &str,
-        now: u64,
         request: &str,
         min_secs: u64,
         max_secs: u64,
     ) -> Result<String, JsError> {
-        let view = view(info, now)?;
+        let view = view(info)?;
         let request = parse::<PaymentRequest>(request)?;
         let spacing = Spacing { min_secs, max_secs };
         let payment = self.inner.pay(&view, &request, spacing).map_err(error)?;
@@ -180,28 +180,31 @@ impl Holder {
     }
 
     /// The outgoing transfers to resend before the mint's next rotation,
-    /// each at a random moment before it, as `refresh` spreads its own.
+    /// each at a random moment before it, as `refresh` spreads its own from
+    /// the same `now`.
     #[wasm_bindgen(js_name = dueResends)]
     pub fn due_resends(&self, info: &str, now: u64) -> Result<Vec<Scheduled>, JsError> {
-        let view = view(info, now)?;
+        let view = view(info)?;
         Ok(scheduled(self.inner.due_resends(&view, now)))
     }
 
     /// Pays the mint's notes that die at the next rotation back to fresh
-    /// keys, each at a random moment before it.
+    /// keys, each at a random moment before it, counted from `now` by the
+    /// mint's clock; all at once when `now` is at or past it.
     pub fn refresh(&mut self, info: &str, now: u64) -> Result<Vec<Scheduled>, JsError> {
-        let view = view(info, now)?;
+        let view = view(info)?;
         Ok(scheduled(self.inner.refresh(&view, now)))
     }
 
-    /// Drops the mint's expired notes and returns the value lost.
-    pub fn prune(&mut self, info: &str, now: u64) -> Result<u128, JsError> {
-        Ok(self.inner.prune(&view(info, now)?))
+    /// Drops the notes of the mint whose layer its info says was dropped,
+    /// and returns the value lost.
+    pub fn prune(&mut self, info: &str) -> Result<u128, JsError> {
+        Ok(self.inner.prune(&view(info)?))
     }
 
     /// Value held at the mint, by what it can do now.
-    pub fn balance(&self, info: &str, now: u64) -> Result<Balance, JsError> {
-        let balance = self.inner.balance(&view(info, now)?);
+    pub fn balance(&self, info: &str) -> Result<Balance, JsError> {
+        let balance = self.inner.balance(&view(info)?);
         Ok(Balance {
             spendable: balance.spendable,
             frozen: balance.frozen,
@@ -594,9 +597,10 @@ pub fn note_report(verified: &str) -> Result<NoteReport, JsError> {
     })
 }
 
-fn view(info: &str, now: u64) -> Result<MintView, JsError> {
+/// The view a mint's info gives, as the server answered it.
+fn view(info: &str) -> Result<MintView, JsError> {
     let info = parse::<MintInfo>(info)?;
-    Ok(MintView::new(&info).map_err(error)?.at(now))
+    MintView::new(&info).map_err(error)
 }
 
 fn parse<T: DeserializeOwned>(text: &str) -> Result<T, JsError> {

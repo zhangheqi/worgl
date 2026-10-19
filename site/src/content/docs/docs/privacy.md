@@ -39,8 +39,10 @@ batching transfers blurs this.
 
 The SDKs and `worgl` spread the transfers of one payment at random gaps, 2
 to 60 seconds apart by default, and spread refreshes across the rotation
-period. Closer spacing, `worgl refresh --now`, or a spacing of zero in your
-own code lets the mint link the notes by when they arrive. Outputs are
+period. A refresh made once the rotation's time has come, before the mint
+makes it, has no time left to spread over and sends everything at once.
+Closer spacing, `worgl refresh --now`, or a spacing of zero in your own code
+lets the mint link the notes by when they arrive. Outputs are
 shuffled too, so the payee's notes are not always first.
 
 ## What each party sees

@@ -37,6 +37,39 @@ function now(transfers: ScheduledTransfer[]): ScheduledTransfer[] {
   return transfers.map((transfer) => ({ ...transfer, afterSecs: 0 }));
 }
 
+/** A day, in seconds: a period whose rotations, at midnight UTC, no test waits for. */
+const DAY = 86_400;
+
+/**
+ * Serves `server`'s mint info as a machine whose clock is `skew` seconds
+ * behind the server's would read it: the next rotation and the answer's
+ * `Date` move on by `skew`, which is negative for a clock ahead. It serves
+ * nothing else.
+ */
+async function skewed(
+  server: TestServer,
+  skew: number,
+): Promise<{ client: Client; close: () => Promise<void> }> {
+  const stub = createHttpServer(async (_, response) => {
+    const info = await server.client().infoText(server.mint);
+    const moved = info.replace(
+      /"next_at":(\d+)/,
+      (_, at: string) => `"next_at":${BigInt(at) + BigInt(skew)}`,
+    );
+    response.writeHead(200, {
+      'content-type': 'application/json',
+      date: new Date(Date.now() + skew * 1000).toUTCString(),
+    });
+    response.end(moved);
+  });
+  await new Promise<void>((resolve) => stub.listen(0, '127.0.0.1', resolve));
+  const { port } = stub.address() as AddressInfo;
+  return {
+    client: new Client(`http://127.0.0.1:${port}`),
+    close: () => new Promise((resolve) => stub.close(() => resolve())),
+  };
+}
+
 let server: TestServer;
 before(async () => {
   server = await TestServer.start();
@@ -486,6 +519,82 @@ describe('refresh', () => {
       assert.equal(received.value, 3n);
     } finally {
       await own.stop();
+    }
+  });
+});
+
+describe("a clock off the mint's", () => {
+  // Its own server, whose mint rotates once a day besides on request.
+  let own: TestServer;
+  before(async () => {
+    own = await TestServer.start({}, DAY);
+  });
+  after(async () => {
+    await own.stop();
+  });
+
+  test('ahead of it, drops nothing live', async () => {
+    const alice = await Purse.open(own.client(), quick);
+    await own.fund(alice, 12n, 8n);
+    await own.rotate();
+    await own.rotate();
+    const notes = alice.notes();
+
+    // Ten periods ahead, the clock has passed the next rotation by far, but
+    // the mint has not made it.
+    const stub = await skewed(own, -10 * DAY);
+    try {
+      const ahead = await Purse.open(stub.client, {
+        store: new MemoryStore(alice.toJson()),
+        ...quick,
+      });
+      assert.equal(await ahead.prune(own.mint), 0n);
+      assert.equal(ahead.notes().length, 2);
+      assert.equal((await ahead.balance(own.mint)).expiring, 12n);
+      for (const note of notes) {
+        assert.equal((await own.client().verify(note)).live?.position, 0);
+      }
+
+      // They die at the next rotation the mint makes, so they are
+      // refreshed, and the mint takes the refreshes.
+      const plan = await ahead.planRefresh(own.mint);
+      assert.equal(plan.length, 2);
+      const back = await Purse.open(own.client(), {
+        store: new MemoryStore(ahead.toJson()),
+        ...quick,
+      });
+      const refreshed = await back.submit(now(plan));
+      allAnswered(refreshed, 2);
+      assert.equal(refreshed.value, 12n);
+    } finally {
+      await stub.close();
+    }
+  });
+
+  test('behind it, still refreshes before the rotation', async () => {
+    const alice = await Purse.open(own.client(), quick);
+    await own.fund(alice, 8n, 2n);
+    await own.rotate();
+    await own.rotate();
+
+    // A year behind, the clock would put the next rotation a year further.
+    const stub = await skewed(own, 365 * DAY);
+    try {
+      const behind = await Purse.open(stub.client, {
+        store: new MemoryStore(alice.toJson()),
+        ...quick,
+      });
+      const plan = await behind.planRefresh(own.mint);
+      const nextAt = (await own.client().info(own.mint)).rotation?.nextAt ?? 0n;
+      const left = Number(nextAt) - Math.floor(Date.now() / 1000);
+      const times = plan.map((transfer) => transfer.afterSecs);
+      assert.equal(times.length, 4);
+      assert.ok(
+        times.every((after) => after < left),
+        `${times.join(', ')} with ${left} s left`,
+      );
+    } finally {
+      await stub.close();
     }
   });
 });

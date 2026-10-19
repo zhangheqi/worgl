@@ -117,6 +117,23 @@ export class Client {
     return this.#send('GET', `/v1/mints/${mint}/info`);
   }
 
+  /**
+   * {@link infoText}, with the time the server answered: Unix seconds by its
+   * clock, from the answer's `Date` header, or by this machine's if the
+   * answer has no `Date` it can read. A browser reads the `Date` of an
+   * answer from another origin only if the answer carries
+   * `Access-Control-Expose-Headers: Date`. Plan the transfers due before the
+   * mint's next rotation from it, as `Purse.planRefresh` does: the mint
+   * rotates by its server's clock, and planning by this machine's, if it
+   * runs slow, can put them past the rotation.
+   */
+  async infoTextAndTime(mint: string): Promise<{ info: string; time: bigint }> {
+    const { text, date } = await this.#answer('GET', `/v1/mints/${mint}/info`);
+    const answered = date === null ? Number.NaN : Date.parse(date);
+    const ms = Number.isNaN(answered) ? Date.now() : answered;
+    return { info: text, time: BigInt(Math.floor(ms / 1000)) };
+  }
+
   /** `GET /v1/mints/{mint}/info`, read. */
   async info(mint: string): Promise<MintInfo> {
     const summary = mintSummary(await this.infoText(mint));
@@ -238,6 +255,16 @@ export class Client {
   }
 
   async #send(method: string, path: string, body?: string, token?: string): Promise<string> {
+    return (await this.#answer(method, path, body, token)).text;
+  }
+
+  /** Sends a request and returns the answer and its `Date` header, or rejects with the refusal. */
+  async #answer(
+    method: string,
+    path: string,
+    body?: string,
+    token?: string,
+  ): Promise<{ text: string; date: string | null }> {
     const headers: Record<string, string> = {};
     if (body !== undefined) {
       headers['content-type'] = 'application/json';
@@ -256,7 +283,7 @@ export class Client {
     const response = await this.#fetch(`${this.baseUrl}${path}`, init);
     const text = await response.text();
     if (response.ok) {
-      return text;
+      return { text, date: response.headers.get('date') };
     }
     let code = 'http';
     let message = text.trim().slice(0, 512);

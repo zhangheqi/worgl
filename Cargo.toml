@@ -37,6 +37,7 @@ ed25519-dalek = "3"
 getrandom = "0.4"
 hex = "0.4"
 http-body-util = "0.1"
+httpdate = "1"
 openraft = { version = "0.9.25", features = ["serde", "storage-v2", "generic-snapshot-data"] }
 proptest = "1"
 reqwest = { version = "0.13", default-features = false, features = ["http2", "json", "rustls"] }

@@ -297,7 +297,7 @@ export class Purse {
   /** Value held at `mint`, from its info. */
   async balance(mint: string): Promise<Balance> {
     const info = await this.client.infoText(mint);
-    const balance = this.#holder.balance(info, now());
+    const balance = this.#holder.balance(info);
     try {
       return {
         spendable: balance.spendable,
@@ -320,7 +320,7 @@ export class Purse {
   async request(mint: string, amount: bigint): Promise<PaymentRequest> {
     const info = await this.client.infoText(mint);
     const json = await this.#change(
-      () => this.#holder.request(info, now(), amount),
+      () => this.#holder.request(info, amount),
       (json) => this.#holder.withdraw(json),
     );
     return PaymentRequest.from(json);
@@ -330,7 +330,7 @@ export class Purse {
   async requestAtMost(mint: string, amount: bigint, largest: bigint): Promise<PaymentRequest> {
     const info = await this.client.infoText(mint);
     const json = await this.#change(
-      () => this.#holder.requestAtMost(info, now(), amount, largest),
+      () => this.#holder.requestAtMost(info, amount, largest),
       (json) => this.#holder.withdraw(json),
     );
     return PaymentRequest.from(json);
@@ -382,7 +382,7 @@ export class Purse {
   async pay(request: PaymentRequest, spacing: Spacing = DEFAULT_SPACING): Promise<Payment> {
     const info = await this.client.infoText(request.mint);
     const json = await this.#changeOrRestore(() =>
-      this.#holder.pay(info, now(), request.json, BigInt(spacing.minSecs), BigInt(spacing.maxSecs)),
+      this.#holder.pay(info, request.json, BigInt(spacing.minSecs), BigInt(spacing.maxSecs)),
     );
     return Payment.from(json);
   }
@@ -487,14 +487,21 @@ export class Purse {
    * reading its info, and saves the plan. The outgoing transfers to resend
    * before that rotation join it; if the save fails, only the refreshes are
    * undone. Submit it with {@link submit}.
+   *
+   * The times are planned by the server's clock, from the `Date` of its info
+   * answer ({@link Client.infoTextAndTime}), so this machine's clock, slow
+   * or fast, moves none of them past the rotation. When that `Date` cannot
+   * be read, as in a browser calling a mint on another origin that does not
+   * expose it, they are planned by this machine's clock instead. Once the
+   * rotation's time has come and the mint has not made it yet, they are all
+   * due at once.
    */
   async planRefresh(mint: string): Promise<ScheduledTransfer[]> {
-    const info = await this.client.infoText(mint);
-    const at = now();
+    const { info, time } = await this.client.infoTextAndTime(mint);
     const { refreshes, resends } = await this.#changeOrRestore(() => {
       // Before the refreshes join the outgoing transfers.
-      const resends = read(this.#holder.dueResends(info, at));
-      return { refreshes: read(this.#holder.refresh(info, at)), resends };
+      const resends = read(this.#holder.dueResends(info, time));
+      return { refreshes: read(this.#holder.refresh(info, time)), resends };
     });
     return [...refreshes, ...resends].sort((a, b) => a.afterSecs - b.afterSecs);
   }
@@ -512,12 +519,14 @@ export class Purse {
   /**
    * Drops `mint`'s expired notes and returns the value lost. It also stops
    * waiting for unconfirmed change that would sit in a dropped layer, and
-   * stops keeping notes owed to payees once their layer is dropped.
+   * stops keeping notes owed to payees once their layer is dropped. The info
+   * alone decides, not this machine's clock: a note goes, with its key, only
+   * once the mint has dropped its layer.
    */
   async prune(mint: string): Promise<bigint> {
     const info = await this.client.infoText(mint);
     return this.#change(
-      () => this.#holder.prune(info, now()),
+      () => this.#holder.prune(info),
       () => {},
     );
   }
@@ -670,11 +679,6 @@ function read(transfers: Scheduled[]): ScheduledTransfer[] {
     transfer.free();
     return copy;
   });
-}
-
-/** Seconds since the Unix epoch, as mints count time. */
-function now(): bigint {
-  return BigInt(Math.floor(Date.now() / 1000));
 }
 
 function sleep(ms: number): Promise<void> {

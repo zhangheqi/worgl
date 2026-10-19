@@ -39,9 +39,13 @@ export class TestServer {
 
   /**
    * Creates a state directory with one four-layer mint and serves it. The
-   * mint's policy fields not in `policy` take their cash-like defaults.
+   * mint's policy fields not in `policy` take their cash-like defaults. With
+   * `rotateEvery`, the mint also rotates every that many seconds.
    */
-  static async start(policy: Record<string, unknown> = {}): Promise<TestServer> {
+  static async start(
+    policy: Record<string, unknown> = {},
+    rotateEvery?: number,
+  ): Promise<TestServer> {
     const dir = mkdtempSync(join(tmpdir(), 'worgl-ts-'));
     const state = join(dir, 'state');
     execFileSync(binary, ['init', '--state', state], { stdio: 'ignore' });
@@ -52,6 +56,7 @@ export class TestServer {
       [
         'create-mint', '--state', state, '--layers', '4', '--layer-size', '1024',
         '--policy', policyFile,
+        ...(rotateEvery === undefined ? [] : ['--rotate-every', String(rotateEvery)]),
       ],
       { encoding: 'utf8' },
     );

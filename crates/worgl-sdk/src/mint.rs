@@ -42,8 +42,10 @@ pub struct NoLayers;
 /// whether a note can move now and when it dies.
 ///
 /// A note's layer follows from its serial: generations are consecutive, so a
-/// note of generation `g` sits at position `g − oldest`. A view read once
-/// stays accurate across scheduled rotations through [`MintView::at`].
+/// note of generation `g` sits at position `g − oldest`. A view holds the
+/// layers as the mint's info gave them, and no clock moves it: a note counts
+/// as expired only once the info says its layer was dropped. After a
+/// rotation, read the info again.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct MintView {
     /// The mint's issuer key.
@@ -98,23 +100,6 @@ impl MintView {
         })
     }
 
-    /// The view at Unix time `now`, after the rotations the schedule says
-    /// have happened since this view was read. A paused mint skips its
-    /// scheduled rotations, so its view does not move.
-    pub fn at(&self, now: u64) -> Self {
-        let mut view = self.clone();
-        if let Some(schedule) = &mut view.schedule
-            && !view.paused
-            && schedule.period_secs > 0
-            && now >= schedule.next_at
-        {
-            let passed = (now - schedule.next_at) / schedule.period_secs + 1;
-            view.oldest += passed;
-            schedule.next_at += passed * schedule.period_secs;
-        }
-        view
-    }
-
     /// Generation of the last layer, where transferred notes land.
     pub fn newest(&self) -> u64 {
         self.oldest + u64::from(self.layers) - 1
@@ -153,21 +138,22 @@ impl MintView {
         }
     }
 
-    /// Seconds from `now` until the next scheduled rotation, if there is
-    /// one.
+    /// Seconds from Unix time `now` until the next scheduled rotation, if
+    /// the mint has a schedule and is not paused. 0 once `now` reaches that
+    /// rotation, however far past: as far as the view knows, the mint has
+    /// not made it yet, so it is the one about to come.
     pub fn until_rotation(&self, now: u64) -> Option<u64> {
-        let view = self.at(now);
-        let schedule = view.schedule.filter(|_| !view.paused)?;
+        let schedule = self.schedule.filter(|_| !self.paused)?;
         Some(schedule.next_at.saturating_sub(now))
     }
 
     /// Unix time, in seconds, of the scheduled rotation that drops a note's
-    /// layer, as the view at `now` sees it. `None` when the mint has no
-    /// schedule or is paused, or the note is not live in that view.
-    pub fn expires_at(&self, note: &Note, now: u64) -> Option<u64> {
-        let view = self.at(now);
-        let schedule = view.schedule.filter(|_| !view.paused)?;
-        let rotations = match view.state(note) {
+    /// layer, counted from the next rotation the view names. `None` when the
+    /// mint has no schedule or is paused, or the note is not live in the
+    /// view.
+    pub fn expires_at(&self, note: &Note) -> Option<u64> {
+        let schedule = self.schedule.filter(|_| !self.paused)?;
+        let rotations = match self.state(note) {
             NoteState::Spendable {
                 expires_after_rotations,
             }

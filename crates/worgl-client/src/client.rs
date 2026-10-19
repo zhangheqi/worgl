@@ -2,7 +2,7 @@
 
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
-use reqwest::{Method, RequestBuilder, Response};
+use reqwest::{Method, RequestBuilder, Response, header};
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 use worgl::issuer::LayerSummary;
@@ -165,11 +165,35 @@ impl Client {
         self.send(self.mint_route(Method::GET, mint, "info")).await
     }
 
-    /// The mint's info as a [`MintView`] of now, ready for a
-    /// [`Holder`](worgl_sdk::Holder).
+    /// The mint's info as a [`MintView`], ready for a
+    /// [`Holder`](worgl_sdk::Holder): its layers are the ones the server
+    /// answered with, whatever this machine's clock says.
     pub async fn view(&self, mint: &PublicKey) -> Result<MintView, Error> {
         let info = self.info(mint).await?;
-        Ok(MintView::new(&info.mint_info())?.at(unix_now()))
+        Ok(MintView::new(&info.mint_info())?)
+    }
+
+    /// [`info`](Self::info), with the time the server answered: Unix seconds
+    /// by its clock, from the answer's `Date` header, or by this machine's
+    /// if the answer has no `Date` it can read.
+    pub async fn info_and_time(&self, mint: &PublicKey) -> Result<(Info, u64), Error> {
+        let answer = self
+            .answer(self.mint_route(Method::GET, mint, "info"))
+            .await?;
+        let time = answered_at(&answer).unwrap_or_else(unix_now);
+        Ok((answer.json().await?, time))
+    }
+
+    /// [`view`](Self::view), with the time the server answered, as
+    /// [`info_and_time`](Self::info_and_time) reads it. Plan the transfers
+    /// due before the mint's next rotation from it, as in
+    /// [`Holder::refresh`](worgl_sdk::Holder::refresh): the mint rotates by
+    /// its server's clock, and planning by this machine's, if it runs slow
+    /// by more than the [margin](worgl_sdk::REFRESH_MARGIN_SECS), can put
+    /// them past the rotation.
+    pub async fn view_and_time(&self, mint: &PublicKey) -> Result<(MintView, u64), Error> {
+        let (info, time) = self.info_and_time(mint).await?;
+        Ok((MintView::new(&info.mint_info())?, time))
     }
 
     /// `GET /v1/mints/{mint}/keys`: the keys that sign the mint's live
@@ -259,13 +283,26 @@ impl Client {
     }
 
     async fn send<T: DeserializeOwned>(&self, request: RequestBuilder) -> Result<T, Error> {
+        Ok(self.answer(request).await?.json().await?)
+    }
+
+    /// Sends a request and returns the answer, or the refusal as an error.
+    async fn answer(&self, request: RequestBuilder) -> Result<Response, Error> {
         let response = request.send().await?;
         if response.status().is_success() {
-            Ok(response.json().await?)
+            Ok(response)
         } else {
             Err(Error::Refused(refusal(response).await))
         }
     }
+}
+
+/// When an answer was made, in seconds since the Unix epoch by the server's
+/// clock, from its `Date` header.
+fn answered_at(response: &Response) -> Option<u64> {
+    let date = response.headers().get(header::DATE)?.to_str().ok()?;
+    let time = httpdate::parse_http_date(date).ok()?;
+    Some(time.duration_since(UNIX_EPOCH).ok()?.as_secs())
 }
 
 /// Reads an error answer, keeping what it says even without a code.
@@ -293,7 +330,7 @@ async fn refusal(response: Response) -> Refusal {
 }
 
 /// Seconds since the Unix epoch, as mints count time.
-pub(crate) fn unix_now() -> u64 {
+fn unix_now() -> u64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map_or(0, |elapsed| elapsed.as_secs())

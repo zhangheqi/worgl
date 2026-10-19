@@ -269,7 +269,8 @@ impl Cluster {
     }
 
     /// Sends the request in `parts` and `body` to the member whose public
-    /// API is at `api`, and returns its answer.
+    /// API is at `api`, and returns its answer, with its `Content-Type` and
+    /// `Date`.
     async fn relay(&self, api: &str, parts: &Parts, body: Bytes) -> reqwest::Result<Response> {
         let path = parts.uri.path_and_query().map_or("/", |path| path.as_str());
         let mut request = self
@@ -285,13 +286,15 @@ impl Cluster {
         }
         let answer = request.send().await?;
         let status = answer.status();
-        let content_type = answer.headers().get(header::CONTENT_TYPE).cloned();
+        let headers = answer.headers().clone();
         let bytes = answer.bytes().await?;
         let mut response = (status, bytes).into_response();
-        if let Some(content_type) = content_type {
-            response
-                .headers_mut()
-                .insert(header::CONTENT_TYPE, content_type);
+        // The leader's `Date` too: clients plan by it, as the mint rotates by
+        // the leader's clock, not this member's.
+        for name in [header::CONTENT_TYPE, header::DATE] {
+            if let Some(value) = headers.get(&name) {
+                response.headers_mut().insert(name, value.clone());
+            }
         }
         Ok(response)
     }
@@ -736,5 +739,37 @@ where
             closed = cancel => return Err(closed.into()),
         };
         answer.map_err(|error| RemoteError::new(self.target, error).into())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn a_relayed_answer_keeps_the_leaders_date() {
+        // A leader whose clock is far from this member's.
+        const DATE: &str = "Sun, 06 Nov 1994 08:49:37 GMT";
+        let answer = || async { ([(header::DATE, DATE)], Json("answered")) };
+        let leader = axum::Router::new().route("/v1/info", axum::routing::get(answer));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let api = listener.local_addr().unwrap().to_string();
+        tokio::spawn(async move { axum::serve(listener, leader).await.unwrap() });
+
+        let cluster = Cluster {
+            config: ClusterConfig {
+                node: 2,
+                members: BTreeMap::new(),
+            },
+            token: String::new(),
+            client: reqwest::Client::new(),
+            forwarder: reqwest::Client::new(),
+        };
+        let request = axum::http::Request::get("/v1/info").body(()).unwrap();
+        let (parts, ()) = request.into_parts();
+        let response = cluster.relay(&api, &parts, Bytes::new()).await.unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(response.headers()[header::DATE], DATE);
+        assert_eq!(response.headers()[header::CONTENT_TYPE], "application/json");
     }
 }

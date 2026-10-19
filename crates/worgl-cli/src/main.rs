@@ -288,8 +288,9 @@ async fn run(cli: Cli) -> Result<()> {
             out,
         } => {
             let request: PaymentRequest = read_json(&request)?;
-            // For the deadline; read first, so nothing fails once the payment is out.
-            let view = purse.client().view(&request.mint).await?;
+            // For the deadline, by the mint's clock; read first, so nothing
+            // fails once the payment is out.
+            let (view, now) = purse.client().view_and_time(&request.mint).await?;
             let payment = match purse.pay(&request, spacing).await {
                 Err(error @ worgl_client::Error::Pay(PayError::Paid(key))) => {
                     let holder = purse.holder();
@@ -326,8 +327,7 @@ async fn run(cli: Cli) -> Result<()> {
                 request.amount(),
                 payment.transfers.len()
             );
-            let now = unix_now();
-            if let Some(by) = settle_by(&view, &payment, now) {
+            if let Some(by) = settle_by(&view, &payment) {
                 let when = match by.saturating_sub(now) {
                     0 => "now".to_owned(),
                     left => format!("within {}", duration(left)),
@@ -551,7 +551,8 @@ async fn run(cli: Cli) -> Result<()> {
 }
 
 async fn info(client: &Client, mint: &PublicKey) -> Result<()> {
-    let info = client.info(mint).await?;
+    // For the time to the next rotation, by the mint's clock.
+    let (info, now) = client.info_and_time(mint).await?;
     println!("mint        {}", info.issuer);
     println!(
         "state       {}",
@@ -561,7 +562,7 @@ async fn info(client: &Client, mint: &PublicKey) -> Result<()> {
         Some(schedule) => println!(
             "rotation    every {}, next in {}",
             duration(schedule.period_secs),
-            duration(schedule.next_at.saturating_sub(unix_now()))
+            duration(schedule.next_at.saturating_sub(now))
         ),
         None => println!("rotation    on request only"),
     }
@@ -585,7 +586,8 @@ async fn info(client: &Client, mint: &PublicKey) -> Result<()> {
 }
 
 async fn balance(purse: &Purse<Vault>, mint: &PublicKey) -> Result<()> {
-    let view = purse.client().view(mint).await?;
+    // For the time to the next rotation, by the mint's clock.
+    let (view, now) = purse.client().view_and_time(mint).await?;
     let balance = purse.holder().balance(&view);
     println!("spendable  {}", balance.spendable);
     println!(
@@ -616,7 +618,7 @@ async fn balance(purse: &Purse<Vault>, mint: &PublicKey) -> Result<()> {
             balance.unknown
         );
     }
-    if let Some(left) = view.until_rotation(unix_now()) {
+    if let Some(left) = view.until_rotation(now) {
         println!("next rotation in {}", duration(left));
     }
     Ok(())
@@ -849,12 +851,12 @@ fn announce(transfers: &[ScheduledTransfer]) {
 /// When to have settled a payment by: the refresh margin before the
 /// rotation that drops the first of the notes it spends, if the mint
 /// rotates on a schedule.
-fn settle_by(view: &MintView, payment: &Payment, now: u64) -> Option<u64> {
+fn settle_by(view: &MintView, payment: &Payment) -> Option<u64> {
     payment
         .transfers
         .iter()
         .flat_map(|t| &t.request.inputs)
-        .filter_map(|spend| view.expires_at(&spend.note, now))
+        .filter_map(|spend| view.expires_at(&spend.note))
         .min()
         .map(|at| at.saturating_sub(REFRESH_MARGIN_SECS))
 }
@@ -1085,12 +1087,6 @@ fn duration(secs: u64) -> String {
         3600..86_400 => format!("{} h {} min", secs / 3600, secs % 3600 / 60),
         _ => format!("{} d {} h", secs / 86_400, secs % 86_400 / 3600),
     }
-}
-
-fn unix_now() -> u64 {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map_or(0, |elapsed| elapsed.as_secs())
 }
 
 fn micros_now() -> u64 {

@@ -578,6 +578,9 @@ pub(crate) struct Mint {
     backend: Backend,
     changes: mpsc::Sender<Job>,
     token: Box<str>,
+    /// The schedule as the rotation clock last set it, which trails a
+    /// scheduled rotation until the rotation is answered (see
+    /// [`info`](Self::info)).
     schedule: RwLock<Option<RotationSchedule>>,
 }
 
@@ -778,17 +781,37 @@ impl Mint {
         }
     }
 
+    /// The mint's info. Its next scheduled rotation is worked out in the same
+    /// read of the issuer as its layers: the later of the clock's and the one
+    /// after the last scheduled rotation the issuer logged.
     pub(crate) async fn info(&self) -> Result<Info, ApiError> {
-        let rotation = *self.schedule.read().unwrap_or_else(|e| e.into_inner());
-        self.read(move |issuer| Info {
-            issuer: *issuer.public_key(),
-            sequence: issuer.sequence(),
-            mint_layer: issuer.mint_position(),
-            layers: issuer.layers(),
-            supply: issuer.supply(),
-            policy: issuer.policy().clone(),
-            rotation,
-            paused: issuer.is_paused(),
+        let schedule = *self.schedule.read().unwrap_or_else(|e| e.into_inner());
+        self.read(move |issuer| {
+            // The clock moves its schedule on once a scheduled rotation is
+            // answered, so it trails that rotation's layers for a while. The
+            // issuer logs each one with the boundary it was due at, so the
+            // rotation after that boundary is the next; the clock's is later
+            // only for a boundary it passed without rotating, on a restart or
+            // while the mint was paused.
+            let rotation = schedule.map(|schedule| {
+                let logged = issuer
+                    .last_scheduled_rotation()
+                    .map_or(0, |due| due.saturating_add(schedule.period_secs));
+                RotationSchedule {
+                    next_at: schedule.next_at.max(logged),
+                    ..schedule
+                }
+            });
+            Info {
+                issuer: *issuer.public_key(),
+                sequence: issuer.sequence(),
+                mint_layer: issuer.mint_position(),
+                layers: issuer.layers(),
+                supply: issuer.supply(),
+                policy: issuer.policy().clone(),
+                rotation,
+                paused: issuer.is_paused(),
+            }
         })
         .await
     }
