@@ -59,6 +59,8 @@ use std::fs::{self, File, OpenOptions, TryLockError};
 use std::io::{self, Write};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use std::thread;
+use std::time::{Duration, Instant};
 
 use sha2::{Digest, Sha256};
 use thiserror::Error;
@@ -515,16 +517,30 @@ fn unseal_keys(
     Ok(any)
 }
 
+/// How long opening a store waits for its lock before counting the store as
+/// in use.
+const LOCK_WAIT: Duration = Duration::from_secs(1);
+
 fn lock(dir: &Path) -> Result<File, StoreError> {
     let file = OpenOptions::new()
         .create(true)
         .truncate(false)
         .write(true)
         .open(dir.join(LOCK))?;
-    match file.try_lock() {
-        Ok(()) => Ok(file),
-        Err(TryLockError::WouldBlock) => Err(StoreError::Locked),
-        Err(TryLockError::Error(error)) => Err(error.into()),
+    // A child that another thread of this process is starting shares every
+    // open file, and so this lock, until it execs. A store closed and opened
+    // again meanwhile finds its own lock held for that moment, so a held
+    // lock is tried again for a short while.
+    let deadline = Instant::now() + LOCK_WAIT;
+    loop {
+        match file.try_lock() {
+            Ok(()) => return Ok(file),
+            Err(TryLockError::WouldBlock) if Instant::now() < deadline => {
+                thread::sleep(Duration::from_millis(10));
+            }
+            Err(TryLockError::WouldBlock) => return Err(StoreError::Locked),
+            Err(TryLockError::Error(error)) => return Err(error.into()),
+        }
     }
 }
 
