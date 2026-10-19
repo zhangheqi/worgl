@@ -1,0 +1,31 @@
+---
+// A note, byte by byte: scripts/note-bytes.ts. Used inside the Storage section's grid.
+import '../../styles/figures/note.css';
+---
+<div class="note-bytes" data-note-bytes>
+  <figure class="note-fig">
+    <div class="bytes" data-part="bytes" role="img" aria-label="The 149 bytes of one note, coloured by field: version, mint key, generation, index, amount, holder key and signature."></div>
+    <ul class="legend" data-part="legend" aria-label="Note fields"></ul>
+    <figcaption class="byte-read" data-part="read" aria-live="polite">Note 1291:238066, byte by byte. Hover or tap a field to see what it holds.</figcaption>
+  </figure>
+  <div class="storage-side">
+    <slot />
+    <div class="share">
+      <div class="share-frame">
+        <span class="label muted">The mint's share, to scale</span>
+        <div class="bigbit" data-part="bit" role="img" aria-label="The note's bit, drawn at one eighth the area of one byte"></div>
+        <div class="bit-meta"><span class="ser">bit for <span data-part="bit-serial">1291:238066</span></span><span class="val" data-part="bit-state">1, live</span></div>
+      </div>
+      <div><button class="btn btn-sm" type="button" data-part="bit-btn">Spend the note</button></div>
+    </div>
+  </div>
+</div>
+
+<style>
+  .note-bytes { display: contents; }
+</style>
+
+<script>
+  import { mountNoteBytes } from '../../scripts/note-bytes';
+  document.querySelectorAll<HTMLElement>('[data-note-bytes]').forEach(mountNoteBytes);
+</script>

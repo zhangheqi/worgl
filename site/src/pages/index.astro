@@ -1,0 +1,229 @@
+---
+import Page from '../layouts/Page.astro';
+import SectionHead from '../components/SectionHead.astro';
+import LiveField from '../components/figures/LiveField.astro';
+import NoteBytes from '../components/figures/NoteBytes.astro';
+import StampLab from '../components/figures/StampLab.astro';
+import { DISCUSSIONS, README, REPO, page } from '../lib/links';
+import '../styles/figures/lineage.css';
+import '../styles/figures/strip.css';
+import '../styles/code.css';
+import '../styles/home.css';
+
+const expire = [...'expire.'];
+---
+<Page>
+  <section class="band cobalt hero edge edge-paper" data-tone="cobalt">
+    <div class="wrap grid">
+      <p class="eyebrow label"><span>Open source</span><span>Rust and TypeScript</span><span>v0.1</span></p>
+      <h1 class="display">One bit per token.<br />No accounts.<br />Idle tokens <em class="expire"><span class="sr-only">expire.</span><span aria-hidden="true">{expire.map((ch, i) => <span class="l" style={`--i:${i}`}>{ch}</span>)}</span></em></h1>
+      <div class="hero-side">
+        <p class="lede">Worgl is an open-source issuer for the credits, quotas and points that services and agents hand each other. It keeps one bit per token. Tokens change hands with no accounts, under a fresh key every time, and a token that sits still expires.</p>
+        <div class="ctas">
+          <a class="btn btn-solid-paper" href={REPO}>Read the code</a>
+          <a class="btn" href={page('how-it-works/')}>How it works</a>
+        </div>
+        <p class="status-top">0.1. Not yet independently security reviewed. Don't use it to hold anything you can't afford to lose.</p>
+      </div>
+    </div>
+    <LiveField>A simulated mint running in this page, with a rotation every 12 seconds. Brighter notes are worth more. Hover a bit to read its note and click a lit one to spend it. Then stop moving for a few seconds and watch what happens to idle notes.</LiveField>
+  </section>
+
+  <section class="band paper storage edge edge-cobalt" id="storage" data-tone="paper">
+    <div class="wrap">
+      <SectionHead num="01" name="Storage" />
+      <div class="grid">
+        <h2 class="h2">You hold 149 bytes.<br />The mint keeps <em>one bit</em><span class="big-bit-glyph" aria-hidden="true"></span></h2>
+        <NoteBytes>
+          <p class="body">The holder keeps the note: the mint's key, a serial, an amount, the holder's one-time key and the mint's signature. The mint keeps none of it. It keeps one bit per note, 1 while the note is live and 0 once it is spent, so checking a note is a signature check and one bit read.</p>
+        </NoteBytes>
+        <div class="stats3">
+          <div><b>512 KiB</b><span>Four layers of 2²⁰ bits, holding over four million notes in flight. <a class="fig-link" href={README.efficiency}>README</a></span></div>
+          <div><b>0.65 µs</b><span>To map a serial to its bit and read it, in a release build. <a class="fig-link" href={README.efficiency}>README</a></span></div>
+          <div><b>0 notes</b><span>Stored by the mint. It keeps bits, a few counters and recent receipts. <a class="fig-link" href={REPO}>README</a></span></div>
+        </div>
+      </div>
+    </div>
+  </section>
+
+  <section class="band cobalt privacy edge edge-paper" id="privacy" data-tone="cobalt">
+    <div class="wrap">
+      <SectionHead num="02" name="Privacy" />
+      <div class="grid">
+        <h2 class="h2">The mint sees every hop.<br />It never sees <em>who.</em></h2>
+        <p class="lede intro muted">There are no accounts to look anyone up in. Every note is bound to a fresh one-time key, so the mint can follow how value moves without knowing whose it is.</p>
+        <figure class="lineage">
+          <div class="lineage-frame"><svg data-lineage aria-hidden="true"></svg></div>
+          <figcaption>Every box is a note under its own one-time key. The mint can draw these lines. It can't say which boxes belong to the same holder.</figcaption>
+        </figure>
+        <ol class="rules">
+          <li><h3>A fresh key for every note</h3><p>Each note is bound to a one-time key of whoever receives it. No key is used twice, so no key names an owner.</p></li>
+          <li><h3>One note per transfer</h3><p>Spending two notes together would tell the mint they had one owner. The default policy refuses it.</p></li>
+          <li><h3>Transfers spread out in time</h3><p>The SDKs submit the parts of one payment, and the refreshes before a rotation, at random moments.</p></li>
+        </ol>
+        <div class="spectrum">
+          <div class="spec-ends label"><span>The issuer sees more</span><span>The issuer sees less</span></div>
+          <div class="spec-row">
+            <div><h3>Account ledgers</h3><p>Every balance has a name. The issuer knows who holds what.</p></div>
+            <div><h3>Worgl</h3><p>Sees each note's lineage, never its holder. While holders keep the three rules, it can't tell that two unrelated notes share an owner.</p></div>
+            <div><h3>Blind signatures</h3><p>Chaum, Cashu, GNU Taler. The issuer can't even link a note to the one it replaced.</p></div>
+          </div>
+          <p class="timing">Blind signatures don't fit this design: the mint has to choose each note's serial, because the serial names the note's bit. Timing still shows, too. Three notes sent to one payee in the same second invite a guess, which is why the SDKs space them out. <a class="fig-link" href={README.privacy}>README</a></p>
+        </div>
+      </div>
+    </div>
+  </section>
+
+  <section class="band paper circ edge edge-night" id="circulation" data-tone="paper">
+    <div class="wrap">
+      <SectionHead num="03" name="Circulation" />
+      <div class="grid">
+        <h2 class="h2">Every rotation drops a <em>layer.</em></h2>
+        <p class="intro body muted">The bits are split into layers, oldest first. New notes land in the second-to-last layer, and a transfer issues its outputs one layer on. The last layer is frozen until the next rotation, which drops the oldest layer and every note still in it.</p>
+        <StampLab />
+        <div class="presets">
+          <div class="built"><h3 class="h3">Built for</h3><p class="body muted">One setting, the rotation period, sets both how fast tokens can move and how long they can sit still. Three uses, with a setting each:</p></div>
+          <div class="tbl-wrap">
+            <table>
+              <thead><tr><th class="label" scope="col">Use</th><th class="label" scope="col">Rotation</th><th class="label" scope="col">Layers</th><th class="label" scope="col">Idle tokens die within</th></tr></thead>
+              <tbody>
+                <tr><td>API quotas<span class="sub">Sell quota as tokens a customer splits across its systems. Quota nobody uses lapses.</span></td><td class="n">1 minute</td><td class="n">60</td><td>an hour</td></tr>
+                <tr><td>Agent credits<span class="sub">Agents and services that pay per call, with no account per agent.</span></td><td class="n">1 hour</td><td class="n">168</td><td>a week</td></tr>
+                <tr><td>Points that circulate<span class="sub">Rewards worth more moving than hoarded, because idle points expire.</span></td><td class="n">1 day</td><td class="n">30</td><td>a month</td></tr>
+              </tbody>
+            </table>
+          </div>
+        </div>
+      </div>
+    </div>
+  </section>
+
+  <section class="band night origin edge edge-paper" id="origin" data-tone="night">
+    <div class="wrap">
+      <SectionHead num="04" name="Origin" />
+      <div class="grid">
+        <h2>Wörgl, <em>1932.</em></h2>
+        <div class="story">
+          <p>In the summer of 1932, deep in the Depression, the Austrian town of Wörgl began paying for public works with notes of its own.</p>
+          <p>The notes carried a cost borrowed from the economist Silvio Gesell. Each month the holder had to buy a stamp worth 1% of the note and stick it on, or the note stopped being valid. Holding one cost money, so nobody held them for long.</p>
+          <p>The notes kept moving. Mayor Michael Unterguggenberger's experiment ran until Austria's central bank ended it in September 1933.</p>
+        </div>
+        <div class="strip-wrap">
+          <div class="strip" data-strip></div>
+          <p class="strip-cap">One stamp a month. An illustration, not a replica of the note.</p>
+        </div>
+        <p class="closing">Wörgl stamped its notes every month. Worgl drops a layer <em>every rotation.</em></p>
+        <div class="origin-foot">
+          <p class="sources">Sources: <a href="https://en.wikipedia.org/wiki/W%C3%B6rgl">Wörgl on Wikipedia</a> and <a href="https://wiki.p2pfoundation.net/Worgl_Shillings">Wörgl Shillings on the P2P Foundation wiki</a>. They differ on the exact day in September 1933.</p>
+          <a class="btn btn-sm" href={page('why-worgl/')}>Why Worgl</a>
+        </div>
+      </div>
+    </div>
+  </section>
+
+  <section class="band paper build" id="build" data-tone="paper">
+    <div class="wrap">
+      <SectionHead num="05" name="Build" />
+      <div class="grid">
+        <h2 class="h2">Built in the <em>open.</em></h2>
+        <div class="intro">
+          <p class="body muted">A Rust workspace with a TypeScript SDK, dual-licensed MIT or Apache-2.0. Nothing is on crates.io or npm yet, so build it from the repository.</p>
+          <div class="term-box">
+            <div class="term-bar"><span class="label">Try it locally</span><button class="copy" type="button" data-copy="#try-it">Copy</button></div>
+            <pre class="term" id="try-it" data-text={'git clone https://github.com/zhangheqi/worgl\ncd worgl && cargo run --example lifecycle'}><span class="p">$ </span>git clone https://github.com/zhangheqi/worgl
+<span class="p">$ </span>cd worgl &amp;&amp; cargo run --example lifecycle
+<span class="c"># mint, split, pay, freeze, rotate, expire</span></pre>
+          </div>
+        </div>
+        <div class="steps">
+          <div><span class="num">1</span><h3 class="h3">Request</h3><p>The payee asks for the amount as notes, each to a fresh key of its own.</p></div>
+          <div><span class="num">2</span><h3 class="h3">Pay</h3><p>The payer signs one transfer per note it spends, each with a time to submit it.</p></div>
+          <div><span class="num">3</span><h3 class="h3">Settle</h3><p>The mint clears each input's bit and issues the new notes. A resent request gets the same answer.</p></div>
+        </div>
+        <div class="codebox">
+          <div class="tabs" role="tablist" aria-label="Code examples" data-tabs>
+            <button role="tab" type="button" id="t-ts" aria-controls="p-ts" aria-selected="true">TypeScript</button>
+            <button role="tab" type="button" id="t-rs" aria-controls="p-rs" aria-selected="false" tabindex="-1">Rust</button>
+            <button role="tab" type="button" id="t-cli" aria-controls="p-cli" aria-selected="false" tabindex="-1">CLI</button>
+          </div>
+          <div class="panel" role="tabpanel" id="p-ts" aria-labelledby="t-ts" tabindex="0"><pre><span class="k">import</span> {'{'} Client, Purse {'}'} <span class="k">from</span> <span class="s">'worgl'</span>;
+<span class="k">import</span> {'{'} FileStore {'}'} <span class="k">from</span> <span class="s">'worgl/node'</span>;
+
+<span class="k">const</span> client = <span class="k">new</span> Client(<span class="s">'https://mint.example.com'</span>);
+<span class="k">const</span> alice = <span class="k">await</span> Purse.open(client, {'{'} store: <span class="k">new</span> FileStore(<span class="s">'alice.json'</span>) {'}'});
+<span class="k">const</span> bob = <span class="k">await</span> Purse.open(client, {'{'} store: <span class="k">new</span> FileStore(<span class="s">'bob.json'</span>) {'}'});
+
+<span class="k">const</span> request = <span class="k">await</span> bob.request(mint, 5n);          <span class="c">// Bob sends request.json to Alice</span>
+<span class="k">const</span> payment = <span class="k">await</span> alice.pay(request);             <span class="c">// Alice sends payment.json to Bob</span>
+<span class="k">const</span> received = <span class="k">await</span> bob.receive(request, payment); <span class="c">// checks, submits at its times, keeps</span>
+<span class="k">await</span> alice.settle();                                 <span class="c">// later: Alice takes in her change</span></pre></div>
+          <div class="panel" role="tabpanel" id="p-rs" aria-labelledby="t-rs" tabindex="0" hidden><pre><span class="k">let</span> client = Client::new(<span class="s">"https://mint.example.com"</span>)?;
+<span class="k">let</span> alice = Purse::open(client.clone(), <span class="s">"alice.json"</span>)?;
+<span class="k">let</span> bob = Purse::open(client, <span class="s">"bob.json"</span>)?;
+
+<span class="k">let</span> request = bob.request(&amp;mint, 5).<span class="k">await</span>?;                 <span class="c">// Bob → Alice</span>
+<span class="k">let</span> payment = alice.pay(&amp;request, Spacing::default()).<span class="k">await</span>?; <span class="c">// Alice → Bob</span>
+bob.receive(&amp;request, &amp;payment).<span class="k">await</span>?;                     <span class="c">// checks, submits, keeps</span>
+alice.settle(Spacing::default()).<span class="k">await</span>?;                    <span class="c">// later: her change</span></pre></div>
+          <div class="panel" role="tabpanel" id="p-cli" aria-labelledby="t-cli" tabindex="0" hidden><pre>worgl init                                     <span class="c"># each side, once</span>
+worgl request $MINT 5 -o request.json          <span class="c"># payee → send request.json</span>
+worgl pay request.json -o payment.json         <span class="c"># payer → send payment.json</span>
+worgl receive request.json payment.json        <span class="c"># payee: checks, submits, keeps</span>
+worgl settle                                   <span class="c"># payer, later: takes in the change</span>
+worgl balance $MINT
+worgl refresh $MINT                            <span class="c"># once per rotation period</span></pre></div>
+        </div>
+        <div class="figs">
+          <div><b>17,000/s</b><span>Transfers through the server on a 4-core cloud VM with 64 clients. <a class="fig-link" href={README.efficiency}>README</a></span></div>
+          <div><b>41,000/s</b><span>Transfers the library alone commits, in batches of 256. <a class="fig-link" href={README.efficiency}>README</a></span></div>
+          <div><b>2 of 3</b><span>Cluster members that hold a transfer on disk before it is answered. <a class="fig-link" href={README.cluster}>README</a></span></div>
+        </div>
+        <div class="parts">
+          <h3 class="h3">Seven crates and a package</h3>
+          <div><code>worgl</code><span>Ledger, note format, transfer protocol, policy and crash-safe storage.</span></div>
+          <div><code>worgl-server</code><span>An HTTP server that hosts many mints side by side.</span></div>
+          <div><code>worgl-raft</code><span>Raft replication, so three members keep every mint.</span></div>
+          <div><code>worgl-sdk</code><span>The holder's side, with the privacy rules built in.</span></div>
+          <div><code>worgl-client</code><span>Typed calls for every route, and a purse over HTTP.</span></div>
+          <div><code>worgl-cli</code><span>A command-line purse in a passphrase-encrypted file.</span></div>
+          <div><code>worgl-wasm</code><span>The SDK core compiled to WebAssembly.</span></div>
+          <div><code>sdk/typescript</code><span>The TypeScript SDK for Node and browsers.</span></div>
+        </div>
+        <div class="isnt">
+          <h3 class="h3">What Worgl is not</h3>
+          <ul>
+            <li><b>Not a blockchain.</b> Each mint has one issuer and one ledger, run by whoever runs the mint. Nothing is mined.</li>
+            <li><b>Not money.</b> Worgl never sells, buys or redeems tokens. What a token is worth is up to whoever mints it.</li>
+            <li><b>Not untraceable.</b> The issuer sees each token's lineage from hop to hop. It never learns who holds them.</li>
+            <li><b>Not reviewed yet.</b> Version 0.1 has had no independent security review.</li>
+          </ul>
+        </div>
+      </div>
+    </div>
+  </section>
+
+  <section class="band paper cloud edge edge-cobalt" id="cloud" data-tone="paper">
+    <div class="wrap">
+      <div class="stamp">
+        <div class="stamp-l">
+          <span class="tag label">Worgl Cloud · Not available yet</span>
+          <h2>Your mints, run for you.</h2>
+        </div>
+        <div class="stamp-r">
+          <p>Worgl Cloud will run your mints for you, replicated across three zones, on the same open server. It is not available yet. Tell us what you'd build.</p>
+          <div class="ctas"><a class="btn btn-solid-paper" href={DISCUSSIONS}>Tell us on GitHub</a><a class="btn" href={page('cloud/')}>What it will promise</a></div>
+        </div>
+      </div>
+    </div>
+  </section>
+</Page>
+
+<script>
+  import { mountLineage } from '../scripts/lineage';
+  import { mountStrip } from '../scripts/stamp-strip';
+  import { mountCopy, mountTabs } from '../scripts/tabs';
+  document.querySelectorAll<SVGSVGElement>('svg[data-lineage]').forEach(mountLineage);
+  document.querySelectorAll<HTMLElement>('[data-strip]').forEach(mountStrip);
+  document.querySelectorAll<HTMLElement>('[data-tabs]').forEach(mountTabs);
+  document.querySelectorAll<HTMLButtonElement>('button[data-copy]').forEach(mountCopy);
+</script>

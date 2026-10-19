@@ -1,0 +1,5 @@
+---
+interface Props { num: string; name: string }
+const { num, name } = Astro.props;
+---
+<div class="sec-head"><span class="label">{num}</span><span class="rule"></span><span class="label">{name}</span><svg class="reg" viewBox="0 0 14 14" aria-hidden="true"><circle cx="7" cy="7" r="4" fill="none" stroke="currentColor" /><path d="M7 0v14M0 7h14" stroke="currentColor" /></svg></div>

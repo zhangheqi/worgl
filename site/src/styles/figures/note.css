@@ -1,0 +1,33 @@
+/* A note's 149 bytes, coloured by field, and the mint's one bit drawn to scale. */
+.bytes { display: grid; grid-template-columns: repeat(15, minmax(0, 1fr)); gap: 3px; font-family: var(--f-mono); font-size: 11px; font-stretch: 75%; }
+.bytes .b { aspect-ratio: 1; display: grid; place-items: center; line-height: 1; user-select: none; transition: opacity .2s, box-shadow .2s; cursor: default; }
+.bytes[data-hl]:not([data-hl=""]) .b:not(.on) { opacity: .28; }
+.bytes .b.on { box-shadow: 0 0 0 2px var(--pink); }
+.f-ver { background: var(--ink); color: var(--paper); }
+.f-iss { background: var(--cobalt); color: var(--on-cobalt); }
+.f-gen { background: color-mix(in srgb, var(--cobalt) 62%, var(--paper)); color: var(--on-cobalt); }
+.f-idx { background: color-mix(in srgb, var(--cobalt) 40%, var(--paper)); color: var(--ink); }
+.f-amt { background: transparent; box-shadow: inset 0 0 0 1.5px var(--cobalt); color: var(--accent-text); }
+.bytes .b.f-amt.on { box-shadow: inset 0 0 0 1.5px var(--cobalt), 0 0 0 2px var(--pink); }
+.f-hol { background: color-mix(in srgb, var(--cobalt) 16%, var(--paper)); color: var(--ink); }
+.f-sig { background: radial-gradient(circle, color-mix(in srgb, var(--ink) 30%, transparent) 1px, transparent 1.3px) 0 0 / 4px 4px; color: var(--ink); }
+.legend { list-style: none; margin: 0; padding: 0; display: flex; flex-wrap: wrap; gap: 6px; }
+.legend button { display: inline-flex; align-items: center; gap: 8px; border: 1px solid var(--rule); background: transparent; padding: 6px 10px; font-size: 13.5px; cursor: pointer; }
+.legend button:hover, .legend button[aria-pressed="true"] { border-color: var(--pink); }
+.legend .sw { width: 12px; height: 12px; display: inline-block; }
+.legend em { font-style: normal; font-family: var(--f-mono); font-size: 10.5px; color: var(--muted); font-stretch: 87.5%; }
+.byte-read { font-size: 15px; color: var(--muted); min-height: 3em; }
+.byte-read b { color: var(--ink); font-weight: 600; }
+.share { display: flex; flex-direction: column; gap: 14px; }
+.share-frame { position: relative; aspect-ratio: 3 / 2; border: 1px dashed var(--rule-strong); display: grid; grid-template-rows: auto 1fr auto; padding: 14px 16px; max-width: 100%; }
+.share-frame .bigbit { place-self: center; }
+.bit-meta { display: flex; justify-content: space-between; align-items: baseline; gap: 12px; flex-wrap: wrap; }
+.bigbit { width: calc(var(--cell, 48px) / 2.828); aspect-ratio: 1; background: var(--cobalt); position: relative; transition: background-color .3s; }
+.bigbit.spent { background: transparent; box-shadow: inset 0 0 0 2px var(--cobalt); }
+.bigbit.flash { animation: bitflash .9s ease-out; }
+@keyframes bitflash { 0% { box-shadow: 0 0 0 0 var(--pink), inset 0 0 0 999px var(--pink); } 100% { box-shadow: 0 0 0 22px transparent; } }
+.bigbit.spent.flash { animation: bitflash2 .9s ease-out; }
+@keyframes bitflash2 { 0% { box-shadow: inset 0 0 0 2px var(--cobalt), 0 0 0 0 var(--pink); } 100% { box-shadow: inset 0 0 0 2px var(--cobalt), 0 0 0 22px transparent; } }
+.bit-meta .val { font-family: var(--f-serif); font-size: clamp(28px, 2.6vw, 40px); line-height: 1; }
+.bit-meta .ser { font-family: var(--f-mono); font-size: 12.5px; font-stretch: 87.5%; }
+@media (max-width: 640px) { .bytes { grid-template-columns: repeat(10, minmax(0, 1fr)); font-size: 10px; } }

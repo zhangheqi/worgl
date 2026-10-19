@@ -1,0 +1,10 @@
+---
+// The wordmark drawn in bits: the same glyphs as the footer's canvas, 4px apart.
+import { wordBitmap } from '../scripts/word';
+
+const bm = wordBitmap();
+let d = '';
+for (let y = 0; y < bm.h; y++) for (let x = 0; x < bm.w; x++) if (bm.at(x, y)) d += `M${x * 4} ${y * 4}h3v3h-3z`;
+const w = bm.w * 4 - 1, h = bm.h * 4 - 1;
+---
+<svg class="logo" viewBox={`0 0 ${w} ${h}`} width={w} height={h} aria-hidden="true"><path fill="currentColor" d={d} /></svg>
