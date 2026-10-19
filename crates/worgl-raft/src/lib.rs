@@ -197,7 +197,9 @@ impl fmt::Debug for SnapshotData {
 /// Timings and snapshot policy for a group on one network: heartbeats every
 /// 250 ms, an election after 1 to 2 s without one, a minute to send a
 /// snapshot, and a snapshot every 10,000 entries (and after every rotation,
-/// which [`Replica`] asks for).
+/// which [`Replica`] asks for). A leader's lease is the longest election
+/// timeout: one that has not heard from a majority for that long refuses
+/// changes and reads, since the others may have elected a new leader.
 pub fn default_config() -> openraft::Config {
     openraft::Config {
         cluster_name: "worgl".into(),

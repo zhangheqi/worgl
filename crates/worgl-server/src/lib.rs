@@ -52,12 +52,13 @@
 //! once a majority of the members hold it on disk, and a read once the
 //! leader has confirmed it still leads, so no answer is lost when a member
 //! fails and none reflects less than an earlier one. While a mint has no
-//! leader, as for a second or two after its leader fails, its requests are
-//! answered `503 no_leader`, and sending them again is safe. Members also
-//! serve [`raft_router`] on a port of their own, for each other only.
-//! Creating a mint goes through the cluster's registry, from which every
-//! member writes and serves the new mint; a creation answered `503 timeout`
-//! may have made a mint, so list the mints before creating another.
+//! leader, as for a few seconds after its leader fails or is cut off from
+//! the other members, its requests are answered `503 no_leader`, and
+//! sending them again is safe. Members also serve [`raft_router`] on a port
+//! of their own, for each other only. Creating a mint goes through the
+//! cluster's registry, from which every member writes and serves the new
+//! mint; a creation answered `503 timeout` may have made a mint, so list the
+//! mints before creating another.
 
 pub mod cluster;
 pub mod files;

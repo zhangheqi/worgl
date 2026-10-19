@@ -90,8 +90,9 @@ pub enum ReplicaError {
         /// Where to reach it.
         node: Option<BasicNode>,
     },
-    /// The group did not answer in time, as when a leader is cut off from
-    /// the rest of it. A batch may still commit, so send the same requests
+    /// The group did not answer in time, or this replica stopped hearing
+    /// from a majority while it waited, as when a leader is cut off from the
+    /// rest of it. A batch may still commit, so send the same requests
     /// again: a resent transfer, burn or authorized mint is carried out
     /// once.
     #[error("the group did not answer in time")]
@@ -122,6 +123,10 @@ pub struct Replica {
     kek: Arc<dyn Kek>,
     timeout: Duration,
     heartbeat: Duration,
+    /// How long a leader may go without hearing from a majority and still
+    /// count as one: the longest a member waits for the leader's heartbeat
+    /// before it may help elect another.
+    lease: Duration,
     /// Asks openraft for the snapshots the state machine wants.
     snapshots: JoinHandle<()>,
     /// Closes once the state machine has released the directory.
@@ -158,6 +163,7 @@ impl Replica {
             .map_err(|error| OpenError::Config(Box::new(error)))?;
         let config = Arc::new(config);
         let heartbeat = Duration::from_millis(config.heartbeat_interval);
+        let lease = Duration::from_millis(config.election_timeout_max);
         let files = StateFiles::open(&dir)?;
         let public = key.public_key();
         let (wanted, mut snapshots) = mpsc::unbounded_channel();
@@ -199,6 +205,7 @@ impl Replica {
             kek,
             timeout,
             heartbeat,
+            lease,
             snapshots,
             released: Mutex::new(Some(released)),
         })
@@ -220,7 +227,9 @@ impl Replica {
     }
 
     /// Whether this replica leads its group, as far as it knows. A leader
-    /// cut off from the rest may not know yet that it no longer does.
+    /// cut off from the rest stops counting as one once it has gone a lease
+    /// (see [`default_config`]) without hearing from a majority, since the
+    /// others may have elected a new one by then.
     pub fn is_leader(&self) -> bool {
         self.leading().is_ok()
     }
@@ -312,14 +321,37 @@ impl Replica {
             .unwrap_or_else(|poisoned| poisoned.into_inner())
     }
 
-    /// The current term, if this replica leads in it as far as it knows.
+    /// The current term, if this replica leads in it as far as it knows and
+    /// its lease has not lapsed.
     fn leading(&self) -> Result<u64, ReplicaError> {
         let metrics = self.raft.metrics();
         let metrics = metrics.borrow();
-        if metrics.state == ServerState::Leader {
+        if metrics.state == ServerState::Leader && !self.lapsed(&metrics) {
             return Ok(metrics.current_term);
         }
         Err(self.not_leader(&metrics))
+    }
+
+    /// Whether this replica leads but has not heard from a majority for
+    /// longer than its lease. Requests to it then fail at once, rather than
+    /// wait for a group it cannot reach.
+    fn lapsed(&self, metrics: &RaftMetrics<NodeId, BasicNode>) -> bool {
+        metrics.state == ServerState::Leader
+            && metrics
+                .millis_since_quorum_ack
+                .is_some_and(|millis| Duration::from_millis(millis) > self.lease)
+    }
+
+    /// Returns once this replica's lease has lapsed. openraft refreshes the
+    /// time since a majority answered on every tick, a heartbeat and a half
+    /// apart, so this looks once a heartbeat.
+    async fn lapse(&self) {
+        loop {
+            tokio::time::sleep(self.heartbeat).await;
+            if self.lapsed(&self.raft.metrics().borrow()) {
+                return;
+            }
+        }
     }
 
     fn not_leader(&self, metrics: &RaftMetrics<NodeId, BasicNode>) -> ReplicaError {
@@ -356,7 +388,7 @@ impl Replica {
                     // Too few members answered within one heartbeat interval,
                     // which a member busy syncing its disk is enough for. Ask
                     // again while this replica still leads; one cut off from
-                    // the group asks until the caller's timeout.
+                    // the group stops once its lease lapses.
                     self.leading()?;
                     tokio::time::sleep(self.heartbeat).await;
                 }
@@ -510,26 +542,32 @@ impl Batch<'_> {
             keys: std::mem::take(&mut self.keys),
         };
         let replica = self.replica;
-        let written =
-            tokio::time::timeout(replica.timeout, replica.raft.client_write(request)).await;
+        // A leader cut off while it waits gives up once its lease lapses: the
+        // entry may still commit, under a new leader or once it is back.
+        let written = tokio::select! {
+            written = tokio::time::timeout(replica.timeout, replica.raft.client_write(request)) => {
+                written.ok()
+            }
+            () = replica.lapse() => None,
+        };
         let outcome = match written {
-            Err(_) => Err(ReplicaError::Timeout),
-            Ok(Ok(response))
+            None => Err(ReplicaError::Timeout),
+            Some(Ok(response))
                 if response.data.applied.len() == count
                     && response.data.applied.iter().all(|&applied| applied) =>
             {
                 Ok(())
             }
-            Ok(Ok(_)) => Err(ReplicaError::Stale),
+            Some(Ok(_)) => Err(ReplicaError::Stale),
             // The entry never reached the log, or a new leader removed it.
-            Ok(Err(RaftError::APIError(ClientWriteError::ForwardToLeader(forward)))) => {
+            Some(Err(RaftError::APIError(ClientWriteError::ForwardToLeader(forward)))) => {
                 Err(ReplicaError::NotLeader {
                     leader: forward.leader_id,
                     node: forward.leader_node,
                 })
             }
-            Ok(Err(RaftError::APIError(error))) => Err(ReplicaError::Stopped(error.to_string())),
-            Ok(Err(RaftError::Fatal(fatal))) => Err(ReplicaError::Stopped(fatal.to_string())),
+            Some(Err(RaftError::APIError(error))) => Err(ReplicaError::Stopped(error.to_string())),
+            Some(Err(RaftError::Fatal(fatal))) => Err(ReplicaError::Stopped(fatal.to_string())),
         };
         if outcome.is_err() {
             *self.planner = None;
