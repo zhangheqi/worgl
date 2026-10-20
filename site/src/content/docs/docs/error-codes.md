@@ -108,3 +108,15 @@ changes nothing, so nothing happens twice.
   answer and can hand the notes over: `worgl receive` writes the payer's
   change, and `worgl submit` the payee's notes, each kept with
   `worgl accept` (`Purse::accept` or `purse.accept` in the SDKs).
+- A purse acts on the refusal of a transfer it made. One refused as `spent`
+  or `expired` with status 409 is dropped, since the note it spends is gone
+  either way, but the keys of its change are kept, so change handed over
+  later is still taken in. One refused as `policy` while the policy the mint
+  publishes refuses it too is cancelled and its note taken back. Any other
+  refusal leaves it outgoing, to send again: `unknown_mint` and `unissued`,
+  for one, say nothing about the transfer, only about the server, and the
+  mint never answers `unauthorized` or `duplicate_input` to a transfer a
+  purse signed, so those come from something else, such as a gateway.
+  `Refused::outcome` in Rust and `outcome` in TypeScript say what was done,
+  and `worgl` prints it (see
+  [Refused transfers](../command-line/#refused-transfers)).

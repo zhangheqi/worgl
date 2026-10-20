@@ -1,6 +1,7 @@
 //! The client and purse against a real server on a local port.
 
 use std::io;
+use std::net::SocketAddr;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::time::{Duration, Instant};
@@ -9,12 +10,15 @@ use axum::Json;
 use axum::http::{StatusCode, header};
 use axum::response::IntoResponse;
 use serde_json::json;
+use tokio::net::TcpListener;
+use tokio::sync::oneshot;
+use tokio::task::JoinHandle;
 use worgl::{
     HolderKey, Issuer, IssuerKey, LedgerConfig, MintKey, MintRequest, Note, NoteStatus, Output,
     Policy, PublicKey, TransferRequest,
 };
-use worgl_client::{Client, Error, MemoryStore, Purse, Retry, Store, Submitted};
-use worgl_sdk::{ScheduledTransfer, Spacing};
+use worgl_client::{Client, Error, MemoryStore, Outcome, Purse, Retry, Store, Submitted};
+use worgl_sdk::{PayError, PaymentRequest, ScheduledTransfer, Spacing};
 use worgl_server::{AppState, MintSpec, init_state, router};
 
 /// No waiting between transfers.
@@ -32,11 +36,28 @@ const QUICK: Retry = Retry {
 /// A server on a local port with one mint.
 struct Server {
     url: String,
+    address: SocketAddr,
     mint: PublicKey,
     token: String,
     authority: MintKey,
     sequence: AtomicU64,
-    _dir: tempfile::TempDir,
+    /// Stops serving, and the task that ends once the state is let go.
+    serving: Option<(oneshot::Sender<()>, JoinHandle<()>)>,
+    dir: tempfile::TempDir,
+}
+
+/// Serves `state` on `listener` until told to stop.
+fn serve(listener: TcpListener, state: AppState) -> (oneshot::Sender<()>, JoinHandle<()>) {
+    let (stop, stopped) = oneshot::channel::<()>();
+    let serving = tokio::spawn(async move {
+        axum::serve(listener, router(state))
+            .with_graceful_shutdown(async {
+                stopped.await.ok();
+            })
+            .await
+            .unwrap()
+    });
+    (stop, serving)
 }
 
 impl Server {
@@ -61,17 +82,46 @@ impl Server {
             })
             .await
             .unwrap();
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let url = format!("http://{}", listener.local_addr().unwrap());
-        tokio::spawn(async move { axum::serve(listener, router(state)).await.unwrap() });
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
         Self {
-            url,
+            url: format!("http://{address}"),
+            address,
             mint: created.mint,
             token: created.token,
             authority,
             sequence: AtomicU64::new(0),
-            _dir: dir,
+            serving: Some(serve(listener, state)),
+            dir,
         }
+    }
+
+    /// Stops serving, changes the mint's policy on disk as its operator
+    /// would, and serves again at the same address.
+    async fn restart_with(&mut self, edit: impl FnOnce(&mut Policy)) {
+        let (stop, serving) = self.serving.take().unwrap();
+        stop.send(()).unwrap();
+        serving.await.unwrap();
+        let file = self
+            .dir
+            .path()
+            .join("mints")
+            .join(self.mint.to_string())
+            .join("policy.json");
+        let mut policy: Policy =
+            serde_json::from_str(&std::fs::read_to_string(&file).unwrap()).unwrap();
+        edit(&mut policy);
+        std::fs::write(&file, serde_json::to_string(&policy).unwrap()).unwrap();
+        // Each committer lets go of its store once it sees its mint dropped.
+        for _ in 0..200 {
+            if let Ok(state) = AppState::open(self.dir.path(), 1000) {
+                let listener = TcpListener::bind(self.address).await.unwrap();
+                self.serving = Some(serve(listener, state));
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        panic!("the stores were never released");
     }
 
     fn client(&self) -> Client {
@@ -306,24 +356,203 @@ async fn the_payee_hands_back_change_the_mint_no_longer_answers_for() {
     };
     assert_eq!(refused.error.code(), Some("spent"));
     assert_eq!(refused.at_stake, Some(5));
-    assert_eq!(alice.balance(&server.mint).await.unwrap().outgoing, 8);
+    // The note is gone either way, so the transfer is dropped; its change
+    // keys stay.
+    assert_eq!(refused.outcome, Outcome::Dropped);
+    let balance = alice.balance(&server.mint).await.unwrap();
+    assert_eq!(
+        (balance.outgoing, balance.expected, balance.unconfirmed),
+        (0, 0, 5)
+    );
+    assert_eq!(alice.holder().outgoing().count(), 0);
+    let again = alice.settle(NOW).await.unwrap();
+    assert_eq!((again.answered, again.refused.len()), (0, 0));
 
-    // A forged note is refused and settles nothing.
+    // A forged note is refused and takes nothing in.
     let mut forged = received.theirs[0].to_bytes();
     let last = forged.len() - 1;
     forged[last] ^= 1;
     let forged = Note::from_bytes(&forged).unwrap();
     assert!(matches!(alice.accept(&[forged]).await, Err(Error::Note(_))));
-    assert_eq!(alice.holder().outgoing().count(), 1);
+    assert_eq!(alice.balance(&server.mint).await.unwrap().unconfirmed, 5);
 
-    // The change Bob hands back recovers it and settles the transfer.
+    // The change Bob hands back is still taken in.
     assert_eq!(alice.accept(&received.theirs).await.unwrap(), 5);
     let balance = alice.balance(&server.mint).await.unwrap();
     assert_eq!(
-        (balance.frozen, balance.outgoing, balance.expected),
-        (5, 0, 0)
+        (
+            balance.frozen,
+            balance.outgoing,
+            balance.expected,
+            balance.unconfirmed
+        ),
+        (5, 0, 0, 0)
     );
-    assert_eq!(alice.holder().outgoing().count(), 0);
+}
+
+#[tokio::test]
+async fn a_request_for_a_note_the_mint_would_not_make_is_refused_before_signing() {
+    let server = Server::start().await;
+    let alice = Purse::new(server.client(), Default::default(), Flaky::default());
+    server.fund(&alice, 8, 8).await;
+    let saved = alice.store().inner.saved().unwrap();
+
+    let request = PaymentRequest {
+        mint: server.mint,
+        outputs: vec![Output {
+            amount: 3,
+            holder: HolderKey::generate().public_key(),
+        }],
+    };
+    assert!(matches!(
+        alice.pay(&request, NOW).await,
+        Err(Error::Pay(PayError::Denomination(3)))
+    ));
+    // Nothing is parked: no transfer to resend, nothing saved.
+    let balance = alice.balance(&server.mint).await.unwrap();
+    assert_eq!(
+        (balance.spendable, balance.outgoing, balance.expected),
+        (8, 0, 0)
+    );
+    assert_eq!(alice.holder().payments().count(), 0);
+    assert_eq!(alice.store().inner.saved().unwrap(), saved);
+    let settled = alice.settle(NOW).await.unwrap();
+    assert_eq!((settled.answered, settled.refused.len()), (0, 0));
+}
+
+/// A server that answers every transfer with `status` and the error
+/// `code`, as a gateway or a server of another version might, and returns
+/// its URL.
+async fn refusing(status: u16, code: &'static str) -> String {
+    let answer = move || async move {
+        let body = format!(r#"{{"error":"{code}","message":"sign in first"}}"#);
+        (axum::http::StatusCode::from_u16(status).unwrap(), body)
+    };
+    let app = axum::Router::new().route("/v1/transfer", axum::routing::post(answer));
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let url = format!("http://{}", listener.local_addr().unwrap());
+    tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+    url
+}
+
+#[tokio::test]
+async fn a_refusal_the_mint_would_not_give_drops_or_cancels_nothing() {
+    let server = Server::start().await;
+    let (alice, bob) = (server.purse(), server.purse());
+    server.fund(&alice, 8, 8).await;
+    let request = bob.request(&server.mint, 5).await.unwrap();
+    alice.pay(&request, NOW).await.unwrap();
+
+    // The mint answers `spent` and `expired` with 409, and never answers
+    // `unauthorized` or `duplicate_input` to a transfer a holder signed.
+    for (status, code) in [
+        (401, "spent"),
+        (401, "expired"),
+        (403, "unauthorized"),
+        (400, "duplicate_input"),
+    ] {
+        let client = Client::new(&refusing(status, code).await).unwrap();
+        let lost = Purse::new(client, alice.holder(), MemoryStore::new()).with_retry(QUICK);
+        let settled = lost.settle(NOW).await.unwrap();
+        let [refused] = settled.refused.as_slice() else {
+            panic!("{:?}", settled.refused)
+        };
+        assert_eq!(refused.error.code(), Some(code));
+        assert_eq!(refused.outcome, Outcome::Kept, "{code}");
+        let holder = lost.holder();
+        assert_eq!(
+            (holder.outgoing().count(), holder.notes().count()),
+            (1, 0),
+            "{code}"
+        );
+    }
+
+    // The mint's own server still answers it.
+    all_answered(&alice.settle(NOW).await.unwrap(), 1);
+    assert_eq!(alice.balance(&server.mint).await.unwrap().frozen, 3);
+}
+
+#[tokio::test]
+async fn a_transfer_another_server_does_not_know_stays_outgoing() {
+    let (server, other) = (Server::start().await, Server::start().await);
+    let (alice, bob) = (server.purse(), server.purse());
+    server.fund(&alice, 8, 8).await;
+    let request = bob.request(&server.mint, 5).await.unwrap();
+    alice.pay(&request, NOW).await.unwrap();
+
+    // Pointed at a server that is not the mint's, the purse keeps it.
+    let lost = Purse::new(other.client(), alice.holder(), MemoryStore::new()).with_retry(QUICK);
+    let settled = lost.settle(NOW).await.unwrap();
+    let [refused] = settled.refused.as_slice() else {
+        panic!("{:?}", settled.refused)
+    };
+    assert_eq!(refused.error.code(), Some("unknown_mint"));
+    assert_eq!(refused.outcome, Outcome::Kept);
+    assert_eq!(lost.holder().outgoing().count(), 1);
+
+    // The mint's own server still answers it.
+    let back = Purse::new(server.client(), lost.holder(), MemoryStore::new());
+    all_answered(&back.settle(NOW).await.unwrap(), 1);
+    assert_eq!(back.balance(&server.mint).await.unwrap().frozen, 3);
+}
+
+#[tokio::test]
+async fn a_transfer_the_policy_now_refuses_is_cancelled() {
+    let mut server = Server::start().await;
+    let (alice, bob) = (server.purse(), server.purse());
+    server.fund(&alice, 8, 8).await;
+    let request = bob.request(&server.mint, 5).await.unwrap();
+    let payment = alice.pay(&request, NOW).await.unwrap();
+
+    // The operator allows one output per transfer from now on.
+    server.restart_with(|policy| policy.max_outputs = 1).await;
+    let alice = Purse::new(server.client(), alice.holder(), MemoryStore::new()).with_retry(QUICK);
+    let settled = alice.settle(NOW).await.unwrap();
+    let [refused] = settled.refused.as_slice() else {
+        panic!("{:?}", settled.refused)
+    };
+    assert_eq!(refused.error.code(), Some("policy"));
+    assert_eq!(refused.outcome, Outcome::Cancelled);
+    // The note is back; the change keys stay in case the transfer went
+    // through under the old policy.
+    let balance = alice.balance(&server.mint).await.unwrap();
+    assert_eq!(
+        (balance.spendable, balance.outgoing, balance.unconfirmed),
+        (8, 0, 3)
+    );
+    let spends = payment.transfers[0].request.inputs[0].note;
+    assert_eq!(alice.holder().notes().collect::<Vec<_>>(), [&spends]);
+    assert_eq!(alice.holder().payments().count(), 0);
+}
+
+#[tokio::test]
+async fn a_settle_that_carries_out_a_payment_keeps_the_payees_notes() {
+    let server = Server::start().await;
+    let (alice, bob) = (server.purse(), server.purse());
+    server.fund(&alice, 8, 8).await;
+    let request = bob.request(&server.mint, 5).await.unwrap();
+    let payment = alice.pay(&request, NOW).await.unwrap();
+    let holder = alice.holder();
+    let [made] = holder.payments().collect::<Vec<_>>()[..] else {
+        panic!("one payment is kept")
+    };
+    assert_eq!((&made.request, &made.payment), (&request, &payment));
+
+    // Bob never submits; Alice's settle carries the payment out.
+    let settled = alice.settle(NOW).await.unwrap();
+    all_answered(&settled, 1);
+    assert_eq!(settled.value, 3);
+    let owed = alice.holder().payments().next().unwrap().owed.clone();
+    assert_eq!(owed, settled.theirs);
+    assert_eq!(owed.len(), request.outputs.len());
+
+    // Handed to Bob, who keeps them, and then no longer kept by Alice.
+    assert_eq!(bob.accept(&owed).await.unwrap(), 5);
+    assert_eq!(alice.forget_owed(&owed).unwrap(), 5);
+    assert_eq!(alice.holder().payments().count(), 0);
+    assert_eq!(alice.forget_owed(&owed).unwrap(), 0);
+    let balance = alice.balance(&server.mint).await.unwrap();
+    assert_eq!((balance.frozen, balance.outgoing), (3, 0));
 }
 
 #[tokio::test]
