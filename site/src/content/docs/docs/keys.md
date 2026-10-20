@@ -25,7 +25,7 @@ it to `mint.key` (mode 0600) in the mint's directory and lists it in
 To mint, sign a request and post it:
 
 ```sh
-./target/release/worgl-server sign-mint --key ./server/mints/<mint>/mint.key --issuer <mint> \
+worgl-server sign-mint --key ./server/mints/<mint>/mint.key --issuer <mint> \
     --sequence 1 --amount 8 --holder <holder public key> \
   | curl -sd @- -H 'content-type: application/json' http://127.0.0.1:8080/v1/mints/<mint>/mint
 ```

@@ -6,8 +6,8 @@ edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
 repository.workspace = true
+homepage.workspace = true
 authors.workspace = true
-readme = "../../README.md"
 keywords = ["token", "issuer", "bitmap", "ed25519", "ledger"]
 categories = ["cryptography", "data-structures"]
 

@@ -6,9 +6,13 @@ edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
 repository.workspace = true
+homepage.workspace = true
 authors.workspace = true
 keywords = ["token", "credits", "client", "sdk"]
 categories = ["cryptography", "web-programming::http-client"]
+# Its tests run a server and a faucet, which are dev-dependencies cargo drops
+# when it publishes.
+exclude = ["tests/"]
 
 [dependencies]
 httpdate.workspace = true

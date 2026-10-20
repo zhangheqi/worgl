@@ -17,13 +17,16 @@ edition = "2024"
 rust-version = "1.89"
 license = "MIT OR Apache-2.0"
 repository = "https://github.com/zhangheqi/worgl"
+homepage = "https://zhangheqi.github.io/worgl/"
 authors = ["The Worgl contributors"]
 
 [workspace.dependencies]
+# Crates that are only ever dev-dependencies take no version: cargo drops them
+# from a package's manifest when it publishes.
 worgl = { path = "crates/worgl", version = "0.1.0" }
 worgl-client = { path = "crates/worgl-client", version = "0.1.0" }
 worgl-faucet = { path = "crates/worgl-faucet" }
-worgl-raft = { path = "crates/worgl-raft" }
+worgl-raft = { path = "crates/worgl-raft", version = "0.1.0" }
 worgl-sdk = { path = "crates/worgl-sdk", version = "0.1.0" }
 worgl-server = { path = "crates/worgl-server" }
 

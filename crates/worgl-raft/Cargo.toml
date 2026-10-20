@@ -6,8 +6,10 @@ edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
 repository.workspace = true
+homepage.workspace = true
 authors.workspace = true
-publish = false
+keywords = ["raft", "replication", "issuer", "token", "openraft"]
+categories = ["network-programming", "database-implementations"]
 
 [dependencies]
 openraft.workspace = true

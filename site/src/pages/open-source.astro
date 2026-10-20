@@ -83,12 +83,13 @@ const checks = ['rustfmt', 'clippy', 'tests on Linux', 'tests on macOS', 'Rust 1
     <div class="wrap">
       <SectionHead num="02" name="Getting it" />
       <div class="grid">
-        <h2 class="h2">Build it from the <em>source.</em></h2>
-        <div class="sec-aside"><p class="body">Nothing is on crates.io or npm yet. Depend on the crates from git, and build the TypeScript package from <code>sdk/typescript</code>.</p></div>
+        <h2 class="h2">Get it from <em>crates.io.</em></h2>
+        <div class="sec-aside"><p class="body">The libraries, the server and the <code>worgl</code> command are on crates.io. Nothing is on npm yet, so build the TypeScript package from <code>sdk/typescript</code>.</p></div>
         <div class="term-box">
-          <div class="term-bar"><span class="label">From the repository</span><button class="copy" type="button" data-copy="#get-it">Copy</button></div>
-          <pre class="term" id="get-it" data-text={'cargo add --git https://github.com/zhangheqi/worgl worgl-client\ngit clone https://github.com/zhangheqi/worgl\ncd worgl/sdk/typescript && npm ci && npm run build'}><span class="c"># Rust: depend on a crate straight from git</span>
-<span class="p">$ </span>cargo add --git https://github.com/zhangheqi/worgl worgl-client
+          <div class="term-bar"><span class="label">Rust and TypeScript</span><button class="copy" type="button" data-copy="#get-it">Copy</button></div>
+          <pre class="term" id="get-it" data-text={'cargo add worgl-client\ncargo install worgl-cli\ngit clone https://github.com/zhangheqi/worgl\ncd worgl/sdk/typescript && npm ci && npm run build'}><span class="c"># Rust: add the client to a project, or install the command</span>
+<span class="p">$ </span>cargo add worgl-client
+<span class="p">$ </span>cargo install worgl-cli
 
 <span class="c"># TypeScript: build the package. It needs the wasm32 target</span>
 <span class="c"># and wasm-bindgen-cli; sdk/typescript/README.md has the steps.</span>
@@ -96,8 +97,8 @@ const checks = ['rustfmt', 'clippy', 'tests on Linux', 'tests on macOS', 'Rust 1
 <span class="p">$ </span>cd worgl/sdk/typescript &amp;&amp; npm ci &amp;&amp; npm run build</pre>
         </div>
         <div class="registries">
+          <div><b>crates.io</b><span class="label">Available now</span></div>
           <div><b>From git</b><span class="label">Available now</span></div>
-          <div><b>crates.io</b><span class="label na">Not available yet</span></div>
           <div><b>npm</b><span class="label na">Not available yet</span></div>
         </div>
       </div>
