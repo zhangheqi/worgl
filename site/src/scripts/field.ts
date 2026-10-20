@@ -455,7 +455,7 @@ export function mountField(root: HTMLElement) {
       say(`Note ${s} is frozen. The last layer cannot move until the next rotation.`, true);
     } else {
       const r = transfer(k, i, now, { vis: true, thread: true, own: true });
-      if ('err' in r) say('The next layer is full until the next rotation.', true);
+      if ('err' in r) say('The next layer is full and stays full until a rotation drops it. This note’s layer is dropped first, so the note cannot move on.', true);
       else {
         mine = { L: L(r.k), i: r.js[0]! };
         focusT = now;

@@ -98,7 +98,7 @@ export function mountStampLab(root: HTMLElement) {
       return false;
     }
     const next = sheet(k + 1);
-    if (next.cells.length >= CAP) { say(`Layer ${k + 1} is full until the next rotation.`); return false; }
+    if (next.cells.length >= CAP) { say(`Layer ${k + 1} is full and stays full until a rotation drops it. Layer ${k} is dropped first, so its notes cannot move on.`); return false; }
     c.live = false;
     fx.set(`${sheet(k).gen}:${i}`, 'fs');
     next.cells.push({ a: c.a, live: true });
@@ -115,7 +115,7 @@ export function mountStampLab(root: HTMLElement) {
   const act: Record<string, () => void> = {
     mint() {
       const k = N - 2, layer = sheet(k);
-      if (layer.cells.length >= CAP) return say(`Layer ${k} is full until the next rotation.`);
+      if (layer.cells.length >= CAP) return say(`Layer ${k} is full and stays full until a rotation drops it. The next rotation moves layer ${k + 1} up to take new notes.`);
       layer.cells.push({ a: 8, live: true });
       fx.set(`${layer.gen}:${layer.cells.length - 1}`, 'fl');
       if (selectMode) sel = { gen: layer.gen, i: layer.cells.length - 1 };

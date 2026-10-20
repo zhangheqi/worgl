@@ -155,25 +155,25 @@ const expire = [...'expire.'];
 <span class="k">const</span> request = <span class="k">await</span> bob.request(mint, 5n);          <span class="c">// Bob sends request.json to Alice</span>
 <span class="k">const</span> payment = <span class="k">await</span> alice.pay(request);             <span class="c">// Alice sends payment.json to Bob</span>
 <span class="k">const</span> received = <span class="k">await</span> bob.receive(request, payment); <span class="c">// checks, submits at its times, keeps</span>
-<span class="k">await</span> alice.settle();                                 <span class="c">// later: Alice takes in her change</span></pre></div>
+<span class="k">await</span> alice.accept(received.theirs);                  <span class="c">// Alice keeps the change Bob sends</span></pre></div>
           <div class="panel" role="tabpanel" id="p-rs" aria-labelledby="t-rs" tabindex="0" hidden><pre><span class="k">let</span> client = Client::new(<span class="s">"https://mint.example.com"</span>)?;
 <span class="k">let</span> alice = Purse::open(client.clone(), <span class="s">"alice.json"</span>)?;
 <span class="k">let</span> bob = Purse::open(client, <span class="s">"bob.json"</span>)?;
 
 <span class="k">let</span> request = bob.request(&amp;mint, 5).<span class="k">await</span>?;                 <span class="c">// Bob → Alice</span>
 <span class="k">let</span> payment = alice.pay(&amp;request, Spacing::default()).<span class="k">await</span>?; <span class="c">// Alice → Bob</span>
-bob.receive(&amp;request, &amp;payment).<span class="k">await</span>?;                     <span class="c">// checks, submits, keeps</span>
-alice.settle(Spacing::default()).<span class="k">await</span>?;                    <span class="c">// later: her change</span></pre></div>
-          <div class="panel" role="tabpanel" id="p-cli" aria-labelledby="t-cli" tabindex="0" hidden><pre>worgl init                                     <span class="c"># each side, once</span>
-worgl request $MINT 5 -o request.json          <span class="c"># payee → send request.json</span>
-worgl pay request.json -o payment.json         <span class="c"># payer → send payment.json</span>
-worgl receive request.json payment.json        <span class="c"># payee: checks, submits, keeps</span>
-worgl settle                                   <span class="c"># payer, later: takes in the change</span>
+<span class="k">let</span> received = bob.receive(&amp;request, &amp;payment).<span class="k">await</span>?;      <span class="c">// checks, submits, keeps</span>
+alice.accept(&amp;received.theirs).<span class="k">await</span>?;                      <span class="c">// Bob → Alice: her change</span></pre></div>
+          <div class="panel" role="tabpanel" id="p-cli" aria-labelledby="t-cli" tabindex="0" hidden><pre>worgl init                                              <span class="c"># each side, once</span>
+worgl request $MINT 5 -o request.json                   <span class="c"># payee → send request.json</span>
+worgl pay request.json -o payment.json                  <span class="c"># payer → send payment.json</span>
+worgl receive request.json payment.json -o change.json  <span class="c"># payee → send change.json</span>
+worgl accept change.json                                <span class="c"># payer: keeps the change</span>
 worgl balance $MINT
-worgl refresh $MINT                            <span class="c"># once per rotation period</span></pre></div>
+worgl refresh $MINT                                     <span class="c"># once per rotation period</span></pre></div>
         </div>
         <div class="figs">
-          <div><b>17,000/s</b><span>Transfers through the server on a 4-core cloud VM with 64 clients. <a class="fig-link" href={README.efficiency}>README</a></span></div>
+          <div><b>17,000/s</b><span>Transfers through the server on a 4-core cloud VM with 64 clients. One mint sustains at most 8,192/s by default. <a class="fig-link" href={README.efficiency}>README</a></span></div>
           <div><b>41,000/s</b><span>Transfers the library alone commits, in batches of 256. <a class="fig-link" href={README.efficiency}>README</a></span></div>
           <div><b>2 of 3</b><span>Cluster members that hold a transfer on disk before it is answered. <a class="fig-link" href={README.cluster}>README</a></span></div>
         </div>
