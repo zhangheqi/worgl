@@ -3,7 +3,7 @@
 
 use std::collections::BTreeMap;
 use std::fs;
-use std::net::SocketAddr;
+use std::net::{SocketAddr, UdpSocket};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
@@ -101,12 +101,58 @@ fn serve(
     })
 }
 
+/// A port on 127.0.0.1 kept for one test while this lives, so that a
+/// server there can stop and start again on it.
+///
+/// It is below the ports the kernel picks for a bind to port 0 or an
+/// outgoing connection, so no other socket takes it while the server is
+/// stopped, and until the server is back a connection to it is refused.
+/// Tests, in this process or another, claim such a port by binding a UDP
+/// socket to it, which only one of them can, and leave the TCP port free.
+struct Port {
+    address: SocketAddr,
+    _claim: UdpSocket,
+}
+
+impl Port {
+    fn new() -> Self {
+        let ephemeral = first_ephemeral_port();
+        for port in (1024..ephemeral).rev() {
+            let address = SocketAddr::from(([127, 0, 0, 1], port));
+            // Claimed by another test, or used by another program.
+            let Ok(claim) = UdpSocket::bind(address) else {
+                continue;
+            };
+            if std::net::TcpListener::bind(address).is_ok() {
+                return Self {
+                    address,
+                    _claim: claim,
+                };
+            }
+        }
+        panic!("no port below {ephemeral} is free");
+    }
+}
+
+/// The first port the kernel picks itself: on Linux the start of
+/// `net.ipv4.ip_local_port_range`, and elsewhere 49152, where macOS starts.
+fn first_ephemeral_port() -> u16 {
+    if cfg!(target_os = "linux") {
+        let range = fs::read_to_string("/proc/sys/net/ipv4/ip_local_port_range").unwrap();
+        range.split_whitespace().next().unwrap().parse().unwrap()
+    } else {
+        49152
+    }
+}
+
 /// One member: where it keeps its state and listens, and while it runs,
 /// what serves it.
 struct Server {
     dir: PathBuf,
     api: SocketAddr,
     raft: SocketAddr,
+    /// The ports it was given, kept for it while the test runs.
+    _ports: [Port; 2],
     running: Option<Running>,
 }
 
@@ -184,16 +230,19 @@ impl Cluster {
     /// any member starts.
     async fn from_seed_with(seed: tempfile::TempDir, edit: impl Fn(u64, &Path)) -> Self {
         let mut listeners = Vec::new();
+        let mut ports = Vec::new();
         let mut members = BTreeMap::new();
         for id in 1..=3 {
-            let api = TcpListener::bind("127.0.0.1:0").await.unwrap();
-            let raft = TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let kept = [Port::new(), Port::new()];
+            let api = TcpListener::bind(kept[0].address).await.unwrap();
+            let raft = TcpListener::bind(kept[1].address).await.unwrap();
             let member = Member {
                 api: api.local_addr().unwrap().to_string(),
                 raft: raft.local_addr().unwrap().to_string(),
             };
             members.insert(id, member);
             listeners.push((id, api, raft));
+            ports.push(kept);
         }
         let config = |node| ClusterConfig {
             node,
@@ -203,7 +252,7 @@ impl Cluster {
         // Every copy is made before any member starts.
         let copies = tempfile::tempdir().unwrap();
         let mut servers = Vec::new();
-        for (id, api, raft) in &listeners {
+        for ((id, api, raft), ports) in listeners.iter().zip(ports) {
             let dir = if *id == 1 {
                 seed.path().to_owned()
             } else {
@@ -216,6 +265,7 @@ impl Cluster {
                 dir,
                 api: api.local_addr().unwrap(),
                 raft: raft.local_addr().unwrap(),
+                _ports: ports,
                 running: None,
             });
         }
@@ -948,8 +998,9 @@ async fn a_member_that_moves_is_reached_at_its_new_raft_address() {
     let note = cluster.mint(0, &mint, 8, &alice).await;
     let (paid, _) = cluster.pay(1, &note, &alice).await;
     let created = cluster.create(0).await;
-    let raft = TcpListener::bind("127.0.0.1:0").await.unwrap();
-    cluster.servers[2].raft = raft.local_addr().unwrap();
+    let moved = Port::new();
+    let raft = TcpListener::bind(moved.address).await.unwrap();
+    cluster.servers[2].raft = moved.address;
     assert_eq!(cluster.rejoin(), [[3], [3], [3]]);
     assert_eq!(cluster.rejoin(), vec![Vec::<u64>::new(); 3]);
     for server in 0..2 {
@@ -1027,20 +1078,15 @@ async fn a_member_dialed_as_another_does_not_answer_itself() {
     // The first member runs alone. Nothing listens at the second's
     // addresses, and the third's Raft address leads to the first under
     // another name, which the check of `cluster.json` cannot tell.
-    let api = TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let raft = TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let mut nowhere = Vec::new();
-    for _ in 0..3 {
-        nowhere.push(TcpListener::bind("127.0.0.1:0").await.unwrap());
-    }
-    let nowhere: Vec<_> = nowhere
-        .into_iter()
-        .map(|listener| listener.local_addr().unwrap().to_string())
-        .collect();
+    let ports = [Port::new(), Port::new()];
+    let api = TcpListener::bind(ports[0].address).await.unwrap();
+    let raft = TcpListener::bind(ports[1].address).await.unwrap();
+    let nowhere = [Port::new(), Port::new(), Port::new()];
     let mut server = Server {
         dir: seed.path().to_owned(),
         api: api.local_addr().unwrap(),
         raft: raft.local_addr().unwrap(),
+        _ports: ports,
         running: None,
     };
     let first = Member {
@@ -1048,11 +1094,11 @@ async fn a_member_dialed_as_another_does_not_answer_itself() {
         raft: server.raft.to_string(),
     };
     let second = Member {
-        api: nowhere[0].clone(),
-        raft: nowhere[1].clone(),
+        api: nowhere[0].address.to_string(),
+        raft: nowhere[1].address.to_string(),
     };
     let third = Member {
-        api: nowhere[2].clone(),
+        api: nowhere[2].address.to_string(),
         raft: format!("localhost:{}", server.raft.port()),
     };
     let members = BTreeMap::from([(1, first), (2, second), (3, third)]);

@@ -3,6 +3,7 @@
 // point WORGL_SERVER and WORGL_FAUCET_BINARY at the binaries.
 
 import { type ChildProcess, execFileSync, spawn } from 'node:child_process';
+import { createSocket, type Socket } from 'node:dgram';
 import { mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { createServer } from 'node:net';
 import { tmpdir } from 'node:os';
@@ -71,7 +72,7 @@ export class TestServer {
     const token = readFileSync(field('admin token'), 'utf8').trim();
     const mintKey = field('mint key');
 
-    const port = await freePort();
+    const port = await keptPort();
     const child = spawn(binary, ['serve', '--state', state, '--listen', `127.0.0.1:${port}`], {
       stdio: 'ignore',
     });
@@ -87,7 +88,7 @@ export class TestServer {
    * refuses, so give a faucet a server of its own.
    */
   async startFaucet(): Promise<Client> {
-    const port = await freePort();
+    const port = await keptPort();
     const child = spawn(
       faucetBinary,
       [
@@ -190,19 +191,68 @@ async function healthy(url: string, child: ChildProcess, name: string): Promise<
   }
 }
 
-function freePort(): Promise<number> {
-  return new Promise((resolve, reject) => {
-    const probe = createServer();
-    probe.once('error', reject);
-    probe.listen(0, '127.0.0.1', () => {
-      const address = probe.address();
-      probe.close(() => {
-        if (address !== null && typeof address === 'object') {
-          resolve(address.port);
-        } else {
-          reject(new Error('no port'));
-        }
-      });
+/** The ports this process keeps, each claimed by a UDP socket bound to it. */
+const kept: Socket[] = [];
+
+/**
+ * A port on 127.0.0.1 kept for this process, so that a server there can stop
+ * and start again on it. It is below the ports the kernel picks for a bind to
+ * port 0 or an outgoing connection, so no other socket takes it while the
+ * server is stopped, and until the server is back a connection to it is
+ * refused. Tests, in this process or another, claim such a port by binding a
+ * UDP socket to it, which only one of them can, and leave the TCP port free.
+ */
+async function keptPort(): Promise<number> {
+  const ephemeral = firstEphemeralPort();
+  for (let port = ephemeral - 1; port >= 1024; port -= 1) {
+    // Claimed by another test, or used by another program.
+    const claim = await claimed(port);
+    if (claim === undefined) {
+      continue;
+    }
+    if (await listenable(port)) {
+      claim.unref();
+      kept.push(claim);
+      return port;
+    }
+    claim.close();
+  }
+  throw new Error(`no port below ${ephemeral} is free`);
+}
+
+/**
+ * The first port the kernel picks itself: on Linux the start of
+ * net.ipv4.ip_local_port_range, and elsewhere 49152, where macOS starts.
+ */
+function firstEphemeralPort(): number {
+  if (process.platform !== 'linux') {
+    return 49152;
+  }
+  const range = readFileSync('/proc/sys/net/ipv4/ip_local_port_range', 'utf8');
+  return Number(range.trim().split(/\s+/)[0]);
+}
+
+/** A UDP socket bound to `port` on 127.0.0.1, unless one is bound there. */
+function claimed(port: number): Promise<Socket | undefined> {
+  return new Promise((resolve) => {
+    const socket = createSocket('udp4');
+    const taken = (): void => {
+      socket.close();
+      resolve(undefined);
+    };
+    socket.once('error', taken);
+    socket.bind(port, '127.0.0.1', () => {
+      socket.off('error', taken);
+      resolve(socket);
     });
+  });
+}
+
+/** Whether a TCP server can listen on `port` on 127.0.0.1. */
+function listenable(port: number): Promise<boolean> {
+  return new Promise((resolve) => {
+    const probe = createServer();
+    probe.once('error', () => resolve(false));
+    probe.listen(port, '127.0.0.1', () => probe.close(() => resolve(true)));
   });
 }
