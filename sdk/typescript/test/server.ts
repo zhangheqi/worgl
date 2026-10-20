@@ -3,7 +3,7 @@
 // point WORGL_SERVER and WORGL_FAUCET_BINARY at the binaries.
 
 import { type ChildProcess, execFileSync, spawn } from 'node:child_process';
-import { mkdtempSync, readFileSync, rmSync } from 'node:fs';
+import { mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { createServer } from 'node:net';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
@@ -37,14 +37,22 @@ export class TestServer {
     this.#process = child;
   }
 
-  /** Creates a state directory with one four-layer mint and serves it. */
-  static async start(): Promise<TestServer> {
+  /**
+   * Creates a state directory with one four-layer mint and serves it. The
+   * mint's policy fields not in `policy` take their cash-like defaults.
+   */
+  static async start(policy: Record<string, unknown> = {}): Promise<TestServer> {
     const dir = mkdtempSync(join(tmpdir(), 'worgl-ts-'));
     const state = join(dir, 'state');
     execFileSync(binary, ['init', '--state', state], { stdio: 'ignore' });
+    const policyFile = join(dir, 'policy.json');
+    writeFileSync(policyFile, JSON.stringify(policy));
     const created = execFileSync(
       binary,
-      ['create-mint', '--state', state, '--layers', '4', '--layer-size', '1024'],
+      [
+        'create-mint', '--state', state, '--layers', '4', '--layer-size', '1024',
+        '--policy', policyFile,
+      ],
       { encoding: 'utf8' },
     );
     const field = (name: string): string => {

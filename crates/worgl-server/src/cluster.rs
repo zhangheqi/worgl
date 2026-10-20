@@ -26,6 +26,18 @@
 //! the mint's group and answers once the group has a leader, or after a
 //! while if it has none yet.
 //!
+//! A mint's `policy.json` and `mint.json` are not replicated. Each member
+//! reads its own when it starts serving the mint, and nothing compares them:
+//! the leader checks requests against its policy and makes scheduled
+//! rotations on its period, and the others apply what it logs. Each member
+//! also remembers as many recent transfers and burns as its own
+//! [`receipt_capacity`](worgl::Policy::receipt_capacity) says, and the
+//! leader answers a resent one from what it remembers. The rules in force
+//! are therefore the leader's: change them alike on every member and
+//! restart each in turn, with the mint paused meanwhile. A member that
+//! writes a mint's directory from the registry gets the policy and period
+//! the mint was created with, not later edits.
+//!
 //! Members send each other Raft's RPCs as HTTP requests to their Raft ports,
 //! with the cluster token. A mint applies whatever its group's log holds,
 //! and whoever shows the token can append to that log as if they led, so
@@ -282,7 +294,8 @@ impl Cluster {
     }
 
     /// Sends the request in `parts` and `body` to the member whose API
-    /// address is `api`, and returns its answer.
+    /// address is `api`, and returns its answer: the status, the body, and
+    /// the body's type and `Retry-After`, if any.
     async fn relay(&self, api: &str, parts: &Parts, body: Bytes) -> reqwest::Result<Response> {
         let path = parts.uri.path_and_query().map_or("/", |path| path.as_str());
         let mut request = self
@@ -298,13 +311,17 @@ impl Cluster {
         }
         let answer = request.send().await?;
         let status = answer.status();
-        let content_type = answer.headers().get(header::CONTENT_TYPE).cloned();
+        let kept: Vec<_> = [header::CONTENT_TYPE, header::RETRY_AFTER]
+            .into_iter()
+            .filter_map(|name| {
+                let value = answer.headers().get(&name)?.clone();
+                Some((name, value))
+            })
+            .collect();
         let bytes = answer.bytes().await?;
         let mut response = (status, bytes).into_response();
-        if let Some(content_type) = content_type {
-            response
-                .headers_mut()
-                .insert(header::CONTENT_TYPE, content_type);
+        for (name, value) in kept {
+            response.headers_mut().insert(name, value);
         }
         Ok(response)
     }

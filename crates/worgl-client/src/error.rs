@@ -2,6 +2,7 @@
 
 use std::fmt;
 use std::io;
+use std::time::Duration;
 
 use serde::Deserialize;
 use worgl::NoteError;
@@ -71,10 +72,20 @@ impl Error {
             Self::Refused(refusal) => {
                 matches!(
                     refusal.code.as_str(),
-                    "paused" | "storage" | "internal" | "layer_full"
+                    "paused" | "busy" | "storage" | "internal" | "layer_full"
                 ) || refusal.status >= 500
             }
             _ => false,
+        }
+    }
+
+    /// How long the mint asked to wait before trying again, when it
+    /// answered with a `Retry-After`, as it does with `busy`; see
+    /// [`Refusal::retry_after`].
+    pub fn retry_after(&self) -> Option<Duration> {
+        match self {
+            Self::Refused(refusal) => refusal.retry_after,
+            _ => None,
         }
     }
 }
@@ -92,6 +103,11 @@ pub struct Refusal {
     pub code: String,
     /// What went wrong, for people.
     pub message: String,
+    /// How long to wait before sending the request again, from the
+    /// answer's `Retry-After` in seconds. A `busy` mint sends one; it took
+    /// nothing, and has room again after that.
+    #[serde(skip)]
+    pub retry_after: Option<Duration>,
 }
 
 impl fmt::Display for Refusal {

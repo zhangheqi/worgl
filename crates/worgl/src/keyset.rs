@@ -24,11 +24,16 @@
 //! generations, which is all anyone needs to check a note's signature
 //! offline. A [`KeyRing`] holds the secrets, which only the issuer needs; a
 //! [`store`](crate::store) keeps it in a file of its own, never in the
-//! snapshot or the log.
+//! snapshot or the log. The issuer also keeps the public halves of the last
+//! generations dropped, one fewer than it has layers, so that a request
+//! resent after its inputs' generation was dropped still verifies (see
+//! [`Verifier`](crate::Verifier)).
 //!
 //! Issuers created before generation keys existed signed every note with the
-//! issuer key. Their generations keep verifying under it until they are
-//! dropped; every generation created since has a key of its own.
+//! issuer key. Their generations keep verifying under it just as a
+//! generation with a key of its own would: while live, and for a resent
+//! request while dropped recently enough that its key would still be kept.
+//! Every generation created since has a key of its own.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Arc;
@@ -200,9 +205,9 @@ impl KeySet {
         self.keys.first().map(|c| c.generation)
     }
 
-    /// The set after a rotation that dropped the oldest generation and
-    /// certified `created`, or `None` for a rotation made before generation
-    /// keys existed.
+    /// The set from generation `oldest` on, followed by `created`: the key a
+    /// rotation certified, or `None` for a rotation made before generation
+    /// keys existed or for no rotation at all.
     pub(crate) fn rotated(&self, oldest: u64, created: Option<KeyCertificate>) -> Self {
         let mut keys: Vec<KeyCertificate> = self
             .keys

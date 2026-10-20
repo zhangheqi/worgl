@@ -126,7 +126,13 @@ What each party to a payment sees is in the
   cloud VM the server went from about 4,000 transfers/s, whatever the
   number of clients, to about 8,800 with 8 concurrent clients and 17,000
   with 64, where signature checks become the limit. The library alone
-  commits about 41,000 transfers/s in batches of 256.
+  commits about 41,000 transfers/s in batches of 256. Sustained, one mint
+  takes at most `receipt_capacity / receipt_min_age_secs` transfers and
+  burns a second, about 8,192 at the defaults, since it keeps each answer
+  for a resend for at least 128 seconds. A burst of up to 1,048,576 is not
+  held back, except for up to 128 seconds after a restart if the mint
+  already holds that many answers, and mints on one server are not capped
+  together.
 
 ## How the design maps onto the code
 
@@ -153,10 +159,13 @@ from the other members stops taking requests after two seconds without
 hearing from them, and a member that cannot reach the leader says so within a
 few seconds. Clients need one address that covers all three, such as a proxy
 in front of them. The members talk to each other in plain HTTP, tokens
-included, so they need a private network between them.
+included, so they need a private network between them. A mint's policy and
+rotation period are not replicated: each member reads its own files, and the
+member leading the mint applies its own, so change them identically on every
+member with the mint paused.
 
-How to start one, keep it private, point clients at it, create mints on it
-and what its limits are:
+How to start one, keep it private, point clients at it, create mints on it,
+change their rules and what its limits are:
 [Running a cluster](site/src/content/docs/docs/running-a-cluster.md).
 
 ## Not covered yet

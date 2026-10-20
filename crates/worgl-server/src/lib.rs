@@ -41,7 +41,8 @@
 //! and rotations, scheduled or not, so no note expires while its holder
 //! cannot refresh it; it still verifies notes. Errors answer with a status
 //! code and `{"error": code, "message": text}`, where `code` is one of the
-//! stable strings listed on [`ApiError::code`].
+//! stable strings listed on [`ApiError::code`]; `503 busy` also says in
+//! `Retry-After` how many seconds to wait before sending the request again.
 //!
 //! # Clusters
 //!
@@ -64,7 +65,11 @@
 //! members and a proxy in front of them can reach (see [`cluster`]).
 //! Creating a mint goes through the cluster's registry, from which every
 //! member writes and serves the new mint; a creation answered `503 timeout`
-//! may have made a mint, so list the mints before creating another.
+//! may have made a mint, so list the mints before creating another. A
+//! mint's policy and rotation period are not replicated: each member reads
+//! its own from the mint's directory, and the leader carries out requests
+//! and scheduled rotations under its own, so they must be the same on every
+//! member.
 
 pub mod cluster;
 pub mod files;
@@ -77,7 +82,7 @@ use std::time::{Duration, Instant};
 use anyhow::{Context, bail};
 use axum::extract::rejection::JsonRejection;
 use axum::extract::{DefaultBodyLimit, Path as UrlPath, State};
-use axum::http::{HeaderMap, StatusCode, header};
+use axum::http::{HeaderMap, HeaderValue, StatusCode, header};
 use axum::middleware;
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
@@ -763,6 +768,9 @@ pub struct ApiError {
     status: StatusCode,
     code: &'static str,
     message: String,
+    /// Seconds to wait before sending the request again, sent as
+    /// `Retry-After`.
+    retry_after: Option<u32>,
 }
 
 #[derive(Serialize)]
@@ -777,6 +785,7 @@ impl ApiError {
             status,
             code,
             message: message.into(),
+            retry_after: None,
         }
     }
 
@@ -791,6 +800,16 @@ impl ApiError {
             "paused",
             "the mint is paused; its notes keep their places until it resumes",
         )
+    }
+
+    /// A transfer or burn the mint keeps no room for yet, since every
+    /// receipt it holds is younger than its policy's minimum age.
+    fn busy(error: &Error, retry_after_secs: u32) -> Self {
+        Self {
+            // At least a second, so a client does not come straight back.
+            retry_after: Some(retry_after_secs.max(1)),
+            ..Self::new(StatusCode::SERVICE_UNAVAILABLE, "busy", error.to_string())
+        }
     }
 
     fn no_leader() -> Self {
@@ -836,13 +855,16 @@ impl ApiError {
     /// One of: `malformed`, `policy`, `invalid_note`, `duplicate_input`,
     /// `unauthorized` (a holder's or mint authority's signature),
     /// `unknown_authority`, `admin_unauthorized` (a missing or wrong token),
-    /// `unknown_mint`, `paused`, `spent`, `expired`, `unissued`, `frozen`,
-    /// `stale_mint`, `stale_rotation`, `layer_full`, `storage`, `internal`,
-    /// and on a cluster `no_leader` (nothing was done; send the request
-    /// again) and `timeout` (the change may still be made: send the same
-    /// note request again, but before rotating again read the mint's info
-    /// once it has carried out a change sent after this answer, and list the
-    /// mints before creating another).
+    /// `unknown_mint`, `paused`, `spent`, `expired`, `unissued`, `overdrawn`,
+    /// `frozen`, `stale_mint`, `stale_rotation`, `layer_full`, `busy` (the
+    /// mint must keep its recent transfers' answers a while longer before it
+    /// takes another transfer or burn; nothing was done: send the request
+    /// again after the seconds its `Retry-After` header gives), `storage`,
+    /// `internal`, and on a cluster `no_leader` (nothing was done; send the
+    /// request again) and `timeout` (the change may still be made: send the
+    /// same note request again, but before rotating again read the mint's
+    /// info once it has carried out a change sent after this answer, and
+    /// list the mints before creating another).
     pub fn code(&self) -> &'static str {
         self.code
     }
@@ -852,6 +874,7 @@ impl From<Error> for ApiError {
     fn from(error: Error) -> Self {
         let (status, code) = match &error {
             Error::Paused => return Self::paused(),
+            Error::Busy { retry_after_secs } => return Self::busy(&error, *retry_after_secs),
             Error::Policy(_) => (StatusCode::BAD_REQUEST, "policy"),
             Error::Note { .. } => (StatusCode::BAD_REQUEST, "invalid_note"),
             Error::DuplicateInput(_) => (StatusCode::BAD_REQUEST, "duplicate_input"),
@@ -864,8 +887,10 @@ impl From<Error> for ApiError {
             Error::Spent(_) => (StatusCode::CONFLICT, "spent"),
             Error::Expired(_) => (StatusCode::CONFLICT, "expired"),
             Error::Unissued(_) => (StatusCode::CONFLICT, "unissued"),
+            Error::Overdrawn { .. } => (StatusCode::CONFLICT, "overdrawn"),
             Error::Frozen(_) => (StatusCode::CONFLICT, "frozen"),
             Error::LayerFull { .. } => (StatusCode::SERVICE_UNAVAILABLE, "layer_full"),
+            Error::Misfit(_) => return Self::internal(&error.to_string()),
             _ => (StatusCode::BAD_REQUEST, "malformed"),
         };
         Self::new(status, code, error.to_string())
@@ -939,6 +964,12 @@ impl IntoResponse for ApiError {
             error: self.code,
             message: &self.message,
         };
-        (self.status, Json(body)).into_response()
+        let mut response = (self.status, Json(body)).into_response();
+        if let Some(secs) = self.retry_after {
+            response
+                .headers_mut()
+                .insert(header::RETRY_AFTER, HeaderValue::from(secs));
+        }
+        response
     }
 }
