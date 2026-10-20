@@ -58,7 +58,9 @@ The mint's answers to a payment hold notes for both sides, and
 payer: they are the payer's change, which `Purse::accept` checks against the
 mint's keys, keeps, and uses to settle the payer's transfer. When the payer
 submits instead, with `Purse::submit`, it hands `theirs` to the payee, who
-keeps its notes with `Purse::accept` the same way.
+keeps its notes with `Purse::accept` the same way. The payer's purse keeps
+them for the payee too, until the payer calls `Purse::forget_owed` with
+them once they are handed over, as `worgl submit` does.
 `Purse::take_from_faucet` asks a playground [faucet](../running-a-faucet/)
 for a note, to a fresh key like any other.
 
@@ -68,9 +70,11 @@ for a note, to a fresh key like any other.
 |---|---|
 | `request(&mint, amount)` | Asks to be paid: a `PaymentRequest` of fresh keys to send the payer. |
 | `request_at_most(&mint, amount, largest)` | The same, in notes no larger than `largest`. |
-| `pay(&request, spacing)` | Answers a request with a `Payment` of signed transfers. |
+| `pay(&request, spacing)` | Answers a request with a `Payment` of signed transfers. Refuses, before signing, a request for a note the mint does not make or to a key the purse has paid already. |
 | `receive(&request, &payment)` | Checks a payment, submits each transfer at its time and keeps the notes. |
 | `settle(spacing)` | Sends the transfers not yet seen answered again, and takes in the change. |
+| `cancel(&transfer)` / `forget(&transfer)` | Ends an outgoing transfer: `cancel` takes back the note of one the mint never applied, `forget` drops one whose note is gone. Both keep its change keys, so change handed over later is still taken in. |
+| `holder().payments()` / `forget_owed(&notes)` | The payments the purse made and keeps, each with the `Payment` to send again (less any transfer cancelled or forgotten) and the payee's notes from every answer the purse got itself, by settling, refreshing or submitting; then stops keeping those notes once they are handed over. |
 | `submit(&transfers)` / `accept(&notes)` | One side submits; the other keeps what it is handed, and settles the transfers it answers. |
 | `withdraw(&request)` | Stops expecting the notes of a request that will not be paid. |
 | `balance(&mint)` | What the purse holds at a mint, by what it can do now. |
@@ -83,8 +87,14 @@ A resent transfer gets the same notes only while the mint keeps its answer
 expire. After that, a transfer already applied is refused as `spent` or
 `expired`, and `Refused::at_stake` says it was possibly applied and what may
 be lost: the change can then only come from the counterparty, for
-`accept`. `refresh` resends the transfers whose spent note dies at the next
-rotation, or died at the last one.
+`accept`. The purse drops such a transfer, keeping its change keys, and
+cancels one refused as `policy` that the policy the mint publishes refuses
+too; `Refused::outcome` says what it did
+(see [Error codes](../error-codes/#sending-a-request-again)). `refresh`
+resends the transfers whose spent note dies at the next rotation, or died at
+the last one. The answer to a payment's transfer keeps the payee's notes, in
+`MadePayment::owed`, for the payer to hand over: the purse cannot tell
+whether the payee submitted the payment or the resend carried it out.
 
 `Client` errors keep the mint's stable code, such as `spent` or `frozen`, in
 `Error::code`, `Error::is_transient` says whether trying again later may
@@ -112,7 +122,8 @@ in place of the server. CI runs it.
    `Holder::take_answers`, which settles the transfers they answer. Without
    them, it resends its outgoing transfers at the times `Holder::resend`
    gives and records each answer with `Holder::settle`, which works while
-   the mint keeps its answers.
+   the mint keeps its answers, and keeps the payee's notes from it in
+   `Holder::payments`, in case the payee has not submitted.
 
 A `MintView`, read from a mint's info, tells the holder which notes can move
 now, which are frozen until the next rotation and which die at it, and

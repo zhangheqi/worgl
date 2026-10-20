@@ -135,16 +135,41 @@ impl Holder {
         Ok(stake.map_or(JsValue::UNDEFINED, JsValue::from))
     }
 
-    /// Drops an outgoing transfer the mint refused for good.
-    pub fn forget(&mut self, transfer: &str) -> Result<(), JsError> {
-        self.inner.forget(&parse::<TransferRequest>(transfer)?);
-        Ok(())
+    /// Drops an outgoing transfer whose note is gone, keeping the keys of
+    /// its change. Returns whether it was outgoing.
+    pub fn forget(&mut self, transfer: &str) -> Result<bool, JsError> {
+        Ok(self.inner.forget(&parse::<TransferRequest>(transfer)?))
     }
 
-    /// Takes back the note of an outgoing transfer nobody else holds.
-    pub fn cancel(&mut self, transfer: &str) -> Result<(), JsError> {
-        self.inner.cancel(&parse::<TransferRequest>(transfer)?);
-        Ok(())
+    /// Takes back the note of an outgoing transfer the mint never applied,
+    /// keeping the keys of its change. Returns whether it was outgoing.
+    pub fn cancel(&mut self, transfer: &str) -> Result<bool, JsError> {
+        Ok(self.inner.cancel(&parse::<TransferRequest>(transfer)?))
+    }
+
+    /// The transfers not yet answered, each as JSON.
+    pub fn outgoing(&self) -> Vec<String> {
+        self.inner.outgoing().map(json).collect()
+    }
+
+    /// The payments this holder made and keeps: while one of their transfers
+    /// is outgoing, or it keeps notes owed to the payee.
+    pub fn payments(&self) -> Vec<MadePayment> {
+        self.inner
+            .payments()
+            .map(|made| MadePayment {
+                request: json(&made.request),
+                payment: json(&made.payment),
+                owed: json(&made.owed),
+            })
+            .collect()
+    }
+
+    /// Stops keeping the notes, a JSON array, owed to payees, once they are
+    /// handed over. Returns the value it stopped keeping.
+    #[wasm_bindgen(js_name = forgetOwed)]
+    pub fn forget_owed(&mut self, notes: &str) -> Result<u128, JsError> {
+        Ok(self.inner.forget_owed(&parse::<Vec<Note>>(notes)?))
     }
 
     /// The outgoing transfers in random order, spaced by gaps of `min_secs`
@@ -184,6 +209,7 @@ impl Holder {
             unknown: balance.unknown,
             outgoing: balance.outgoing,
             expected: balance.expected,
+            unconfirmed: balance.unconfirmed,
         })
     }
 
@@ -213,6 +239,37 @@ impl Scheduled {
     #[wasm_bindgen(getter)]
     pub fn request(&self) -> String {
         self.request.clone()
+    }
+}
+
+/// A payment a holder made and keeps; see [`worgl_sdk::MadePayment`].
+#[wasm_bindgen]
+#[derive(Debug)]
+pub struct MadePayment {
+    request: String,
+    payment: String,
+    owed: String,
+}
+
+#[wasm_bindgen]
+impl MadePayment {
+    /// The request it answers, as JSON.
+    #[wasm_bindgen(getter)]
+    pub fn request(&self) -> String {
+        self.request.clone()
+    }
+
+    /// The payment, as JSON, to send again to a payee who lost it, less any
+    /// transfer cancelled or forgotten.
+    #[wasm_bindgen(getter)]
+    pub fn payment(&self) -> String {
+        self.payment.clone()
+    }
+
+    /// The notes kept for the payee, a JSON array.
+    #[wasm_bindgen(getter)]
+    pub fn owed(&self) -> String {
+        self.owed.clone()
     }
 }
 
@@ -248,6 +305,10 @@ pub struct Balance {
     /// Value asked for and not yet received.
     #[wasm_bindgen(readonly)]
     pub expected: u128,
+    /// Change of transfers dropped or cancelled, which comes only if the
+    /// counterparty hands it over.
+    #[wasm_bindgen(readonly)]
+    pub unconfirmed: u128,
 }
 
 /// One note a payment request asks for.
@@ -315,6 +376,27 @@ pub fn payment_mint(payment: &str) -> Result<String, JsError> {
 #[wasm_bindgen(js_name = paymentTransfers)]
 pub fn payment_transfers(payment: &str) -> Result<Vec<Scheduled>, JsError> {
     Ok(scheduled(parse::<Payment>(payment)?.transfers))
+}
+
+/// The issuer key of the mint a transfer goes to: its first input's.
+#[wasm_bindgen(js_name = transferMint)]
+pub fn transfer_mint(transfer: &str) -> Result<String, JsError> {
+    let transfer = parse::<TransferRequest>(transfer)?;
+    let spend = transfer
+        .inputs
+        .first()
+        .ok_or_else(|| JsError::new("the transfer spends no notes"))?;
+    Ok(spend.note.issuer().to_string())
+}
+
+/// Whether a transfer breaks the policy in a mint's info.
+#[wasm_bindgen(js_name = breaksPolicy)]
+pub fn breaks_policy(info: &str, transfer: &str) -> Result<bool, JsError> {
+    let policy = parse::<MintInfo>(info)?.policy;
+    let transfer = parse::<TransferRequest>(transfer)?;
+    let inputs: Vec<u64> = transfer.inputs.iter().map(|s| s.note.amount()).collect();
+    let outputs: Vec<u64> = transfer.outputs.iter().map(|o| o.amount).collect();
+    Ok(policy.check_transfer(&inputs, &outputs).is_err())
 }
 
 /// The issuer key of a note, given as a JSON string.

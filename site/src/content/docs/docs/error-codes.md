@@ -57,21 +57,37 @@ Errors answer with a status code and a body like:
 | `timeout` | 503 | On a cluster: the mint's group or the registry did not answer in time. The change may still be made. |
 | `kek_mismatch` | 403 | Only on a cluster member's Raft port, which clients never use: the member that sent the Raft request holds another `kek.key`. See [Running a cluster](../running-a-cluster/#the-key-encryption-key). |
 | `kek_unavailable` | 503 | Only on a cluster member's Raft port: the member could not use its own key-encryption key to check the sender's. The sender tries again later. |
+| `misdirected` | 421 | Only between cluster members, at a Raft port: a member's Raft request reached that member itself, because its `cluster.json` gives another member an address that leads back to it. See [Moving a member](../running-a-cluster/#moving-a-member). |
 
 ## Sending a request again
 
-Transfers, burns and mint requests are safe to send again unchanged. The
-mint answers a resent transfer or burn from its record of recent ones, and
-the latest mint request of an authority with the same note, so nothing
-happens twice.
+Transfers, burns and mint requests are safe to send again unchanged, and
+so are pauses and resumes. The mint answers a resent transfer or burn from
+its record of recent ones, and the latest mint request of an authority with
+the same note, and a pause of a paused mint or a resume of a running one
+changes nothing, so nothing happens twice.
 
-- After `no_leader` or `timeout`, send the same request again.
+- After `no_leader` or `timeout`, send the same transfer, burn, mint, pause
+  or resume request again.
 - After `busy`, send the same request again once the seconds its
   `Retry-After` header gives have passed. Both SDKs wait that long before
   their next try, up to 30 seconds.
+- A rotation (`POST /v1/mints/{mint}/rotate`) is made again each time it is
+  sent, and each one drops a layer, so note the last layer's `generation`
+  in `info` before you rotate. One answered `no_leader` was not made. One
+  answered `timeout`, or not answered at all, may have been, and may still
+  be made after an `info` read that does not show it, until the mint has
+  carried out a change sent after that answer. To make one with the admin
+  token, pause the mint, or resume it if it is paused; a transfer, burn or
+  mint request sent after the answer counts too. Once the mint has carried
+  it out, read `info`, and rotate again only if the last layer's
+  `generation` is still the one you noted, resuming the mint first if you
+  paused it.
 - A creation of a mint (`POST /v1/admin/mints`) answered `no_leader` made
   nothing, so send it again. One answered `timeout` may have made a mint the
   answer never named: list the mints before creating another.
+- Sending a rotation or a creation to another member of a cluster is sending
+  it again, so check first there too.
 - `paused`, `busy`, `layer_full`, `storage` and `internal` may go away
   later. Both SDKs count them, and any other 5xx status, as worth trying
   again: `Error::is_transient` in Rust and `isTransient(error)` in
@@ -95,3 +111,15 @@ happens twice.
   answer and can hand the notes over: `worgl receive` writes the payer's
   change, and `worgl submit` the payee's notes, each kept with
   `worgl accept` (`Purse::accept` or `purse.accept` in the SDKs).
+- A purse acts on the refusal of a transfer it made. One refused as `spent`
+  or `expired` with status 409 is dropped, since the note it spends is gone
+  either way, but the keys of its change are kept, so change handed over
+  later is still taken in. One refused as `policy` while the policy the mint
+  publishes refuses it too is cancelled and its note taken back. Any other
+  refusal leaves it outgoing, to send again: `unknown_mint` and `unissued`,
+  for one, say nothing about the transfer, only about the server, and the
+  mint never answers `unauthorized` or `duplicate_input` to a transfer a
+  purse signed, so those come from something else, such as a gateway.
+  `Refused::outcome` in Rust and `outcome` in TypeScript say what was done,
+  and `worgl` prints it (see
+  [Refused transfers](../command-line/#refused-transfers)).

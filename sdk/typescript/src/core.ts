@@ -16,6 +16,7 @@ if (wasm.protocol === 'file:' && fs !== undefined) {
 
 export {
   Holder,
+  breaksPolicy,
   checkPayment,
   mintSummary,
   noteIssuer,
@@ -25,6 +26,7 @@ export {
   requestAmount,
   requestMint,
   requestNotes,
+  transferMint,
   verifyNotes,
 } from '../wasm/worgl_wasm.js';
-export type { Scheduled } from '../wasm/worgl_wasm.js';
+export type { MadePayment, Scheduled } from '../wasm/worgl_wasm.js';
