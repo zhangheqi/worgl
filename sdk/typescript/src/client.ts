@@ -63,12 +63,19 @@ export class MintError extends Error {
    * answer carried none, such as from a proxy.
    */
   readonly code: string;
+  /**
+   * How long to wait before sending the request again, in milliseconds,
+   * from the answer's `Retry-After`. A `busy` mint sends one; it took
+   * nothing, and has room again after that.
+   */
+  readonly retryAfterMs: number | undefined;
 
-  constructor(status: number, code: string, message: string) {
+  constructor(status: number, code: string, message: string, retryAfterMs?: number) {
     super(`${message} (${code}, HTTP ${status})`);
     this.name = 'MintError';
     this.status = status;
     this.code = code;
+    this.retryAfterMs = retryAfterMs;
   }
 }
 
@@ -80,7 +87,8 @@ export class MintError extends Error {
 export function isTransient(error: unknown): boolean {
   if (error instanceof MintError) {
     return (
-      ['paused', 'storage', 'internal', 'layer_full'].includes(error.code) || error.status >= 500
+      ['paused', 'busy', 'storage', 'internal', 'layer_full'].includes(error.code) ||
+      error.status >= 500
     );
   }
   // fetch rejects with a TypeError when the request never completed, and
@@ -269,6 +277,10 @@ export class Client {
     } catch {
       // Not JSON: keep the text.
     }
-    throw new MintError(response.status, code, message);
+    // In seconds; the server never sends the date form.
+    const retryAfter = response.headers.get('retry-after')?.trim();
+    const retryAfterMs =
+      retryAfter !== undefined && /^\d+$/.test(retryAfter) ? Number(retryAfter) * 1000 : undefined;
+    throw new MintError(response.status, code, message, retryAfterMs);
   }
 }

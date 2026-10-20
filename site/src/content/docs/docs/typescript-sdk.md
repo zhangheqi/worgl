@@ -66,7 +66,9 @@ run purses against a real server.
 - `Purse` reads mint info itself, submits each transfer at its time, retries
   what fails on the way (a resent transfer gets the same answer) and saves
   after every change, before handing out anything that depends on it. If a
-  save fails, the change is undone and the call rejects.
+  save fails, the change is undone and the call rejects. After a `busy`
+  answer it waits as long as the mint's `Retry-After` asks, up to 30
+  seconds, before the next try.
 - `purse.refresh(mint)` pays the notes about to expire back to the purse,
   each at a random moment before the next rotation, and resends the
   outgoing transfers that must land before it. `planRefresh` and `submit`
@@ -103,8 +105,8 @@ run purses against a real server.
 
 `Client` makes one call per route and rejects with a `MintError` carrying the
 mint's code (`spent`, `frozen`, `paused`…). `isTransient(error)` says whether
-trying again may work. The codes are listed in
-[Error codes](../error-codes/).
+trying again may work, and `retryAfterMs` how long a `busy` mint asked to
+wait first. The codes are listed in [Error codes](../error-codes/).
 
 ## Stores
 

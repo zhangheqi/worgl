@@ -34,10 +34,19 @@ export const NO_SPACING: Spacing = { minSecs: 0, maxSecs: 0 };
 
 /**
  * How a purse resends a transfer that failed on the way: a lost connection,
- * a timeout, or a mint that was paused or could not store it. Resending is
- * safe, since the mint answers an identical transfer with identical notes,
- * before or after a rotation, for as long as it remembers the transfer (see
- * {@link Purse.settle}).
+ * a timeout, or a mint that was paused, busy or could not store it.
+ * Resending is safe, since the mint answers an identical transfer with
+ * identical notes, before or after a rotation, for as long as it remembers
+ * the transfer (see {@link Purse.settle}).
+ *
+ * When the mint answers `busy`, the next wait is as long as its
+ * `Retry-After` asks, up to 30 seconds, if that is longer; the waits after
+ * it double from where they were. A `Retry-After` on any other answer, such
+ * as a proxy's, changes no wait. The mint answers `busy` only to a request
+ * it did not apply, so with the default and a 30-second request timeout,
+ * the client's default, the last try still ends within 127 seconds of any
+ * the mint may have applied, inside the 128 seconds a mint keeps each
+ * answer by default, and is answered as before.
  */
 export interface Retry {
   /** Tries in all, the first included. */
@@ -51,6 +60,9 @@ export const DEFAULT_RETRY: Retry = { attempts: 4, firstDelayMs: 1000 };
 
 /** Longest wait honored before submitting a transfer: a year, in seconds. */
 export const MAX_DELAY_SECS = 365 * 24 * 60 * 60;
+
+/** Longest a mint's `Retry-After` makes a purse wait before a retry, in milliseconds. */
+const MAX_RETRY_AFTER_MS = 30_000;
 
 /** A signed transfer, as JSON, and when to submit it. */
 export interface ScheduledTransfer {
@@ -620,7 +632,7 @@ export class Purse {
         if (!isTransient(error) || attempt >= this.#retry.attempts) {
           throw error;
         }
-        await sleep(delay);
+        await sleep(nextWait(delay, error));
         delay *= 2;
       }
     }
@@ -679,6 +691,22 @@ function now(): bigint {
 
 function sleep(ms: number): Promise<void> {
   return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+/**
+ * The wait before the next try after `error`, in milliseconds: `delay`, or
+ * after `busy` what the mint's `Retry-After` asks if that is longer, up to
+ * 30 seconds. It stretches this wait only, never the ones after.
+ *
+ * Only `busy` stretches it: the mint answers so only to a request it did
+ * not apply. Another answer, such as a proxy's, may come after the mint
+ * applied the try, and longer waits could take the last try past the time
+ * the mint keeps the receipt for.
+ */
+function nextWait(delay: number, error: unknown): number {
+  const asked =
+    error instanceof MintError && error.code === 'busy' ? error.retryAfterMs : undefined;
+  return asked === undefined ? delay : Math.max(delay, Math.min(asked, MAX_RETRY_AFTER_MS));
 }
 
 /** Waits until `deadline`, in milliseconds since the epoch, in steps that timers can hold. */
