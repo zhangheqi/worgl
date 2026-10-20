@@ -43,7 +43,7 @@ Errors answer with a status code and a body like:
 | `overdrawn` | 409 | The inputs spend more from a layer than the mint counts as live in it. This happens only after the mint's state was rolled back, as by a restore from a backup, and it handed out the same serials again. See [Backups](../backups/#why-a-lost-state-matters). |
 | `stale_mint` | 409 | A mint request reuses a sequence number, or goes below one, that its authority already used. |
 | `stale_rotation` | 409 | A scheduled rotation is due no later than the last one logged, which already covered it. |
-| `layer_full` | 503 | The layer the outputs would land in has too few free bits left until the next rotation. |
+| `layer_full` | 503 | The layer the outputs would land in has too few free bits left, and gets none back until a rotation drops it. |
 | `paused` | 503 | The mint is paused. Its notes keep their places until it resumes. |
 | `busy` | 503 | The mint holds `receipt_capacity` receipts, all younger than `receipt_min_age_secs` or, for a while after a restart, counted so, and takes no new transfer or burn until the oldest may go. The `Retry-After` header says in how many seconds. Nothing was done. |
 
@@ -91,7 +91,11 @@ changes nothing, so nothing happens twice.
 - `paused`, `busy`, `layer_full`, `storage` and `internal` may go away
   later. Both SDKs count them, and any other 5xx status, as worth trying
   again: `Error::is_transient` in Rust and `isTransient(error)` in
-  TypeScript.
+  TypeScript. `layer_full` on a transfer is the exception, though both SDKs
+  still count it as transient and a purse retries it like the others: sent
+  again unchanged, its outputs would land in the same full generation after
+  every rotation, so it is refused every time. See
+  [Layer size](../choosing-a-period/#layer-size).
 - A transfer or burn sent again is answered as before for at least
   `receipt_min_age_secs` (128 seconds by default), and while it is among the
   last `receipt_capacity` (1,048,576 by default) the mint took. One sent

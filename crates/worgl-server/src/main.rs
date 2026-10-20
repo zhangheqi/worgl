@@ -45,7 +45,8 @@ enum Command {
         /// Number of layers.
         #[arg(long, default_value_t = 4)]
         layers: u32,
-        /// Notes each layer can hold per generation; a multiple of 64.
+        /// Bits per layer: how many notes can ever enter one generation,
+        /// minted or moved in. A multiple of 64.
         #[arg(long, default_value_t = 1 << 20)]
         layer_size: u32,
         /// Policy as a JSON file, copied into the mint's directory. Missing

@@ -148,7 +148,7 @@ pub enum LedgerError {
     #[error("no layer at position {0}")]
     NoSuchPosition(u32),
     /// Every bit of the layer has been handed out for this generation.
-    #[error("layer at position {position} is full until the next rotation")]
+    #[error("layer at position {position} is full until a rotation drops it")]
     LayerFull {
         /// Position of the full layer.
         position: u32,
