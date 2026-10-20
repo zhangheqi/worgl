@@ -24,7 +24,7 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::Duration;
 
-use openraft::error::{ClientWriteError, InitializeError, RaftError};
+use openraft::error::{CheckIsLeaderError, ClientWriteError, InitializeError, RaftError};
 use openraft::impls::OneshotResponder;
 use openraft::storage::{LogFlushed, RaftLogStorage, RaftStateMachine};
 use openraft::{
@@ -181,9 +181,10 @@ impl Registry {
         self.raft.metrics().borrow().current_leader
     }
 
-    /// Adds `mint` with `record`, if this member leads, once a majority of
-    /// the members hold the entry. Returns whether the mint was added: a
-    /// registry that holds it already keeps the record it has.
+    /// Adds `mint` with `record`, if this member leads and a majority of the
+    /// members confirm it does, once a majority of them hold the entry.
+    /// Returns whether the mint was added: a registry that holds it already
+    /// keeps the record it has.
     pub async fn insert(
         &self,
         mint: PublicKey,
@@ -204,19 +205,47 @@ impl Registry {
                 return Err(ReplicaError::NotLeader { leader, node });
             }
         }
-        let written =
-            tokio::time::timeout(TIMEOUT, self.raft.client_write(Insert { mint, record })).await;
-        match written {
-            Err(_) => Err(ReplicaError::Timeout),
-            Ok(Ok(response)) => Ok(response.data.added),
-            Ok(Err(RaftError::APIError(ClientWriteError::ForwardToLeader(forward)))) => {
+        tokio::time::timeout(TIMEOUT, self.confirm_and_write(Insert { mint, record }))
+            .await
+            .map_err(|_| ReplicaError::Timeout)?
+    }
+
+    /// Proposes `insert` once a majority of the members confirm this member
+    /// leads. A member that restarts as leader takes up its term at once,
+    /// before it hears from any other, so without that it could append an
+    /// entry while no other will hear from it, and the entry would commit
+    /// whenever they next did.
+    async fn confirm_and_write(&self, insert: Insert) -> Result<bool, ReplicaError> {
+        loop {
+            match self.raft.ensure_linearizable().await {
+                Ok(_) => break,
+                Err(RaftError::APIError(CheckIsLeaderError::ForwardToLeader(forward))) => {
+                    return Err(ReplicaError::NotLeader {
+                        leader: forward.leader_id,
+                        node: forward.leader_node,
+                    });
+                }
+                Err(RaftError::APIError(CheckIsLeaderError::QuorumNotEnough(_))) => {
+                    // Too few members answered within one heartbeat interval:
+                    // ask again until the insert gives up.
+                    let heartbeat = self.raft.config().heartbeat_interval;
+                    tokio::time::sleep(Duration::from_millis(heartbeat)).await;
+                }
+                Err(RaftError::Fatal(fatal)) => {
+                    return Err(ReplicaError::Stopped(fatal.to_string()));
+                }
+            }
+        }
+        match self.raft.client_write(insert).await {
+            Ok(response) => Ok(response.data.added),
+            Err(RaftError::APIError(ClientWriteError::ForwardToLeader(forward))) => {
                 Err(ReplicaError::NotLeader {
                     leader: forward.leader_id,
                     node: forward.leader_node,
                 })
             }
-            Ok(Err(RaftError::APIError(error))) => Err(ReplicaError::Stopped(error.to_string())),
-            Ok(Err(RaftError::Fatal(fatal))) => Err(ReplicaError::Stopped(fatal.to_string())),
+            Err(RaftError::APIError(error)) => Err(ReplicaError::Stopped(error.to_string())),
+            Err(RaftError::Fatal(fatal)) => Err(ReplicaError::Stopped(fatal.to_string())),
         }
     }
 

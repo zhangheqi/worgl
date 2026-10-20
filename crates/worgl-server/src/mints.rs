@@ -6,7 +6,9 @@
 //! - `operator.token`, which authorizes creating and listing mints,
 //! - `kek.key`, the key-encryption key that seals each new generation key
 //!   into its rotation's log entry, mode 0600 (a [`FileKek`], for
-//!   development; replicas will share one from a KMS), and
+//!   development; replicas will share one from a KMS). Only [`init_state`]
+//!   makes it, the directory does not open without it, and every member of
+//!   a cluster must hold the same one; and
 //! - `mints/<issuer key>/`, one directory per mint, named by its issuer key
 //!   in hex.
 //!
@@ -142,7 +144,7 @@ struct Settings {
 }
 
 /// Creates a server's state directory: an operator token, a key-encryption
-/// key and no mints.
+/// key and no mints. This is the only place a key-encryption key is made.
 pub fn init_state(dir: &Path) -> Result<()> {
     if dir.join(OPERATOR_TOKEN_FILE).exists() {
         bail!("{} already holds a server", dir.display());
@@ -151,22 +153,24 @@ pub fn init_state(dir: &Path) -> Result<()> {
         .with_context(|| format!("creating {}", dir.display()))?;
     FileKek::create(&dir.join(KEK_FILE))
         .with_context(|| format!("creating {}", dir.join(KEK_FILE).display()))?;
-    write_secret(&dir.join(OPERATOR_TOKEN_FILE), &files::random_token()?)
+    write_secret(&dir.join(OPERATOR_TOKEN_FILE), &files::random_token()?)?;
+    files::sync_dir(dir).with_context(|| format!("syncing {}", dir.display()))
 }
 
-/// Reads the state directory's key-encryption key, making one for a state
-/// directory from before they existed.
+/// Reads the state directory's key-encryption key. A missing one is an
+/// error: a new key would not open what the old one sealed, and on a
+/// cluster it would differ from the other members' key.
 pub(crate) fn open_kek(dir: &Path) -> Result<Arc<dyn Kek>> {
     let path = dir.join(KEK_FILE);
-    let kek = match FileKek::open(&path) {
-        Ok(kek) => kek,
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-            tracing::info!(path = %path.display(), "creating a key-encryption key");
-            FileKek::create(&path).with_context(|| format!("creating {}", path.display()))?
-        }
-        Err(error) => return Err(error).with_context(|| format!("reading {}", path.display())),
-    };
-    Ok(Arc::new(kek))
+    match FileKek::open(&path) {
+        Ok(kek) => Ok(Arc::new(kek)),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => bail!(
+            "{} is missing: restore it from a backup of this directory or, on a cluster, \
+             copy it from another member; a new key would not open what the old one sealed",
+            path.display()
+        ),
+        Err(error) => Err(error).with_context(|| format!("reading {}", path.display())),
+    }
 }
 
 /// Creates a mint in the state directory `state` with a fresh issuer key and

@@ -36,10 +36,12 @@ the addresses themselves, see [Moving a member](#moving-a-member).
 `join-cluster` writes `cluster.json` and, the first time, `cluster.token`
 (mode 0600), which the members show each other on their Raft ports. Copy the
 directory before any member starts: the copies share the mints, tokens and
-key-encryption key, and differ only in `--node`. A directory a server has
-already run mints in can join too, and its mints carry on with every note
-and setting. On a member, `serve` also listens on its Raft port, or on
-`--raft-listen` if given.
+key-encryption key, and differ only in `--node`. Copy `kek.key` with the
+rest, and do not run `init` on the other machines, which would make each a
+key of its own: see [The key-encryption key](#the-key-encryption-key). A
+directory a server has already run mints in can join too, and its mints
+carry on with every note and setting. On a member, `serve` also listens on
+its Raft port, or on `--raft-listen` if given.
 
 ## Keep the members private
 
@@ -50,9 +52,13 @@ lead, and each mint creation, on to the leader's API address with its
 `Authorization` header, so mint admin and operator tokens cross too.
 
 A mint applies whatever its group's log holds without asking who wrote it,
-and the cluster token lets anyone who reaches a Raft port append to that
-log as if they led. With it they can append events the mints will sign
-notes for, so the cluster token is as strong as the mints' issuer keys.
+and the cluster token, shown with a member's seal of a fixed value under
+its key-encryption key (see
+[The key-encryption key](#the-key-encryption-key)), lets anyone who reaches
+a Raft port append to that log as if they led. Both cross the
+network in the clear with every Raft message. With them anyone can append
+events the mints will sign notes for, so the cluster token is as strong as
+the mints' issuer keys.
 
 Put every member's API and Raft address on a private network:
 
@@ -170,6 +176,34 @@ Beside what any server's state directory holds (see
 mint's directory also holds `vote.json`, the replica's Raft vote. Tokens
 are read once, not reloaded; to replace one, see
 [Replacing a token](../keys/#replacing-a-token).
+
+## The key-encryption key
+
+`kek.key` must be identical on every member. A rotation seals its new
+generation key with the leader's `kek.key`, and the registry seals a new
+mint's secrets with that of the member leading it, so every member has to
+unseal what any other sealed.
+
+A member does not join or start without `kek.key`. `join-cluster` and
+`serve` fail with `…/kek.key is missing`, and `join-cluster` writes nothing.
+Copy `kek.key` from another member, or from a backup of this member's
+directory. Only `init` makes one, and a new key would not open what the old
+one sealed.
+
+Members also check each other's key on every Raft request: each request
+carries the sender's seal of a fixed value, which the receiver opens once and
+remembers. A member whose `kek.key` differs, such as one that ran its own
+`init` and was given only the cluster token, is refused by the others, and
+refuses them in turn. Both sides log `kek.key differs from member N's`, and
+the Raft port answers `403 kek_mismatch` with the same words. To each other
+the two look cut off: nothing either sealed reaches the other, so no
+member's copy of a mint stops over a key it cannot unseal. The odd member
+creates no mint and makes no rotation, even if it led the registry or a mint
+before it restarted: a leader proposes nothing until a majority has answered
+it, and the others never answer the odd member. The other two carry on while
+they are a majority, but until the odd member is fixed the cluster cannot
+lose another. To fix it, stop it, copy `kek.key` from a member the others
+accept, and start it again; it catches up from the others.
 
 ## Backups and a failed member
 
@@ -326,8 +360,9 @@ stop until the third is back.
 
 - A mint's rules are not replicated: each member keeps its own `policy.json`
   and `mint.json`. See [Changing the rules](#changing-the-rules).
-- Members talk in plain HTTP, and the Raft port checks only the cluster
-  token, so they need a private network between them; see
+- Members talk in plain HTTP, and what the Raft port checks, the cluster
+  token and the members' seals, crosses the network in the clear, so they
+  need a private network between them; see
   [Keep the members private](#keep-the-members-private). TLS between
   members is not available yet.
 - The members are fixed once the cluster starts: members cannot be added or

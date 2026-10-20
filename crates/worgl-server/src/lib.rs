@@ -60,9 +60,10 @@
 //! read the mint's info once it has carried out a change sent after that
 //! answer. Members also serve [`raft_router`] on a port of their own, for
 //! each other only. They talk to each other in plain HTTP, Raft's RPCs with
-//! one shared token and the requests they pass on with their clients'
-//! tokens, so every member's addresses must be on a network only the
-//! members and a proxy in front of them can reach (see [`cluster`]).
+//! one shared token and each member's key-encryption key seal, and the
+//! requests they pass on with their clients' tokens, so every member's
+//! addresses must be on a network only the members and a proxy in front of
+//! them can reach (see [`cluster`]).
 //! Creating a mint goes through the cluster's registry, from which every
 //! member writes and serves the new mint; a creation answered `503 timeout`
 //! may have made a mint, so list the mints before creating another. A
@@ -145,7 +146,8 @@ pub struct RotationSchedule {
 impl AppState {
     /// Opens the server state in `dir`, made by [`init_state`], and every
     /// mint in it, starting their committers and rotation clocks. Fails if
-    /// any mint does not open, rather than serve without it.
+    /// `kek.key` is missing or any mint does not open, rather than serve
+    /// without it.
     /// `compact_every` is how many logged events trigger a fresh snapshot
     /// of a mint; rotations always do. Must be called within a Tokio runtime.
     pub fn open(dir: &Path, compact_every: u64) -> anyhow::Result<Self> {
@@ -177,7 +179,7 @@ impl AppState {
     /// runtime.
     pub async fn open_member(dir: &Path, compact_every: u64) -> anyhow::Result<Self> {
         let (operator_token, kek) = Self::read_state(dir)?;
-        let cluster = Cluster::open(dir)?;
+        let cluster = Cluster::open(dir, kek.clone())?;
         let registry = cluster::open_registry(dir, &cluster).await?;
         let records = registry.records();
         // Mints created while this member was away.
@@ -525,6 +527,17 @@ pub fn router(state: AppState) -> Router {
 /// `Authorization: Bearer <cluster token>`. Serve them on a port of their
 /// own that only the members can reach.
 ///
+/// Each request also carries `x-worgl-member`, the sender's id, and
+/// `x-worgl-kek-check`, in hex, the sender's key-encryption key's seal of 32
+/// zero bytes under the context `worgl/cluster/kek-check/v1`. A member
+/// refuses one whose seal its own key does not open with `403 kek_mismatch`
+/// (see [`cluster`]), one whose seal it cannot check while its key is
+/// unavailable with `503 kek_unavailable`, and one that lacks either header,
+/// names no member in its `cluster.json` or carries a seal that is not hex
+/// with `400 malformed`. Past those checks, it refuses one whose Raft vote
+/// names the receiving member itself as its sender with `421 misdirected`
+/// (see [`cluster`]).
+///
 /// | method | path                       | body                              |
 /// |--------|----------------------------|-----------------------------------|
 /// | POST   | `/raft/{mint}/append`      | openraft's `AppendEntriesRequest` |
@@ -864,8 +877,11 @@ impl ApiError {
     /// request again) and `timeout` (the change may still be made: send the
     /// same note request again, but before rotating again read the mint's
     /// info once it has carried out a change sent after this answer, and
-    /// list the mints before creating another), and on a cluster's Raft port
-    /// only `misdirected` (a Raft request reached the member that sent it).
+    /// list the mints before creating another). A cluster's Raft port also
+    /// answers `misdirected` (a Raft request reached the member that sent
+    /// it), `kek_mismatch` (to a member that holds another key-encryption
+    /// key) and `kek_unavailable` (while its own key-encryption key cannot be
+    /// used).
     pub fn code(&self) -> &'static str {
         self.code
     }

@@ -110,7 +110,7 @@ A KMS-backed key is not available yet.
 |---|---|---|
 | Operator token | `operator.token` | Creating and listing mints: `/v1/admin/mints`. |
 | Admin token | `mints/<mint>/admin.token` | Rotating, pausing and resuming that mint only. |
-| Cluster token | `cluster.token`, on cluster members | The members' Raft port, and with it every mint's log, so it is as strong as the issuer keys. See [Keep the members private](../running-a-cluster/#keep-the-members-private). |
+| Cluster token | `cluster.token`, on cluster members | The members' Raft port, shown with a member's seal of a fixed value under `kek.key`, which crosses beside it in the clear, and with it every mint's log, so it is as strong as the issuer keys. See [Keep the members private](../running-a-cluster/#keep-the-members-private). |
 
 Routes with a token take `Authorization: Bearer <token>`. A missing or wrong
 token is answered `401 admin_unauthorized`. The server refuses to start if a
