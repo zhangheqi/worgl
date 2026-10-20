@@ -86,9 +86,14 @@ pub struct Submitted {
     pub value: u128,
     /// Transfers the mint answered.
     pub answered: usize,
-    /// Every note in the answers, the counterparty's included, to hand on
-    /// when the counterparty did not submit them itself.
+    /// Every note in the answers, this purse's own included.
     pub notes: Vec<Note>,
+    /// The notes in the answers for neither a note this purse holds nor a
+    /// key it expects: the counterparty's (see [`Holder::theirs`]). Hand
+    /// them over for its [`Purse::accept`]: a payee hands the payer its
+    /// change, and a payer that submitted a payment hands the payee its
+    /// notes.
+    pub theirs: Vec<Note>,
     /// Transfers the mint refused, or that kept failing on the way.
     pub refused: Vec<Refused>,
 }
@@ -102,6 +107,12 @@ pub struct Refused {
     /// again later may work; a refusal such as `spent` or `expired` will
     /// not.
     pub error: Error,
+    /// For a transfer refused as `spent` or `expired` that this purse made
+    /// or is paid by, what it may lose ([`Holder::at_stake`]): the transfer
+    /// may have been applied, with an answer the mint no longer keeps. Only
+    /// a counterparty that submitted it can then hand the notes over, for
+    /// [`accept`](Purse::accept). `None` otherwise.
+    pub at_stake: Option<u128>,
 }
 
 impl Purse<FileStore> {
@@ -213,8 +224,9 @@ impl<S: Store> Purse<S> {
 
     /// Answers a payment request, after reading the mint's info. The notes
     /// spent and the keys for the change are saved before the payment is
-    /// returned. Send it to the payee, who submits it, then
-    /// [`settle`](Self::settle) later to take in the change.
+    /// returned. Send it to the payee, who submits it and can hand back the
+    /// change for [`accept`](Self::accept); or [`settle`](Self::settle)
+    /// later to take it in.
     pub async fn pay(&self, request: &PaymentRequest, spacing: Spacing) -> Result<Payment, Error> {
         let view = self.client.view(&request.mint).await?;
         self.change(
@@ -230,7 +242,8 @@ impl<S: Store> Purse<S> {
     /// Takes a payment for `request`: checks that it pays what was asked,
     /// then submits each transfer at its time and takes in the notes.
     /// Returns once the last transfer is answered or refused. The payer
-    /// chose the times; wrap the call in a timeout to bound the wait.
+    /// chose the times; wrap the call in a timeout to bound the wait. Hand
+    /// [`Submitted::theirs`], the payer's change, back to the payer.
     pub async fn receive(
         &self,
         request: &PaymentRequest,
@@ -240,10 +253,16 @@ impl<S: Store> Purse<S> {
         self.submit(&payment.transfers).await
     }
 
-    /// Takes in notes the counterparty handed over from the mint's
-    /// answers, after checking each one's signature against its mint's keys.
-    /// Notes for keys this purse never handed out are ignored. Returns the
-    /// value taken in.
+    /// Takes in notes the counterparty handed over from the mint's answers,
+    /// after checking each one's signature against its mint's keys, and
+    /// settles the outgoing transfers they answer (see
+    /// [`Holder::take_answers`]). Notes for keys this purse never handed out
+    /// are ignored. A note whose layer the mint has dropped no longer
+    /// verifies and fails the call. Returns the value taken in.
+    ///
+    /// The signatures show that the mint issued the notes, not that it
+    /// applied the transfers they settle: a counterparty could pay the same
+    /// keys from notes of its own (see [`Holder::take_answers`]).
     pub async fn accept(&self, notes: &[Note]) -> Result<u128, Error> {
         let mut keys: HashMap<PublicKey, KeySet> = HashMap::new();
         for note in notes {
@@ -253,7 +272,7 @@ impl<S: Store> Purse<S> {
             }
             note.verify(&keys[note.issuer()])?;
         }
-        self.change(|holder| Ok(holder.absorb(notes)), |_, _| {})
+        self.change(|holder| Ok(holder.take_answers(notes)), |_, _| {})
     }
 
     /// Resends the transfers this purse made and has not seen answered, at
@@ -261,34 +280,52 @@ impl<S: Store> Purse<S> {
     /// payee has had time to submit a payment, or after a restart. Planned
     /// refreshes still waiting for their time are resent too.
     ///
-    /// The mint keeps the answers to its most recent transfers only, and
-    /// each only until the notes it issued expire: settle before many more
-    /// have passed and while the change is live, or a transfer already
-    /// applied is refused as `spent` or `expired` and its change is lost.
+    /// The mint answers a resent transfer with the same notes only while it
+    /// keeps its answer, and at the latest until the notes it issued expire
+    /// (see [Error codes]). After that, a transfer already applied is
+    /// refused as `spent` or `expired`, with [`Refused::at_stake`] set, and
+    /// its change can only come from the counterparty, for
+    /// [`accept`](Self::accept). [`refresh`](Self::refresh) resends the
+    /// transfers whose chance the next rotation ends.
+    ///
+    /// [Error codes]: https://github.com/zhangheqi/worgl/blob/main/site/src/content/docs/docs/error-codes.md#sending-a-request-again
     pub async fn settle(&self, spacing: Spacing) -> Result<Submitted, Error> {
         let transfers = self.lock().resend(spacing);
         self.submit(&transfers).await
     }
 
     /// Plans the refresh of `mint`'s notes that die at the next rotation,
-    /// after reading its info, and saves the plan. Submit the transfers at
-    /// their times with [`submit`](Self::submit).
+    /// after reading its info, and saves the plan. The outgoing transfers
+    /// to resend before that rotation join it (see
+    /// [`Holder::due_resends`]); if the save fails, only the refreshes are
+    /// undone. Submit the transfers at their times with
+    /// [`submit`](Self::submit).
     pub async fn plan_refresh(&self, mint: &PublicKey) -> Result<Vec<ScheduledTransfer>, Error> {
         let view = self.client.view(mint).await?;
-        self.change(
-            |holder| Ok(holder.refresh(&view, unix_now())),
-            |holder, transfers| {
-                for transfer in transfers {
+        let now = unix_now();
+        let (mut transfers, resends) = self.change(
+            |holder| {
+                // Before the refreshes join the outgoing transfers.
+                let resends = holder.due_resends(&view, now);
+                Ok((holder.refresh(&view, now), resends))
+            },
+            |holder, (refreshes, _)| {
+                for transfer in refreshes {
                     holder.cancel(&transfer.request);
                 }
             },
-        )
+        )?;
+        transfers.extend(resends);
+        transfers.sort_by_key(|t| t.after_secs);
+        Ok(transfers)
     }
 
-    /// Refreshes `mint`'s notes that die at the next rotation: plans the
-    /// transfers and submits each at its random time before the rotation.
-    /// Returns once the last one is done, which may be most of a rotation
-    /// period away; run it in a task of its own.
+    /// Refreshes `mint`'s notes that die at the next rotation and resends
+    /// the outgoing transfers that must land before it: plans the transfers
+    /// with [`plan_refresh`](Self::plan_refresh) and submits each at its
+    /// random time before the rotation. Returns once the last one is done,
+    /// which may be most of a rotation period away; run it in a task of its
+    /// own.
     pub async fn refresh(&self, mint: &PublicKey) -> Result<Submitted, Error> {
         let transfers = self.plan_refresh(mint).await?;
         self.submit(&transfers).await
@@ -317,17 +354,29 @@ impl<S: Store> Purse<S> {
             sleep_until(start + delay).await;
             match self.send(&transfer.request).await {
                 Ok(notes) => {
-                    submitted.value += self.change(
-                        |holder| Ok(holder.settle(&transfer.request, &notes)),
+                    let (value, theirs) = self.change(
+                        |holder| {
+                            let value = holder.settle(&transfer.request, &notes);
+                            Ok((value, holder.theirs(&notes)))
+                        },
                         |_, _| {},
                     )?;
+                    submitted.value += value;
                     submitted.answered += 1;
                     submitted.notes.extend(notes);
+                    submitted.theirs.extend(theirs);
                 }
-                Err(error) => submitted.refused.push(Refused {
-                    request: transfer.request.clone(),
-                    error,
-                }),
+                Err(error) => {
+                    let at_stake = match error.code() {
+                        Some("spent" | "expired") => self.lock().at_stake(&transfer.request),
+                        _ => None,
+                    };
+                    submitted.refused.push(Refused {
+                        request: transfer.request.clone(),
+                        error,
+                        at_stake,
+                    });
+                }
             }
         }
         Ok(submitted)

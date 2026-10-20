@@ -23,12 +23,18 @@ be copied or audited without exposing a secret. The secrets are the files in
 mode 0600. `mint.key`, if it is still in the mint's directory, is a mint
 authority key the server never reads; keep it wherever you mint from instead.
 
-A rotation writes its new key to `keys.bin` before logging the rotation, and
-keys of dropped generations leave the file at the next snapshot. A backup of
-`keys.bin` older than the log it goes with can therefore lack the newest
-generation's key. Given the key-encryption key, the store unseals any such
-key from the rotation's log entry when it opens, so keep `kek.key` with the
-rest.
+On a server on its own, a rotation writes its new key to `keys.bin` before
+logging the rotation, and the snapshot the server writes right after it
+takes the keys of dropped generations out of the file and the rotation out
+of the log. A copy of `keys.bin` older than the log it goes with can lack
+the newest generation's key; given the key-encryption key, the store
+unseals it from the rotation's log entry when it opens. A copy of `keys.bin`
+older than the snapshot it goes with can lack a key that nothing recovers,
+since the rotation has left the log, and the store then does not open. On a
+cluster member, `keys.bin` is written only with a snapshot, so the keys of
+rotations logged since the member's last snapshot are in the log alone,
+sealed, and the member cannot apply them without `kek.key`. Keep `kek.key`
+with the rest.
 
 ## A consistent copy
 
@@ -41,8 +47,35 @@ it leaves out the sealed keys, so it is for an audit, not a restore. See
 ## Why a lost state matters
 
 The mint stores no notes, only their bits. If its state is lost or rolled
-back, notes it signed after the copy are unknown to the ledger: spending one
-is refused with `unissued`, and notes spent after the copy are live again.
+back to a copy, notes spent after the copy are live again, and notes it
+signed after the copy are unknown to the ledger, so spending one is refused
+with `unissued`. That lasts only until the restored mint hands out their
+serials again, which it does: each layer hands out its bits in the same
+order as before, and the restored `keys.bin` signs them with the same
+generation keys. The notes signed between the copy and the restore come
+back and collide with new notes on the same serials. Both are genuinely
+signed, so whichever is spent first wins and the other is refused as
+`spent`. Where the two differ in amount, the layer's count of live value
+drifts from what its notes are worth, and a spend that takes more than that
+count is refused as `overdrawn`, even with notes that collided with none.
+This lasts until every generation live at the copy has rotated out. Notes of
+generations created after the copy were signed with keys the restored
+`keys.bin` lacks, so they are refused as `invalid_note`.
+
+Until a restore step can tell the two notes of a serial apart, the only
+recovery free of collisions is to rotate every restored mint as many times
+as it has layers before the server serves anyone: serve on a loopback
+address and post to each mint's rotate route (see
+[Rotation](../running-a-server/#rotation)). That drops every generation the
+copy knew, so every outstanding note expires, those from before the copy
+too, and holders get the value back only if it is minted again.
+
+A whole cluster restored from its members' backups is rolled back the same
+way, but serving on a loopback address does not work there: a member passes
+a rotation of a mint it does not lead to the leader's API address in
+`cluster.json`. Serve the members on their usual addresses, keep clients off
+their API ports some other way, such as a firewall that lets only the
+members through, and post every mint's rotations to any member.
 
 ## How storage fails
 
@@ -51,6 +84,24 @@ damaged record is dropped only when nothing readable follows it, which is
 the one place a crash can leave a torn write. Damage anywhere else stops the
 store from opening rather than silently losing acknowledged transfers.
 
-On a cluster each mint is kept on all three members, and a member that was
-away catches up from the others. That covers a failed server, not a deleted
-mint or an operator's mistake, so back up a member's directory as well.
+## On a cluster
+
+Each mint is kept on all three members, and a member that was away catches
+up from the others. That covers a failed server, not a deleted mint or an
+operator's mistake, so back up the members' directories as well.
+
+Those copies restore the whole cluster to one moment: every member from a
+copy of that moment, with every member stopped, before any of them starts.
+Either copy every member with every member stopped and restore each from
+its own copy, or restore all three from the copy of one member that held
+every change another member held; see
+[Running a cluster](../running-a-cluster/#backups-and-a-failed-member) for
+how to check. Never restore one member on its own, whether the others run
+or not. Raft counts on a member never forgetting what it acknowledged to
+the others, and one restored from an older copy has forgotten it. Nothing
+prevents that, and at most the leader logs a warning containing
+`follower log is reverted`. Should it help a member that lacks the same
+changes become leader, as when the leader fails and the third member was
+away while those changes were made, they are lost: transfers the cluster
+answered are undone, and a note paid away can be spent again. To replace a
+member that failed, copy one that runs instead; see the same page.

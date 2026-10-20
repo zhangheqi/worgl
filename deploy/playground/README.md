@@ -67,9 +67,18 @@ SDK defaults pointed at it keep working.
   own log after a snapshot, so two members' exports can start at different
   entries; an entry with the same index and term is the same on both. See
   [When the log is purged](../../site/src/content/docs/docs/audit.md#when-the-log-is-purged).
-- Back up one of the `member*` volumes: each holds the whole mint, its keys
-  and the key-encryption key. Back up the `faucet` volume too, since only it
-  holds the mint authority key; without that key nothing can mint.
+- Back up one of the `member*` volumes: it holds the whole mint, its keys
+  and the key-encryption key. Copy a member that holds every change another
+  member holds, checked as
+  [Running a cluster](../../site/src/content/docs/docs/running-a-cluster.md#backups-and-a-failed-member)
+  describes, and stop it for the copy while the others serve. The copy
+  restores all three members, never one alone, with every change answered
+  before the check: with all three stopped, put it in every member's volume
+  and run `worgl-server join-cluster` on each with its own `--node`, as
+  `setup.sh` does, then start them. A member restored on its own can undo
+  transfers the cluster answered; to replace one, see the same page. Back
+  up the `faucet` volume too, since only it holds the mint authority key;
+  without that key nothing can mint.
 - `docker compose down -v` deletes the mint for good, with every note.
 
 The three members share one machine here, so the cluster survives a member

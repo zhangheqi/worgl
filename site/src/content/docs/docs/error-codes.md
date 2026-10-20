@@ -40,6 +40,7 @@ Errors answer with a status code and a body like:
 | `expired` | 409 | An input's layer has been dropped. |
 | `frozen` | 409 | An input is in the last layer and cannot move until the next rotation. |
 | `unissued` | 409 | The mint signed this note but its ledger has no record of it, which only happens if the mint's state was lost or rolled back. |
+| `overdrawn` | 409 | The inputs spend more from a layer than the mint counts as live in it. This happens only after the mint's state was rolled back, as by a restore from a backup, and it handed out the same serials again. See [Backups](../backups/#why-a-lost-state-matters). |
 | `stale_mint` | 409 | A mint request reuses a sequence number, or goes below one, that its authority already used. |
 | `stale_rotation` | 409 | A scheduled rotation is due no later than the last one logged, which already covered it. |
 | `layer_full` | 503 | The layer the outputs would land in has too few free bits left, and gets none back until a rotation drops it. |
@@ -87,3 +88,12 @@ happens twice.
   the same notes, until those notes expire in turn. A burn sent again is
   answered the same while its inputs' layer is live or one of the last
   `layers − 1` dropped, and refused as `expired` after.
+- A transfer sent again and refused as `spent` or `expired` is possibly
+  applied: it may have gone through before, sent by the other side or by an
+  earlier try whose answer was lost, and the mint no longer keeps the
+  answer. For a transfer a purse made or is paid by, both SDKs say what may
+  be lost, in `Refused::at_stake` in Rust and `atStake` in TypeScript, and
+  `worgl` prints it. If the other side submitted it, it got the mint's
+  answer and can hand the notes over: `worgl receive` writes the payer's
+  change, and `worgl submit` the payee's notes, each kept with
+  `worgl accept` (`Purse::accept` or `purse.accept` in the SDKs).

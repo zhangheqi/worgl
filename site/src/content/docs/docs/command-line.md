@@ -35,16 +35,31 @@ Or build it in a clone with `cargo build --release -p worgl-cli`, as the
 ## A payment
 
 ```sh
-worgl init                                     # each side, once
-worgl playground --faucet $FAUCET              # a note from a playground faucet; prints its mint
-worgl mint $MINT 8 --authority-key mint.key    # as a mint authority, for testing
-worgl request $MINT 5 -o request.json          # payee → send request.json
-worgl pay request.json -o payment.json         # payer → send payment.json
-worgl receive request.json payment.json        # payee: checks, submits, keeps
-worgl settle                                   # payer, later: takes in the change
+worgl init                                             # each side, once
+worgl playground --faucet $FAUCET                      # a note from a playground faucet; prints its mint
+worgl mint $MINT 8 --authority-key mint.key            # as a mint authority, for testing
+worgl request $MINT 5 -o request.json                  # payee → send request.json
+worgl pay request.json -o payment.json                 # payer → send payment.json
+worgl receive request.json payment.json -o change.json # payee: checks, submits, keeps → send change.json
+worgl accept change.json                               # payer: keeps the change
 worgl balance $MINT
-worgl refresh $MINT                            # once per rotation period
+worgl refresh $MINT                                    # once per rotation period
 ```
+
+`change.json` holds the payer's change from the mint's answers, nothing of
+the payee's. Keeping it with `accept` also settles the payer's transfer.
+The signatures `accept` checks show that the notes are the mint's, not that
+the payment went through: a payee could pay those keys from notes of its own
+and leave the payment unsubmitted. Without the change, the payer runs
+`worgl settle` once the payee has submitted the payment: it sends the
+transfers again, and the mint answers with the same notes for as long as it
+keeps its answers (see [Error codes](../error-codes/)). On a mint that
+rotates on a schedule, `pay` says by when to settle: before the rotation
+that drops a note the payment spends. `refresh` resends a payment still
+outgoing in the period before it (see
+[Keeping notes alive](#keeping-notes-alive)). A resend the mint no longer
+answers is reported as possibly applied, with the value that may be lost;
+the change can then only come from the payee.
 
 ## Commands
 
@@ -56,12 +71,12 @@ worgl refresh $MINT                            # once per rotation period
 | `notes` | Lists the notes held and what each can do now. |
 | `request MINT AMOUNT` | Asks to be paid: writes a payment request to send to the payer. `--at-most N` asks for notes no larger than N, for a payer whose notes are small. `-o` names the file (default `-`). |
 | `withdraw REQUEST` | Stops expecting the notes of a request that will not be paid. |
-| `pay REQUEST` | Answers a payment request: writes a payment to send to the payee. `-o` names the file. |
-| `receive REQUEST PAYMENT` | Takes a payment: checks it, submits each transfer at its time and keeps the notes. |
-| `submit PAYMENT` | Submits a payment as the payer and writes the notes for the payee, who keeps them with `accept`. `-o` names the file. |
-| `accept NOTES` | Keeps notes a payer handed over, after checking their signatures. |
-| `settle` | Sends the transfers not yet seen answered again and takes in their change. |
-| `refresh MINT` | Pays the notes that die at the next rotation back to the purse, each at a random moment before it. Waits until the last is done. `--now` submits them all at once: faster, but the mint can then tell the notes belong together. |
+| `pay REQUEST` | Answers a payment request: writes a payment to send to the payee, and says by when to settle it if the mint rotates on a schedule. `-o` names the file. |
+| `receive REQUEST PAYMENT` | Takes a payment: checks it, submits each transfer at its time and keeps the notes. Writes the payer's change from the mint's answers, to send back to the payer. `-o` names the file (default `-`). |
+| `submit PAYMENT` | Submits a payment as the payer and writes the payee's notes, which the payee keeps with `accept`. `-o` names the file. |
+| `accept NOTES` | Keeps notes the other side handed over, after checking their signatures: the payee's from `submit`, or the payer's change from `receive`, which settles the transfers it answers. Notes whose layer the mint has dropped are skipped. |
+| `settle` | Sends the transfers not yet seen answered again and takes in their change. One the mint may have applied but no longer answers is reported as possibly applied. |
+| `refresh MINT` | Pays the notes that die at the next rotation back to the purse, each at a random moment before it, and resends the transfers not yet seen answered that must land before it. Waits until the last is done. `--now` submits them all at once: faster, but the mint can then tell the notes belong together. |
 | `prune MINT` | Drops notes whose layer the mint has dropped. |
 | `playground` | Asks a playground [faucet](../running-a-faucet/) for a note and keeps it, then prints the faucet's mint. `--faucet URL` (or `WORGL_FAUCET`) names the faucet when it is not at the server's URL. |
 | `mint MINT AMOUNT` | Mints notes into the purse, signing as one of the mint's authorities with `--authority-key FILE`. `--sequence N` sets the first sequence number, above every one this key has used; it defaults to the time in microseconds. `--at-most N` mints notes no larger than N. |
@@ -85,6 +100,12 @@ another one took in. The lock is a file beside the purse,
 
 A note left alone dies when its layer is dropped. Run `worgl refresh MINT`
 once per rotation period: it pays the notes that would die at the next
-rotation to fresh keys of the purse, spread over the time left. `worgl info`
-and `worgl balance` say when the next rotation is. `worgl prune` clears out
-notes that died anyway.
+rotation to fresh keys of the purse, spread over the time left. It also
+resends the transfers not yet seen answered whose spent note dies at that
+rotation, or died at the last one. The change of a payment the payee has
+submitted then comes back while the mint still has the answer. A payment the
+payee has not submitted yet still goes through, but the payee then gets its
+notes only by running `worgl receive` while the mint keeps the answer (see
+[Error codes](../error-codes/)), and `refresh` says it resent a payment.
+`worgl info` and `worgl balance` say when the next rotation is.
+`worgl prune` clears out notes that died anyway.

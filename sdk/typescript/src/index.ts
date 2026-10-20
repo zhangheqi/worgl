@@ -17,7 +17,7 @@
  * const request = await bob.request(mint, 5n);        // Bob → Alice: request.json
  * const payment = await alice.pay(request);           // Alice → Bob: payment.json
  * const received = await bob.receive(request, payment);
- * await alice.settle();                               // later: Alice's change
+ * await alice.accept(received.theirs);                // Bob → Alice: her change
  * ```
  *
  * @module
