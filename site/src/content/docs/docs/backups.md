@@ -50,8 +50,35 @@ it leaves out the sealed keys, so it is for an audit, not a restore. See
 ## Why a lost state matters
 
 The mint stores no notes, only their bits. If its state is lost or rolled
-back, notes it signed after the copy are unknown to the ledger: spending one
-is refused with `unissued`, and notes spent after the copy are live again.
+back to a copy, notes spent after the copy are live again, and notes it
+signed after the copy are unknown to the ledger, so spending one is refused
+with `unissued`. That lasts only until the restored mint hands out their
+serials again, which it does: each layer hands out its bits in the same
+order as before, and the restored `keys.bin` signs them with the same
+generation keys. The notes signed between the copy and the restore come
+back and collide with new notes on the same serials. Both are genuinely
+signed, so whichever is spent first wins and the other is refused as
+`spent`. Where the two differ in amount, the layer's count of live value
+drifts from what its notes are worth, and a spend that takes more than that
+count is refused as `overdrawn`, even with notes that collided with none.
+This lasts until every generation live at the copy has rotated out. Notes of
+generations created after the copy were signed with keys the restored
+`keys.bin` lacks, so they are refused as `invalid_note`.
+
+Until a restore step can tell the two notes of a serial apart, the only
+recovery free of collisions is to rotate every restored mint as many times
+as it has layers before the server serves anyone: serve on a loopback
+address and post to each mint's rotate route (see
+[Rotation](../running-a-server/#rotation)). That drops every generation the
+copy knew, so every outstanding note expires, those from before the copy
+too, and holders get the value back only if it is minted again.
+
+A whole cluster restored from its members' backups is rolled back the same
+way, but serving on a loopback address does not work there: a member passes
+a rotation of a mint it does not lead to the leader's API address in
+`cluster.json`. Serve the members on their usual addresses, keep clients off
+their API ports some other way, such as a firewall that lets only the
+members through, and post every mint's rotations to any member.
 
 ## How storage fails
 

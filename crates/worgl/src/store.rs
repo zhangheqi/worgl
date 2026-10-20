@@ -19,10 +19,11 @@
 //!
 //! [`PersistentIssuer`] writes each event to the log and flushes it to disk
 //! *before* applying it, so a note is never handed out unless the event that
-//! created it would survive a crash. [`compact`](PersistentIssuer::compact)
-//! writes a fresh snapshot and purges the log up to it; call it after
-//! rotations or whenever [`log_events`](PersistentIssuer::log_events) grows
-//! large.
+//! created it would survive a crash. It [checks](Issuer::check) the event
+//! first, so the log never holds one that does not replay.
+//! [`compact`](PersistentIssuer::compact) writes a fresh snapshot and purges
+//! the log up to it; call it after rotations or whenever
+//! [`log_events`](PersistentIssuer::log_events) grows large.
 //!
 //! A flush costs far more than the work around it, so a busy issuer can share
 //! one among many requests with a [`Batch`]: each change takes effect in
@@ -1148,12 +1149,15 @@ impl PersistentIssuer {
         Ok((report, sealed))
     }
 
-    fn commit(&mut self, event: &Event) -> io::Result<()> {
+    fn commit(&mut self, event: &Event) -> Result<(), CommitError> {
         self.commit_sealed(event, &[])
     }
 
-    fn commit_sealed(&mut self, event: &Event, keys: &[SealedKey]) -> io::Result<()> {
+    fn commit_sealed(&mut self, event: &Event, keys: &[SealedKey]) -> Result<(), CommitError> {
         self.check_in_step()?;
+        // Before it is logged, so the log never holds an event that does
+        // not replay.
+        self.issuer.check(event).map_err(Error::from)?;
         self.store.append_sealed(
             self.issuer.sequence() + 1,
             std::slice::from_ref(event),
@@ -1161,7 +1165,7 @@ impl PersistentIssuer {
         )?;
         self.issuer
             .apply(event)
-            .expect("an event planned under the same borrow applies");
+            .expect("an event that passed the check applies");
         Ok(())
     }
 
@@ -1203,7 +1207,7 @@ impl Batch<'_> {
     /// Mints a note.
     pub fn mint(&mut self, amount: u64, holder: PublicKey) -> Result<Note, Error> {
         let event = self.owner.issuer.plan_mint(amount, holder)?;
-        Ok(self.stage(event).remove(0))
+        Ok(self.stage(event)?.remove(0))
     }
 
     /// Mints at a verified mint authority's request. Resending the
@@ -1212,7 +1216,7 @@ impl Batch<'_> {
     pub fn authorized_mint(&mut self, mint: &VerifiedMint) -> Result<Note, Error> {
         let mut notes = match self.owner.issuer.plan_authorized_mint(mint)? {
             Plan::Replay(notes) => notes,
-            Plan::Apply(event) => self.stage(event),
+            Plan::Apply(event) => self.stage(event)?,
         };
         Ok(notes.remove(0))
     }
@@ -1222,7 +1226,7 @@ impl Batch<'_> {
     pub fn transfer(&mut self, transfer: &VerifiedTransfer) -> Result<Vec<Note>, Error> {
         match self.owner.issuer.plan_transfer(transfer)? {
             Plan::Replay(notes) => Ok(notes),
-            Plan::Apply(event) => Ok(self.stage(event)),
+            Plan::Apply(event) => self.stage(event),
         }
     }
 
@@ -1230,7 +1234,7 @@ impl Batch<'_> {
     /// burn that was already applied adds nothing to the batch.
     pub fn burn(&mut self, burn: &VerifiedBurn) -> Result<u128, Error> {
         if let Plan::Apply(event) = self.owner.issuer.plan_burn(burn)? {
-            self.stage(event);
+            self.stage(event)?;
         }
         Ok(burn.value())
     }
@@ -1251,12 +1255,15 @@ impl Batch<'_> {
     /// if it already is. Changes after a pause in the same batch are refused.
     pub fn set_paused(&mut self, paused: bool) {
         if let Some(event) = self.owner.issuer.plan_pause(paused) {
-            self.stage(event);
+            self.stage(event)
+                .expect("plan_pause plans only what applies");
         }
     }
 
     fn rotate_due(&mut self, due: Option<u64>) -> Result<RotationReport, CommitError> {
         let (report, sealed) = self.owner.plan_rotate(due)?;
+        // The key joins the entry only with its rotation.
+        self.stage(Event::Rotate(report))?;
         if let Some(sealed) = sealed {
             // The key count once, then generation, public key, length and
             // the sealed bytes.
@@ -1266,7 +1273,6 @@ impl Batch<'_> {
             self.bytes += 8 + PUBLIC_KEY_LEN + 4 + sealed.sealed.len();
             self.keys.push(sealed);
         }
-        self.stage(Event::Rotate(report));
         Ok(report)
     }
 
@@ -1298,16 +1304,15 @@ impl Batch<'_> {
         written
     }
 
-    fn stage(&mut self, event: Event) -> Vec<Note> {
-        self.owner
-            .issuer
-            .apply(&event)
-            .expect("an event planned under the same borrow applies");
+    /// Applies `event` and adds it to the batch, or adds nothing if it does
+    /// not apply.
+    fn stage(&mut self, event: Event) -> Result<Vec<Note>, Error> {
+        self.owner.issuer.apply(&event)?;
         // Each event is framed by a 4-byte length in the entry.
         self.bytes += 4 + event.to_bytes().len();
         let notes = self.owner.issuer.notes(&event);
         self.events.push(event);
-        notes
+        Ok(notes)
     }
 }
 
@@ -2024,6 +2029,137 @@ mod tests {
         p.batch().unwrap().commit().unwrap();
         drop(p.batch().unwrap());
         p.mint(2, HolderKey::generate().public_key()).unwrap();
+    }
+
+    #[test]
+    fn an_event_that_does_not_apply_is_neither_logged_nor_staged() {
+        let dir = tempfile::tempdir().unwrap();
+        let (key, mut p) = fresh(dir.path());
+        let holder = HolderKey::generate().public_key();
+        let mint = p.issuer().plan_mint(8, holder).unwrap();
+        p.commit(&mint).unwrap();
+        let events = p.log_events();
+        let next = p.store.log().next_index();
+        let len = fs::metadata(log_path(dir.path())).unwrap().len();
+        let state = p.issuer().snapshot();
+
+        // Its bit is taken now, so the same mint does not apply again.
+        assert!(matches!(
+            p.commit(&mint),
+            Err(CommitError::Rejected(Error::Misfit(_)))
+        ));
+        let mut batch = p.batch().unwrap();
+        assert!(matches!(batch.stage(mint.clone()), Err(Error::Misfit(_))));
+        assert!(batch.is_empty());
+        drop(batch);
+        assert_eq!(p.log_events(), events);
+        assert_eq!(p.store.log().next_index(), next);
+        assert_eq!(fs::metadata(log_path(dir.path())).unwrap().len(), len);
+        assert_eq!(p.issuer().snapshot(), state);
+
+        // The store carries on, and opens again.
+        p.mint(2, holder).unwrap();
+        let expected = p.issuer().snapshot();
+        drop(p);
+        let p = PersistentIssuer::open(dir.path(), key, Policy::cash_like()).unwrap();
+        assert_eq!(p.issuer().snapshot(), expected);
+    }
+
+    /// Copies the files of a closed store, as a backup does.
+    fn copy_store(from: &Path, to: &Path) {
+        fs::create_dir_all(to).unwrap();
+        for entry in fs::read_dir(from).unwrap() {
+            let entry = entry.unwrap();
+            fs::copy(entry.path(), to.join(entry.file_name())).unwrap();
+        }
+    }
+
+    #[test]
+    fn a_restored_copy_issues_its_serials_again_and_refuses_overdrawn_spends() {
+        let dir = tempfile::tempdir().unwrap();
+        let (mint, backup) = (dir.path().join("mint"), dir.path().join("backup"));
+        let (key, p) = fresh(&mint);
+        drop(p);
+        copy_store(&mint, &backup);
+        let pay = |p: &mut PersistentIssuer, amounts: [u64; 4]| {
+            amounts.map(|amount| {
+                let holder = HolderKey::generate();
+                (p.mint(amount, holder.public_key()).unwrap(), holder)
+            })
+        };
+        let spend = |p: &PersistentIssuer, (note, holder): &(Note, HolderKey)| {
+            let output = Output {
+                amount: note.amount(),
+                holder: HolderKey::generate().public_key(),
+            };
+            let request = TransferRequest::single(*note, holder, output).unwrap();
+            p.issuer().verifier().verify(&request).unwrap()
+        };
+
+        let mut p = PersistentIssuer::open(&mint, key.clone(), Policy::cash_like()).unwrap();
+        let alice = pay(&mut p, [4, 32, 64, 8]);
+        drop(p);
+
+        // Put back, the copy gives Bob's notes the serials of Alice's.
+        fs::remove_dir_all(&mint).unwrap();
+        copy_store(&backup, &mint);
+        let mut p = PersistentIssuer::open(&mint, key.clone(), Policy::cash_like()).unwrap();
+        for (note, _) in &alice {
+            assert_eq!(p.issuer().status(note), Ok(NoteStatus::Unissued));
+        }
+        let bob = pay(&mut p, [32, 4, 64, 8]);
+        for ((old, _), (new, _)) in alice.iter().zip(&bob) {
+            assert_eq!(old.serial(), new.serial());
+            assert!(matches!(
+                p.issuer().status(old),
+                Ok(NoteStatus::Live { .. })
+            ));
+        }
+
+        // Whichever note of a serial is spent first wins, the new one or the
+        // old one, even where the old one is worth more.
+        p.transfer(&spend(&p, &bob[3])).unwrap();
+        assert!(matches!(
+            p.transfer(&spend(&p, &alice[3])),
+            Err(CommitError::Rejected(Error::Spent(_)))
+        ));
+        p.transfer(&spend(&p, &alice[2])).unwrap();
+        assert!(matches!(
+            p.transfer(&spend(&p, &bob[2])),
+            Err(CommitError::Rejected(Error::Spent(_)))
+        ));
+        p.transfer(&spend(&p, &alice[1])).unwrap();
+
+        // The mint layer holds 4 now, less than Bob's own 32: planning
+        // refuses it, and nothing is written.
+        let position = p.issuer().mint_position();
+        assert_eq!(p.issuer().layers()[position as usize].value, 4);
+        let events = p.log_events();
+        let transfer = spend(&p, &bob[0]);
+        assert_eq!(
+            p.issuer().plan_transfer(&transfer),
+            Err(Error::Overdrawn { position })
+        );
+        assert!(matches!(
+            p.transfer(&transfer),
+            Err(CommitError::Rejected(Error::Overdrawn { .. }))
+        ));
+        let burn = BurnRequest::single(bob[0].0, &bob[0].1).unwrap();
+        let burn = p.issuer().verifier().verify_burn(&burn).unwrap();
+        assert_eq!(
+            p.issuer().plan_burn(&burn),
+            Err(Error::Overdrawn { position })
+        );
+        assert!(matches!(
+            p.burn(&burn),
+            Err(CommitError::Rejected(Error::Overdrawn { .. }))
+        ));
+        assert_eq!(p.log_events(), events);
+
+        let expected = p.issuer().snapshot();
+        drop(p);
+        let p = PersistentIssuer::open(&mint, key, Policy::cash_like()).unwrap();
+        assert_eq!(p.issuer().snapshot(), expected);
     }
 
     /// Keeps 2 receipts, each for at least 100 s.

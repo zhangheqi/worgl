@@ -7,6 +7,7 @@
 mod vault;
 
 use std::collections::BTreeMap;
+use std::collections::btree_map::Entry;
 use std::fs;
 use std::io::{self, Read};
 use std::path::{Path, PathBuf};
@@ -17,7 +18,9 @@ use anyhow::{Context, Result, bail};
 use clap::{Parser, Subcommand};
 use worgl::{MintKey, MintRequest, Note, PublicKey};
 use worgl_client::{Client, Purse, Submitted};
-use worgl_sdk::{MintView, NoteState, Payment, PaymentRequest, ScheduledTransfer, Spacing};
+use worgl_sdk::{
+    MintView, NoteState, Payment, PaymentRequest, REFRESH_MARGIN_SECS, ScheduledTransfer, Spacing,
+};
 use zeroize::Zeroizing;
 
 use crate::vault::Vault;
@@ -85,7 +88,8 @@ enum Command {
         /// The request.
         request: PathBuf,
     },
-    /// Answer a payment request: write a payment to send to the payee.
+    /// Answer a payment request: write a payment to send to the payee, and
+    /// say by when to settle it if the mint rotates on a schedule.
     Pay {
         /// The payee's request.
         request: PathBuf,
@@ -99,12 +103,16 @@ enum Command {
         out: PathBuf,
     },
     /// Take a payment: check it, submit each transfer at its time and keep
-    /// the notes.
+    /// the notes. Writes the payer's change from the mint's answers, for the
+    /// payer to keep with `accept`.
     Receive {
         /// The request this pays.
         request: PathBuf,
         /// The payer's payment.
         payment: PathBuf,
+        /// Where to write the payer's change.
+        #[arg(long, short, default_value = "-")]
+        out: PathBuf,
     },
     /// Submit a payment as the payer and write the notes for the payee, who
     /// keeps them with `accept`.
@@ -115,9 +123,12 @@ enum Command {
         #[arg(long, short, default_value = "-")]
         out: PathBuf,
     },
-    /// Keep notes a payer handed over, after checking their signatures.
+    /// Keep notes the other side handed over, after checking their
+    /// signatures: a payee's notes from `submit`, or a payer's change from
+    /// `receive`, which settles the transfers it answers. Notes whose layer
+    /// the mint has dropped are skipped.
     Accept {
-        /// The notes, as `submit` wrote them.
+        /// The notes, as `submit` or `receive` wrote them.
         notes: PathBuf,
     },
     /// Resend the transfers not yet seen answered and take in their change.
@@ -127,7 +138,8 @@ enum Command {
         spacing: Spacing,
     },
     /// Pay the notes that die at the next rotation back to the purse, each at
-    /// a random moment before it. Waits until the last is done.
+    /// a random moment before it, and resend the transfers not yet seen
+    /// answered that must land before it. Waits until the last is done.
     Refresh {
         /// The mint's issuer key.
         mint: PublicKey,
@@ -231,35 +243,74 @@ async fn run(cli: Cli) -> Result<()> {
             out,
         } => {
             let request: PaymentRequest = read_json(&request)?;
+            // For the deadline; read first, so nothing fails once the payment is out.
+            let view = purse.client().view(&request.mint).await?;
             let payment = purse.pay(&request, spacing).await?;
             write(&out, &serde_json::to_string_pretty(&payment)?)?;
             eprintln!(
-                "Paid {} in {} transfer(s). Send the payment to the payee, then run \
-                 `worgl settle` once they have submitted it to take in your change.",
+                "Paid {} in {} transfer(s). Send the payment to the payee, then keep the \
+                 change they send back with `worgl accept`, or run `worgl settle` once \
+                 they have submitted it.",
                 request.amount(),
                 payment.transfers.len()
             );
+            let now = unix_now();
+            if let Some(by) = settle_by(&view, &payment, now) {
+                let when = match by.saturating_sub(now) {
+                    0 => "now".to_owned(),
+                    left => format!("within {}", duration(left)),
+                };
+                eprintln!(
+                    "Settle {when}, before the rotation that drops a note the payment spends."
+                );
+            }
             Ok(())
         }
-        Command::Receive { request, payment } => {
+        Command::Receive {
+            request,
+            payment,
+            out,
+        } => {
             let request: PaymentRequest = read_json(&request)?;
             let payment: Payment = read_json(&payment)?;
             announce(&payment.transfers);
             let submitted = purse.receive(&request, &payment).await?;
+            write(&out, &serde_json::to_string_pretty(&submitted.theirs)?)?;
+            if !submitted.theirs.is_empty() {
+                eprintln!("Send the notes to the payer, who keeps the change with `worgl accept`.");
+            }
             finish(&submitted, "Received")
         }
         Command::Submit { payment, out } => {
             let payment: Payment = read_json(&payment)?;
             announce(&payment.transfers);
             let submitted = purse.submit(&payment.transfers).await?;
-            write(&out, &serde_json::to_string_pretty(&submitted.notes)?)?;
+            write(&out, &serde_json::to_string_pretty(&submitted.theirs)?)?;
             eprintln!("Send the notes to the payee, who keeps them with `worgl accept`.");
             finish(&submitted, "Kept in change")
         }
         Command::Accept { notes } => {
             let notes: Vec<Note> = read_json(&notes)?;
+            let (notes, expired) = split_expired(purse.client(), notes).await?;
+            // Only what the purse would have kept is lost: it ignores the
+            // rest, as it does live notes for keys it never handed out.
+            let mut probe = purse.holder();
+            let held = probe.notes().count();
+            let lost = probe.absorb(&expired);
+            if lost > 0 {
+                eprintln!(
+                    "Skipped {} note(s) worth {lost}: the mint has dropped their layer.",
+                    probe.notes().count() - held
+                );
+            }
             let value = purse.accept(&notes).await?;
-            eprintln!("Kept {value}.");
+            match purse.holder().outgoing().count() {
+                0 => eprintln!("Kept {value}."),
+                outgoing => eprintln!(
+                    "Kept {value}. {outgoing} transfer(s) still outgoing; `worgl settle` \
+                     resends them."
+                ),
+            }
             Ok(())
         }
         Command::Settle { spacing } => {
@@ -285,6 +336,12 @@ async fn run(cli: Cli) -> Result<()> {
             }
             announce(&plan);
             let submitted = purse.submit(&plan).await?;
+            if !submitted.theirs.is_empty() {
+                eprintln!(
+                    "Resent a payment the payee may not have submitted yet: if so, it gets its \
+                     notes with `worgl receive` while the mint keeps the answer."
+                );
+            }
             finish(&submitted, "Refreshed")
         }
         Command::Prune { mint } => {
@@ -455,6 +512,38 @@ fn announce(transfers: &[ScheduledTransfer]) {
     }
 }
 
+/// When to have settled a payment by: the refresh margin before the
+/// rotation that drops the first of the notes it spends, if the mint
+/// rotates on a schedule.
+fn settle_by(view: &MintView, payment: &Payment, now: u64) -> Option<u64> {
+    payment
+        .transfers
+        .iter()
+        .flat_map(|t| &t.request.inputs)
+        .filter_map(|spend| view.expires_at(&spend.note, now))
+        .min()
+        .map(|at| at.saturating_sub(REFRESH_MARGIN_SECS))
+}
+
+/// Splits off the notes whose layer their mint has dropped: they no longer
+/// verify, and are worth nothing.
+async fn split_expired(client: &Client, notes: Vec<Note>) -> Result<(Vec<Note>, Vec<Note>)> {
+    let mut oldest: BTreeMap<PublicKey, u64> = BTreeMap::new();
+    let (mut live, mut expired) = (Vec::new(), Vec::new());
+    for note in notes {
+        let issuer = *note.issuer();
+        if let Entry::Vacant(entry) = oldest.entry(issuer) {
+            entry.insert(client.keys(&issuer).await?.oldest());
+        }
+        if note.serial().generation < oldest[&issuer] {
+            expired.push(note);
+        } else {
+            live.push(note);
+        }
+    }
+    Ok((live, expired))
+}
+
 /// Reports what submitting came to, failing if anything was refused.
 fn finish(submitted: &Submitted, what: &str) -> Result<()> {
     eprintln!(
@@ -463,12 +552,35 @@ fn finish(submitted: &Submitted, what: &str) -> Result<()> {
     );
     for refused in &submitted.refused {
         eprintln!("refused: {}", refused.error);
+        match refused.at_stake {
+            Some(0) => eprintln!("possibly applied: the mint no longer has its answer"),
+            Some(value) => eprintln!(
+                "possibly applied: the mint no longer has its answer, {value} may be lost"
+            ),
+            None => {}
+        }
     }
-    if !submitted.refused.is_empty() {
-        bail!(
-            "{} transfer(s) did not go through; try again later",
-            submitted.refused.len()
+    if submitted
+        .refused
+        .iter()
+        .any(|r| r.at_stake.is_some_and(|value| value > 0))
+    {
+        eprintln!(
+            "If the other side sent you notes from the mint's answers, keep them with \
+             `worgl accept FILE`."
         );
+    }
+    let possibly_applied = submitted
+        .refused
+        .iter()
+        .filter(|r| r.at_stake.is_some())
+        .count();
+    let others = submitted.refused.len() - possibly_applied;
+    if others > 0 {
+        bail!("{others} transfer(s) did not go through; try again later");
+    }
+    if possibly_applied > 0 {
+        bail!("{possibly_applied} transfer(s) possibly applied, but not answered");
     }
     Ok(())
 }

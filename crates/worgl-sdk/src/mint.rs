@@ -160,4 +160,23 @@ impl MintView {
         let schedule = view.schedule.filter(|_| !view.paused)?;
         Some(schedule.next_at.saturating_sub(now))
     }
+
+    /// Unix time, in seconds, of the scheduled rotation that drops a note's
+    /// layer, as the view at `now` sees it. `None` when the mint has no
+    /// schedule or is paused, or the note is not live in that view.
+    pub fn expires_at(&self, note: &Note, now: u64) -> Option<u64> {
+        let view = self.at(now);
+        let schedule = view.schedule.filter(|_| !view.paused)?;
+        let rotations = match view.state(note) {
+            NoteState::Spendable {
+                expires_after_rotations,
+            }
+            | NoteState::Frozen {
+                expires_after_rotations,
+            } => expires_after_rotations,
+            NoteState::Expired | NoteState::Unknown | NoteState::OtherMint => return None,
+        };
+        let later = u64::from(rotations - 1).saturating_mul(schedule.period_secs);
+        Some(schedule.next_at.saturating_add(later))
+    }
 }
