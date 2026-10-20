@@ -102,11 +102,37 @@ impl Holder {
         Ok(self.inner.absorb(&parse::<Vec<Note>>(notes)?))
     }
 
+    /// The notes, a JSON array, made for neither a note this holder holds
+    /// nor a key it expects: the counterparty's, to hand over. Returned as a
+    /// JSON array.
+    pub fn theirs(&self, notes: &str) -> Result<String, JsError> {
+        Ok(json(&self.inner.theirs(&parse::<Vec<Note>>(notes)?)))
+    }
+
     /// Records the mint's answer, a JSON array of notes, to a transfer.
     /// Returns the value taken in.
     pub fn settle(&mut self, transfer: &str, notes: &str) -> Result<u128, JsError> {
         let transfer = parse::<TransferRequest>(transfer)?;
         Ok(self.inner.settle(&transfer, &parse::<Vec<Note>>(notes)?))
+    }
+
+    /// Takes in notes, a JSON array, handed over from the mint's answers,
+    /// and settles the outgoing transfers they answer. Returns the value
+    /// taken in. Check signatures first with [`verify_notes`].
+    #[wasm_bindgen(js_name = takeAnswers)]
+    pub fn take_answers(&mut self, notes: &str) -> Result<u128, JsError> {
+        Ok(self.inner.take_answers(&parse::<Vec<Note>>(notes)?))
+    }
+
+    /// What this holder may lose on a transfer if the mint applied it and
+    /// its answer is lost: the value it pays to keys still expected, or
+    /// `undefined` when the transfer is neither outgoing nor pays such a
+    /// key.
+    #[wasm_bindgen(js_name = atStake, unchecked_return_type = "bigint | undefined")]
+    pub fn at_stake(&self, transfer: &str) -> Result<JsValue, JsError> {
+        // An optional u128 does not fit a fallible return, so it goes as a value.
+        let stake = self.inner.at_stake(&parse::<TransferRequest>(transfer)?);
+        Ok(stake.map_or(JsValue::UNDEFINED, JsValue::from))
     }
 
     /// Drops an outgoing transfer the mint refused for good.
@@ -126,6 +152,14 @@ impl Holder {
     pub fn resend(&self, min_secs: u64, max_secs: u64) -> Vec<Scheduled> {
         let spacing = Spacing { min_secs, max_secs };
         scheduled(self.inner.resend(spacing))
+    }
+
+    /// The outgoing transfers to resend before the mint's next rotation,
+    /// each at a random moment before it, as `refresh` spreads its own.
+    #[wasm_bindgen(js_name = dueResends)]
+    pub fn due_resends(&self, info: &str, now: u64) -> Result<Vec<Scheduled>, JsError> {
+        let view = view(info, now)?;
+        Ok(scheduled(self.inner.due_resends(&view, now)))
     }
 
     /// Pays the mint's notes that die at the next rotation back to fresh

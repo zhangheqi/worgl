@@ -83,3 +83,12 @@ happens twice.
   the same notes, until those notes expire in turn. A burn sent again is
   answered the same while its inputs' layer is live or one of the last
   `layers − 1` dropped, and refused as `expired` after.
+- A transfer sent again and refused as `spent` or `expired` is possibly
+  applied: it may have gone through before, sent by the other side or by an
+  earlier try whose answer was lost, and the mint no longer keeps the
+  answer. For a transfer a purse made or is paid by, both SDKs say what may
+  be lost, in `Refused::at_stake` in Rust and `atStake` in TypeScript, and
+  `worgl` prints it. If the other side submitted it, it got the mint's
+  answer and can hand the notes over: `worgl receive` writes the payer's
+  change, and `worgl submit` the payee's notes, each kept with
+  `worgl accept` (`Purse::accept` or `purse.accept` in the SDKs).

@@ -34,15 +34,20 @@
 //! // Bob checks them, submits each at its time and keeps the notes.
 //! let received = bob.receive(&request, &payment).await?;
 //! assert_eq!(received.value, 5);
-//! // Later, Alice resends her transfers to learn her change.
-//! alice.settle(Spacing::default()).await?;
+//! // Bob sends Alice the rest of the answers, her change, and she keeps it.
+//! alice.accept(&received.theirs).await?;
 //! # Ok(())
 //! # }
 //! ```
 //!
+//! Without the change from Bob, Alice would [`settle`](Purse::settle):
+//! resend her transfers, which the mint answers with the same notes while
+//! it keeps its answers.
+//!
 //! Either side may submit a payment. When the payer does, with
-//! [`Purse::submit`], it hands the notes from the answers to the payee, who
-//! takes them in with [`Purse::accept`].
+//! [`Purse::submit`], it hands the payee's notes from the answers,
+//! [`Submitted::theirs`], to the payee, who takes them in with
+//! [`Purse::accept`].
 //!
 //! Requests run on Tokio. TLS is rustls with the platform's certificate
 //! roots.
