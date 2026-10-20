@@ -92,31 +92,35 @@ expected   0  (asked for, not yet received)
 ## 6. Pay Bob 5
 
 Bob asks, Alice pays, Bob takes the payment, and Alice takes in her change.
-The request and the payment are JSON files the two sides send each other.
+The request, the payment and the change are JSON files the two sides send
+each other.
 
 ```sh
 worgl --purse bob.worgl request $MINT 5 -o request.json
 worgl --purse alice.worgl pay request.json -o payment.json
-worgl --purse bob.worgl receive request.json payment.json
-worgl --purse alice.worgl settle
+worgl --purse bob.worgl receive request.json payment.json -o change.json
+worgl --purse alice.worgl accept change.json
 ```
 
 ```text
 Asked for 5 in 2 notes. Send the request to the payer.
-Paid 5 in 1 transfer(s). Send the payment to the payee, then run `worgl settle` once they have submitted it to take in your change.
+Paid 5 in 1 transfer(s). Send the payment to the payee, then keep the change they send back with `worgl accept`, or run `worgl settle` once they have submitted it.
 Submitting 1 transfer(s).
+Send the notes to the payer, who keeps the change with `worgl accept`.
 Received 5 in 1 transfer(s).
-Submitting 1 transfer(s).
-Took in 3 in 1 transfer(s).
+Kept 3.
 ```
 
 - `request` asks for 5 as two notes, 4 and 1, each to a fresh key of Bob's.
 - `pay` signs one transfer that spends Alice's 8: 4 and 1 to Bob's keys, and
   3 in change to fresh keys of her own.
 - `receive` checks the payment against the request, submits it to the mint
-  and keeps Bob's new notes.
-- `settle` sends Alice's transfer again. The mint answers a resent transfer
-  with the same notes, which is how Alice learns her change.
+  and keeps Bob's new notes. The mint's answer holds Alice's change too,
+  which it writes to `change.json` for her.
+- `accept` checks the change's signatures, keeps it, and settles Alice's
+  transfer. Without it, `worgl --purse alice.worgl settle` would send her
+  transfer again: the mint answers a resent transfer with the same notes
+  while it keeps its answer.
 
 ## 7. Rotate
 

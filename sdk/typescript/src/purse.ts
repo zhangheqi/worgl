@@ -1,4 +1,4 @@
-import { type Client, isTransient } from './client.ts';
+import { type Client, MintError, isTransient } from './client.ts';
 import {
   Holder,
   type Scheduled,
@@ -32,8 +32,19 @@ export const NO_SPACING: Spacing = { minSecs: 0, maxSecs: 0 };
 
 /**
  * How a purse resends a transfer that failed on the way: a lost connection,
- * a timeout, or a mint that was paused or could not store it. Resending is
- * safe, since the mint answers an identical transfer with identical notes.
+ * a timeout, or a mint that was paused, busy or could not store it.
+ * Resending is safe, since the mint answers an identical transfer with
+ * identical notes, before or after a rotation, for as long as it remembers
+ * the transfer (see {@link Purse.settle}).
+ *
+ * When the mint answers `busy`, the next wait is as long as its
+ * `Retry-After` asks, up to 30 seconds, if that is longer; the waits after
+ * it double from where they were. A `Retry-After` on any other answer, such
+ * as a proxy's, changes no wait. The mint answers `busy` only to a request
+ * it did not apply, so with the default and a 30-second request timeout,
+ * the client's default, the last try still ends within 127 seconds of any
+ * the mint may have applied, inside the 128 seconds a mint keeps each
+ * answer by default, and is answered as before.
  */
 export interface Retry {
   /** Tries in all, the first included. */
@@ -47,6 +58,9 @@ export const DEFAULT_RETRY: Retry = { attempts: 4, firstDelayMs: 1000 };
 
 /** Longest wait honored before submitting a transfer: a year, in seconds. */
 export const MAX_DELAY_SECS = 365 * 24 * 60 * 60;
+
+/** Longest a mint's `Retry-After` makes a purse wait before a retry, in milliseconds. */
+const MAX_RETRY_AFTER_MS = 30_000;
 
 /** A signed transfer, as JSON, and when to submit it. */
 export interface ScheduledTransfer {
@@ -78,6 +92,14 @@ export interface Refused {
   request: string;
   /** The last error; {@link isTransient} tells whether to try again later. */
   error: unknown;
+  /**
+   * For a transfer refused as `spent` or `expired` that this purse made or
+   * is paid by, what it may lose: the transfer may have been applied, with
+   * an answer the mint no longer keeps. Only a counterparty that submitted
+   * it can then hand the notes over, for {@link Purse.accept}. `undefined`
+   * otherwise.
+   */
+  atStake: bigint | undefined;
 }
 
 /** What submitting a set of transfers came to. */
@@ -86,8 +108,15 @@ export interface Submitted {
   value: bigint;
   /** Transfers the mint answered. */
   answered: number;
-  /** Every note in the answers, the counterparty's included, to hand on. */
+  /** Every note in the answers, this purse's own included. */
   notes: string[];
+  /**
+   * The notes in the answers for neither a note this purse holds nor a key
+   * it expects: the counterparty's. Hand them over for its
+   * {@link Purse.accept}: a payee hands the payer its change, and a payer
+   * that submitted a payment hands the payee its notes.
+   */
+  theirs: string[];
   /** Transfers the mint refused, or that kept failing on the way. */
   refused: Refused[];
 }
@@ -279,7 +308,8 @@ export class Purse {
   /**
    * Answers a payment request, after reading the mint's info. The notes
    * spent and the keys for the change are saved before the payment is
-   * returned. Send it to the payee, then {@link settle} later.
+   * returned. Send it to the payee, who submits it and can hand back the
+   * change for {@link accept}; or {@link settle} later to take it in.
    */
   async pay(request: PaymentRequest, spacing: Spacing = DEFAULT_SPACING): Promise<Payment> {
     const info = await this.client.infoText(request.mint);
@@ -305,6 +335,7 @@ export class Purse {
    * Takes a payment for `request`: checks that it pays what was asked, then
    * submits each transfer at its time and takes in the notes. Resolves once
    * the last transfer is answered or refused. The payer chose the times.
+   * Hand {@link Submitted.theirs}, the payer's change, back to the payer.
    */
   async receive(request: PaymentRequest, payment: Payment): Promise<Submitted> {
     checkPayment(request.json, payment.json);
@@ -313,8 +344,17 @@ export class Purse {
 
   /**
    * Takes in notes the counterparty handed over from the mint's answers,
-   * after checking each one's signature against its mint's keys. Notes for
-   * keys this purse never handed out are ignored. Returns the value taken in.
+   * after checking each one's signature against its mint's keys, and
+   * settles the outgoing transfers they answer: those that pay this purse
+   * notes, once it holds them all. Notes for keys this purse never handed
+   * out are ignored. A note whose layer the mint has dropped no longer
+   * verifies and rejects the call. Returns the value taken in.
+   *
+   * The signatures show that the mint issued the notes, not that it applied
+   * the transfers they settle: a counterparty holding a transfer can pay the
+   * same keys from notes of its own and leave the transfer unsubmitted. A
+   * hand-back settles a transfer only as surely as the counterparty
+   * submitted it.
    */
   async accept(notes: string[]): Promise<bigint> {
     const byMint = new Map<string, string[]>();
@@ -326,7 +366,7 @@ export class Purse {
       verifyNotes(await this.client.keysText(mint), JSON.stringify(own));
     }
     return this.#change(
-      () => this.#holder.absorb(JSON.stringify(notes)),
+      () => this.#holder.takeAnswers(JSON.stringify(notes)),
       () => {},
     );
   }
@@ -336,9 +376,14 @@ export class Purse {
    * random gaps, and takes in their change. Call it once a payee has had
    * time to submit a payment, or after a restart.
    *
-   * The mint keeps answers for its most recent transfers only: settle
-   * before many more have passed, or a transfer already applied is refused
-   * as `spent` and its change is lost.
+   * The mint answers a resent transfer with the same notes only while it
+   * keeps its answer, and at the latest until the notes it issued expire
+   * (see
+   * {@link https://github.com/zhangheqi/worgl/blob/main/site/src/content/docs/docs/error-codes.md#sending-a-request-again | Error codes}).
+   * After that, a transfer already applied is refused as `spent` or
+   * `expired`, with {@link Refused.atStake} set, and its change can only
+   * come from the counterparty, for {@link accept}. {@link refresh} resends
+   * the transfers whose chance the next rotation ends.
    */
   async settle(spacing: Spacing = DEFAULT_SPACING): Promise<Submitted> {
     const transfers = read(this.#holder.resend(BigInt(spacing.minSecs), BigInt(spacing.maxSecs)));
@@ -347,24 +392,33 @@ export class Purse {
 
   /**
    * Plans the refresh of `mint`'s notes that die at the next rotation, after
-   * reading its info, and saves the plan. Submit it with {@link submit}.
+   * reading its info, and saves the plan. The outgoing transfers to resend
+   * before that rotation join it; if the save fails, only the refreshes are
+   * undone. Submit it with {@link submit}.
    */
   async planRefresh(mint: string): Promise<ScheduledTransfer[]> {
     const info = await this.client.infoText(mint);
-    return this.#change(
-      () => read(this.#holder.refresh(info, now())),
-      (transfers) => {
-        for (const transfer of transfers) {
+    const at = now();
+    const { refreshes, resends } = await this.#change(
+      () => {
+        // Before the refreshes join the outgoing transfers.
+        const resends = read(this.#holder.dueResends(info, at));
+        return { refreshes: read(this.#holder.refresh(info, at)), resends };
+      },
+      ({ refreshes }) => {
+        for (const transfer of refreshes) {
           this.#holder.cancel(transfer.request);
         }
       },
     );
+    return [...refreshes, ...resends].sort((a, b) => a.afterSecs - b.afterSecs);
   }
 
   /**
    * Refreshes `mint`'s notes that die at the next rotation, each at a random
-   * moment before it. Resolves once the last is done, which may be most of
-   * a rotation period away.
+   * moment before it, and resends the outgoing transfers that must land
+   * before it. Resolves once the last is done, which may be most of a
+   * rotation period away.
    */
   async refresh(mint: string): Promise<Submitted> {
     return this.submit(await this.planRefresh(mint));
@@ -388,22 +442,31 @@ export class Purse {
   async submit(transfers: ScheduledTransfer[]): Promise<Submitted> {
     const order = [...transfers].sort((a, b) => a.afterSecs - b.afterSecs);
     const start = Date.now();
-    const submitted: Submitted = { value: 0n, answered: 0, notes: [], refused: [] };
+    const submitted: Submitted = { value: 0n, answered: 0, notes: [], theirs: [], refused: [] };
     for (const transfer of order) {
       await sleepUntil(start + Math.min(transfer.afterSecs, MAX_DELAY_SECS) * 1000);
       let notes: string[];
       try {
         notes = await this.#send(transfer.request);
       } catch (error) {
-        submitted.refused.push({ request: transfer.request, error });
+        const possiblyApplied =
+          error instanceof MintError && (error.code === 'spent' || error.code === 'expired');
+        const atStake = possiblyApplied ? this.#holder.atStake(transfer.request) : undefined;
+        submitted.refused.push({ request: transfer.request, error, atStake });
         continue;
       }
-      submitted.value += await this.#change(
-        () => this.#holder.settle(transfer.request, JSON.stringify(notes)),
+      const { value, theirs } = await this.#change(
+        () => {
+          const json = JSON.stringify(notes);
+          const value = this.#holder.settle(transfer.request, json);
+          return { value, theirs: JSON.parse(this.#holder.theirs(json)) as string[] };
+        },
         () => {},
       );
+      submitted.value += value;
       submitted.answered += 1;
       submitted.notes.push(...notes);
+      submitted.theirs.push(...theirs);
     }
     return submitted;
   }
@@ -418,7 +481,7 @@ export class Purse {
         if (!isTransient(error) || attempt >= this.#retry.attempts) {
           throw error;
         }
-        await sleep(delay);
+        await sleep(nextWait(delay, error));
         delay *= 2;
       }
     }
@@ -461,6 +524,22 @@ function now(): bigint {
 
 function sleep(ms: number): Promise<void> {
   return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+/**
+ * The wait before the next try after `error`, in milliseconds: `delay`, or
+ * after `busy` what the mint's `Retry-After` asks if that is longer, up to
+ * 30 seconds. It stretches this wait only, never the ones after.
+ *
+ * Only `busy` stretches it: the mint answers so only to a request it did
+ * not apply. Another answer, such as a proxy's, may come after the mint
+ * applied the try, and longer waits could take the last try past the time
+ * the mint keeps the receipt for.
+ */
+function nextWait(delay: number, error: unknown): number {
+  const asked =
+    error instanceof MintError && error.code === 'busy' ? error.retryAfterMs : undefined;
+  return asked === undefined ? delay : Math.max(delay, Math.min(asked, MAX_RETRY_AFTER_MS));
 }
 
 /** Waits until `deadline`, in milliseconds since the epoch, in steps that timers can hold. */
