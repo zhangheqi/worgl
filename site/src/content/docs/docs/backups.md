@@ -23,12 +23,18 @@ be copied or audited without exposing a secret. The secrets are the files in
 mode 0600. `mint.key`, if it is still in the mint's directory, is a mint
 authority key the server never reads; keep it wherever you mint from instead.
 
-A rotation writes its new key to `keys.bin` before logging the rotation, and
-keys of dropped generations leave the file at the next snapshot. A backup of
-`keys.bin` older than the log it goes with can therefore lack the newest
-generation's key. Given the key-encryption key, the store unseals any such
-key from the rotation's log entry when it opens, so keep `kek.key` with the
-rest.
+On a server on its own, a rotation writes its new key to `keys.bin` before
+logging the rotation, and the snapshot the server writes right after it
+takes the keys of dropped generations out of the file and the rotation out
+of the log. A copy of `keys.bin` older than the log it goes with can lack
+the newest generation's key; given the key-encryption key, the store
+unseals it from the rotation's log entry when it opens. A copy of `keys.bin`
+older than the snapshot it goes with can lack a key that nothing recovers,
+since the rotation has left the log, and the store then does not open. On a
+cluster member, `keys.bin` is written only with a snapshot, so the keys of
+rotations logged since the member's last snapshot are in the log alone,
+sealed, and the member cannot apply them without `kek.key`. Keep `kek.key`
+with the rest.
 
 ## A consistent copy
 
@@ -86,6 +92,24 @@ mint stops until the server is restarted. A restart with the disk still
 full opens from the snapshot and log as they are. See
 [When the disk fills up](../running-a-server/#when-the-disk-fills-up).
 
-On a cluster each mint is kept on all three members, and a member that was
-away catches up from the others. That covers a failed server, not a deleted
-mint or an operator's mistake, so back up a member's directory as well.
+## On a cluster
+
+Each mint is kept on all three members, and a member that was away catches
+up from the others. That covers a failed server, not a deleted mint or an
+operator's mistake, so back up the members' directories as well.
+
+Those copies restore the whole cluster to one moment: every member from a
+copy of that moment, with every member stopped, before any of them starts.
+Either copy every member with every member stopped and restore each from
+its own copy, or restore all three from the copy of one member that held
+every change another member held; see
+[Running a cluster](../running-a-cluster/#backups-and-a-failed-member) for
+how to check. Never restore one member on its own, whether the others run
+or not. Raft counts on a member never forgetting what it acknowledged to
+the others, and one restored from an older copy has forgotten it. Nothing
+prevents that, and at most the leader logs a warning containing
+`follower log is reverted`. Should it help a member that lacks the same
+changes become leader, as when the leader fails and the third member was
+away while those changes were made, they are lost: transfers the cluster
+answered are undone, and a note paid away can be spent again. To replace a
+member that failed, copy one that runs instead; see the same page.
