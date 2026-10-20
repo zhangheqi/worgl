@@ -43,7 +43,7 @@ Errors answer with a status code and a body like:
 | `overdrawn` | 409 | The inputs spend more from a layer than the mint counts as live in it. This happens only after the mint's state was rolled back, as by a restore from a backup, and it handed out the same serials again. See [Backups](../backups/#why-a-lost-state-matters). |
 | `stale_mint` | 409 | A mint request reuses a sequence number, or goes below one, that its authority already used. |
 | `stale_rotation` | 409 | A scheduled rotation is due no later than the last one logged, which already covered it. |
-| `layer_full` | 503 | The layer the outputs would land in has too few free bits left, and gets none back until a rotation drops it. |
+| `layer_full` | 503 | The layer the new notes would land in has too few free bits left, and gets none back until a rotation drops it. A transfer refused so is refused every time; a mint request may pass after the next rotation. Nothing was done. |
 | `paused` | 503 | The mint is paused. Its notes keep their places until it resumes. |
 | `busy` | 503 | The mint holds `receipt_capacity` receipts, all younger than `receipt_min_age_secs` or, for a while after a restart, counted so, and takes no new transfer or burn until the oldest may go. The `Retry-After` header says in how many seconds. Nothing was done. |
 
@@ -88,13 +88,15 @@ changes nothing, so nothing happens twice.
   answer never named: list the mints before creating another.
 - Sending a rotation or a creation to another member of a cluster is sending
   it again, so check first there too.
-- `paused`, `busy`, `layer_full`, `storage` and `internal` may go away
-  later. Both SDKs count them, and any other 5xx status, as worth trying
-  again: `Error::is_transient` in Rust and `isTransient(error)` in
-  TypeScript. `layer_full` on a transfer is the exception, though both SDKs
-  still count it as transient and a purse retries it like the others: sent
-  again unchanged, its outputs would land in the same full generation after
-  every rotation, so it is refused every time. See
+- `paused`, `busy`, `storage` and `internal` may go away later. Both SDKs
+  count them, and any other 5xx status, as worth trying again:
+  `Error::is_transient` in Rust and `isTransient(error)` in TypeScript.
+- `layer_full` on a transfer does not go away: sent again unchanged, its
+  outputs would land in the same full generation after every rotation, until
+  the note it spends expires. Neither SDK counts it as worth trying again,
+  though its status is 503, and a purse sends such a transfer once. A mint
+  request refused so may pass after the next rotation, which brings a newer
+  generation to the mint layer. See
   [Layer size](../choosing-a-period/#layer-size).
 - A transfer or burn sent again is answered as before for at least
   `receipt_min_age_secs` (128 seconds by default), and while it is among the
@@ -118,12 +120,14 @@ changes nothing, so nothing happens twice.
 - A purse acts on the refusal of a transfer it made. One refused as `spent`
   or `expired` with status 409 is dropped, since the note it spends is gone
   either way, but the keys of its change are kept, so change handed over
-  later is still taken in. One refused as `policy` while the policy the mint
-  publishes refuses it too is cancelled and its note taken back. Any other
-  refusal leaves it outgoing, to send again: `unknown_mint` and `unissued`,
-  for one, say nothing about the transfer, only about the server, and the
-  mint never answers `unauthorized` or `duplicate_input` to a transfer a
-  purse signed, so those come from something else, such as a gateway.
-  `Refused::outcome` in Rust and `outcome` in TypeScript say what was done,
-  and `worgl` prints it (see
+  later is still taken in. One refused as `layer_full` with status 503 is
+  cancelled and its note taken back: the mint checks that the note is live
+  before it looks for room, so it never applied the transfer, and never
+  will. So is one refused as `policy` while the policy the mint publishes
+  refuses it too. Any other refusal leaves it outgoing, to send again:
+  `unknown_mint` and `unissued`, for one, say nothing about the transfer,
+  only about the server, and the mint never answers `unauthorized` or
+  `duplicate_input` to a transfer a purse signed, so those come from
+  something else, such as a gateway. `Refused::outcome` in Rust and
+  `outcome` in TypeScript say what was done, and `worgl` prints it (see
   [Refused transfers](../command-line/#refused-transfers)).
