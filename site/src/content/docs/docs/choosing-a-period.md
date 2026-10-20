@@ -71,7 +71,7 @@ To see how close a mint is, compare each layer's `issued` with its
 ## What it costs
 
 The ledger stores one bit per note: `n × layer_size` bits in all. Four
-layers of 2²⁰ bits take 512 KiB and hold over four million notes in flight
+layers of 2<sup>20</sup> bits take 512 KiB and hold over four million notes in flight
 ([measured in the README](https://github.com/zhangheqi/worgl#efficiency)).
 
 A rotation costs one word write per 64 bits the dropped layer used.
@@ -82,7 +82,7 @@ A rotation costs one word write per 64 bits the dropped layer used.
 |---|---|
 | Layers | 2 to 65,536 |
 | `layer_size` | a positive multiple of 64 |
-| Layers × `layer_size` | at most 2³⁶ bits |
+| Layers × `layer_size` | at most 2<sup>36</sup> bits |
 | `mint_layer` | below the number of layers |
 
 `worgl-server create-mint` takes `--layers` (default 4), `--layer-size`
