@@ -55,6 +55,7 @@ Errors answer with a status code and a body like:
 | `internal` | 500 | Something else went wrong on the server. |
 | `no_leader` | 503 | On a cluster: no member leading the mint, or the cluster's registry, could be reached, or the leader changed while the request was carried out. Nothing was done. |
 | `timeout` | 503 | On a cluster: the mint's group or the registry did not answer in time. The change may still be made. |
+| `misdirected` | 421 | Only between cluster members, at a Raft port: a member's Raft request reached that member itself, because its `cluster.json` gives another member an address that leads back to it. See [Moving a member](../running-a-cluster/#moving-a-member). |
 
 ## Sending a request again
 

@@ -8,6 +8,8 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
+use openraft::Vote;
+use openraft::raft::{AppendEntriesRequest, VoteRequest};
 use reqwest::{Method, StatusCode};
 use serde_json::{Value, json};
 use tokio::net::TcpListener;
@@ -16,6 +18,7 @@ use tokio::task::JoinHandle;
 use worgl::{
     HolderKey, LedgerConfig, MintKey, MintRequest, Note, Output, Policy, PublicKey, TransferRequest,
 };
+use worgl_raft::TypeConfig;
 use worgl_server::{
     AppState, ClusterConfig, Member, MintSpec, Verified, create_mint, init_state, join_cluster,
     raft_router, router,
@@ -411,6 +414,33 @@ impl Cluster {
             .await;
         assert_eq!(status, StatusCode::OK, "{answer}");
         answer
+    }
+
+    /// Writes every member's addresses as they are now into each member's
+    /// `cluster.json`, as an operator who moves a member would, and returns
+    /// the members whose addresses that changed, as each `join_cluster`
+    /// named them.
+    fn rejoin(&self) -> Vec<Vec<u64>> {
+        let members: BTreeMap<_, _> = (1..)
+            .zip(&self.servers)
+            .map(|(id, server)| {
+                let member = Member {
+                    api: server.api.to_string(),
+                    raft: server.raft.to_string(),
+                };
+                (id, member)
+            })
+            .collect();
+        (1..)
+            .zip(&self.servers)
+            .map(|(node, server)| {
+                let config = ClusterConfig {
+                    node,
+                    members: members.clone(),
+                };
+                join_cluster(&server.dir, &config).unwrap()
+            })
+            .collect()
     }
 
     /// Stops every member that runs.
@@ -850,6 +880,199 @@ async fn a_new_registry_leader_creates_mints() {
         assert_eq!(cluster.state_of(server, &note).await, "live");
     }
     cluster.stop().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_member_that_moves_is_reached_at_its_new_raft_address() {
+    let (seed, mint) = seed(None);
+    let mut cluster = Cluster::from_seed(seed).await;
+    cluster.leader(&mint.key).await;
+    cluster.registry_leader().await;
+
+    // The third member moves to a new Raft port. While it is away the
+    // others go on, in the mint's group and the registry's, so it comes
+    // back behind them in groups that formed with its old port.
+    cluster.servers[2].stop().await;
+    let alice = HolderKey::generate();
+    let note = cluster.mint(0, &mint, 8, &alice).await;
+    let (paid, _) = cluster.pay(1, &note, &alice).await;
+    let created = cluster.create(0).await;
+    let raft = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    cluster.servers[2].raft = raft.local_addr().unwrap();
+    assert_eq!(cluster.rejoin(), [[3], [3], [3]]);
+    assert_eq!(cluster.rejoin(), vec![Vec::<u64>::new(); 3]);
+    for server in 0..2 {
+        cluster.servers[server].stop().await;
+        cluster.servers[server].restart().await;
+    }
+    let api = TcpListener::bind(cluster.servers[2].api).await.unwrap();
+    cluster.servers[2].start_on(api, raft).await;
+
+    // Only a leader that reaches it at the new port can bring it up to
+    // date, as it is when it writes the mint the registry gained.
+    cluster.hosts(&created).await;
+    cluster.leader(&mint.key).await;
+    cluster.leader(&created.key).await;
+
+    // With the first member stopped, every group needs the moved one for a
+    // majority.
+    cluster.servers[0].stop().await;
+    let bob = HolderKey::generate();
+    let fresh = cluster.mint(1, &mint, 4, &bob).await;
+    let (last, _) = cluster.pay(2, &fresh, &bob).await;
+    let other = cluster.mint(2, &created, 8, &bob).await;
+    let another = cluster.create(1).await;
+    cluster.hosts(&another).await;
+    for server in cluster.running() {
+        assert_eq!(cluster.state_of(server, &paid).await, "live");
+        assert_eq!(cluster.state_of(server, &fresh).await, "spent");
+        assert_eq!(cluster.state_of(server, &last).await, "live");
+        assert_eq!(cluster.state_of(server, &other).await, "live");
+    }
+    cluster.stop().await;
+}
+
+#[tokio::test]
+async fn two_members_at_one_address_are_refused() {
+    let (seed, _) = seed(None);
+    let members: BTreeMap<_, _> = (1..=3)
+        .map(|id| {
+            let member = Member {
+                api: format!("member{id}:8080"),
+                raft: format!("member{id}:7080"),
+            };
+            (id, member)
+        })
+        .collect();
+    let config = ClusterConfig { node: 1, members };
+    join_cluster(seed.path(), &config).unwrap();
+    let file = seed.path().join("cluster.json");
+    let written = fs::read(&file).unwrap();
+
+    // A rewrite that gives the third member the first one's Raft address,
+    // with which the first would dial itself as the third, or its API
+    // address.
+    let mut same_raft = config.clone();
+    same_raft.members.get_mut(&3).unwrap().raft = config.members[&1].raft.clone();
+    let mut same_api = config.clone();
+    same_api.members.get_mut(&3).unwrap().api = config.members[&1].api.clone();
+    for (typo, kind) in [(same_raft, "Raft"), (same_api, "API")] {
+        let refused = format!("members 1 and 3 have the same {kind} address");
+        let error = join_cluster(seed.path(), &typo).unwrap_err();
+        assert!(error.to_string().contains(&refused), "{error}");
+        assert_eq!(fs::read(&file).unwrap(), written);
+        // Written by hand, it keeps the member from starting.
+        fs::write(&file, serde_json::to_vec(&typo).unwrap()).unwrap();
+        let opened = AppState::open_member(seed.path(), 1000).await;
+        let error = opened.err().unwrap();
+        assert!(format!("{error:#}").contains(&refused), "{error:#}");
+        fs::write(&file, &written).unwrap();
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_member_dialed_as_another_does_not_answer_itself() {
+    let (seed, mint) = seed(None);
+    // The first member runs alone. Nothing listens at the second's
+    // addresses, and the third's Raft address leads to the first under
+    // another name, which the check of `cluster.json` cannot tell.
+    let api = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let raft = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let mut nowhere = Vec::new();
+    for _ in 0..3 {
+        nowhere.push(TcpListener::bind("127.0.0.1:0").await.unwrap());
+    }
+    let nowhere: Vec<_> = nowhere
+        .into_iter()
+        .map(|listener| listener.local_addr().unwrap().to_string())
+        .collect();
+    let mut server = Server {
+        dir: seed.path().to_owned(),
+        api: api.local_addr().unwrap(),
+        raft: raft.local_addr().unwrap(),
+        running: None,
+    };
+    let first = Member {
+        api: server.api.to_string(),
+        raft: server.raft.to_string(),
+    };
+    let second = Member {
+        api: nowhere[0].clone(),
+        raft: nowhere[1].clone(),
+    };
+    let third = Member {
+        api: nowhere[2].clone(),
+        raft: format!("localhost:{}", server.raft.port()),
+    };
+    let members = BTreeMap::from([(1, first), (2, second), (3, third)]);
+    join_cluster(seed.path(), &ClusterConfig { node: 1, members }).unwrap();
+    server.start_on(api, raft).await;
+
+    // Every election it starts goes unanswered, so it starts another, as it
+    // would not once it had counted itself as the third member.
+    let votes = [
+        seed.path()
+            .join("mints")
+            .join(mint.key.to_string())
+            .join("vote.json"),
+        seed.path().join("registry").join("vote.json"),
+    ];
+    let term = |vote: &Path| {
+        let vote: Value = serde_json::from_slice(&fs::read(vote).ok()?).ok()?;
+        vote["leader_id"]["term"].as_u64()
+    };
+    let deadline = Instant::now() + PATIENCE;
+    for vote in &votes {
+        while term(vote) < Some(2) {
+            assert!(Instant::now() < deadline, "one election only in {vote:?}");
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+    }
+    let state = server.state().unwrap();
+    assert_eq!(state.leader(&mint.key), None);
+    assert_eq!(state.registry_leader(), None);
+    let client = reqwest::Client::new();
+    let alice = HolderKey::generate();
+    let answer = client
+        .post(format!("http://{}{}", server.api, mint.path("mint")))
+        .json(&mint.request(8, &alice))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(answer.status(), StatusCode::SERVICE_UNAVAILABLE);
+    assert_eq!(answer.json::<Value>().await.unwrap()["error"], "no_leader");
+
+    // Its Raft port refuses what says it comes from itself, for the mint's
+    // group and the registry's.
+    let token = read_token(&seed.path().join("cluster.token"));
+    let vote = Vote::new_committed(9, 1);
+    let ballot = VoteRequest::new(vote, None);
+    let append = AppendEntriesRequest::<TypeConfig> {
+        vote,
+        prev_log_id: None,
+        entries: Vec::new(),
+        leader_commit: None,
+    };
+    let rpcs = [
+        ("vote", serde_json::to_value(ballot).unwrap()),
+        ("append", serde_json::to_value(append).unwrap()),
+    ];
+    for group in [mint.key.to_string(), "registry".into()] {
+        for (route, rpc) in &rpcs {
+            let answer = client
+                .post(format!("http://{}/raft/{group}/{route}", server.raft))
+                .bearer_auth(&token)
+                .json(rpc)
+                .send()
+                .await
+                .unwrap();
+            let status = answer.status();
+            let answer: Value = answer.json().await.unwrap();
+            assert_eq!(status, StatusCode::MISDIRECTED_REQUEST, "{route}: {answer}");
+            assert_eq!(answer["error"], "misdirected");
+        }
+    }
+    server.stop().await;
 }
 
 /// Waits until no store holds the mint directory `dir` open.
