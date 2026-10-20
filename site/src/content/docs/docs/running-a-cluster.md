@@ -227,14 +227,33 @@ Take the copies one of two ways:
   then needs its own `cluster.json`: run `join-cluster` on each with its
   own `--node`, as when the cluster started.
 
-A member holds every change another holds when, for each mint, the last
-entry `export-log` prints on the other, run first, is among those it
-prints, and the last `log_id` in the other's `registry/log.json`, its copy
-of the registry's log, is in its own. Every change the cluster answered is
-on at least two of the three members, so such a member holds every change
-answered before the check. A member that was away, cut off or behind may
-lack changes the other two made, and restoring all three from its copy
-undoes them.
+A member holds every change another holds when, for each mint and for the
+registry, its log holds the other's last entry or starts after it:
+
+- For a mint, run `export-log` on the other first, then on the member. Its
+  log holds the other's last entry if it prints one with the same `index`,
+  `term` and `node`, and starts after it if the first entry it prints has
+  a higher `index`.
+- For the registry, read each member's `registry/log.json`, its copy of the
+  registry's log. The other's last entry is the last `log_id` under
+  `entries`, or `purged` if there are none. The member's log holds it if
+  one of its `entries` has the same `log_id`, and starts after it if its
+  own `purged` has that `index` or a higher one.
+
+An entry with the same index, term and node is the same on both members,
+and so is every entry before it, so a member whose log holds the other's
+last entry holds every entry the other holds. A member purges only entries
+its snapshot holds, and a snapshot holds only entries the cluster answered,
+which are the same on every member, so a member whose log starts after the
+other's last entry lacks only entries the cluster never answered. Every
+change the cluster answered is on at least two of the three members, so
+such a member holds every change answered before the check. A member that
+was away, cut off or behind may lack changes the other two made, and
+restoring all three from its copy undoes them.
+
+An export that prints nothing tells nothing: that member has purged its
+whole log, as after installing the leader's snapshot. Use another member in
+its place, or check again once it has logged the mint's next change.
 
 Never restore one member on its own. A member restored from an older copy
 has forgotten what it acknowledged to the others, and nothing prevents
