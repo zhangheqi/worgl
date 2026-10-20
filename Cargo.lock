@@ -2942,6 +2942,7 @@ dependencies = [
  "tracing-subscriber",
  "worgl",
  "worgl-raft",
+ "zeroize",
 ]
 
 [[package]]

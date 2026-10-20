@@ -11,7 +11,7 @@ directory, `keys.bin` included.
 | File | Secret | Why it matters |
 |---|---|---|
 | `operator.token` | yes | Creates and lists mints. |
-| `kek.key` | yes | Unseals the generation keys that rotations carry in the log. |
+| `kek.key` | yes | Unseals the generation keys that rotations carry in the log. The server does not start without it, and on a cluster it must be identical on every member. |
 | `mints/<mint>/issuer.key` | yes | The mint's identity. Without it there is no mint. |
 | `mints/<mint>/admin.token` | yes | Rotates and pauses the mint. |
 | `mints/<mint>/keys.bin` | yes | The live generations' signing keys. Without it the store does not open. |
@@ -35,6 +35,15 @@ cluster member, `keys.bin` is written only with a snapshot, so the keys of
 rotations logged since the member's last snapshot are in the log alone,
 sealed, and the member cannot apply them without `kek.key`. Keep `kek.key`
 with the rest.
+
+A server whose state directory lacks `kek.key` does not start: `serve`
+fails with `…/kek.key is missing`. Restore the file from a backup of the
+same directory or, on a cluster, copy it from another member. Only `init`
+makes one, and a new key would not open what the old one sealed. Every
+member of a cluster must hold the same `kek.key`, so restore a member's from
+a backup of the same cluster: a member with another key is refused by the
+rest, and both sides log `kek.key differs from member N's`. See
+[Running a cluster](../running-a-cluster/#the-key-encryption-key).
 
 ## A consistent copy
 
