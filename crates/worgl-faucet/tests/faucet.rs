@@ -1,7 +1,7 @@
 //! The faucet against a real server on a local port.
 
 use std::collections::HashSet;
-use std::net::SocketAddr;
+use std::net::{SocketAddr, UdpSocket};
 use std::sync::Arc;
 
 use reqwest::StatusCode;
@@ -76,6 +76,50 @@ async fn serve(config: Config) -> String {
     let app = router(faucet).into_make_service_with_connect_info::<SocketAddr>();
     tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
     url
+}
+
+/// A port on 127.0.0.1 kept for one test while this lives, with nothing
+/// listening on it.
+///
+/// It is below the ports the kernel picks for a bind to port 0 or an
+/// outgoing connection, so no other socket takes it, and a connection to it
+/// is refused. Tests, in this process or another, claim such a port by
+/// binding a UDP socket to it, which only one of them can, and leave the
+/// TCP port free.
+struct Port {
+    address: SocketAddr,
+    _claim: UdpSocket,
+}
+
+impl Port {
+    fn new() -> Self {
+        let ephemeral = first_ephemeral_port();
+        for port in (1024..ephemeral).rev() {
+            let address = SocketAddr::from(([127, 0, 0, 1], port));
+            // Claimed by another test, or used by another program.
+            let Ok(claim) = UdpSocket::bind(address) else {
+                continue;
+            };
+            if std::net::TcpListener::bind(address).is_ok() {
+                return Self {
+                    address,
+                    _claim: claim,
+                };
+            }
+        }
+        panic!("no port below {ephemeral} is free");
+    }
+}
+
+/// The first port the kernel picks itself: on Linux the start of
+/// `net.ipv4.ip_local_port_range`, and elsewhere 49152, where macOS starts.
+fn first_ephemeral_port() -> u16 {
+    if cfg!(target_os = "linux") {
+        let range = std::fs::read_to_string("/proc/sys/net/ipv4/ip_local_port_range").unwrap();
+        range.split_whitespace().next().unwrap().parse().unwrap()
+    } else {
+        49152
+    }
 }
 
 fn limits(per_address_per_hour: u32, per_day: u32) -> Limits {
@@ -257,12 +301,11 @@ async fn requests_at_once_each_get_their_own_note() {
 #[tokio::test]
 async fn a_server_that_does_not_answer_is_passed_over() {
     let mint = Mint::start().await;
-    let gone = {
-        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
-        format!("http://{}", listener.local_addr().unwrap())
-    };
+    let gone = Port::new();
     let mut config = mint.config(Limits::default());
-    config.servers.insert(0, Client::new(&gone).unwrap());
+    config
+        .servers
+        .insert(0, Client::new(&format!("http://{}", gone.address)).unwrap());
     let url = serve(config).await;
 
     for _ in 0..3 {

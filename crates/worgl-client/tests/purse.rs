@@ -1,7 +1,7 @@
 //! The client and purse against a real server on a local port.
 
 use std::io;
-use std::net::SocketAddr;
+use std::net::{SocketAddr, UdpSocket};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
@@ -37,10 +37,54 @@ const QUICK: Retry = Retry {
     first_delay: Duration::from_millis(10),
 };
 
+/// A port on 127.0.0.1 kept for one test while this lives, so that a
+/// server there can stop and start again on it.
+///
+/// It is below the ports the kernel picks for a bind to port 0 or an
+/// outgoing connection, so no other socket takes it while the server is
+/// stopped, and until the server is back a connection to it is refused.
+/// Tests, in this process or another, claim such a port by binding a UDP
+/// socket to it, which only one of them can, and leave the TCP port free.
+struct Port {
+    address: SocketAddr,
+    _claim: UdpSocket,
+}
+
+impl Port {
+    fn new() -> Self {
+        let ephemeral = first_ephemeral_port();
+        for port in (1024..ephemeral).rev() {
+            let address = SocketAddr::from(([127, 0, 0, 1], port));
+            // Claimed by another test, or used by another program.
+            let Ok(claim) = UdpSocket::bind(address) else {
+                continue;
+            };
+            if std::net::TcpListener::bind(address).is_ok() {
+                return Self {
+                    address,
+                    _claim: claim,
+                };
+            }
+        }
+        panic!("no port below {ephemeral} is free");
+    }
+}
+
+/// The first port the kernel picks itself: on Linux the start of
+/// `net.ipv4.ip_local_port_range`, and elsewhere 49152, where macOS starts.
+fn first_ephemeral_port() -> u16 {
+    if cfg!(target_os = "linux") {
+        let range = std::fs::read_to_string("/proc/sys/net/ipv4/ip_local_port_range").unwrap();
+        range.split_whitespace().next().unwrap().parse().unwrap()
+    } else {
+        49152
+    }
+}
+
 /// A server on a local port with one mint.
 struct Server {
     url: String,
-    address: SocketAddr,
+    port: Port,
     mint: PublicKey,
     token: String,
     authority: MintKey,
@@ -100,11 +144,11 @@ impl Server {
             })
             .await
             .unwrap();
-        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let address = listener.local_addr().unwrap();
+        let port = Port::new();
+        let listener = TcpListener::bind(port.address).await.unwrap();
         Self {
-            url: format!("http://{address}"),
-            address,
+            url: format!("http://{}", port.address),
+            port,
             mint: created.mint,
             token: created.token,
             authority,
@@ -133,7 +177,7 @@ impl Server {
         // Each committer lets go of its store once it sees its mint dropped.
         for _ in 0..200 {
             if let Ok(state) = AppState::open(self.dir.path(), 1000) {
-                let listener = TcpListener::bind(self.address).await.unwrap();
+                let listener = TcpListener::bind(self.port.address).await.unwrap();
                 self.serving = Some(serve(listener, state));
                 return;
             }
@@ -298,10 +342,8 @@ async fn errors_say_what_went_wrong() {
     }
 
     // Nothing listening: the request never completed, so it may be retried.
-    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
-    let closed = format!("http://{}", listener.local_addr().unwrap());
-    drop(listener);
-    let error = Client::new(&closed)
+    let closed = Port::new();
+    let error = Client::new(&format!("http://{}", closed.address))
         .unwrap()
         .info(&server.mint)
         .await

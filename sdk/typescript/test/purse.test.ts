@@ -3,7 +3,7 @@
 import assert from 'node:assert/strict';
 import { mkdtempSync, readdirSync, rmSync, statSync, writeFileSync } from 'node:fs';
 import { createServer as createHttpServer } from 'node:http';
-import { type AddressInfo, createServer } from 'node:net';
+import { type AddressInfo } from 'node:net';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { after, before, describe, test } from 'node:test';
@@ -23,7 +23,7 @@ import {
   isTransient,
 } from '../src/index.ts';
 import { FileStore } from '../src/node.ts';
-import { TestServer } from './server.ts';
+import { keptPort, TestServer } from './server.ts';
 
 /** Fast retries, so a refused transfer does not hold a test up. */
 const quick = { retry: { attempts: 2, firstDelayMs: 10 } };
@@ -116,12 +116,7 @@ describe('client', () => {
     });
     assert.throws(() => new Client('ftp://example.com'), TypeError);
 
-    const port = await new Promise<number>((resolve) => {
-      const probe = createServer().listen(0, '127.0.0.1', () => {
-        const address = probe.address();
-        probe.close(() => resolve(typeof address === 'object' && address ? address.port : 0));
-      });
-    });
+    const port = await keptPort();
     await assert.rejects(new Client(`http://127.0.0.1:${port}`).info(server.mint), (error) =>
       isTransient(error),
     );
