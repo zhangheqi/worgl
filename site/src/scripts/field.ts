@@ -47,6 +47,8 @@ export function mountField(root: HTMLElement) {
   const B = 18, buckets: number[][] = Array.from({ length: B }, () => []);
   const L = (k: number) => layers[k]!;
   const isMine = (layer: Layer, i: number) => !!mine && mine.L === layer && mine.i === i;
+  // Whether a note in layer k can move: the last layer is frozen, and a full layer takes no more.
+  const room = (k: number) => k < N - 1 && L(k + 1).used < cap;
   const spendBtn = part<HTMLButtonElement>('spend');
   function focus(now: number) {
     if (isReduced()) return 0;
@@ -359,7 +361,7 @@ export function mountField(root: HTMLElement) {
     out.l.textContent = fmt(layers.reduce((s, x) => s + x.live, 0));
     out.e.textContent = fmt(stats.expired);
     out.r.textContent = reduced ? 'paused' : phase === 'run' ? `${Math.max(0, Math.ceil((nextRot - now) / 1000))} s` : 'now';
-    const k = mine ? layers.indexOf(mine.L) : -1, label = k >= 0 && k < N - 1 ? 'Spend it again' : 'Spend a note';
+    const k = mine ? layers.indexOf(mine.L) : -1, label = k >= 0 && room(k) ? 'Spend it again' : 'Spend a note';
     if (spendBtn.textContent !== label) spendBtn.textContent = label;
     const st = reduced ? 'paused' : isIdle() ? 'idle' : 'moving';
     if (out.chip.dataset.state !== st || !out.chip.textContent) {
@@ -476,14 +478,21 @@ export function mountField(root: HTMLElement) {
   cv.addEventListener('pointerleave', () => { hover = null; tip.hidden = true; if (!running) draw(performance.now()); });
   cv.addEventListener('click', (e) => { const h = cellAt(e); if (h) { act(h); showTip(h); } });
   spendBtn.addEventListener('click', () => {
-    // Spend the visitor's own note while it can still move, else pick one.
+    // Spend the visitor's own note while it can still move, else pick one. A layer whose
+    // next layer has room comes first; if none has room, the refusal says why.
     const own = mine ? layers.indexOf(mine.L) : -1;
-    if (mine && own >= 0 && own < N - 1) { act({ k: own, L: mine.L, i: mine.i }); return; }
-    const cand = [0, 1, 2].filter((k) => L(k).live);
-    if (!cand.length) { issue(L(N - 2), 3, performance.now(), true); stats.minted++; cand.push(N - 2); }
+    if (mine && own >= 0 && room(own)) { act({ k: own, L: mine.L, i: mine.i }); return; }
+    const live = [0, 1, 2].filter((k) => L(k).live);
+    if (!live.length) {
+      if (issue(L(N - 2), 3, performance.now(), true) < 0) { say('Nothing can move: every live note is frozen in the last layer, and the layer new notes land in is full. The next rotation thaws them.', true); return; }
+      stats.minted++; live.push(N - 2);
+    }
+    const cand = live.some(room) ? live.filter(room) : live;
     let best = cand[0]!;
     for (const k of cand) if (L(k).live > L(best).live) best = k;
-    act({ k: best, L: L(best), i: pickLive(L(best)) });
+    // pickLive passes over the visitor's note, which can be the only live one left there.
+    const i = pickLive(L(best));
+    act({ k: best, L: L(best), i: i < 0 && mine?.L === L(best) ? mine.i : i });
   });
 
   onIdleChange((idle) => {

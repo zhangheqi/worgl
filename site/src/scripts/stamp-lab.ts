@@ -115,7 +115,8 @@ export function mountStampLab(root: HTMLElement) {
   const act: Record<string, () => void> = {
     mint() {
       const k = N - 2, layer = sheet(k);
-      if (layer.cells.length >= CAP) return say(`Layer ${k} is full and stays full until a rotation drops it. The next rotation moves layer ${k + 1} up to take new notes.`);
+      if (layer.cells.length >= CAP) return say(`Layer ${k} is full and stays full until a rotation drops it. ` +
+        (sheet(k + 1).cells.length >= CAP ? `Layer ${k + 1}, which the next rotation moves up to take new notes, is full too.` : `The next rotation moves layer ${k + 1} up to take new notes.`));
       layer.cells.push({ a: 8, live: true });
       fx.set(`${layer.gen}:${layer.cells.length - 1}`, 'fl');
       if (selectMode) sel = { gen: layer.gen, i: layer.cells.length - 1 };
@@ -125,10 +126,15 @@ export function mountStampLab(root: HTMLElement) {
     transfer() {
       const s = selected();
       if (selectMode && s && s.c.live) { move(s.k, s.i); render(); return; }
+      // The oldest live note with room one layer on moves. If none has room, move() says why for the oldest.
+      let stuck = -1;
       for (let k = 0; k < N - 1; k++) {
         const i = sheet(k).cells.findIndex((c) => c.live);
-        if (i >= 0) { move(k, i); render(); return; }
+        if (i < 0) continue;
+        if (sheet(k + 1).cells.length < CAP) { move(k, i); render(); return; }
+        if (stuck < 0) stuck = k;
       }
+      if (stuck >= 0) { move(stuck, sheet(stuck).cells.findIndex((c) => c.live)); render(); return; }
       say('Nothing can move: every live note is frozen in the last layer. Rotate to thaw them.');
     },
     refresh() {
@@ -137,7 +143,11 @@ export function mountStampLab(root: HTMLElement) {
       let n = 0;
       for (const i of idx) if (move(0, i, true)) n++;
       render();
-      say(`Refreshed ${n} ${n === 1 ? 'note' : 'notes'}: each paid to a fresh key of your own, one layer on. ${n === 1 ? 'It now dies' : 'They now die'} in 2 rotations instead of 1.`);
+      // With layer 1 full from the start, move() has already said why nothing moved.
+      if (!n) return;
+      const left = idx.length - n;
+      say(`Refreshed ${n} ${n === 1 ? 'note' : 'notes'}: each paid to a fresh key of your own, one layer on. ${n === 1 ? 'It now dies' : 'They now die'} in 2 rotations instead of 1.` +
+        (left ? ` Layer 1 is full now, so ${left === 1 ? 'the last one stays behind and dies' : `the other ${left} stay behind and die`} at the next rotation.` : ''));
     },
     rotate() {
       if (busy) return;
