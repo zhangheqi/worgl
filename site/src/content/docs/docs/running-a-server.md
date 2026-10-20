@@ -88,6 +88,11 @@ Every field is in [Policy fields](../policy/). Input amounts are not checked
 against the denominations, so notes issued under an earlier policy still
 spend.
 
+On a cluster, each member reads its own `policy.json`, so pause the mint,
+make the same edit on every member, restart them one at a time, then
+resume. See
+[Running a cluster](../running-a-cluster/#changing-the-rules).
+
 ## Rotation
 
 With `--rotate-every`, a mint rotates at multiples of its period since the

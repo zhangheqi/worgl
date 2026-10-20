@@ -59,7 +59,10 @@
 //! of their own, for each other only. Creating a mint goes through the
 //! cluster's registry, from which every member writes and serves the new
 //! mint; a creation answered `503 timeout` may have made a mint, so list the
-//! mints before creating another.
+//! mints before creating another. A mint's policy and rotation period are
+//! not replicated: each member reads its own from the mint's directory, and
+//! the leader carries out requests and scheduled rotations under its own, so
+//! they must be the same on every member.
 
 pub mod cluster;
 pub mod files;
@@ -846,11 +849,11 @@ impl ApiError {
     /// One of: `malformed`, `policy`, `invalid_note`, `duplicate_input`,
     /// `unauthorized` (a holder's or mint authority's signature),
     /// `unknown_authority`, `admin_unauthorized` (a missing or wrong token),
-    /// `unknown_mint`, `paused`, `spent`, `expired`, `unissued`, `frozen`,
-    /// `stale_mint`, `stale_rotation`, `layer_full`, `busy` (the mint must
-    /// keep its recent transfers' answers a while longer before it takes
-    /// another transfer or burn; nothing was done: send the request again
-    /// after the seconds its `Retry-After` header gives), `storage`,
+    /// `unknown_mint`, `paused`, `spent`, `expired`, `unissued`, `overdrawn`,
+    /// `frozen`, `stale_mint`, `stale_rotation`, `layer_full`, `busy` (the
+    /// mint must keep its recent transfers' answers a while longer before it
+    /// takes another transfer or burn; nothing was done: send the request
+    /// again after the seconds its `Retry-After` header gives), `storage`,
     /// `internal`, and on a cluster `no_leader` (nothing was done; send the
     /// request again) and `timeout` (the change may still be made: send the
     /// same note request again, but list the mints before creating another).
@@ -876,8 +879,10 @@ impl From<Error> for ApiError {
             Error::Spent(_) => (StatusCode::CONFLICT, "spent"),
             Error::Expired(_) => (StatusCode::CONFLICT, "expired"),
             Error::Unissued(_) => (StatusCode::CONFLICT, "unissued"),
+            Error::Overdrawn { .. } => (StatusCode::CONFLICT, "overdrawn"),
             Error::Frozen(_) => (StatusCode::CONFLICT, "frozen"),
             Error::LayerFull { .. } => (StatusCode::SERVICE_UNAVAILABLE, "layer_full"),
+            Error::Misfit(_) => return Self::internal(&error.to_string()),
             _ => (StatusCode::BAD_REQUEST, "malformed"),
         };
         Self::new(status, code, error.to_string())
