@@ -1026,16 +1026,17 @@ impl PersistentIssuer {
 
     /// Mints a note once the mint is on disk.
     pub fn mint(&mut self, amount: u64, holder: PublicKey) -> Result<Note, CommitError> {
-        let event = self.issuer.plan_mint(amount, holder)?;
+        let event = self.planner()?.plan_mint(amount, holder)?;
         self.commit(&event)?;
         Ok(self.issuer.notes(&event).remove(0))
     }
 
     /// Mints at a verified mint authority's request once the mint is on disk.
     /// Resending the authority's last request returns the same note and
-    /// writes nothing.
+    /// writes nothing. While the store is not [in step](StoreState::InStep),
+    /// it is refused like every change, resent or not.
     pub fn authorized_mint(&mut self, mint: &VerifiedMint) -> Result<Note, CommitError> {
-        let mut notes = match self.issuer.plan_authorized_mint(mint)? {
+        let mut notes = match self.planner()?.plan_authorized_mint(mint)? {
             Plan::Replay(notes) => notes,
             Plan::Apply(event) => {
                 self.commit(&event)?;
@@ -1047,8 +1048,10 @@ impl PersistentIssuer {
 
     /// Carries out a verified transfer once it is on disk. A resent request
     /// that was already applied returns the same notes and writes nothing.
+    /// While the store is not [in step](StoreState::InStep), it is refused
+    /// like every change, resent or not.
     pub fn transfer(&mut self, transfer: &VerifiedTransfer) -> Result<Vec<Note>, CommitError> {
-        match self.issuer.plan_transfer(transfer)? {
+        match self.planner()?.plan_transfer(transfer)? {
             Plan::Replay(notes) => Ok(notes),
             Plan::Apply(event) => {
                 self.commit(&event)?;
@@ -1059,8 +1062,10 @@ impl PersistentIssuer {
 
     /// Carries out a verified burn once it is on disk and returns the value
     /// destroyed. A resent burn that was already applied writes nothing.
+    /// While the store is not [in step](StoreState::InStep), it is refused
+    /// like every change, resent or not.
     pub fn burn(&mut self, burn: &VerifiedBurn) -> Result<u128, CommitError> {
-        if let Plan::Apply(event) = self.issuer.plan_burn(burn)? {
+        if let Plan::Apply(event) = self.planner()?.plan_burn(burn)? {
             self.commit(&event)?;
         }
         Ok(burn.value())
@@ -1081,9 +1086,11 @@ impl PersistentIssuer {
     }
 
     /// Pauses the issuer once the pause is on disk, or resumes it if
-    /// `paused` is false. Writes nothing if it already is.
+    /// `paused` is false. Writes nothing if it already is. While the store
+    /// is not [in step](StoreState::InStep), it is refused like every
+    /// change, even where it would write nothing.
     pub fn set_paused(&mut self, paused: bool) -> Result<(), CommitError> {
-        if let Some(event) = self.issuer.plan_pause(paused) {
+        if let Some(event) = self.planner()?.plan_pause(paused) {
             self.commit(&event)?;
         }
         Ok(())
@@ -1139,7 +1146,6 @@ impl PersistentIssuer {
     }
 
     fn rotate_due(&mut self, due: Option<u64>) -> Result<RotationReport, CommitError> {
-        self.check_in_step()?;
         let (report, sealed) = self.plan_rotate(due)?;
         self.commit_sealed(&Event::Rotate(report), sealed.as_slice())?;
         Ok(report)
@@ -1151,10 +1157,11 @@ impl PersistentIssuer {
         &mut self,
         due: Option<u64>,
     ) -> Result<(RotationReport, Option<SealedKey>), CommitError> {
+        let issuer = self.planner()?;
         let next = GenerationKey::try_generate().map_err(io::Error::other)?;
         let report = match due {
-            Some(due) => self.issuer.plan_scheduled_rotation(next, due)?,
-            None => self.issuer.plan_rotate(next)?,
+            Some(due) => issuer.plan_scheduled_rotation(next, due)?,
+            None => issuer.plan_rotate(next)?,
         };
         let Event::Rotate(report) = report else {
             unreachable!("a rotation is planned as one")
@@ -1177,11 +1184,24 @@ impl PersistentIssuer {
         Ok((report, sealed))
     }
 
+    /// The issuer, to plan a change on, once the store is in step. Every
+    /// change outside a [`Batch`] is planned on it, so that while the store
+    /// is not in step the change is refused before it is planned: planning
+    /// answers a request that was already applied from what memory holds,
+    /// which may then not match the disk. A batch needs no check of its
+    /// own, since it starts only in step and stays so until it commits.
+    fn planner(&mut self) -> io::Result<&mut Issuer> {
+        self.check_in_step()?;
+        Ok(&mut self.issuer)
+    }
+
     fn commit(&mut self, event: &Event) -> Result<(), CommitError> {
         self.commit_sealed(event, &[])
     }
 
     fn commit_sealed(&mut self, event: &Event, keys: &[SealedKey]) -> Result<(), CommitError> {
+        // Also checked before planning; this keeps an event planned any
+        // other way off a log the store is not in step with.
         self.check_in_step()?;
         // Before it is logged, so the log never holds an event that does
         // not replay.
@@ -2038,32 +2058,203 @@ mod tests {
         assert_eq!(issuer.sequence(), 1);
     }
 
+    /// A store whose policy lists `authority` as a mint authority.
+    fn fresh_with_authority(
+        dir: &Path,
+        authority: &MintKey,
+    ) -> (IssuerKey, Policy, PersistentIssuer) {
+        let key = IssuerKey::generate();
+        let policy = Policy {
+            mint_authorities: vec![authority.public_key()],
+            ..Policy::cash_like()
+        };
+        let issuer = Issuer::new(key.clone(), LEDGER, policy.clone()).unwrap();
+        (key, policy, PersistentIssuer::create(dir, issuer).unwrap())
+    }
+
+    /// A request of each kind that a store answers again from memory once
+    /// it has applied it.
+    struct Requests {
+        mint: VerifiedMint,
+        transfer: VerifiedTransfer,
+        burn: VerifiedBurn,
+    }
+
+    impl Requests {
+        /// Mints the notes that the transfer and the burn spend.
+        fn new(p: &mut PersistentIssuer, authority: &MintKey) -> Self {
+            let request = MintRequest::sign(
+                authority,
+                p.public_key(),
+                1,
+                8,
+                HolderKey::generate().public_key(),
+            );
+            let mint = p.issuer().verifier().verify_mint(&request).unwrap();
+            let alice = HolderKey::generate();
+            let note = p.mint(8, alice.public_key()).unwrap();
+            let output = Output {
+                amount: 8,
+                holder: HolderKey::generate().public_key(),
+            };
+            let request = TransferRequest::single(note, &alice, output).unwrap();
+            let transfer = p.issuer().verifier().verify(&request).unwrap();
+            let note = p.mint(4, alice.public_key()).unwrap();
+            let request = BurnRequest::single(note, &alice).unwrap();
+            let burn = p.issuer().verifier().verify_burn(&request).unwrap();
+            Self {
+                mint,
+                transfer,
+                burn,
+            }
+        }
+
+        fn stage(&self, batch: &mut Batch<'_>) {
+            batch.authorized_mint(&self.mint).unwrap();
+            batch.transfer(&self.transfer).unwrap();
+            assert_eq!(batch.burn(&self.burn).unwrap(), 4);
+        }
+
+        /// Asserts that `p` refuses each of them, applied or not.
+        fn assert_refused(&self, p: &mut PersistentIssuer) {
+            assert!(matches!(
+                p.authorized_mint(&self.mint),
+                Err(CommitError::Io(_))
+            ));
+            assert!(matches!(
+                p.transfer(&self.transfer),
+                Err(CommitError::Io(_))
+            ));
+            assert!(matches!(p.burn(&self.burn), Err(CommitError::Io(_))));
+        }
+    }
+
     #[test]
     fn a_batch_that_does_not_reach_the_disk_stops_all_changes() {
+        // Dropped without committing, or refused by the log.
+        for refused in [false, true] {
+            let dir = tempfile::tempdir().unwrap();
+            let authority = MintKey::generate();
+            let (key, policy, mut p) = fresh_with_authority(dir.path(), &authority);
+            let requests = Requests::new(&mut p, &authority);
+            p.set_paused(true).unwrap();
+            let on_disk = p.issuer().snapshot();
+            let sequence = p.issuer().sequence();
+
+            let mut batch = p.batch().unwrap();
+            batch.set_paused(false);
+            requests.stage(&mut batch);
+            if refused {
+                // A sealed key too large for any record.
+                batch.keys.push(SealedKey {
+                    generation: 0,
+                    public: key.public_key(),
+                    sealed: vec![0; MAX_PAYLOAD],
+                });
+                assert!(batch.commit().is_err());
+            } else {
+                drop(batch);
+            }
+            assert_eq!(p.state(), StoreState::Ahead);
+            assert_eq!(
+                p.issuer().sequence(),
+                sequence + 4,
+                "the batch took effect in memory"
+            );
+            // The batch's own requests sent again are refused too, rather
+            // than answered from memory, as is resuming again.
+            requests.assert_refused(&mut p);
+            assert!(matches!(p.set_paused(false), Err(CommitError::Io(_))));
+            assert!(matches!(
+                p.mint(2, HolderKey::generate().public_key()),
+                Err(CommitError::Io(_))
+            ));
+            // Rotations are refused before a key is made and saved for them.
+            let keys = fs::read(dir.path().join(KEYS)).unwrap();
+            assert!(matches!(p.rotate(), Err(CommitError::Io(_))));
+            assert!(matches!(p.rotate_scheduled(1), Err(CommitError::Io(_))));
+            assert_eq!(fs::read(dir.path().join(KEYS)).unwrap(), keys);
+            assert!(p.batch().is_err());
+            assert!(
+                p.compact().is_err(),
+                "a snapshot would save unwritten changes"
+            );
+            assert_eq!(p.state(), StoreState::Ahead);
+            drop(p);
+            let mut p = PersistentIssuer::open(dir.path(), key, policy).unwrap();
+            assert_eq!(p.issuer().snapshot(), on_disk);
+
+            // An empty batch writes nothing and does no harm.
+            p.batch().unwrap().commit().unwrap();
+            drop(p.batch().unwrap());
+            p.set_paused(false).unwrap();
+            p.mint(2, HolderKey::generate().public_key()).unwrap();
+        }
+    }
+
+    #[test]
+    fn a_change_after_a_lost_batch_is_refused_before_it_is_planned() {
         let dir = tempfile::tempdir().unwrap();
-        let (key, mut p) = fresh(dir.path());
+        let (_, mut p) = fresh(dir.path());
         let mut batch = p.batch().unwrap();
-        mint_and_pay(&mut batch);
+        batch.set_paused(true);
         drop(batch);
-        assert_eq!(p.issuer().sequence(), 2, "the batch took effect in memory");
+        // Planned on memory, which is paused while the disk is not, a mint
+        // or a rotation would be refused as paused, and pausing again
+        // would write nothing.
         assert!(matches!(
             p.mint(2, HolderKey::generate().public_key()),
             Err(CommitError::Io(_))
         ));
-        assert!(p.batch().is_err());
-        assert!(
-            p.compact().is_err(),
-            "a snapshot would save unwritten changes"
-        );
-        drop(p);
-        let p = PersistentIssuer::open(dir.path(), key, Policy::cash_like()).unwrap();
-        assert_eq!(p.issuer().sequence(), 0);
+        assert!(matches!(p.rotate(), Err(CommitError::Io(_))));
+        assert!(matches!(p.set_paused(true), Err(CommitError::Io(_))));
+    }
 
-        // An empty batch writes nothing and does no harm.
-        let mut p = p;
-        p.batch().unwrap().commit().unwrap();
-        drop(p.batch().unwrap());
-        p.mint(2, HolderKey::generate().public_key()).unwrap();
+    #[test]
+    fn requests_resent_after_a_lost_batch_are_made_once_the_store_recovers() {
+        // Recovered in place, or reopened.
+        for reopen in [false, true] {
+            let dir = tempfile::tempdir().unwrap();
+            let authority = MintKey::generate();
+            let (key, policy, mut p) = fresh_with_authority(dir.path(), &authority);
+            let requests = Requests::new(&mut p, &authority);
+            let mut batch = p.batch().unwrap();
+            requests.stage(&mut batch);
+            drop(batch);
+            // Answered from memory, they would hand out notes and report a
+            // burn that are gone once the store is rebuilt from its disk,
+            // and the notes' serials would then be issued to others.
+            requests.assert_refused(&mut p);
+            if reopen {
+                drop(p);
+                p = PersistentIssuer::open(dir.path(), key.clone(), policy.clone()).unwrap();
+            } else {
+                p.recover().unwrap();
+            }
+
+            // Sent again now, each is made and reaches the disk; sent once
+            // more, it is answered as made.
+            let minted = p.authorized_mint(&requests.mint).unwrap();
+            let paid = p.transfer(&requests.transfer).unwrap();
+            assert_eq!(p.burn(&requests.burn).unwrap(), 4);
+            assert_eq!(p.transfer(&requests.transfer).unwrap(), paid);
+            drop(p);
+            let p = PersistentIssuer::open(dir.path(), key, policy).unwrap();
+            let issuer = p.issuer();
+            assert!(matches!(
+                issuer.status(&minted),
+                Ok(NoteStatus::Live { .. })
+            ));
+            assert_eq!(issuer.mint_sequence(&authority.public_key()), Some(1));
+            assert!(matches!(
+                issuer.status(&paid[0]),
+                Ok(NoteStatus::Live { .. })
+            ));
+            for spent in [requests.transfer.inputs(), requests.burn.inputs()] {
+                assert_eq!(issuer.status(&spent[0]), Ok(NoteStatus::Spent));
+            }
+            assert_eq!(issuer.supply().burned, 4);
+        }
     }
 
     #[test]
@@ -2143,9 +2334,10 @@ mod tests {
     fn a_log_that_cannot_be_cut_back_after_a_failed_write_stops_the_store() {
         for batched in [false, true] {
             let dir = tempfile::tempdir().unwrap();
-            let (key, mut p) = fresh(dir.path());
+            let authority = MintKey::generate();
+            let (key, policy, mut p) = fresh_with_authority(dir.path(), &authority);
             let holder = HolderKey::generate().public_key();
-            p.mint(8, holder).unwrap();
+            let requests = Requests::new(&mut p, &authority);
             let on_disk = p.issuer().snapshot();
 
             // Neither the write nor the cut-back after it gets through a
@@ -2153,7 +2345,7 @@ mod tests {
             p.store.log.lose_write_access().unwrap();
             if batched {
                 let mut batch = p.batch().unwrap();
-                mint_and_pay(&mut batch);
+                requests.stage(&mut batch);
                 assert!(batch.commit().is_err());
             } else {
                 assert!(matches!(p.mint(2, holder), Err(CommitError::Io(_))));
@@ -2161,13 +2353,14 @@ mod tests {
             assert_eq!(p.state(), StoreState::Stopped);
             assert!(p.recover().is_err());
             assert_eq!(p.state(), StoreState::Stopped);
+            requests.assert_refused(&mut p);
             assert!(matches!(p.mint(2, holder), Err(CommitError::Io(_))));
             assert!(p.batch().is_err());
             assert!(p.compact().is_err());
             drop(p);
 
             // Reopening reads the log again.
-            let mut p = PersistentIssuer::open(dir.path(), key, Policy::cash_like()).unwrap();
+            let mut p = PersistentIssuer::open(dir.path(), key, policy).unwrap();
             assert_eq!(p.issuer().snapshot(), on_disk);
             p.mint(2, holder).unwrap();
         }
