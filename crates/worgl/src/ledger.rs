@@ -468,7 +468,9 @@ impl Ledger {
         (self.config.layer_size / 64) as usize
     }
 
-    fn serial_of(&self, generation: u64, bit: u32) -> Serial {
+    /// The serial that names `bit` of `generation`'s layer, whether or not
+    /// the bit was handed out. `bit` must be below the layer size.
+    pub(crate) fn serial_of(&self, generation: u64, bit: u32) -> Serial {
         let index = match &self.order {
             Some(order) => order.index(generation, bit),
             None => bit,
@@ -476,22 +478,29 @@ impl Ledger {
         Serial { generation, index }
     }
 
+    /// The bit a serial names in its layer, or `None` if its generation is
+    /// not in the ledger or its index is past the layer's size.
+    pub(crate) fn bit_of(&self, serial: Serial) -> Option<u32> {
+        self.position(serial.generation)?;
+        if serial.index >= self.config.layer_size {
+            return None;
+        }
+        Some(match &self.order {
+            Some(order) => order.bit(serial.generation, serial.index),
+            None => serial.index,
+        })
+    }
+
     /// A serial's status and, if it is issued, its bit.
     fn locate(&self, serial: Serial) -> (Status, u32) {
         if serial.generation < self.oldest {
             return (Status::Expired, 0);
         }
-        let Some(position) = self.position(serial.generation) else {
+        let (Some(position), Some(bit)) = (self.position(serial.generation), self.bit_of(serial))
+        else {
             return (Status::Unissued, 0);
         };
-        if serial.index >= self.config.layer_size {
-            return (Status::Unissued, 0);
-        }
         let slot = self.slot_of(serial.generation);
-        let bit = match &self.order {
-            Some(order) => order.bit(serial.generation, serial.index),
-            None => serial.index,
-        };
         let status = if bit >= self.slots[slot].next {
             Status::Unissued
         } else if self.bit(slot, bit) {

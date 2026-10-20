@@ -19,9 +19,10 @@ once it is spent. A transfer clears its input notes' bits and issues new
 notes to the receivers, so no note can be spent twice. A burn clears them
 and issues nothing, for value that leaves circulation.
 
-The mint also keeps a bounded list of recent transfers (65,536 by default),
-so a client whose answer was lost can send the same request again and get
-the same notes back.
+The mint also keeps a receipt of each recent transfer and burn, the last
+1,048,576 by default and each for at least 128 seconds, so a client whose
+answer was lost can send the same request again and get the same notes back.
+See [Policy fields](../policy/#receipt_capacity-and-receipt_min_age_secs).
 
 ## Mints
 

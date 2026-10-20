@@ -29,7 +29,9 @@ The other side reads what it is sent with `PaymentRequest.from(json)` and
 - `Purse` reads mint info itself, submits each transfer at its time, retries
   what fails on the way (a resent transfer gets the same answer) and saves
   after every change, before handing out anything that depends on it. If a
-  save fails, the change is undone and the call rejects.
+  save fails, the change is undone and the call rejects. After a `busy`
+  answer it waits as long as the mint's `Retry-After` asks, up to 30
+  seconds, before the next try.
 - `purse.refresh(mint)` pays the notes about to expire back to the purse,
   each at a random moment before the next rotation. `planRefresh` and
   `submit` split it for applications with their own scheduler.

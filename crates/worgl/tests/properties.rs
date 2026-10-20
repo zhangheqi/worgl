@@ -307,6 +307,8 @@ fn run_history(
     let mut wallet: Vec<(Note, HolderKey)> = Vec::new();
     let mut spent: Vec<(Note, HolderKey)> = Vec::new();
     let mut events: Vec<Event> = Vec::new();
+    // Every transfer applied, with the notes it was answered with.
+    let mut answered: Vec<(TransferRequest, Vec<Note>)> = Vec::new();
     // Notes that entered each generation, and value burned from each.
     let mut entered: BTreeMap<u64, u32> = BTreeMap::new();
     let mut burned: BTreeMap<u64, u128> = BTreeMap::new();
@@ -379,6 +381,7 @@ fn run_history(
                     Ok(Plan::Apply(event)) => {
                         let notes = commit(&mut issuer, event);
                         prop_assert_eq!(notes.len(), outputs.len());
+                        answered.push((request, notes.clone()));
                         wallet.extend(notes.into_iter().zip(outputs.into_iter().map(|(_, k)| k)));
                         spent.push((note, holder));
                     }
@@ -418,6 +421,7 @@ fn run_history(
                 match issuer.plan_transfer(&verified.unwrap()) {
                     Ok(Plan::Apply(event)) => {
                         let note = commit(&mut issuer, event).remove(0);
+                        answered.push((request, vec![note]));
                         wallet.retain(|(n, _)| n != &a && n != &b);
                         wallet.push((note, out));
                         spent.push((a, ka));
@@ -493,6 +497,34 @@ fn run_history(
             prop_assert!(issuer.plan_transfer(&verified).is_err());
         }
         prop_assert_eq!(issuer.sequence(), before);
+    }
+
+    // A snapshot restores to the same state, and both answer every transfer
+    // whose notes are still live as before: with the same notes, signed
+    // again. Receipts go only with their notes, since none of these
+    // histories reaches the receipt capacity.
+    let snapshot = issuer.snapshot();
+    let restored = Issuer::restore(
+        key.clone(),
+        issuer.key_ring().clone(),
+        &snapshot,
+        policy.clone(),
+    )
+    .unwrap();
+    prop_assert_eq!(restored.snapshot(), snapshot);
+    let oldest = issuer.ledger().oldest_generation();
+    for (request, notes) in &answered {
+        for each in [&issuer, &restored] {
+            let planned = each
+                .verifier()
+                .verify(request)
+                .and_then(|verified| each.plan_transfer(&verified));
+            if notes[0].serial().generation >= oldest {
+                prop_assert_eq!(planned, Ok(Plan::Replay(notes.clone())));
+            } else {
+                prop_assert!(planned.is_err(), "{:?}", planned);
+            }
+        }
     }
 
     // Replaying the events onto the starting snapshot rebuilds the same state.
