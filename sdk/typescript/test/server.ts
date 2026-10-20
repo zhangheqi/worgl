@@ -202,7 +202,7 @@ const kept: Socket[] = [];
  * refused. Tests, in this process or another, claim such a port by binding a
  * UDP socket to it, which only one of them can, and leave the TCP port free.
  */
-async function keptPort(): Promise<number> {
+export async function keptPort(): Promise<number> {
   const ephemeral = firstEphemeralPort();
   for (let port = ephemeral - 1; port >= 1024; port -= 1) {
     // Claimed by another test, or used by another program.
