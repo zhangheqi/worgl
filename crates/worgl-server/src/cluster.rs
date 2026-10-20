@@ -269,7 +269,8 @@ impl Cluster {
     }
 
     /// Sends the request in `parts` and `body` to the member whose public
-    /// API is at `api`, and returns its answer.
+    /// API is at `api`, and returns its answer: the status, the body, and
+    /// the body's type and `Retry-After`, if any.
     async fn relay(&self, api: &str, parts: &Parts, body: Bytes) -> reqwest::Result<Response> {
         let path = parts.uri.path_and_query().map_or("/", |path| path.as_str());
         let mut request = self
@@ -285,13 +286,17 @@ impl Cluster {
         }
         let answer = request.send().await?;
         let status = answer.status();
-        let content_type = answer.headers().get(header::CONTENT_TYPE).cloned();
+        let kept: Vec<_> = [header::CONTENT_TYPE, header::RETRY_AFTER]
+            .into_iter()
+            .filter_map(|name| {
+                let value = answer.headers().get(&name)?.clone();
+                Some((name, value))
+            })
+            .collect();
         let bytes = answer.bytes().await?;
         let mut response = (status, bytes).into_response();
-        if let Some(content_type) = content_type {
-            response
-                .headers_mut()
-                .insert(header::CONTENT_TYPE, content_type);
+        for (name, value) in kept {
+            response.headers_mut().insert(name, value);
         }
         Ok(response)
     }

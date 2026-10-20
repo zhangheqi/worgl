@@ -31,7 +31,10 @@ pub struct Options {
     pub dir: PathBuf,
     /// The issuer key.
     pub key: IssuerKey,
-    /// The policy the issuer enforces.
+    /// The policy the issuer enforces. Give every replica of the mint the
+    /// same `receipt_capacity` and `receipt_min_age_secs`: the leader keeps
+    /// room for a transfer's receipt by the count it holds, and the others
+    /// push receipts out by the same count.
     pub policy: Policy,
     /// The group's key-encryption key, which seals the generation keys the
     /// log and snapshots carry.
@@ -250,8 +253,8 @@ impl Replica {
         *self.issuer().public_key()
     }
 
-    /// A verifier for the issuer's live keys, which changes after each
-    /// rotation this replica applies.
+    /// A verifier for the issuer's keys as they are now, which changes after
+    /// each rotation this replica applies.
     pub fn verifier(&self) -> watch::Receiver<Verifier> {
         self.shared.verifier.subscribe()
     }

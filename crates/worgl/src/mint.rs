@@ -189,9 +189,10 @@ mod tests {
                 mint_authorities: vec![mint.public_key()],
                 ..Policy::cash_like()
             };
+            let keys = KeySet::new(issuer, 0, Vec::new()).unwrap();
             Self {
                 issuer,
-                verifier: Verifier::new(KeySet::new(issuer, 0, Vec::new()).unwrap(), policy),
+                verifier: Verifier::new(keys.clone(), keys, policy),
                 mint,
             }
         }
