@@ -40,6 +40,7 @@ Errors answer with a status code and a body like:
 | `expired` | 409 | An input's layer has been dropped. |
 | `frozen` | 409 | An input is in the last layer and cannot move until the next rotation. |
 | `unissued` | 409 | The mint signed this note but its ledger has no record of it, which only happens if the mint's state was lost or rolled back. |
+| `overdrawn` | 409 | The inputs spend more from a layer than the mint counts as live in it. This happens only after the mint's state was rolled back, as by a restore from a backup, and it handed out the same serials again. See [Backups](../backups/#why-a-lost-state-matters). |
 | `stale_mint` | 409 | A mint request reuses a sequence number, or goes below one, that its authority already used. |
 | `stale_rotation` | 409 | A scheduled rotation is due no later than the last one logged, which already covered it. |
 | `layer_full` | 503 | The layer the outputs would land in has too few free bits left until the next rotation. |
