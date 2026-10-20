@@ -16,9 +16,11 @@ pub const MAX_REQUESTED_NOTES: usize = 256;
 /// Version of the format [`Holder::to_json`] writes.
 const FORMAT: u32 = 1;
 
-/// Seconds before a scheduled rotation by which refreshes should have been
-/// submitted, at most.
-const REFRESH_MARGIN_SECS: u64 = 300;
+/// Seconds before a scheduled rotation by which the transfers that
+/// [`Holder::refresh`] and [`Holder::due_resends`] plan are due, or half the
+/// time left when that is shorter. A payer should settle a payment this long
+/// before the rotation that drops a note it spends.
+pub const REFRESH_MARGIN_SECS: u64 = 300;
 
 /// Seconds over which refreshes are spread when the mint has no schedule.
 const UNSCHEDULED_REFRESH_SECS: u64 = 60;
@@ -242,7 +244,7 @@ impl Holder {
     /// `spacing`. Only notes [spendable](NoteState::Spendable) under `mint`
     /// are used. The notes spent leave the store and wait among the
     /// [outgoing](Self::outgoing) transfers until [`settle`](Self::settle)
-    /// sees them answered.
+    /// or [`take_answers`](Self::take_answers) sees them answered.
     pub fn pay(
         &mut self,
         mint: &MintView,
@@ -425,6 +427,24 @@ impl Holder {
         taken
     }
 
+    /// The notes of a mint's answers made for neither a note this holder
+    /// holds nor a key it expects: the counterparty's. A payee hands them
+    /// back to the payer, whose change they are, and a payer that submitted
+    /// a payment hands them to the payee. They tell the counterparty nothing
+    /// about this holder's notes: they are bound to the counterparty's own
+    /// keys.
+    pub fn theirs(&self, notes: &[Note]) -> Vec<Note> {
+        notes
+            .iter()
+            .filter(|note| {
+                let holder = note.holder();
+                !self.notes.iter().any(|h| h.note.holder() == holder)
+                    && !self.expected.iter().any(|e| e.key.public_key() == *holder)
+            })
+            .copied()
+            .collect()
+    }
+
     /// Records the mint's answer to one of this holder's transfers: the
     /// transfer stops being outgoing and its notes for this holder are taken
     /// in. Returns the value taken in.
@@ -433,8 +453,58 @@ impl Holder {
         self.absorb(answer)
     }
 
+    /// Takes in notes the counterparty handed over from the mint's answers,
+    /// as [`absorb`](Self::absorb) does, then settles each outgoing transfer
+    /// that pays this holder notes, once it holds every one of them with the
+    /// transfer's mint, amount and key. Returns the value taken in.
+    ///
+    /// A transfer that pays this holder nothing, such as a payment that
+    /// needs no change, stays outgoing: only [resending](Self::resend) it
+    /// shows it was applied.
+    ///
+    /// Give it notes from the mint's own answer, or check them first with
+    /// [`Note::verify`]: the store does not check signatures, and a forged
+    /// note would settle a transfer as surely as a real one.
+    ///
+    /// A signature shows that the mint issued a note, not which transfer it
+    /// answers. A counterparty holding the transfer can pay the same keys
+    /// from notes of its own and leave the transfer unsubmitted: it then
+    /// stops being outgoing though the mint never applied it, and nothing
+    /// resends it before its note dies. A hand-back settles a transfer only
+    /// as surely as the counterparty submitted it; to be sure, ask the mint
+    /// (`POST /v1/verify`) whether the note the transfer spends is spent
+    /// before taking the notes in.
+    pub fn take_answers(&mut self, notes: &[Note]) -> u128 {
+        let taken = self.absorb(notes);
+        let (held, expected) = (&self.notes, &self.expected);
+        self.outgoing.retain(|o| {
+            let mint = o.spends.note.issuer();
+            let mut own = o
+                .request
+                .outputs
+                .iter()
+                .filter(|out| {
+                    held.iter().any(|h| h.note.holder() == &out.holder)
+                        || expected.iter().any(|e| e.key.public_key() == out.holder)
+                })
+                .peekable();
+            let answered = own.peek().is_some()
+                && own.all(|out| {
+                    held.iter().any(|h| {
+                        h.note.issuer() == mint
+                            && h.note.amount() == out.amount
+                            && h.note.holder() == &out.holder
+                    })
+                });
+            !answered
+        });
+        taken
+    }
+
     /// Drops an outgoing transfer the mint refused because its note was
-    /// already spent or had expired. The note is gone either way.
+    /// already spent or had expired. The note is gone either way: had the
+    /// mint applied this transfer and still remembered it, it would have
+    /// answered with the notes (see [`resend`](Self::resend)).
     pub fn forget(&mut self, request: &TransferRequest) {
         self.outgoing.retain(|o| o.request != *request);
     }
@@ -460,18 +530,50 @@ impl Holder {
 
     /// Transfers not yet answered. Resend them after a crash or a timeout,
     /// with [`resend`](Self::resend): the mint answers an identical request
-    /// with the identical notes.
+    /// with the identical notes, before or after a rotation, for as long as
+    /// it remembers the transfer.
     pub fn outgoing(&self) -> impl Iterator<Item = &TransferRequest> {
         self.outgoing.iter().map(|o| &o.request)
+    }
+
+    /// What this holder may lose on `request` if the mint applied it and its
+    /// answer is lost: the value it pays to keys this holder still expects.
+    /// `Some` when the transfer is outgoing or pays such a key, even if the
+    /// value is 0; `None` when nothing of this holder's rides on it.
+    ///
+    /// A transfer refused as spent or expired may have been applied after
+    /// all, by the counterparty or by an earlier try whose answer was lost.
+    /// A counterparty that submitted it holds the answer and can hand the
+    /// notes over, for [`take_answers`](Self::take_answers).
+    pub fn at_stake(&self, request: &TransferRequest) -> Option<u128> {
+        let mint = request.inputs.first().map(|spend| spend.note.issuer());
+        let expected: u128 = request
+            .outputs
+            .iter()
+            .filter(|o| {
+                self.expected.iter().any(|e| {
+                    Some(&e.mint) == mint && e.amount == o.amount && e.key.public_key() == o.holder
+                })
+            })
+            .map(|o| u128::from(o.amount))
+            .sum();
+        let outgoing = self.outgoing.iter().any(|o| o.request == *request);
+        (outgoing || expected > 0).then_some(expected)
     }
 
     /// The [outgoing](Self::outgoing) transfers in random order, each with a
     /// time to resend it, spaced by `spacing`. Resent together, they would
     /// tell the mint their notes had one owner.
     ///
-    /// The mint remembers the answers to its most recent transfers only
-    /// (the policy's `receipt_capacity`); resend before then, or a transfer
-    /// already applied is refused as spent and its change is lost.
+    /// The mint answers a resent transfer with the same notes only while it
+    /// keeps its answer, and at the latest until the notes it issued expire
+    /// (see [Error codes]). After that, a transfer already applied is
+    /// refused as spent or expired, and its change can only come from the
+    /// counterparty, for [`take_answers`](Self::take_answers).
+    /// [`due_resends`](Self::due_resends) gives the transfers to resend
+    /// before a rotation ends their chance.
+    ///
+    /// [Error codes]: https://github.com/zhangheqi/worgl/blob/main/site/src/content/docs/docs/error-codes.md#sending-a-request-again
     pub fn resend(&self, spacing: Spacing) -> Vec<ScheduledTransfer> {
         let mut requests: Vec<TransferRequest> = self.outgoing().cloned().collect();
         random::shuffle(&mut requests);
@@ -491,6 +593,49 @@ impl Holder {
             .collect()
     }
 
+    /// The [outgoing](Self::outgoing) transfers at `mint` to resend before
+    /// its next rotation, each at its own random moment before it, as
+    /// [`refresh`](Self::refresh) spreads its transfers. Nothing in the store
+    /// changes.
+    ///
+    /// A transfer is due when the note it spends dies at that rotation:
+    /// after it, a transfer the mint never applied can no longer be
+    /// applied. It is still due when that note was dropped at the last
+    /// rotation, since the mint may keep an applied transfer's answer until
+    /// the notes it issued die, at the next. Call it before
+    /// [`refresh`](Self::refresh), whose transfers it would list too, submit
+    /// them with the refreshes and [`settle`](Self::settle) the answers.
+    /// Resending a payment the payee has not submitted yet carries it out;
+    /// the payee still gets the same notes by submitting it while the mint
+    /// keeps its answer.
+    pub fn due_resends(&self, mint: &MintView, now: u64) -> Vec<ScheduledTransfer> {
+        let window = refresh_window(mint, now);
+        let mut transfers: Vec<ScheduledTransfer> = self
+            .outgoing
+            .iter()
+            .filter(|o| {
+                let note = &o.spends.note;
+                let dropped_last = note.issuer() == &mint.issuer
+                    && note.serial().generation.checked_add(1) == Some(mint.oldest);
+                dropped_last
+                    || matches!(
+                        mint.state(note),
+                        NoteState::Spendable {
+                            expires_after_rotations: 1
+                        } | NoteState::Frozen {
+                            expires_after_rotations: 1
+                        }
+                    )
+            })
+            .map(|o| ScheduledTransfer {
+                after_secs: random::between(0, window),
+                request: o.request.clone(),
+            })
+            .collect();
+        transfers.sort_by_key(|t| t.after_secs);
+        transfers
+    }
+
     /// Pays each of `mint`'s notes that dies at the next rotation to a fresh
     /// key of this holder, each at its own random moment before the
     /// rotation, so the mint cannot group one holder's notes by when they
@@ -501,10 +646,7 @@ impl Holder {
     /// Submit each transfer at its time and [`settle`](Self::settle) the
     /// answer.
     pub fn refresh(&mut self, mint: &MintView, now: u64) -> Vec<ScheduledTransfer> {
-        let window = match mint.until_rotation(now) {
-            Some(left) => left.saturating_sub(REFRESH_MARGIN_SECS.min(left / 2)),
-            None => UNSCHEDULED_REFRESH_SECS,
-        };
+        let window = refresh_window(mint, now);
         let mut transfers = Vec::new();
         let mut i = 0;
         while i < self.notes.len() {
@@ -624,6 +766,15 @@ impl Holder {
             expected: saved.expected,
             outgoing: saved.outgoing,
         })
+    }
+}
+
+/// Seconds from `now` over which to spread transfers that must land before
+/// `mint`'s next rotation.
+fn refresh_window(mint: &MintView, now: u64) -> u64 {
+    match mint.until_rotation(now) {
+        Some(left) => left.saturating_sub(REFRESH_MARGIN_SECS.min(left / 2)),
+        None => UNSCHEDULED_REFRESH_SECS,
     }
 }
 

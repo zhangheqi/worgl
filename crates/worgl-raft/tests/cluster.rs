@@ -19,8 +19,8 @@ use openraft::{
 };
 use tempfile::TempDir;
 use worgl::{
-    FileKek, FileStore, HolderKey, Issuer, IssuerKey, LedgerConfig, Note, NoteStatus, Output,
-    PersistentIssuer, Policy, StoreError, TransferRequest,
+    Error, FileKek, FileStore, HolderKey, Issuer, IssuerKey, LedgerConfig, Note, NoteStatus,
+    Output, PersistentIssuer, Policy, StoreError, TransferRequest,
 };
 use worgl_raft::{
     NodeId, Options, Raft, Replica, ReplicaError, SnapshotData, TypeConfig, default_config,
@@ -130,6 +130,8 @@ struct Cluster {
     key: IssuerKey,
     kek: Arc<FileKek>,
     timeout: Duration,
+    /// The policy every replica enforces.
+    policy: Policy,
     replicas: BTreeMap<NodeId, Replica>,
 }
 
@@ -142,16 +144,22 @@ impl Cluster {
     /// A group formed from three copies of a new mint, whose replicas wait
     /// `timeout` for the group.
     async fn start_with(timeout: Duration) -> Self {
+        Self::start_with_policy(timeout, Policy::cash_like()).await
+    }
+
+    /// A group formed from three copies of a new mint of `policy`, whose
+    /// replicas wait `timeout` for the group.
+    async fn start_with_policy(timeout: Duration, policy: Policy) -> Self {
         let key = IssuerKey::generate();
-        let issuer = Issuer::new(key.clone(), LEDGER, Policy::cash_like()).unwrap();
+        let issuer = Issuer::new(key.clone(), LEDGER, policy.clone()).unwrap();
         let seed = tempfile::tempdir().unwrap();
         drop(FileStore::create(seed.path(), &issuer).unwrap());
-        Self::from_copies(seed.path(), key, timeout).await
+        Self::from_copies(seed.path(), key, timeout, policy).await
     }
 
     /// Readies three copies of the mint in `seed`, opens a replica on each
     /// and forms the group from the first.
-    async fn from_copies(seed: &Path, key: IssuerKey, timeout: Duration) -> Self {
+    async fn from_copies(seed: &Path, key: IssuerKey, timeout: Duration, policy: Policy) -> Self {
         let dirs: BTreeMap<_, _> = (1..=3)
             .map(|id| (id, tempfile::tempdir().unwrap()))
             .collect();
@@ -161,13 +169,18 @@ impl Cluster {
             key,
             kek: Arc::new(FileKek::from_bytes(&[7; 32])),
             timeout,
+            policy,
             replicas: BTreeMap::new(),
         };
         for id in 1..=3 {
             let dir = cluster.dirs[&id].path();
             copy_store(seed, dir);
-            let ready =
-                worgl_raft::prepare(dir, cluster.key.clone(), Policy::cash_like(), &*cluster.kek);
+            let ready = worgl_raft::prepare(
+                dir,
+                cluster.key.clone(),
+                cluster.policy.clone(),
+                &*cluster.kek,
+            );
             assert!(
                 ready.unwrap(),
                 "a copy of a new store has never joined a group"
@@ -186,7 +199,7 @@ impl Cluster {
             id,
             self.dirs[&id].path(),
             self.key.clone(),
-            Policy::cash_like(),
+            self.policy.clone(),
             self.kek.clone(),
         );
         options.raft = openraft::Config {
@@ -590,6 +603,120 @@ async fn a_group_restarted_whole_restores_what_it_committed() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn every_member_verifies_a_payment_resent_after_its_note_was_dropped() {
+    let mut cluster = Cluster::start().await;
+    let leader = cluster.leader().await;
+    let alice = HolderKey::generate();
+    let note = mint(cluster.replica(leader), 8, &alice).await;
+    let (paid, _) = pay(cluster.replica(leader), note, &alice).await;
+    // The answer is lost, and rotations drop the spent note's generation
+    // before the payer resends.
+    let mut batch = cluster.replica(leader).batch().await.unwrap();
+    for _ in 0..3 {
+        batch.rotate().unwrap();
+    }
+    batch.commit().await.unwrap();
+    assert_eq!(status(cluster.replica(leader), &note), NoteStatus::Expired);
+    assert!(matches!(
+        status(cluster.replica(leader), &paid),
+        NoteStatus::Live { .. }
+    ));
+
+    // One follower restarts from the snapshot it took after the rotations.
+    let rotated = cluster
+        .replica(leader)
+        .raft()
+        .metrics()
+        .borrow()
+        .last_applied;
+    let restarted = (1..=3).find(|&id| id != leader).unwrap();
+    cluster
+        .replica(restarted)
+        .raft()
+        .wait(Some(WAIT))
+        .metrics(|m| m.snapshot >= rotated, "the follower snapshots")
+        .await
+        .unwrap();
+    cluster.stop(restarted).await;
+    cluster.open(restarted).await;
+
+    let output = Output {
+        amount: 8,
+        holder: *paid.holder(),
+    };
+    let request = TransferRequest::single(note, &alice, output).unwrap();
+    for id in 1..=3 {
+        cluster.caught_up(id, leader).await;
+        let verified = cluster.replica(id).verifier().borrow().verify(&request);
+        let mut batch = cluster.replica(leader).batch().await.unwrap();
+        assert_eq!(batch.transfer(&verified.unwrap()).unwrap(), [paid]);
+        assert!(batch.is_empty());
+        batch.commit().await.unwrap();
+    }
+    cluster.shutdown().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_new_leader_keeps_the_young_receipts_the_old_one_held() {
+    // Four receipts, each kept an hour: longer than the test takes.
+    let policy = Policy {
+        receipt_capacity: 4,
+        receipt_min_age_secs: 3600,
+        ..Policy::cash_like()
+    };
+    let cluster = Cluster::start_with_policy(TIMEOUT, policy).await;
+    let old = cluster.leader().await;
+    let alice = HolderKey::generate();
+    let mut requests = Vec::new();
+    for _ in 0..5 {
+        let note = mint(cluster.replica(old), 8, &alice).await;
+        let output = Output {
+            amount: 8,
+            holder: HolderKey::generate().public_key(),
+        };
+        requests.push(TransferRequest::single(note, &alice, output).unwrap());
+    }
+    let verify = |replica: &Replica, request| replica.verifier().borrow().verify(request).unwrap();
+    let mut batch = cluster.replica(old).batch().await.unwrap();
+    let mut paid = Vec::new();
+    for request in &requests[..4] {
+        paid.push(
+            batch
+                .transfer(&verify(cluster.replica(old), request))
+                .unwrap(),
+        );
+    }
+    // A fifth receipt would push out the first while it is young, even in
+    // the batch that made them all.
+    let busy = batch.transfer(&verify(cluster.replica(old), &requests[4]));
+    assert!(matches!(busy, Err(Error::Busy { .. })), "{busy:?}");
+    batch.commit().await.unwrap();
+
+    // The leader that takes over counts them as made no earlier than it
+    // applied them, so it holds the fifth back too and answers the first
+    // as before.
+    cluster.isolate(old);
+    let new = cluster.leader().await;
+    assert_ne!(new, old);
+    let mut batch = cluster.replica(new).batch().await.unwrap();
+    match batch.transfer(&verify(cluster.replica(new), &requests[4])) {
+        Err(Error::Busy { retry_after_secs }) => {
+            assert!(
+                (3500..=3600).contains(&retry_after_secs),
+                "{retry_after_secs}"
+            );
+        }
+        other => panic!("{other:?}"),
+    }
+    let again = batch.transfer(&verify(cluster.replica(new), &requests[0]));
+    assert_eq!(again.unwrap(), paid[0]);
+    assert!(batch.is_empty());
+    batch.commit().await.unwrap();
+    cluster.heal(old);
+    cluster.shutdown().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_mint_that_ran_alone_carries_on_as_a_group() {
     let key = IssuerKey::generate();
     let issuer = Issuer::new(key.clone(), LEDGER, Policy::cash_like()).unwrap();
@@ -602,7 +729,7 @@ async fn a_mint_that_ran_alone_carries_on_as_a_group() {
         (note, store.issuer().snapshot())
     };
 
-    let mut cluster = Cluster::from_copies(seed.path(), key, TIMEOUT).await;
+    let mut cluster = Cluster::from_copies(seed.path(), key, TIMEOUT, Policy::cash_like()).await;
     let leader = cluster.leader().await;
     assert_eq!(
         cluster

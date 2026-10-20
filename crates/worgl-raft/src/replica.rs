@@ -31,7 +31,10 @@ pub struct Options {
     pub dir: PathBuf,
     /// The issuer key.
     pub key: IssuerKey,
-    /// The policy the issuer enforces.
+    /// The policy the issuer enforces. Give every replica of the mint the
+    /// same `receipt_capacity` and `receipt_min_age_secs`: the leader keeps
+    /// room for a transfer's receipt by the count it holds, and the others
+    /// push receipts out by the same count.
     pub policy: Policy,
     /// The group's key-encryption key, which seals the generation keys the
     /// log and snapshots carry.
@@ -250,8 +253,8 @@ impl Replica {
         *self.issuer().public_key()
     }
 
-    /// A verifier for the issuer's live keys, which changes after each
-    /// rotation this replica applies.
+    /// A verifier for the issuer's keys as they are now, which changes after
+    /// each rotation this replica applies.
     pub fn verifier(&self) -> watch::Receiver<Verifier> {
         self.shared.verifier.subscribe()
     }
@@ -457,7 +460,7 @@ impl Batch<'_> {
     /// Mints a note.
     pub fn mint(&mut self, amount: u64, holder: PublicKey) -> Result<Note, Error> {
         let event = self.planned().plan_mint(amount, holder)?;
-        Ok(self.stage(event).remove(0))
+        Ok(self.stage(event)?.remove(0))
     }
 
     /// Mints at a verified mint authority's request. Resending the
@@ -466,7 +469,7 @@ impl Batch<'_> {
     pub fn authorized_mint(&mut self, mint: &VerifiedMint) -> Result<Note, Error> {
         let mut notes = match self.planned().plan_authorized_mint(mint)? {
             Plan::Replay(notes) => notes,
-            Plan::Apply(event) => self.stage(event),
+            Plan::Apply(event) => self.stage(event)?,
         };
         Ok(notes.remove(0))
     }
@@ -476,7 +479,7 @@ impl Batch<'_> {
     pub fn transfer(&mut self, transfer: &VerifiedTransfer) -> Result<Vec<Note>, Error> {
         match self.planned().plan_transfer(transfer)? {
             Plan::Replay(notes) => Ok(notes),
-            Plan::Apply(event) => Ok(self.stage(event)),
+            Plan::Apply(event) => self.stage(event),
         }
     }
 
@@ -484,7 +487,7 @@ impl Batch<'_> {
     /// burn that was already applied adds nothing to the batch.
     pub fn burn(&mut self, burn: &VerifiedBurn) -> Result<u128, Error> {
         if let Plan::Apply(event) = self.planned().plan_burn(burn)? {
-            self.stage(event);
+            self.stage(event)?;
         }
         Ok(burn.value())
     }
@@ -506,7 +509,8 @@ impl Batch<'_> {
     /// if it already is. Changes after a pause in the same batch are refused.
     pub fn set_paused(&mut self, paused: bool) {
         if let Some(event) = self.planned().plan_pause(paused) {
-            self.stage(event);
+            self.stage(event)
+                .expect("plan_pause plans only what applies");
         }
     }
 
@@ -598,6 +602,8 @@ impl Batch<'_> {
             unreachable!("a rotation is planned as one")
         };
         debug_assert_eq!(report.created, generation);
+        // The key joins the entry only with its rotation.
+        self.stage(Event::Rotate(report))?;
         // The key count once, then generation, public key, length and the
         // sealed bytes, as the log entry frames them.
         if self.keys.is_empty() {
@@ -605,20 +611,19 @@ impl Batch<'_> {
         }
         self.bytes += 8 + 32 + 4 + sealed.sealed.len();
         self.keys.push(sealed);
-        self.stage(Event::Rotate(report));
         Ok(report)
     }
 
-    fn stage(&mut self, event: Event) -> Vec<Note> {
+    /// Applies `event` to the planning copy and adds it to the batch, or
+    /// adds nothing if it does not apply, so it is never proposed.
+    fn stage(&mut self, event: Event) -> Result<Vec<Note>, Error> {
         let issuer = self.planned();
-        issuer
-            .apply(&event)
-            .expect("an event planned under the same borrow applies");
+        issuer.apply(&event)?;
         let notes = issuer.notes(&event);
         // Each event is framed by a 4-byte length in the entry.
         self.bytes += 4 + event.to_bytes().len();
         self.events.push(event);
-        notes
+        Ok(notes)
     }
 }
 

@@ -72,6 +72,10 @@ State written by an earlier build of 0.1 still opens:
   them.
 - An issuer from before generation keys keeps its existing generations
   signed by the issuer key until those generations are dropped.
+- An issuer restored from a snapshot written before dropped generations'
+  public keys were kept has none for the generations dropped before that
+  snapshot, so a transfer or burn sent again with an input in one of them
+  is still refused as `expired`.
 
 ## Changing the rules
 
@@ -85,6 +89,11 @@ take the defaults of the `cash_like` preset:
 Every field is in [Policy fields](../policy/). Input amounts are not checked
 against the denominations, so notes issued under an earlier policy still
 spend.
+
+On a cluster, each member reads its own `policy.json`, so pause the mint,
+make the same edit on every member, restart them one at a time, then
+resume. See
+[Running a cluster](../running-a-cluster/#changing-the-rules).
 
 ## Rotation
 
@@ -141,6 +150,11 @@ Sign a request with the mint key and post it to the mint:
 - Every change is written and flushed to the log before it is answered. One
   flush covers every request waiting at that moment, up to 256.
 - Request bodies are limited to 64 KiB.
+- After a restart, a mint counts the receipts it holds as made as late as
+  its snapshot and log allow, so for up to `receipt_min_age_secs` (128
+  seconds by default) one that holds `receipt_capacity` of them may answer
+  new transfers and burns `503 busy`. See
+  [Policy fields](../policy/#receipt_capacity-and-receipt_min_age_secs).
 - Back up the state directory, `keys.bin` included. See
   [Backups](../backups/).
 - Three servers can run as a cluster, so each mint carries on when one

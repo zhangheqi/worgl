@@ -52,6 +52,16 @@ it minting. The mint keeps its sequence number, so adding it back cannot
 replay its old requests. A request from a key the policy does not list is
 refused with `unknown_authority`.
 
+On a cluster, each member reads its own `policy.json`, and the member
+leading the mint checks requests against its own list. Editing one member
+does not stop a key: it mints again whenever a member that still lists it
+leads. To remove a leaked key, pause the mint, which stops all minting on
+every member at once, make the same edit on every member, restart them one
+at a time, then resume. A member that has no directory for the mint yet
+writes one from the cluster's registry, listing the keys the mint was
+created with, so keep the mint paused until it has and make the edit there
+too. See [Running a cluster](../running-a-cluster/#changing-the-rules).
+
 ## The issuer key
 
 A mint's issuer key is its identity: every note names it, and it names the
@@ -65,6 +75,12 @@ certifies it with the issuer key and signs that generation's notes with it.
 The key's secret is erased once its generation is dropped. A leaked
 generation key therefore forges notes for at most as many rotations as there
 are layers, and a leak exposes no key made after it.
+
+The mint keeps the public halves of the last `layers − 1` generations it
+dropped, in its snapshot but not in the published set. A transfer resent
+after its inputs' layer was dropped therefore still checks out and, while
+the mint remembers it, gets its notes again until those notes expire. A new
+spend of such a note is refused as `expired`.
 
 The certificates of the live generations are published at
 `GET /v1/mints/{mint}/keys`, so anyone who knows the issuer key can check a

@@ -141,6 +141,52 @@ describe('purse', () => {
 
     assert.equal(await bob.accept(submitted.notes), 6n);
     assert.equal(await bob.accept(submitted.notes), 0n);
+    // What Alice hands over is Bob's notes only, none of her change.
+    assert.equal(submitted.theirs.length, request.notes.length);
+  });
+
+  test('the payee hands back change the mint no longer answers for', async () => {
+    // Two receipts, kept no minimum time, stand in for a mint whose receipts
+    // many transfers pushed out.
+    const own = await TestServer.start({ receipt_capacity: 2, receipt_min_age_secs: 0 });
+    try {
+      const open = () => Purse.open(own.client(), quick);
+      const [alice, bob, carol] = [await open(), await open(), await open()];
+      await own.fund(alice, 8n, 8n);
+      await own.fund(carol, 3n, 1n);
+      const request = await bob.request(own.mint, 3n);
+      const received = await bob.receive(request, await alice.pay(request, NO_SPACING));
+      allAnswered(received, 1);
+      assert.equal(received.value, 3n);
+      assert.equal(received.theirs.length, received.notes.length - request.notes.length);
+
+      // Other holders' transfers push Alice's receipt out.
+      for (let i = 0; i < 3; i += 1) {
+        const dave = await open();
+        const asked = await dave.request(own.mint, 1n);
+        allAnswered(await dave.receive(asked, await carol.pay(asked, NO_SPACING)), 1);
+      }
+      const settled = await alice.settle(NO_SPACING);
+      assert.equal(settled.answered, 0);
+      assert.equal(settled.refused.length, 1);
+      const refused = settled.refused[0]!;
+      assert.ok(refused.error instanceof MintError);
+      assert.equal(refused.error.code, 'spent');
+      assert.equal(refused.atStake, 5n);
+
+      // A forged note is refused and settles nothing.
+      const genuine = received.theirs[0]!;
+      const forged = genuine.slice(0, 190) + (genuine[190] === 'A' ? 'B' : 'A') + genuine.slice(191);
+      await assert.rejects(alice.accept([forged]), /signature/);
+      assert.equal((await alice.balance(own.mint)).outgoing, 8n);
+
+      // The change Bob hands back recovers it and settles the transfer.
+      assert.equal(await alice.accept(received.theirs), 5n);
+      const balance = await alice.balance(own.mint);
+      assert.deepEqual([balance.frozen, balance.outgoing, balance.expected], [5n, 0n, 0n]);
+    } finally {
+      await own.stop();
+    }
   });
 
   test('a payment for another request is not submitted', async () => {
@@ -175,6 +221,51 @@ describe('purse', () => {
     const paid = await bob.receive(request, payment);
     allAnswered(paid, 1);
     assert.equal(paid.value, 8n);
+  });
+
+  test('a busy answer stretches the next wait only', async () => {
+    // The mint's first two answers to the transfer: busy, asking for a
+    // second's wait, then without a leader, asking for the same. The third
+    // try reaches it.
+    const scripted = [
+      { status: 503, error: 'busy', retryAfter: '1' },
+      { status: 503, error: 'no_leader', retryAfter: '1' },
+    ];
+    const fetch: typeof globalThis.fetch = (input, init) => {
+      const answer = String(input).endsWith('/v1/transfer') ? scripted.shift() : undefined;
+      if (answer === undefined) {
+        return globalThis.fetch(input, init);
+      }
+      const headers = new Headers({ 'content-type': 'application/json' });
+      if (answer.retryAfter !== undefined) {
+        headers.set('retry-after', answer.retryAfter);
+      }
+      const body = JSON.stringify({ error: answer.error, message: 'scripted' });
+      return Promise.resolve(new Response(body, { status: answer.status, headers }));
+    };
+    const client = new Client(server.url, { fetch });
+    const alice = await purse();
+    const bob = await Purse.open(client, { retry: { attempts: 3, firstDelayMs: 10 } });
+    await server.fund(alice, 8n, 8n);
+    const request = await bob.request(server.mint, 8n);
+    const payment = await alice.pay(request, NO_SPACING);
+
+    const started = Date.now();
+    const received = await bob.receive(request, payment);
+    const waited = Date.now() - started;
+    allAnswered(received, 1);
+    // A second as busy asked, then 20 ms: the second's wait does not
+    // double, and no_leader's Retry-After does not stretch it.
+    assert.ok(waited >= 1000 && waited < 1900, `waited ${waited} ms`);
+
+    scripted.push({ status: 503, error: 'busy', retryAfter: '7' });
+    await assert.rejects(client.transfer(payment.transfers[0]!.request), (error: unknown) => {
+      assert.ok(error instanceof MintError);
+      assert.equal(error.code, 'busy');
+      assert.equal(error.retryAfterMs, 7000);
+      assert.ok(isTransient(error));
+      return true;
+    });
   });
 
   test('nothing is handed out unless it is saved', async () => {
@@ -230,6 +321,54 @@ describe('refresh', () => {
       assert.equal(await kept.prune(own.mint), 0n);
       assert.equal(await idle.prune(own.mint), 4n);
       assert.deepEqual(idle.notes(), []);
+    } finally {
+      await own.stop();
+    }
+  });
+
+  test('resends what the next rotation would cut off', async () => {
+    const own = await TestServer.start();
+    try {
+      let failing = false;
+      const inner = new MemoryStore();
+      const flaky: Store = {
+        load: () => inner.load(),
+        save: async (json) => {
+          if (failing) {
+            throw new Error('disk full');
+          }
+          await inner.save(json);
+        },
+      };
+      const alice = await Purse.open(own.client(), { store: flaky, ...quick });
+      const bob = await Purse.open(own.client(), quick);
+      await own.fund(alice, 12n, 8n);
+      await own.rotate();
+      await own.rotate();
+      // Alice pays with her 4, which dies at the next rotation like her 8.
+      const request = await bob.request(own.mint, 3n);
+      const payment = await alice.pay(request, NO_SPACING);
+
+      // A plan that fails to save takes back the refresh, not the payment.
+      failing = true;
+      await assert.rejects(alice.planRefresh(own.mint), /disk full/);
+      const balance = await alice.balance(own.mint);
+      assert.deepEqual(
+        [balance.spendable, balance.outgoing, balance.expected],
+        [8n, 4n, 1n],
+      );
+      failing = false;
+
+      const plan = await alice.planRefresh(own.mint);
+      assert.equal(plan.length, 2);
+      const done = await alice.submit(now(plan));
+      allAnswered(done, 2);
+      assert.equal(done.value, 9n);
+      assert.equal((await alice.balance(own.mint)).outgoing, 0n);
+      // Bob, submitting later, gets the same notes.
+      const received = await bob.receive(request, payment);
+      allAnswered(received, 1);
+      assert.equal(received.value, 3n);
     } finally {
       await own.stop();
     }

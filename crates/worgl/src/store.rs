@@ -19,10 +19,11 @@
 //!
 //! [`PersistentIssuer`] writes each event to the log and flushes it to disk
 //! *before* applying it, so a note is never handed out unless the event that
-//! created it would survive a crash. [`compact`](PersistentIssuer::compact)
-//! writes a fresh snapshot and purges the log up to it; call it after
-//! rotations or whenever [`log_events`](PersistentIssuer::log_events) grows
-//! large.
+//! created it would survive a crash. It [checks](Issuer::check) the event
+//! first, so the log never holds one that does not replay.
+//! [`compact`](PersistentIssuer::compact) writes a fresh snapshot and purges
+//! the log up to it; call it after rotations or whenever
+//! [`log_events`](PersistentIssuer::log_events) grows large.
 //!
 //! A flush costs far more than the work around it, so a busy issuer can share
 //! one among many requests with a [`Batch`]: each change takes effect in
@@ -59,13 +60,14 @@ use std::fs::{self, File, OpenOptions, TryLockError};
 use std::io::{self, Write};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use std::time::SystemTime;
 
 use sha2::{Digest, Sha256};
 use thiserror::Error;
 
 use crate::codec::DecodeError;
 use crate::error::{ApplyError, Error, SetupError};
-use crate::issuer::{Event, Issuer, Plan, RotationReport};
+use crate::issuer::{Clock, Event, Issuer, Plan, RotationReport};
 use crate::kek::{Kek, KekError, SealedKey};
 use crate::keys::{GenerationKey, IssuerKey, PUBLIC_KEY_LEN, PublicKey};
 use crate::keyset::KeyRing;
@@ -224,7 +226,39 @@ pub struct FileStore {
     events: u64,
     /// What `keys.bin` holds.
     keys: KeyRing,
+    /// When the files were written before the store opened.
+    written: Written,
+    /// By when, by the system's wall clock, the issuer had made every
+    /// receipt it holds, if known: when the store last logged a transfer or
+    /// burn or, if it has logged none, when it was created or what the files
+    /// said when it opened.
+    newest_receipt: Option<SystemTime>,
     _lock: Lock,
+}
+
+/// When a store's files were last written before it opened, by the system's
+/// wall clock, as far as their modification times say. Every receipt the
+/// issuer held then was made by the time of the file it came from (see
+/// [`FileStore::compact`]).
+#[derive(Debug, Clone, Copy, Default)]
+struct Written {
+    /// The time of `snapshot.bin`.
+    snapshot: Option<SystemTime>,
+    /// When `log.bin` was last written.
+    log: Option<SystemTime>,
+    /// How many transfers and burns were replayed from the log, each making
+    /// at most one receipt: so at most this many of the newest came from it.
+    replayed: usize,
+}
+
+impl Written {
+    /// When every receipt held was made by, if the files say.
+    fn newest(&self) -> Option<SystemTime> {
+        match self.replayed {
+            0 => self.snapshot,
+            _ => Some(self.snapshot?.max(self.log?)),
+        }
+    }
 }
 
 impl FileStore {
@@ -252,6 +286,8 @@ impl FileStore {
             membership: None,
             events: 0,
             keys,
+            written: Written::default(),
+            newest_receipt: Some(SystemTime::now()),
             _lock: lock,
         })
     }
@@ -280,6 +316,8 @@ impl FileStore {
     ) -> Result<(Self, Issuer), StoreError> {
         let dir = dir.as_ref().to_path_buf();
         let lock = lock(&dir)?;
+        // Before anything here writes the log again.
+        let log_written = modified(&dir.join(log::LOG));
         let ring = read_keys(&dir, &key)?;
         let mut keys = ring.clone();
         let mut bytes = fs::read(dir.join(SNAPSHOT))?;
@@ -291,6 +329,12 @@ impl FileStore {
             fs::remove_file(dir.join(journal::JOURNAL))?;
             sync_dir(&dir)?;
         }
+        // After a conversion, whose snapshot holds what the journal did.
+        let mut written = Written {
+            snapshot: modified(&dir.join(SNAPSHOT)),
+            log: log_written,
+            replayed: 0,
+        };
         let (mut applied, mut membership, snapshot) = parse_snapshot(&bytes)?;
         let mut issuer = Issuer::restore(key, ring, snapshot, policy)?;
         drop(bytes);
@@ -316,6 +360,7 @@ impl FileStore {
                 continue;
             }
             unsealed |= unseal_keys(&mut issuer, &entry, kek)?;
+            written.replayed += receipts_made(&entry);
             events += replay(&mut issuer, &entry, &mut membership)?;
             applied = Some(entry.id);
         }
@@ -346,6 +391,8 @@ impl FileStore {
                 membership,
                 events,
                 keys,
+                written,
+                newest_receipt: written.newest(),
                 _lock: lock,
             },
             issuer,
@@ -391,12 +438,24 @@ impl FileStore {
         self.log.append(std::slice::from_ref(&entry))?;
         self.applied = Some(entry.id);
         self.events += events.len() as u64;
+        if events.iter().any(makes_receipt) {
+            self.newest_receipt = Some(SystemTime::now());
+        }
         Ok(())
     }
 
     /// Replaces the snapshot with `issuer`'s state as of the last entry
     /// applied, purges the log up to that entry and rewrites the key ring
     /// without the keys of dropped generations.
+    ///
+    /// The snapshot then takes as its modification time the time by which
+    /// the issuer had made every receipt it holds, as far as the store
+    /// knows: when the store last logged a transfer or burn or, if it has
+    /// logged none, when it was created or what the files said when it
+    /// opened. So a compaction after changes that make no receipt, such as a
+    /// rotation, does not make the receipts look new to the next open's
+    /// [`PersistentIssuer::set_clock`]. If the files did not say, the
+    /// snapshot keeps the time it was written.
     pub fn compact(&mut self, issuer: &Issuer) -> io::Result<()> {
         write_snapshot(
             &self.dir,
@@ -404,6 +463,7 @@ impl FileStore {
             self.membership.as_ref(),
             &issuer.snapshot(),
         )?;
+        self.backdate_snapshot();
         // The snapshot holds every event from here on, whether or not the
         // purge succeeds.
         self.events = 0;
@@ -415,6 +475,17 @@ impl FileStore {
         write_keys(&self.dir, &keys)?;
         self.keys = keys;
         Ok(())
+    }
+
+    /// Dates `snapshot.bin` back to when the receipts it holds were made by,
+    /// if known. If that fails, the next open counts them as made later
+    /// than they were, which is safe.
+    fn backdate_snapshot(&self) {
+        let Some(newest) = self.newest_receipt else {
+            return;
+        };
+        let file = File::options().write(true).open(self.dir.join(SNAPSHOT));
+        let _ = file.and_then(|file| file.set_modified(newest));
     }
 
     /// Adds `ring`'s keys to `keys.bin` and flushes it to disk. Keys leave
@@ -485,6 +556,25 @@ fn replay(
             Ok(events.len() as u64)
         }
     }
+}
+
+/// How many of `entry`'s events are transfers or burns, each of which makes
+/// a receipt.
+fn receipts_made(entry: &Entry) -> usize {
+    let Payload::Events { events, .. } = &entry.payload else {
+        return 0;
+    };
+    events.iter().filter(|event| makes_receipt(event)).count()
+}
+
+/// Whether `event` is a transfer or a burn, which makes a receipt.
+fn makes_receipt(event: &Event) -> bool {
+    matches!(event, Event::Transfer { .. } | Event::Burn { .. })
+}
+
+/// When the file at `path` was last written, if its metadata says.
+fn modified(path: &Path) -> Option<SystemTime> {
+    fs::metadata(path).and_then(|meta| meta.modified()).ok()
 }
 
 /// Adds to the issuer's ring the sealed keys in `entry` that it lacks, and
@@ -894,6 +984,33 @@ impl PersistentIssuer {
         self.kek = Some(kek);
     }
 
+    /// Gives the issuer `clock`, by which it keeps each receipt for at least
+    /// the policy's `receipt_min_age_secs`; see [`Issuer::set_clock`].
+    ///
+    /// Every receipt the store held when it opened was made by the time of
+    /// the file it came from, by the system's wall clock: those restored
+    /// from the snapshot by the time of `snapshot.bin`, which a compaction
+    /// dates back to when the receipts in it were made by (see
+    /// [`FileStore::compact`]), and the newest, as many as the transfers and
+    /// burns replayed from the log, by the time `log.bin` was last written,
+    /// if that is later. Each counts as made then, or `receipt_min_age_secs`
+    /// ago if that was longer ago, and as made now if the file's time is
+    /// unknown or ahead of the wall clock. Call it right after opening the
+    /// store, before any change.
+    pub fn set_clock(&mut self, clock: Clock) {
+        let min_age = u64::from(self.issuer.policy().receipt_min_age_secs);
+        let age = |written: Option<SystemTime>| {
+            written
+                .and_then(|written| SystemTime::now().duration_since(written).ok())
+                .map_or(0, |age| age.as_secs().min(min_age))
+        };
+        let written = self.store.written;
+        let snapshot = age(written.snapshot);
+        let log = age(written.log).min(snapshot);
+        self.issuer
+            .set_clock_split(clock, snapshot, written.replayed, log);
+    }
+
     /// Starts a group commit. See [`Batch`].
     pub fn batch(&mut self) -> io::Result<Batch<'_>> {
         self.check_in_step()?;
@@ -981,7 +1098,8 @@ impl PersistentIssuer {
         Ok(())
     }
 
-    /// Writes a fresh snapshot and purges the log up to it.
+    /// Writes a fresh snapshot and purges the log up to it. The snapshot
+    /// keeps when its receipts were made by; see [`FileStore::compact`].
     pub fn compact(&mut self) -> io::Result<()> {
         self.check_in_step()?;
         self.store.compact(&self.issuer)
@@ -1031,12 +1149,15 @@ impl PersistentIssuer {
         Ok((report, sealed))
     }
 
-    fn commit(&mut self, event: &Event) -> io::Result<()> {
+    fn commit(&mut self, event: &Event) -> Result<(), CommitError> {
         self.commit_sealed(event, &[])
     }
 
-    fn commit_sealed(&mut self, event: &Event, keys: &[SealedKey]) -> io::Result<()> {
+    fn commit_sealed(&mut self, event: &Event, keys: &[SealedKey]) -> Result<(), CommitError> {
         self.check_in_step()?;
+        // Before it is logged, so the log never holds an event that does
+        // not replay.
+        self.issuer.check(event).map_err(Error::from)?;
         self.store.append_sealed(
             self.issuer.sequence() + 1,
             std::slice::from_ref(event),
@@ -1044,7 +1165,7 @@ impl PersistentIssuer {
         )?;
         self.issuer
             .apply(event)
-            .expect("an event planned under the same borrow applies");
+            .expect("an event that passed the check applies");
         Ok(())
     }
 
@@ -1086,7 +1207,7 @@ impl Batch<'_> {
     /// Mints a note.
     pub fn mint(&mut self, amount: u64, holder: PublicKey) -> Result<Note, Error> {
         let event = self.owner.issuer.plan_mint(amount, holder)?;
-        Ok(self.stage(event).remove(0))
+        Ok(self.stage(event)?.remove(0))
     }
 
     /// Mints at a verified mint authority's request. Resending the
@@ -1095,7 +1216,7 @@ impl Batch<'_> {
     pub fn authorized_mint(&mut self, mint: &VerifiedMint) -> Result<Note, Error> {
         let mut notes = match self.owner.issuer.plan_authorized_mint(mint)? {
             Plan::Replay(notes) => notes,
-            Plan::Apply(event) => self.stage(event),
+            Plan::Apply(event) => self.stage(event)?,
         };
         Ok(notes.remove(0))
     }
@@ -1105,7 +1226,7 @@ impl Batch<'_> {
     pub fn transfer(&mut self, transfer: &VerifiedTransfer) -> Result<Vec<Note>, Error> {
         match self.owner.issuer.plan_transfer(transfer)? {
             Plan::Replay(notes) => Ok(notes),
-            Plan::Apply(event) => Ok(self.stage(event)),
+            Plan::Apply(event) => self.stage(event),
         }
     }
 
@@ -1113,7 +1234,7 @@ impl Batch<'_> {
     /// burn that was already applied adds nothing to the batch.
     pub fn burn(&mut self, burn: &VerifiedBurn) -> Result<u128, Error> {
         if let Plan::Apply(event) = self.owner.issuer.plan_burn(burn)? {
-            self.stage(event);
+            self.stage(event)?;
         }
         Ok(burn.value())
     }
@@ -1134,12 +1255,15 @@ impl Batch<'_> {
     /// if it already is. Changes after a pause in the same batch are refused.
     pub fn set_paused(&mut self, paused: bool) {
         if let Some(event) = self.owner.issuer.plan_pause(paused) {
-            self.stage(event);
+            self.stage(event)
+                .expect("plan_pause plans only what applies");
         }
     }
 
     fn rotate_due(&mut self, due: Option<u64>) -> Result<RotationReport, CommitError> {
         let (report, sealed) = self.owner.plan_rotate(due)?;
+        // The key joins the entry only with its rotation.
+        self.stage(Event::Rotate(report))?;
         if let Some(sealed) = sealed {
             // The key count once, then generation, public key, length and
             // the sealed bytes.
@@ -1149,7 +1273,6 @@ impl Batch<'_> {
             self.bytes += 8 + PUBLIC_KEY_LEN + 4 + sealed.sealed.len();
             self.keys.push(sealed);
         }
-        self.stage(Event::Rotate(report));
         Ok(report)
     }
 
@@ -1181,16 +1304,15 @@ impl Batch<'_> {
         written
     }
 
-    fn stage(&mut self, event: Event) -> Vec<Note> {
-        self.owner
-            .issuer
-            .apply(&event)
-            .expect("an event planned under the same borrow applies");
+    /// Applies `event` and adds it to the batch, or adds nothing if it does
+    /// not apply.
+    fn stage(&mut self, event: Event) -> Result<Vec<Note>, Error> {
+        self.owner.issuer.apply(&event)?;
         // Each event is framed by a 4-byte length in the entry.
         self.bytes += 4 + event.to_bytes().len();
         let notes = self.owner.issuer.notes(&event);
         self.events.push(event);
-        notes
+        Ok(notes)
     }
 }
 
@@ -1907,6 +2029,311 @@ mod tests {
         p.batch().unwrap().commit().unwrap();
         drop(p.batch().unwrap());
         p.mint(2, HolderKey::generate().public_key()).unwrap();
+    }
+
+    #[test]
+    fn an_event_that_does_not_apply_is_neither_logged_nor_staged() {
+        let dir = tempfile::tempdir().unwrap();
+        let (key, mut p) = fresh(dir.path());
+        let holder = HolderKey::generate().public_key();
+        let mint = p.issuer().plan_mint(8, holder).unwrap();
+        p.commit(&mint).unwrap();
+        let events = p.log_events();
+        let next = p.store.log().next_index();
+        let len = fs::metadata(log_path(dir.path())).unwrap().len();
+        let state = p.issuer().snapshot();
+
+        // Its bit is taken now, so the same mint does not apply again.
+        assert!(matches!(
+            p.commit(&mint),
+            Err(CommitError::Rejected(Error::Misfit(_)))
+        ));
+        let mut batch = p.batch().unwrap();
+        assert!(matches!(batch.stage(mint.clone()), Err(Error::Misfit(_))));
+        assert!(batch.is_empty());
+        drop(batch);
+        assert_eq!(p.log_events(), events);
+        assert_eq!(p.store.log().next_index(), next);
+        assert_eq!(fs::metadata(log_path(dir.path())).unwrap().len(), len);
+        assert_eq!(p.issuer().snapshot(), state);
+
+        // The store carries on, and opens again.
+        p.mint(2, holder).unwrap();
+        let expected = p.issuer().snapshot();
+        drop(p);
+        let p = PersistentIssuer::open(dir.path(), key, Policy::cash_like()).unwrap();
+        assert_eq!(p.issuer().snapshot(), expected);
+    }
+
+    /// Copies the files of a closed store, as a backup does.
+    fn copy_store(from: &Path, to: &Path) {
+        fs::create_dir_all(to).unwrap();
+        for entry in fs::read_dir(from).unwrap() {
+            let entry = entry.unwrap();
+            fs::copy(entry.path(), to.join(entry.file_name())).unwrap();
+        }
+    }
+
+    #[test]
+    fn a_restored_copy_issues_its_serials_again_and_refuses_overdrawn_spends() {
+        let dir = tempfile::tempdir().unwrap();
+        let (mint, backup) = (dir.path().join("mint"), dir.path().join("backup"));
+        let (key, p) = fresh(&mint);
+        drop(p);
+        copy_store(&mint, &backup);
+        let pay = |p: &mut PersistentIssuer, amounts: [u64; 4]| {
+            amounts.map(|amount| {
+                let holder = HolderKey::generate();
+                (p.mint(amount, holder.public_key()).unwrap(), holder)
+            })
+        };
+        let spend = |p: &PersistentIssuer, (note, holder): &(Note, HolderKey)| {
+            let output = Output {
+                amount: note.amount(),
+                holder: HolderKey::generate().public_key(),
+            };
+            let request = TransferRequest::single(*note, holder, output).unwrap();
+            p.issuer().verifier().verify(&request).unwrap()
+        };
+
+        let mut p = PersistentIssuer::open(&mint, key.clone(), Policy::cash_like()).unwrap();
+        let alice = pay(&mut p, [4, 32, 64, 8]);
+        drop(p);
+
+        // Put back, the copy gives Bob's notes the serials of Alice's.
+        fs::remove_dir_all(&mint).unwrap();
+        copy_store(&backup, &mint);
+        let mut p = PersistentIssuer::open(&mint, key.clone(), Policy::cash_like()).unwrap();
+        for (note, _) in &alice {
+            assert_eq!(p.issuer().status(note), Ok(NoteStatus::Unissued));
+        }
+        let bob = pay(&mut p, [32, 4, 64, 8]);
+        for ((old, _), (new, _)) in alice.iter().zip(&bob) {
+            assert_eq!(old.serial(), new.serial());
+            assert!(matches!(
+                p.issuer().status(old),
+                Ok(NoteStatus::Live { .. })
+            ));
+        }
+
+        // Whichever note of a serial is spent first wins, the new one or the
+        // old one, even where the old one is worth more.
+        p.transfer(&spend(&p, &bob[3])).unwrap();
+        assert!(matches!(
+            p.transfer(&spend(&p, &alice[3])),
+            Err(CommitError::Rejected(Error::Spent(_)))
+        ));
+        p.transfer(&spend(&p, &alice[2])).unwrap();
+        assert!(matches!(
+            p.transfer(&spend(&p, &bob[2])),
+            Err(CommitError::Rejected(Error::Spent(_)))
+        ));
+        p.transfer(&spend(&p, &alice[1])).unwrap();
+
+        // The mint layer holds 4 now, less than Bob's own 32: planning
+        // refuses it, and nothing is written.
+        let position = p.issuer().mint_position();
+        assert_eq!(p.issuer().layers()[position as usize].value, 4);
+        let events = p.log_events();
+        let transfer = spend(&p, &bob[0]);
+        assert_eq!(
+            p.issuer().plan_transfer(&transfer),
+            Err(Error::Overdrawn { position })
+        );
+        assert!(matches!(
+            p.transfer(&transfer),
+            Err(CommitError::Rejected(Error::Overdrawn { .. }))
+        ));
+        let burn = BurnRequest::single(bob[0].0, &bob[0].1).unwrap();
+        let burn = p.issuer().verifier().verify_burn(&burn).unwrap();
+        assert_eq!(
+            p.issuer().plan_burn(&burn),
+            Err(Error::Overdrawn { position })
+        );
+        assert!(matches!(
+            p.burn(&burn),
+            Err(CommitError::Rejected(Error::Overdrawn { .. }))
+        ));
+        assert_eq!(p.log_events(), events);
+
+        let expected = p.issuer().snapshot();
+        drop(p);
+        let p = PersistentIssuer::open(&mint, key, Policy::cash_like()).unwrap();
+        assert_eq!(p.issuer().snapshot(), expected);
+    }
+
+    /// Keeps 2 receipts, each for at least 100 s.
+    fn floor() -> Policy {
+        Policy {
+            receipt_capacity: 2,
+            receipt_min_age_secs: 100,
+            ..Policy::cash_like()
+        }
+    }
+
+    /// A payment of a newly minted note, verified.
+    fn new_payment(issuer: &Issuer, note: Note, key: &HolderKey) -> VerifiedTransfer {
+        let output = Output {
+            amount: note.amount(),
+            holder: HolderKey::generate().public_key(),
+        };
+        let request = TransferRequest::single(note, key, output).unwrap();
+        issuer.verifier().verify(&request).unwrap()
+    }
+
+    /// Sets the modification time of `name` in the store in `dir`.
+    fn date(dir: &Path, name: &str, written: SystemTime) {
+        let file = File::options().write(true).open(dir.join(name)).unwrap();
+        file.set_modified(written).unwrap();
+    }
+
+    /// How many seconds `p` holds back a payment of `note`: 0 if it takes it.
+    fn held_back(p: &PersistentIssuer, note: Note, key: &HolderKey) -> u32 {
+        let verified = new_payment(p.issuer(), note, key);
+        match p.issuer().plan_transfer(&verified) {
+            Err(Error::Busy { retry_after_secs }) => retry_after_secs,
+            Ok(Plan::Apply(_)) => 0,
+            other => panic!("{other:?}"),
+        }
+    }
+
+    #[test]
+    fn reopening_counts_receipts_as_made_when_their_files_were_written() {
+        let dir = tempfile::tempdir().unwrap();
+        let key = IssuerKey::generate();
+        let issuer = Issuer::new(key.clone(), LEDGER, floor()).unwrap();
+        let mut p = PersistentIssuer::create(dir.path(), issuer).unwrap();
+        let alice = HolderKey::generate();
+        let notes: Vec<Note> = (0..5)
+            .map(|_| p.mint(8, alice.public_key()).unwrap())
+            .collect();
+        for note in &notes[..2] {
+            let verified = new_payment(p.issuer(), *note, &alice);
+            p.transfer(&verified).unwrap();
+        }
+        drop(p);
+        let open = || {
+            let mut p = PersistentIssuer::open(dir.path(), key.clone(), floor()).unwrap();
+            p.set_clock(Clock::new(|| 5000));
+            p
+        };
+        let now = SystemTime::now();
+        let ago = |secs| now - std::time::Duration::from_secs(secs);
+
+        // Both receipts came from the log, last written 60 s ago, and none
+        // from the snapshot, written 1000 s ago.
+        date(dir.path(), SNAPSHOT, ago(1000));
+        date(dir.path(), log::LOG, ago(60));
+        let p = open();
+        assert!((39..=40).contains(&held_back(&p, notes[2], &alice)));
+        // Opening compacted them into the snapshot, which keeps the log's
+        // time: opening again at once counts them as made then, not now.
+        drop(p);
+        let p = open();
+        assert!((39..=40).contains(&held_back(&p, notes[2], &alice)));
+        drop(p);
+        // By a clock that has since gone back, written 1000 s from now.
+        date(
+            dir.path(),
+            SNAPSHOT,
+            now + std::time::Duration::from_secs(1000),
+        );
+        assert_eq!(held_back(&open(), notes[2], &alice), 100);
+
+        // Old enough, they make room for a third; the log then holds the
+        // third's receipt, the newest, and the snapshot the second's.
+        date(dir.path(), SNAPSHOT, ago(1000));
+        let mut p = open();
+        assert_eq!(held_back(&p, notes[2], &alice), 0);
+        p.transfer(&new_payment(p.issuer(), notes[2], &alice))
+            .unwrap();
+        drop(p);
+        // The log was written just now, but the oldest receipt came from
+        // the snapshot, so it makes room for a fourth, and the third's
+        // receipt then holds a fifth back.
+        date(dir.path(), SNAPSHOT, ago(1000));
+        let mut p = open();
+        assert_eq!(held_back(&p, notes[3], &alice), 0);
+        p.transfer(&new_payment(p.issuer(), notes[3], &alice))
+            .unwrap();
+        assert!((99..=100).contains(&held_back(&p, notes[4], &alice)));
+    }
+
+    #[test]
+    fn a_compaction_keeps_when_its_receipts_were_made() {
+        let dir = tempfile::tempdir().unwrap();
+        let key = IssuerKey::generate();
+        let issuer = Issuer::new(key.clone(), LEDGER, floor()).unwrap();
+        let mut p = PersistentIssuer::create(dir.path(), issuer).unwrap();
+        let alice = HolderKey::generate();
+        let notes: Vec<Note> = (0..4)
+            .map(|_| p.mint(8, alice.public_key()).unwrap())
+            .collect();
+        for note in &notes[..2] {
+            let verified = new_payment(p.issuer(), *note, &alice);
+            p.transfer(&verified).unwrap();
+        }
+        drop(p);
+        let open = || {
+            let mut p = PersistentIssuer::open(dir.path(), key.clone(), floor()).unwrap();
+            p.set_clock(Clock::new(|| 5000));
+            p
+        };
+        let ago = SystemTime::now() - std::time::Duration::from_secs(1000);
+        date(dir.path(), SNAPSHOT, ago);
+        date(dir.path(), log::LOG, ago);
+
+        // A rotation, a mint and a pause make no receipt, so the snapshots
+        // written after them keep the time of the two receipts, and the
+        // next open counts them as just as old.
+        let mut p = open();
+        assert_eq!(held_back(&p, notes[2], &alice), 0);
+        p.rotate().unwrap();
+        p.compact().unwrap();
+        p.mint(8, alice.public_key()).unwrap();
+        p.set_paused(true).unwrap();
+        p.set_paused(false).unwrap();
+        p.compact().unwrap();
+        drop(p);
+        let mut p = open();
+        assert_eq!(held_back(&p, notes[2], &alice), 0);
+
+        // A transfer makes one, so the next snapshot counts both as made
+        // when it was logged, and holds a fourth back.
+        p.transfer(&new_payment(p.issuer(), notes[2], &alice))
+            .unwrap();
+        p.compact().unwrap();
+        drop(p);
+        assert!((99..=100).contains(&held_back(&open(), notes[3], &alice)));
+    }
+
+    #[test]
+    fn a_batch_counts_the_receipts_it_stages() {
+        let dir = tempfile::tempdir().unwrap();
+        let key = IssuerKey::generate();
+        let issuer = Issuer::new(key, LEDGER, floor()).unwrap();
+        let mut p = PersistentIssuer::create(dir.path(), issuer).unwrap();
+        p.set_clock(Clock::new(|| 0));
+        let alice = HolderKey::generate();
+        let notes: Vec<Note> = (0..4)
+            .map(|_| p.mint(8, alice.public_key()).unwrap())
+            .collect();
+        let burn = BurnRequest::single(notes[3], &alice).unwrap();
+        let burn = p.issuer().verifier().verify_burn(&burn).unwrap();
+
+        let mut batch = p.batch().unwrap();
+        for note in &notes[..2] {
+            let verified = new_payment(batch.issuer(), *note, &alice);
+            batch.transfer(&verified).unwrap();
+        }
+        let busy = Error::Busy {
+            retry_after_secs: 100,
+        };
+        let verified = new_payment(batch.issuer(), notes[2], &alice);
+        assert_eq!(batch.transfer(&verified), Err(busy.clone()));
+        assert_eq!(batch.burn(&burn), Err(busy));
+        assert_eq!(batch.len(), 2);
+        batch.commit().unwrap();
     }
 
     /// A store as it was before the log: the issuer's snapshot alone in

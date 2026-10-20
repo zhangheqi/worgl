@@ -236,15 +236,30 @@ impl<'de> Deserialize<'de> for TransferId {
 /// the issuer's lock and keep the signature checks off the critical section.
 /// Get one from [`Issuer::verifier`](crate::Issuer::verifier), and a fresh
 /// one after every rotation, which adds a generation key.
+///
+/// Besides the live generations' keys it holds the public keys of the last
+/// generations dropped, up to one fewer than the issuer has layers, since a
+/// transfer's receipt outlives its inputs' generation by no more rotations
+/// than that. So a request resent after a rotation dropped its inputs still
+/// verifies and is answered from its receipt, while one that spends such a
+/// note afresh is refused as expired when it is planned. Notes of older
+/// generations are refused as expired here.
 #[derive(Debug, Clone)]
 pub struct Verifier {
     keys: KeySet,
+    /// `keys` preceded by the dropped generations' keys still held, from the
+    /// oldest of them on.
+    recent: KeySet,
     policy: Policy,
 }
 
 impl Verifier {
-    pub(crate) fn new(keys: KeySet, policy: Policy) -> Self {
-        Self { keys, policy }
+    pub(crate) fn new(keys: KeySet, recent: KeySet, policy: Policy) -> Self {
+        Self {
+            keys,
+            recent,
+            policy,
+        }
     }
 
     /// The issuer this verifier checks for.
@@ -300,11 +315,12 @@ impl Verifier {
         }
         for (input, spend) in inputs.iter().enumerate() {
             let note = &spend.note;
-            // A dropped generation's key is erased, but its notes are simply expired.
-            if note.issuer() == self.issuer() && note.serial().generation < self.keys.oldest() {
+            // No key is left to check a generation dropped longer ago than
+            // any receipt lasts, but its notes are simply expired.
+            if note.issuer() == self.issuer() && note.serial().generation < self.recent.oldest() {
                 return Err(Error::Expired(note.serial()));
             }
-            note.verify(&self.keys)
+            note.verify(&self.recent)
                 .map_err(|error| Error::Note { input, error })?;
         }
         for (input, spend) in inputs.iter().enumerate() {
@@ -394,7 +410,7 @@ mod tests {
         fn new(policy: Policy) -> Self {
             let issuer = IssuerKey::generate();
             let keys = KeySet::new(issuer.public_key(), 1, Vec::new()).unwrap();
-            let verifier = Verifier::new(keys, policy);
+            let verifier = Verifier::new(keys.clone(), keys, policy);
             Self { issuer, verifier }
         }
 

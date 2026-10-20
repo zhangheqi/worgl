@@ -13,8 +13,8 @@ use crate::policy::PolicyError;
 /// [`Unauthorized`](Error::Unauthorized),
 /// [`UnknownAuthority`](Error::UnknownAuthority) and
 /// [`MintUnauthorized`](Error::MintUnauthorized) mean a signature is
-/// missing or wrong; the rest are refusals that depend on the issuer's
-/// state.
+/// missing or wrong; [`Misfit`](Error::Misfit) means the issuer is at
+/// fault; the rest are refusals that depend on the issuer's state.
 #[derive(Debug, Clone, PartialEq, Eq, Error)]
 #[non_exhaustive]
 pub enum Error {
@@ -54,6 +54,16 @@ pub enum Error {
     /// only happens if the issuer's state was lost or rolled back.
     #[error("note {0} is unknown to the ledger")]
     Unissued(Serial),
+    /// The inputs spend more from a layer than the issuer counts as live in
+    /// it. This happens only after the issuer's state was rolled back and it
+    /// handed out the same serials again, so that a note from before the
+    /// rollback took its own amount from the layer's count rather than the
+    /// amount issued on its serial.
+    #[error("layer {position} holds less live value than the inputs spend from it")]
+    Overdrawn {
+        /// Position of the layer.
+        position: u32,
+    },
     /// An input is in the last layer, which cannot transfer until the next rotation.
     #[error("note {0} is in the last layer and cannot move until the next rotation")]
     Frozen(Serial),
@@ -73,6 +83,18 @@ pub enum Error {
     /// until it resumes.
     #[error("the issuer is paused")]
     Paused,
+    /// The issuer holds as many receipts as its policy allows, and the
+    /// oldest counts as younger than the policy's `receipt_min_age_secs`: a
+    /// new one would push out the answer to a request its client may still
+    /// resend. Nothing was done.
+    #[error(
+        "the issuer must keep the answers it holds for {retry_after_secs} s more before it takes \
+         another transfer or burn"
+    )]
+    Busy {
+        /// Seconds until the oldest receipt reaches the minimum age.
+        retry_after_secs: u32,
+    },
     /// A scheduled rotation is due no later than the last one logged, so
     /// that one already covered it.
     #[error("a rotation due at {due} is not after the last scheduled one, due at {last}")]
@@ -91,6 +113,11 @@ pub enum Error {
         /// The last sequence number accepted from the authority.
         last: u64,
     },
+    /// The event planned for the request does not apply to the issuer's
+    /// state, so nothing was changed. Planning checks everything applying
+    /// does, so this is a bug in the issuer, not a fault of the request.
+    #[error(transparent)]
+    Misfit(#[from] ApplyError),
 }
 
 /// The issuer could not be created or restored.
