@@ -59,10 +59,14 @@ impl TestMint {
 
 /// A server state directory with one mint, made offline.
 fn seed(rotate_every: Option<u64>) -> (tempfile::TempDir, TestMint) {
+    seed_with(Policy::cash_like(), rotate_every)
+}
+
+/// A server state directory with one mint of `policy`, made offline.
+fn seed_with(mut policy: Policy, rotate_every: Option<u64>) -> (tempfile::TempDir, TestMint) {
     let dir = tempfile::tempdir().unwrap();
     init_state(dir.path()).unwrap();
     let authority = MintKey::generate();
-    let mut policy = Policy::cash_like();
     policy.mint_authorities.push(authority.public_key());
     let spec = MintSpec {
         ledger: LEDGER,
@@ -581,6 +585,49 @@ async fn any_member_answers_for_the_leader() {
     // A member's directory does not open as a server on its own.
     let error = AppState::open(&cluster.servers[1].dir, 1000).err().unwrap();
     assert!(error.to_string().contains("open_member"), "{error}");
+    cluster.stop().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_follower_relays_a_busy_answer_with_its_retry_after() {
+    // One receipt, kept an hour: longer than the test takes.
+    let policy = Policy {
+        receipt_capacity: 1,
+        receipt_min_age_secs: 3600,
+        ..Policy::cash_like()
+    };
+    let (seed, mint) = seed_with(policy, None);
+    let cluster = Cluster::from_seed(seed).await;
+    let leader = cluster.leader(&mint.key).await;
+    let follower = (leader + 1) % 3;
+    let alice = HolderKey::generate();
+    let first = cluster.mint(leader, &mint, 8, &alice).await;
+    let second = cluster.mint(leader, &mint, 8, &alice).await;
+    cluster.pay(leader, &first, &alice).await;
+
+    let output = Output {
+        amount: 8,
+        holder: HolderKey::generate().public_key(),
+    };
+    let request = TransferRequest::single(second, &alice, output).unwrap();
+    for server in [leader, follower] {
+        let url = format!("http://{}/v1/transfer", cluster.servers[server].api);
+        let answer = cluster
+            .client
+            .post(url)
+            .json(&request)
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(answer.status(), StatusCode::SERVICE_UNAVAILABLE);
+        let retry_after: u64 = answer.headers()[reqwest::header::RETRY_AFTER]
+            .to_str()
+            .unwrap()
+            .parse()
+            .unwrap();
+        assert!((3500..=3600).contains(&retry_after), "{retry_after}");
+        assert_eq!(answer.json::<Value>().await.unwrap()["error"], "busy");
+    }
     cluster.stop().await;
 }
 

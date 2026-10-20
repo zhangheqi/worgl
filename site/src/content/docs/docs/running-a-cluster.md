@@ -53,6 +53,19 @@ A mint, transfer or burn the mint already carried out is answered as it was
 the first time, so after `503 no_leader` or `503 timeout`, send the same
 request again. See [Error codes](../error-codes/).
 
+Each member keeps its own receipts of recent transfers and burns, timed from
+when it applied them, and the leader answers `503 busy` rather than take one
+that would push out a receipt younger than the policy's
+`receipt_min_age_secs`. A new leader goes on keeping them, so give every
+member the same `receipt_capacity` and `receipt_min_age_secs` in the mint's
+`policy.json`. A member passing on the leader's `busy` passes on its
+`Retry-After` too. A member counts the receipts it held when it started, or
+took in with a snapshot from the leader, as made then, so if it becomes the
+leader within `receipt_min_age_secs` of that, a mint holding
+`receipt_capacity` receipts answers every new transfer and burn `busy` for
+the rest of that time. Leave at least that long between restarts of
+members. See [Policy fields](../policy/#receipt_capacity-and-receipt_min_age_secs).
+
 ## Creating mints
 
 With the members running, `POST /v1/admin/mints` to any of them creates a

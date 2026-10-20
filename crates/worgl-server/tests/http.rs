@@ -197,6 +197,30 @@ impl Server {
         self.call(Method::POST, "/v1/transfer", None, body).await
     }
 
+    /// Sends a transfer and returns the answer's status, `Retry-After` and
+    /// error code.
+    async fn transfer_retry_after(
+        &self,
+        request: &TransferRequest,
+    ) -> (StatusCode, Option<u64>, Value) {
+        let body = serde_json::to_value(request).unwrap().to_string();
+        let request = Request::builder()
+            .method(Method::POST)
+            .uri("/v1/transfer")
+            .header(header::CONTENT_TYPE, "application/json")
+            .body(Body::from(body))
+            .unwrap();
+        let response = self.app.clone().oneshot(request).await.unwrap();
+        let status = response.status();
+        let retry_after = response
+            .headers()
+            .get(header::RETRY_AFTER)
+            .map(|value| value.to_str().unwrap().parse().unwrap());
+        let bytes = response.into_body().collect().await.unwrap().to_bytes();
+        let answer: Value = serde_json::from_slice(&bytes).unwrap();
+        (status, retry_after, answer["error"].clone())
+    }
+
     async fn verify(&self, note: &Note) -> Value {
         let (status, answer) = self
             .call(Method::POST, "/v1/verify", None, json!({"note": note}))
@@ -430,6 +454,46 @@ async fn a_note_moves_hand_to_hand_and_cannot_be_spent_twice() {
     assert_eq!(report["dropped"], 0);
     let (code, _) = server.transfer(&request).await;
     assert_eq!(code, StatusCode::OK);
+}
+
+#[tokio::test]
+async fn a_mint_full_of_young_receipts_answers_busy_with_retry_after() {
+    // Two receipts, each kept an hour: longer than the test takes.
+    let server = Server::with_policy(
+        Policy {
+            receipt_capacity: 2,
+            receipt_min_age_secs: 3600,
+            ..Policy::cash_like()
+        },
+        None,
+    )
+    .await;
+    let alice = HolderKey::generate();
+    let mut requests = Vec::new();
+    for _ in 0..3 {
+        requests.push(pay(server.mint(8, &alice).await, &alice).0);
+    }
+    for request in &requests[..2] {
+        let (code, answer) = server.transfer(request).await;
+        assert_eq!(code, StatusCode::OK, "{answer}");
+    }
+
+    let busy = |(code, retry_after, error): (StatusCode, Option<u64>, Value)| {
+        assert_eq!(code, StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(error, "busy");
+        let retry_after = retry_after.expect("a busy answer says when to come back");
+        assert!((3500..=3600).contains(&retry_after), "{retry_after}");
+    };
+    busy(server.transfer_retry_after(&requests[2]).await);
+    let (code, retry_after, _) = server.transfer_retry_after(&requests[0]).await;
+    assert_eq!((code, retry_after), (StatusCode::OK, None));
+
+    // A restart counts the receipts the log made as made no earlier than
+    // its last write, so they are still too young to push out.
+    let server = server.restart().await;
+    busy(server.transfer_retry_after(&requests[2]).await);
+    let (code, answer) = server.transfer(&requests[1]).await;
+    assert_eq!(code, StatusCode::OK, "{answer}");
 }
 
 #[tokio::test]
