@@ -100,7 +100,7 @@ worgl --purse alice.worgl accept change.json
 
 ```text
 Asked for 5 in 2 notes. Send the request to the payer.
-Paid 5 in 1 transfer(s). Send the payment to the payee, then keep the change they send back with `worgl accept`, or run `worgl settle` once they have submitted it.
+Paid 5 in 1 transfer(s), payment 5c0f19e2a7d4. Send the payment to the payee, then keep the change they send back with `worgl accept`, or run `worgl settle` once they have submitted it.
 Submitting 1 transfer(s).
 Send the notes to the payer, who keeps the change with `worgl accept`.
 Received 5 in 1 transfer(s).
@@ -109,7 +109,8 @@ Kept 3.
 
 - `request` asks for 5 as two notes, 4 and 1, each to a fresh key of Bob's.
 - `pay` signs one transfer that spends Alice's 8: 4 and 1 to Bob's keys, and
-  3 in change to fresh keys of her own.
+  3 in change to fresh keys of her own. The payment's id, which differs
+  every time, names it for `worgl outgoing` and `worgl export`.
 - `receive` checks the payment against the request, submits it to the mint
   and keeps Bob's new notes. The mint's answer holds Alice's change too,
   which it writes to `change.json` for her.

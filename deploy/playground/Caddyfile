@@ -16,13 +16,20 @@
 		respond "not found" 404
 	}
 
+	# So are a mint's rotations, pauses and resumes, which its admin token
+	# allows: send them to a member from inside it (see README.md).
+	@mint_admin path /v1/mints/*/rotate /v1/mints/*/pause /v1/mints/*/resume
+	handle @mint_admin {
+		respond "not found" 404
+	}
+
 	handle {
 		reverse_proxy member1:8080 member2:8080 member3:8080 {
 			lb_policy round_robin
-			# A member that does not answer is skipped; any member takes
-			# any request.
+			# A member that does not answer, or whose copy of the mint has
+			# stopped, is skipped; any member takes any request.
 			lb_retries 2
-			health_uri /healthz
+			health_uri /readyz
 			health_interval 5s
 			fail_duration 30s
 		}

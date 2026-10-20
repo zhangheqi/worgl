@@ -2,9 +2,10 @@
 //! signed but not seen land.
 
 use std::cmp::Reverse;
+use std::collections::{HashSet, VecDeque};
 
 use serde::{Deserialize, Serialize};
-use worgl::{Denominations, HolderKey, Note, Output, PublicKey, TransferRequest};
+use worgl::{Denominations, HolderKey, Note, Output, PolicyError, PublicKey, TransferRequest};
 
 use crate::mint::{MintView, NoteState};
 use crate::payment::{Payment, PaymentRequest, ScheduledTransfer, Spacing};
@@ -13,20 +14,34 @@ use crate::random;
 /// Most notes one payment request may ask for.
 pub const MAX_REQUESTED_NOTES: usize = 256;
 
-/// Version of the format [`Holder::to_json`] writes.
-const FORMAT: u32 = 1;
+/// How many of the keys it paid last a holder remembers, so as to refuse
+/// paying one of them again: the notes of four requests of the most notes a
+/// request may ask for, or of hundreds of usual ones, for about 67 KiB of
+/// the saved store. A key paid by a transfer still outgoing, or by a payment
+/// the holder still keeps, is refused however long ago it was paid.
+pub const PAID_KEYS_KEPT: usize = 4 * MAX_REQUESTED_NOTES;
+
+/// Version of the format [`Holder::to_json`] writes for a store that holds
+/// unconfirmed change or notes owed to payees. A reader of format 1 skips
+/// fields it does not know, so it would drop those unseen and lose their
+/// value. A store without them is still written as format 1, which such a
+/// reader opens, missing only the payments kept and the keys paid last.
+const FORMAT: u32 = 2;
 
 /// Seconds before a scheduled rotation by which the transfers that
 /// [`Holder::refresh`] and [`Holder::due_resends`] plan are due, or half the
-/// time left when that is shorter. A payer should settle a payment this long
-/// before the rotation that drops a note it spends.
+/// time left when that is shorter. A plan made at or past the rotation's
+/// time, which the mint has not made yet as far as its info says, has them
+/// all due at once. A payer should settle a payment this long before the
+/// rotation that drops a note it spends.
 pub const REFRESH_MARGIN_SECS: u64 = 300;
 
 /// Seconds over which refreshes are spread when the mint has no schedule.
 const UNSCHEDULED_REFRESH_SECS: u64 = 60;
 
 /// The notes one holder owns, with the one-time key of each, plus the keys
-/// it has handed out and the transfers it has signed but not yet seen land.
+/// it has handed out, the transfers it has signed but not yet seen land, and
+/// the payments it made until it is done with them.
 ///
 /// It keeps the privacy rules without being told: a fresh key for every
 /// note it expects, never two notes in one transfer, transfers of one
@@ -41,6 +56,10 @@ pub struct Holder {
     notes: Vec<Held>,
     expected: Vec<Expected>,
     outgoing: Vec<Outgoing>,
+    unconfirmed: Vec<Unconfirmed>,
+    payments: Vec<MadePayment>,
+    /// The keys this holder paid last, oldest first.
+    paid: VecDeque<PublicKey>,
 }
 
 /// A note and the key that spends it.
@@ -68,6 +87,38 @@ struct Outgoing {
     spends: Held,
 }
 
+/// The key for a note of change from a transfer this holder dropped or
+/// cancelled. The note comes only if the counterparty hands it over, and it
+/// would sit in `generation`, so it is worthless once that is dropped.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct Unconfirmed {
+    change: Expected,
+    generation: u64,
+}
+
+/// A payment this holder made, kept while one of its transfers is
+/// [outgoing](Holder::outgoing) or the holder keeps notes owed to the payee
+/// for it.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct MadePayment {
+    /// The request it answers.
+    pub request: PaymentRequest,
+    /// The payment as [`Holder::pay`] returned it, to send again to a payee
+    /// who lost it. A transfer [cancelled](Holder::cancel) or
+    /// [forgotten](Holder::forget) leaves it, so it is never handed out
+    /// again; the payment then no longer pays the whole request, which
+    /// [`PaymentRequest::check`] tells, and the payee would refuse it.
+    pub payment: Payment,
+    /// The payee's notes from the mint's answers this holder got itself:
+    /// each time it [settles](Holder::settle) one of the payment's
+    /// transfers, whether a resend or its own submission of the payment got
+    /// the answer. It cannot tell whether the payee submitted the payment
+    /// and has them already, so it keeps them for the payee until they are
+    /// handed over ([`forget_owed`](Holder::forget_owed)) or their layer is
+    /// dropped ([`prune`](Holder::prune)).
+    pub owed: Vec<Note>,
+}
+
 /// Value a holder has at one mint, by what it can do now.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Balance {
@@ -83,6 +134,10 @@ pub struct Balance {
     pub outgoing: u128,
     /// Expected from keys handed out and not yet paid.
     pub expected: u128,
+    /// Change of transfers dropped or cancelled, which comes only if the
+    /// counterparty hands it over: see [`Holder::forget`].
+    #[serde(default)]
+    pub unconfirmed: u128,
 }
 
 /// A payment request cannot be made.
@@ -108,6 +163,17 @@ pub enum PayError {
     /// The request asks for nothing.
     #[error("the request asks for nothing")]
     Empty,
+    /// The request asks for a note of an amount that is not one of the
+    /// mint's denominations, such as 0. The mint would refuse the transfer.
+    #[error("the request asks for a note of {0}, which is not one of the mint's denominations")]
+    Denomination(u64),
+    /// The request asks for a note to a key this holder has paid already: by
+    /// a transfer still outgoing, by a payment it keeps, among the last
+    /// [`PAID_KEYS_KEPT`] keys it paid, or twice in the request. The payee
+    /// would keep only one of two notes to one key, and the mint would see
+    /// the key twice. Paying again takes a new request.
+    #[error("the request asks for a note to {0}, which this holder has paid already")]
+    Paid(PublicKey),
     /// Not enough value is spendable now. Frozen notes become spendable at
     /// the next rotation.
     #[error("{spendable} is spendable now and {needed} is needed")]
@@ -133,6 +199,10 @@ pub enum PayError {
         /// The mint's limit.
         max_outputs: u8,
     },
+    /// A planned transfer breaks the mint's policy. Plans follow the policy,
+    /// so this means a bug.
+    #[error("a planned transfer breaks the mint's policy: {0}")]
+    Policy(PolicyError),
     /// Signing failed. The library refuses only malformed inputs, so this
     /// means the store is corrupt.
     #[error(transparent)]
@@ -156,6 +226,13 @@ struct Saved {
     notes: Vec<Held>,
     expected: Vec<Expected>,
     outgoing: Vec<Outgoing>,
+    // Missing from stores of format 1 written before format 2 existed.
+    #[serde(default)]
+    unconfirmed: Vec<Unconfirmed>,
+    #[serde(default)]
+    payments: Vec<MadePayment>,
+    #[serde(default)]
+    paid: VecDeque<PublicKey>,
 }
 
 impl Holder {
@@ -244,7 +321,15 @@ impl Holder {
     /// `spacing`. Only notes [spendable](NoteState::Spendable) under `mint`
     /// are used. The notes spent leave the store and wait among the
     /// [outgoing](Self::outgoing) transfers until [`settle`](Self::settle)
-    /// or [`take_answers`](Self::take_answers) sees them answered.
+    /// or [`take_answers`](Self::take_answers) sees them answered, and the
+    /// payment is kept among the [payments](Self::payments).
+    ///
+    /// Before signing anything, it refuses a request for a note the mint
+    /// would not make, of an amount outside its denominations
+    /// ([`PayError::Denomination`]), and a request for a note to a key it
+    /// has paid already ([`PayError::Paid`]), such as the same request
+    /// twice. Each planned transfer is checked against the mint's policy as
+    /// well.
     pub fn pay(
         &mut self,
         mint: &MintView,
@@ -257,7 +342,27 @@ impl Holder {
         if request.outputs.is_empty() {
             return Err(PayError::Empty);
         }
+        let mut asked = HashSet::new();
+        for output in &request.outputs {
+            if !mint.policy.denominations.contains(output.amount) {
+                return Err(PayError::Denomination(output.amount));
+            }
+            if !asked.insert(output.holder) || self.has_paid(&output.holder) {
+                return Err(PayError::Paid(output.holder));
+            }
+        }
         let plan = self.plan(mint, request)?;
+        for part in &plan {
+            let outputs: Vec<u64> = part
+                .paid
+                .iter()
+                .map(|o| o.amount)
+                .chain(part.change.iter().copied())
+                .collect();
+            mint.policy
+                .check_transfer(&[self.notes[part.note].note.amount()], &outputs)
+                .map_err(PayError::Policy)?;
+        }
         let mut transfers = Vec::with_capacity(plan.len());
         let mut expected = Vec::new();
         let mut after_secs = 0u64;
@@ -299,10 +404,39 @@ impl Holder {
             self.notes.remove(i);
         }
         self.expected.extend(expected);
-        Ok(Payment {
+        let payment = Payment {
             mint: mint.issuer,
             transfers,
-        })
+        };
+        self.payments.push(MadePayment {
+            request: request.clone(),
+            payment: payment.clone(),
+            owed: Vec::new(),
+        });
+        self.remember_paid(request.outputs.iter().map(|o| o.holder));
+        Ok(payment)
+    }
+
+    /// Whether this holder has paid a note to `key`: by an outgoing
+    /// transfer, by a payment it keeps, or among the last keys it paid.
+    fn has_paid(&self, key: &PublicKey) -> bool {
+        self.paid.contains(key)
+            || self
+                .outgoing
+                .iter()
+                .any(|o| o.request.outputs.iter().any(|out| out.holder == *key))
+            || self
+                .payments
+                .iter()
+                .any(|p| p.request.outputs.iter().any(|out| out.holder == *key))
+    }
+
+    /// Adds `keys` to the keys paid last, forgetting the oldest beyond
+    /// [`PAID_KEYS_KEPT`].
+    fn remember_paid(&mut self, keys: impl IntoIterator<Item = PublicKey>) {
+        self.paid.extend(keys);
+        let excess = self.paid.len().saturating_sub(PAID_KEYS_KEPT);
+        self.paid.drain(..excess);
     }
 
     /// Chooses which note pays which requested outputs.
@@ -398,9 +532,9 @@ impl Holder {
     }
 
     /// Takes in the notes of a mint's answer that were made for this
-    /// holder's keys: from a payment it received, its own change, or a
-    /// refresh. Notes for other keys are ignored, and a note already held is
-    /// not taken twice. Returns the value taken in.
+    /// holder's keys: from a payment it received, its own change, unconfirmed
+    /// change included, or a refresh. Notes for other keys are ignored, and a
+    /// note already held is not taken twice. Returns the value taken in.
     ///
     /// Give it notes from the mint's own answer, or check them first with
     /// [`Note::verify`]: the store does not check signatures.
@@ -410,29 +544,30 @@ impl Holder {
             if self.notes.iter().any(|h| h.note == *note) {
                 continue;
             }
-            let found = self.expected.iter().position(|e| {
+            let pays = |e: &Expected| {
                 e.mint == *note.issuer()
                     && e.amount == note.amount()
                     && e.key.public_key() == *note.holder()
-            });
-            if let Some(i) = found {
-                let expected = self.expected.swap_remove(i);
-                self.notes.push(Held {
-                    note: *note,
-                    key: expected.key,
-                });
-                taken += u128::from(note.amount());
-            }
+            };
+            let key = if let Some(i) = self.expected.iter().position(pays) {
+                self.expected.swap_remove(i).key
+            } else if let Some(i) = self.unconfirmed.iter().position(|u| pays(&u.change)) {
+                self.unconfirmed.swap_remove(i).change.key
+            } else {
+                continue;
+            };
+            self.notes.push(Held { note: *note, key });
+            taken += u128::from(note.amount());
         }
         taken
     }
 
     /// The notes of a mint's answers made for neither a note this holder
-    /// holds nor a key it expects: the counterparty's. A payee hands them
-    /// back to the payer, whose change they are, and a payer that submitted
-    /// a payment hands them to the payee. They tell the counterparty nothing
-    /// about this holder's notes: they are bound to the counterparty's own
-    /// keys.
+    /// holds nor a key it expects, unconfirmed change included: the
+    /// counterparty's. A payee hands them back to the payer, whose change
+    /// they are, and a payer that submitted a payment hands them to the
+    /// payee. They tell the counterparty nothing about this holder's notes:
+    /// they are bound to the counterparty's own keys.
     pub fn theirs(&self, notes: &[Note]) -> Vec<Note> {
         notes
             .iter()
@@ -440,6 +575,10 @@ impl Holder {
                 let holder = note.holder();
                 !self.notes.iter().any(|h| h.note.holder() == holder)
                     && !self.expected.iter().any(|e| e.key.public_key() == *holder)
+                    && !self
+                        .unconfirmed
+                        .iter()
+                        .any(|u| u.change.key.public_key() == *holder)
             })
             .copied()
             .collect()
@@ -448,9 +587,35 @@ impl Holder {
     /// Records the mint's answer to one of this holder's transfers: the
     /// transfer stops being outgoing and its notes for this holder are taken
     /// in. Returns the value taken in.
+    ///
+    /// When the transfer was outgoing and is part of a payment this holder
+    /// made, the answer's notes for the payee are kept for it, among the
+    /// payment's [owed](MadePayment::owed) notes: a resend may be what
+    /// carried out the payment.
     pub fn settle(&mut self, request: &TransferRequest, answer: &[Note]) -> u128 {
+        let before = self.outgoing.len();
         self.outgoing.retain(|o| o.request != *request);
-        self.absorb(answer)
+        if self.outgoing.len() < before
+            && let Some(made) = self
+                .payments
+                .iter_mut()
+                .find(|p| p.payment.transfers.iter().any(|t| t.request == *request))
+        {
+            for note in answer {
+                let payee = note.issuer() == &made.payment.mint
+                    && made
+                        .request
+                        .outputs
+                        .iter()
+                        .any(|o| o.holder == *note.holder() && o.amount == note.amount());
+                if payee && !made.owed.contains(note) {
+                    made.owed.push(*note);
+                }
+            }
+        }
+        let taken = self.absorb(answer);
+        self.tidy();
+        taken
     }
 
     /// Takes in notes the counterparty handed over from the mint's answers,
@@ -498,34 +663,112 @@ impl Holder {
                 });
             !answered
         });
+        self.tidy();
         taken
     }
 
-    /// Drops an outgoing transfer the mint refused because its note was
-    /// already spent or had expired. The note is gone either way: had the
-    /// mint applied this transfer and still remembered it, it would have
-    /// answered with the notes (see [`resend`](Self::resend)).
-    pub fn forget(&mut self, request: &TransferRequest) {
-        self.outgoing.retain(|o| o.request != *request);
+    /// Drops an outgoing transfer whose note is gone, such as one the mint
+    /// refused because its note was already spent or had expired: had the
+    /// mint applied this transfer and still kept its answer, it would have
+    /// answered with the notes (see [`resend`](Self::resend)). Returns
+    /// whether the transfer was outgoing.
+    ///
+    /// The mint may have applied it all the same, so the keys of its change
+    /// stay, as unconfirmed change: change the counterparty hands over later
+    /// is still taken in by [`take_answers`](Self::take_answers) or
+    /// [`absorb`](Self::absorb), until the layer it would sit in is dropped
+    /// ([`prune`](Self::prune)). The transfer leaves its
+    /// [payment](MadePayment::payment).
+    pub fn forget(&mut self, request: &TransferRequest) -> bool {
+        self.end(request).is_some()
     }
 
-    /// Takes back the note of an outgoing transfer that will never be
-    /// submitted, and stops expecting its change.
+    /// Takes back the note of an outgoing transfer, for one the mint never
+    /// applied, such as one nobody else holds that will never be submitted.
+    /// The keys of its change stay, as unconfirmed change, and the transfer
+    /// leaves its payment, as for [`forget`](Self::forget). Returns whether
+    /// the transfer was outgoing.
     ///
-    /// Only for a transfer nobody else holds: once a payee has it, they can
-    /// submit it, and spending the note elsewhere makes the payment fail.
-    pub fn cancel(&mut self, request: &TransferRequest) {
-        let Some(i) = self.outgoing.iter().position(|o| o.request == *request) else {
-            return;
+    /// A refusal does not always show that the mint never applied it: the
+    /// mint checks its policy before its record of answers, so a transfer it
+    /// applied under a looser policy is refused as `policy` too. Once a payee
+    /// holds the transfer, they can still submit it. If the mint applies it,
+    /// or already had, the payee's notes and the note taken back claim the
+    /// same value, and the mint refuses whichever is spent second.
+    pub fn cancel(&mut self, request: &TransferRequest) -> bool {
+        let Some(spends) = self.end(request) else {
+            return false;
         };
+        self.notes.push(spends);
+        true
+    }
+
+    /// Ends an outgoing transfer and returns the note it spends. The keys of
+    /// its change move from the keys expected to the unconfirmed change, and
+    /// it leaves the [payment](MadePayment::payment) that holds it, so that
+    /// payment is never handed out again with it.
+    fn end(&mut self, request: &TransferRequest) -> Option<Held> {
+        let i = self.outgoing.iter().position(|o| o.request == *request)?;
         let outgoing = self.outgoing.remove(i);
-        self.expected.retain(|e| {
-            !request
-                .outputs
-                .iter()
-                .any(|o| o.holder == e.key.public_key())
+        // A transfer's notes sit one layer past the note it spends.
+        let generation = outgoing.spends.note.serial().generation.saturating_add(1);
+        let mut i = 0;
+        while i < self.expected.len() {
+            let key = self.expected[i].key.public_key();
+            if request.outputs.iter().any(|o| o.holder == key) {
+                let change = self.expected.swap_remove(i);
+                self.unconfirmed.push(Unconfirmed { change, generation });
+            } else {
+                i += 1;
+            }
+        }
+        for made in &mut self.payments {
+            made.payment.transfers.retain(|t| t.request != *request);
+        }
+        self.tidy();
+        Some(outgoing.spends)
+    }
+
+    /// The payments this holder made and keeps: each while one of its
+    /// transfers is [outgoing](Self::outgoing), or while it keeps notes
+    /// [owed](MadePayment::owed) to the payee.
+    pub fn payments(&self) -> impl Iterator<Item = &MadePayment> {
+        self.payments.iter()
+    }
+
+    /// Stops keeping `notes` for payees, once they are handed over: they
+    /// leave the [owed](MadePayment::owed) notes of the payments that keep
+    /// them, and a payment with nothing else kept leaves the
+    /// [payments](Self::payments). Returns the value it stopped keeping.
+    ///
+    /// The payee checks their signatures and takes them in, as notes from
+    /// the mint's answers: with [`take_answers`](Self::take_answers), or
+    /// [`absorb`](Self::absorb).
+    pub fn forget_owed(&mut self, notes: &[Note]) -> u128 {
+        let mut value = 0;
+        for made in &mut self.payments {
+            made.owed.retain(|note| {
+                let handed = notes.contains(note);
+                if handed {
+                    value += u128::from(note.amount());
+                }
+                !handed
+            });
+        }
+        self.tidy();
+        value
+    }
+
+    /// Drops the payments with no transfer outgoing and no notes owed.
+    fn tidy(&mut self) {
+        let outgoing = &self.outgoing;
+        self.payments.retain(|p| {
+            !p.owed.is_empty()
+                || p.payment
+                    .transfers
+                    .iter()
+                    .any(|t| outgoing.iter().any(|o| o.request == t.request))
         });
-        self.notes.push(outgoing.spends);
     }
 
     /// Transfers not yet answered. Resend them after a crash or a timeout,
@@ -537,9 +780,10 @@ impl Holder {
     }
 
     /// What this holder may lose on `request` if the mint applied it and its
-    /// answer is lost: the value it pays to keys this holder still expects.
-    /// `Some` when the transfer is outgoing or pays such a key, even if the
-    /// value is 0; `None` when nothing of this holder's rides on it.
+    /// answer is lost: the value it pays to keys this holder still expects,
+    /// unconfirmed change included. `Some` when the transfer is outgoing or
+    /// pays such a key, even if the value is 0; `None` when nothing of this
+    /// holder's rides on it.
     ///
     /// A transfer refused as spent or expired may have been applied after
     /// all, by the counterparty or by an earlier try whose answer was lost.
@@ -551,9 +795,10 @@ impl Holder {
             .outputs
             .iter()
             .filter(|o| {
-                self.expected.iter().any(|e| {
+                let pays = |e: &Expected| {
                     Some(&e.mint) == mint && e.amount == o.amount && e.key.public_key() == o.holder
-                })
+                };
+                self.expected.iter().any(pays) || self.unconfirmed.iter().any(|u| pays(&u.change))
             })
             .map(|o| u128::from(o.amount))
             .sum();
@@ -595,8 +840,8 @@ impl Holder {
 
     /// The [outgoing](Self::outgoing) transfers at `mint` to resend before
     /// its next rotation, each at its own random moment before it, as
-    /// [`refresh`](Self::refresh) spreads its transfers. Nothing in the store
-    /// changes.
+    /// [`refresh`](Self::refresh) spreads its transfers from the same `now`.
+    /// Nothing in the store changes.
     ///
     /// A transfer is due when the note it spends dies at that rotation:
     /// after it, a transfer the mint never applied can no longer be
@@ -607,7 +852,8 @@ impl Holder {
     /// them with the refreshes and [`settle`](Self::settle) the answers.
     /// Resending a payment the payee has not submitted yet carries it out;
     /// the payee still gets the same notes by submitting it while the mint
-    /// keeps its answer.
+    /// keeps its answer, and settling the answer keeps them for the payee
+    /// too (see [`MadePayment::owed`]).
     pub fn due_resends(&self, mint: &MintView, now: u64) -> Vec<ScheduledTransfer> {
         let window = refresh_window(mint, now);
         let mut transfers: Vec<ScheduledTransfer> = self
@@ -645,6 +891,15 @@ impl Holder {
     /// Call it once per rotation period, after reading the mint's info.
     /// Submit each transfer at its time and [`settle`](Self::settle) the
     /// answer.
+    ///
+    /// `mint` alone says which notes are due: those in its first layer.
+    /// `now`, the Unix time by the mint's clock, says only when: the
+    /// transfers are spread over the time left before the next rotation,
+    /// less [`REFRESH_MARGIN_SECS`], and are all due at once when `now` is at
+    /// or past it, since the mint has not made it yet as far as `mint` knows.
+    /// A clock behind the mint's by more than that margin can spread them
+    /// past the rotation, where they fail, so take `now` from the mint, such
+    /// as from the `Date` of its answer.
     pub fn refresh(&mut self, mint: &MintView, now: u64) -> Vec<ScheduledTransfer> {
         let window = refresh_window(mint, now);
         let mut transfers = Vec::new();
@@ -687,7 +942,13 @@ impl Holder {
     }
 
     /// Removes `mint`'s notes whose layer was dropped and returns the value
-    /// lost.
+    /// lost. It also stops waiting for unconfirmed change of `mint` that
+    /// would sit in a dropped layer, and stops keeping notes owed to payees
+    /// once their layer is dropped; neither counts as lost.
+    ///
+    /// It goes by `mint` alone, with no clock: with a view of the mint's
+    /// info, it removes a note, and its key for good, only once the mint has
+    /// dropped the note's layer.
     pub fn prune(&mut self, mint: &MintView) -> u128 {
         let mut lost = 0;
         self.notes.retain(|h| {
@@ -697,6 +958,13 @@ impl Holder {
             }
             !expired
         });
+        self.unconfirmed
+            .retain(|u| u.change.mint != mint.issuer || u.generation >= mint.oldest);
+        for made in &mut self.payments {
+            made.owed
+                .retain(|note| mint.state(note) != NoteState::Expired);
+        }
+        self.tidy();
         lost
     }
 
@@ -736,6 +1004,11 @@ impl Holder {
                 balance.expected += u128::from(expected.amount);
             }
         }
+        for unconfirmed in &self.unconfirmed {
+            if unconfirmed.change.mint == mint.issuer {
+                balance.unconfirmed += u128::from(unconfirmed.change.amount);
+            }
+        }
         balance
     }
 
@@ -745,32 +1018,44 @@ impl Holder {
     }
 
     /// The whole store as JSON, secret keys included.
+    ///
+    /// A store with unconfirmed change or notes owed to payees is written in
+    /// format 2, which an SDK that reads only format 1 refuses rather than
+    /// open without them; any other store is written in format 1.
     pub fn to_json(&self) -> String {
+        let plain = self.unconfirmed.is_empty() && self.payments.iter().all(|p| p.owed.is_empty());
         serde_json::to_string(&Saved {
-            format: FORMAT,
+            format: if plain { 1 } else { FORMAT },
             notes: self.notes.clone(),
             expected: self.expected.clone(),
             outgoing: self.outgoing.clone(),
+            unconfirmed: self.unconfirmed.clone(),
+            payments: self.payments.clone(),
+            paid: self.paid.clone(),
         })
         .expect("a store always serializes")
     }
 
-    /// Reads a store written by [`to_json`](Self::to_json).
+    /// Reads a store written by [`to_json`](Self::to_json), by this SDK or
+    /// an earlier one.
     pub fn from_json(json: &str) -> Result<Self, LoadError> {
         let saved: Saved = serde_json::from_str(json)?;
-        if saved.format != FORMAT {
+        if !(1..=FORMAT).contains(&saved.format) {
             return Err(LoadError::Format(saved.format));
         }
         Ok(Self {
             notes: saved.notes,
             expected: saved.expected,
             outgoing: saved.outgoing,
+            unconfirmed: saved.unconfirmed,
+            payments: saved.payments,
+            paid: saved.paid,
         })
     }
 }
 
 /// Seconds from `now` over which to spread transfers that must land before
-/// `mint`'s next rotation.
+/// `mint`'s next rotation: none once that rotation is due.
 fn refresh_window(mint: &MintView, now: u64) -> u64 {
     match mint.until_rotation(now) {
         Some(left) => left.saturating_sub(REFRESH_MARGIN_SECS.min(left / 2)),
@@ -884,5 +1169,18 @@ mod tests {
         let fives = Denominations::list([5]).unwrap();
         assert!(matches!(split(&fives, 7, None, 16), Err(Split::Inexact)));
         assert!(matches!(split(&fives, 5, Some(4), 16), Err(Split::Inexact)));
+    }
+
+    #[test]
+    fn the_keys_paid_last_are_kept_up_to_the_bound_and_saved() {
+        let mut holder = Holder::new();
+        let keys: Vec<PublicKey> = (0..=PAID_KEYS_KEPT)
+            .map(|_| HolderKey::generate().public_key())
+            .collect();
+        holder.remember_paid(keys.iter().copied());
+        assert_eq!(holder.paid.len(), PAID_KEYS_KEPT);
+        let holder = Holder::from_json(&holder.to_json()).unwrap();
+        assert!(!holder.has_paid(&keys[0]), "the oldest is forgotten");
+        assert!(keys[1..].iter().all(|key| holder.has_paid(key)));
     }
 }

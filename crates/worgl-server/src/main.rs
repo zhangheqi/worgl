@@ -45,7 +45,8 @@ enum Command {
         /// Number of layers.
         #[arg(long, default_value_t = 4)]
         layers: u32,
-        /// Notes each layer can hold per generation; a multiple of 64.
+        /// Bits per layer: how many notes can ever enter one generation,
+        /// minted or moved in. A multiple of 64.
         #[arg(long, default_value_t = 1 << 20)]
         layer_size: u32,
         /// Policy as a JSON file, copied into the mint's directory. Missing
@@ -88,7 +89,9 @@ enum Command {
     /// Make a state directory a cluster member's: write its cluster.json and
     /// create a cluster token unless it has one. Every member starts from a
     /// copy of one directory, the token, mints and key-encryption key
-    /// included, run with its own --node.
+    /// included, run with its own --node. To give a member new addresses,
+    /// run it again on every member with the same --member list, then
+    /// restart the members one at a time.
     JoinCluster {
         /// State directory made by `init`.
         #[arg(long, env = "WORGL_STATE")]
@@ -96,9 +99,10 @@ enum Command {
         /// This member's id.
         #[arg(long)]
         node: u64,
-        /// A member as ID=API,RAFT, where API is the host:port of its public
-        /// API and RAFT that of its Raft port. Give every member, this one
-        /// included.
+        /// A member as ID=API,RAFT, where API is the host:port other members
+        /// pass API requests on to and RAFT that of its Raft port, both on a
+        /// network only the members and a proxy in front of them can reach.
+        /// Give every member, this one included.
         #[arg(long = "member", value_parser = parse_member, required = true)]
         members: Vec<(u64, Member)>,
     },
@@ -185,9 +189,27 @@ async fn main() -> Result<()> {
         } => {
             let members: BTreeMap<_, _> = members.into_iter().collect();
             let config = ClusterConfig { node, members };
-            worgl_server::join_cluster(&state, &config)?;
+            let changed = worgl_server::join_cluster(&state, &config)?;
             println!("cluster       {}", state.join("cluster.json").display());
             println!("cluster token {}", state.join("cluster.token").display());
+            if !changed.is_empty() {
+                let ids: Vec<_> = changed.iter().map(u64::to_string).collect();
+                let ids = ids.join(", ");
+                println!("moved members {ids}");
+                let s = if changed.len() == 1 { "" } else { "s" };
+                eprintln!(
+                    "warning: this changes the addresses of member{s} {ids}; give every member's \
+                     cluster.json the same addresses, with join-cluster or by hand, then restart \
+                     the members one at a time"
+                );
+                if changed.len() > 1 {
+                    eprintln!(
+                        "warning: move one member at a time, restarting every member before \
+                         moving the next: with two moved at once, a restart can leave the running \
+                         members unable to reach each other"
+                    );
+                }
+            }
             Ok(())
         }
         Command::Serve {

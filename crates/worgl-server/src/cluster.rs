@@ -39,36 +39,74 @@
 //! the mint was created with, not later edits.
 //!
 //! Members send each other Raft's RPCs as HTTP requests to their Raft ports,
-//! with the cluster token. Nothing on that port is encrypted yet, so it must
-//! be reachable by the members only.
+//! with the cluster token. A mint applies whatever its group's log holds,
+//! and whoever shows the token, with a member's seal of a fixed value
+//! under its key-encryption key (see below), can append to that log as if
+//! they led, so the token is as strong as the mints' issuer keys. Members
+//! dial each other in plain HTTP only and nothing between them is
+//! encrypted yet, so the token and the seals cross in the clear, and every
+//! member's addresses must be reachable only by the members and a proxy in
+//! front of them, as over WireGuard between their hosts.
+//!
+//! A member dials the others at the addresses its `cluster.json` held when
+//! it started, for every group alike, not at those a group's membership
+//! kept from when it formed. So a member moves to new addresses once every
+//! member's `cluster.json` gives them and every member has restarted;
+//! [`join_cluster`] says which members' addresses it changes. A member's
+//! Raft port refuses, as `421 misdirected`, an RPC whose Raft vote names
+//! that member as its sender, so one whose `cluster.json` gives another
+//! member an address that leads back to it, under whatever spelling, finds
+//! that member unreachable instead of counting its own votes and appends as
+//! that member's.
+//!
+//! Every member must hold the same key-encryption key, since each unseals
+//! what the others seal: the keys of their rotations and the secrets in the
+//! registry's records. So each RPC also names the member that sent it and
+//! carries that member's seal of a fixed value, made once when it starts.
+//! The receiver unseals a member's seal once, and remembers whether it
+//! opened until that member sends another. A member whose seal does not
+//! open has its RPCs refused with `403 kek_mismatch` ("kek.key differs from
+//! member N's") before they reach Raft, and both members log an error.
+//! Neither applies an entry or snapshot from the other, so no replica stops
+//! on a key it cannot unseal: to each other the two members look cut off,
+//! and the members that agree carry on while they are a majority. Nor does
+//! a member they refuse put a record or rotation sealed under its key into
+//! its own log, to commit once they hear from it, even if it led before it
+//! restarted: the registry and each mint propose nothing until a majority
+//! has answered their leader.
 //!
 //! A member that does not lead a mint passes the requests for it on to the
-//! leader's public API and relays the answer. If it knows of no leader, or
-//! cannot connect to the one it knows of within a second, it answers `503
-//! no_leader`; if the leader does not answer, or the connection to it goes
-//! three seconds without a sign of life, `503 timeout`. A leader cut off
-//! from the other members answers `503 no_leader` too once its lease lapses
-//! (see [`worgl_raft::default_config`]), and gives up waiting on requests it
-//! took before as `503 timeout`, so no client waits on a member that cannot
-//! reach the others. Either way the client sends the same request again: a
-//! mint, transfer or burn the mint already carried out is answered as it
-//! was the first time. A request to create a mint goes to the registry's
-//! leader the same way, but is not answered as before if sent again: after
-//! a `503 timeout`, list the mints before creating another.
+//! leader's [`api`](Member::api) address, `Authorization` headers included,
+//! and relays the answer. If it knows of no leader, or cannot connect to the
+//! one it knows of within a second, it answers `503 no_leader`; if the
+//! leader does not answer, or the connection to it goes three seconds
+//! without a sign of life, `503 timeout`. A leader cut off from the other
+//! members answers `503 no_leader` too once its lease lapses (see
+//! [`worgl_raft::default_config`]), and gives up waiting on requests it took
+//! before as `503 timeout`, so no client waits on a member that cannot reach
+//! the others. Either way the client sends the same request again: a mint,
+//! transfer or burn the mint already carried out is answered as it was the
+//! first time. A rotation is not, and one answered `503 timeout` may still
+//! be made after a read that does not show it, so before rotating again,
+//! read the mint's info once it has carried out a change sent after that
+//! answer. A request to create a mint goes to the registry's leader the
+//! same way, and is not answered as before if sent again either: after a
+//! `503 timeout`, list the mints before creating another.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::future::Future;
 use std::marker::PhantomData;
 use std::path::Path;
-use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::Duration;
 
-use anyhow::{Context, Result, bail};
+use anyhow::{Context, Result, anyhow, bail};
 use axum::Json;
 use axum::body::{Body, Bytes};
 use axum::extract::{Path as UrlPath, Request, State};
 use axum::http::request::Parts;
-use axum::http::{HeaderName, Method, StatusCode, header};
+use axum::http::{HeaderMap, HeaderName, HeaderValue, Method, StatusCode, header};
 use axum::middleware::Next;
 use axum::response::{IntoResponse, Response};
 use openraft::error::{
@@ -85,7 +123,7 @@ use openraft::{
 };
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
-use worgl::{Note, PublicKey};
+use worgl::{Kek, KekError, Note, PublicKey};
 use worgl_raft::registry::{Records, Registry, RegistryConfig};
 use worgl_raft::{NodeId, SnapshotData, TypeConfig, default_config};
 
@@ -101,6 +139,25 @@ const REGISTRY_DIR: &str = "registry";
 /// Marks a request one member passed on to another, so it is passed on at
 /// most once.
 const FORWARDED: HeaderName = HeaderName::from_static("x-worgl-forwarded-by");
+
+/// Names the member that sent a Raft request.
+const MEMBER: HeaderName = HeaderName::from_static("x-worgl-member");
+
+/// Carries the sender's seal of [`KEK_CHECK`], in hex, which the receiver
+/// opens only if the two hold the same key-encryption key.
+const KEK_CHECK_HEADER: HeaderName = HeaderName::from_static("x-worgl-kek-check");
+
+/// What each member seals, under [`KEK_CHECK_CONTEXT`], for the others to
+/// unseal.
+const KEK_CHECK: [u8; 32] = [0; 32];
+const KEK_CHECK_CONTEXT: &[u8] = b"worgl/cluster/kek-check/v1";
+
+/// The code of a Raft request refused for its sender's key-encryption key.
+const KEK_MISMATCH: &str = "kek_mismatch";
+
+/// The code of a Raft request refused because the receiver could not use
+/// its key-encryption key to check the sender's.
+const KEK_UNAVAILABLE: &str = "kek_unavailable";
 
 /// How long a member waits for the leader to answer a request it passed on:
 /// longer than the leader waits for its group.
@@ -130,16 +187,23 @@ pub const RAFT_BODY_LIMIT: usize = 256 << 20;
 pub struct ClusterConfig {
     /// This member's id.
     pub node: NodeId,
-    /// Every member, this one included, by id.
+    /// Every member, this one included, by id. No two may share an API or a
+    /// Raft address.
     pub members: BTreeMap<NodeId, Member>,
 }
 
-/// Where a member can be reached, each as `host:port`.
+/// Where the other members reach a member, each as `host:port`, in plain
+/// HTTP, so both must be on a network only the members and a proxy in front
+/// of them can reach.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Member {
-    /// Its public API, which other members pass requests on to.
+    /// The address other members pass API requests on to, `Authorization`
+    /// headers included, so a private one. Clients reach the API at an
+    /// address of their own, such as a proxy's in front of every member.
     pub api: String,
-    /// Its Raft port.
+    /// Its Raft port, where the other members send the RPCs of the
+    /// registry's group and every mint's, whatever address the group formed
+    /// with.
     pub raft: String,
 }
 
@@ -157,23 +221,55 @@ impl ClusterConfig {
         if !self.members.contains_key(&self.node) {
             bail!("the members do not include this one, {}", self.node);
         }
+        // Members dial each other by these addresses, and Raft's RPCs do not
+        // say which member they are for: a member that dialed itself at
+        // another's Raft address would count its own votes and appends as
+        // that member's, and commit alone. Its Raft port refuses them (see
+        // `from_another`) however the address is spelled; this says why,
+        // before it starts, when two are spelled alike.
+        let mut seen = BTreeMap::new();
+        for (&id, member) in &self.members {
+            for (kind, address) in [("API", &member.api), ("Raft", &member.raft)] {
+                if let Some(other) = seen.insert((kind, address), id) {
+                    bail!("members {other} and {id} have the same {kind} address, {address}");
+                }
+            }
+        }
         Ok(())
     }
 }
 
 /// Makes the server state in `state` a cluster member with `config`,
-/// creating a cluster token unless it has one. The other members need a copy
-/// of the token, and of the rest of the directory, before they first start.
-pub fn join_cluster(state: &Path, config: &ClusterConfig) -> Result<()> {
+/// creating a cluster token unless it has one, and returns the ids of the
+/// members whose addresses differ from those in the `cluster.json` it
+/// replaces: none if there was no `cluster.json`, or one that does not
+/// read. The other members need a copy of the token, and of the rest of the
+/// directory, before they first start. Changed addresses take effect once
+/// every member's `cluster.json` gives the same ones and every member has
+/// restarted. Fails, and writes nothing, if `state` has no readable
+/// `kek.key`.
+pub fn join_cluster(state: &Path, config: &ClusterConfig) -> Result<Vec<NodeId>> {
     config.check()?;
     if !state.join(crate::mints::OPERATOR_TOKEN_FILE).exists() {
         bail!("{} holds no server; run `init` first", state.display());
     }
+    crate::mints::open_kek(state)?;
     if !state.join(TOKEN_FILE).exists() {
         write_secret(&state.join(TOKEN_FILE), &files::random_token()?)?;
     }
+    // A `cluster.json` that does not read is replaced all the same.
+    let before = read_json::<ClusterConfig>(&state.join(CLUSTER_FILE)).ok();
+    let changed = before.map_or_else(Vec::new, |before| {
+        config
+            .members
+            .iter()
+            .filter(|&(id, member)| before.members.get(id).is_some_and(|was| was != member))
+            .map(|(&id, _)| id)
+            .collect()
+    });
     files::write_json(state, CLUSTER_FILE, config)
-        .with_context(|| format!("writing {}", state.join(CLUSTER_FILE).display()))
+        .with_context(|| format!("writing {}", state.join(CLUSTER_FILE).display()))?;
+    Ok(changed)
 }
 
 /// Whether the server state in `state` is a cluster member's.
@@ -185,6 +281,17 @@ pub fn is_member(state: &Path) -> bool {
 pub(crate) struct Cluster {
     config: ClusterConfig,
     token: String,
+    /// The key-encryption key every member must share.
+    kek: Arc<dyn Kek>,
+    /// This member's seal of [`KEK_CHECK`], in hex, sent with every RPC.
+    kek_check: HeaderValue,
+    /// For each member, the last seal it sent and whether it opened here.
+    checked: Mutex<BTreeMap<NodeId, (HeaderValue, bool)>>,
+    /// The members that refuse this member's seal, as far as it knows.
+    refused_by: Mutex<BTreeSet<NodeId>>,
+    /// Whether the key-encryption key was unavailable the last time it
+    /// checked a seal.
+    kek_unavailable: AtomicBool,
     /// For Raft's RPCs, which openraft bounds itself.
     client: reqwest::Client,
     /// For requests passed on to a leader.
@@ -192,7 +299,9 @@ pub(crate) struct Cluster {
 }
 
 impl Cluster {
-    pub(crate) fn open(state: &Path) -> Result<Arc<Self>> {
+    /// Opens this member's view of its cluster, with `kek` the
+    /// key-encryption key it shows the others.
+    pub(crate) fn open(state: &Path, kek: Arc<dyn Kek>) -> Result<Arc<Self>> {
         let config = ClusterConfig::read(state)?;
         let token = read_secret(&state.join(TOKEN_FILE))?;
         if token.len() < MIN_ADMIN_TOKEN_LEN {
@@ -201,6 +310,11 @@ impl Cluster {
                 state.join(TOKEN_FILE).display()
             );
         }
+        let sealed = kek
+            .seal(&KEK_CHECK, KEK_CHECK_CONTEXT)
+            .map_err(|error| anyhow!("sealing the key-encryption key check: {error}"))?;
+        let kek_check =
+            HeaderValue::from_str(&hex::encode(sealed)).expect("hex is a valid header value");
         let client = reqwest::Client::builder()
             .build()
             .context("building the HTTP client")?;
@@ -215,6 +329,11 @@ impl Cluster {
         Ok(Arc::new(Self {
             config,
             token,
+            kek,
+            kek_check,
+            checked: Mutex::default(),
+            refused_by: Mutex::default(),
+            kek_unavailable: AtomicBool::new(false),
             client,
             forwarder,
         }))
@@ -226,6 +345,126 @@ impl Cluster {
 
     pub(crate) fn token(&self) -> &str {
         &self.token
+    }
+
+    /// Accepts a Raft request only from a member whose seal of
+    /// [`KEK_CHECK`], in `headers`, this member's key-encryption key opens.
+    /// A member's seal is unsealed once, and the outcome kept until it
+    /// sends another, as it does when it restarts.
+    fn check_member(&self, headers: &HeaderMap) -> Result<(), ApiError> {
+        let member = headers
+            .get(&MEMBER)
+            .and_then(|value| value.to_str().ok())
+            .and_then(|value| value.parse::<NodeId>().ok())
+            .filter(|member| self.config.members.contains_key(member))
+            .ok_or_else(|| {
+                ApiError::new(
+                    StatusCode::BAD_REQUEST,
+                    "malformed",
+                    "the request names no member of this cluster",
+                )
+            })?;
+        let check = headers.get(&KEK_CHECK_HEADER).ok_or_else(|| {
+            ApiError::new(
+                StatusCode::BAD_REQUEST,
+                "malformed",
+                "the request carries no key-encryption key check",
+            )
+        })?;
+        let known = self
+            .checked()
+            .get(&member)
+            .and_then(|(seal, same)| (seal == check).then_some(*same));
+        let same = match known {
+            Some(same) => same,
+            None => {
+                let same = self.opens(check)?;
+                let before = self.checked().insert(member, (check.clone(), same));
+                // Two requests can check one seal at once; only one logs it.
+                let first = before.as_ref().is_none_or(|(seal, _)| seal != check);
+                if first && !same {
+                    tracing::error!(
+                        member,
+                        "kek.key differs from member {member}'s; refusing its Raft requests \
+                         until every member holds the same key"
+                    );
+                } else if first && before.is_some_and(|(_, was)| !was) {
+                    tracing::info!(member, "member {member} holds this member's kek.key now");
+                }
+                same
+            }
+        };
+        if same {
+            Ok(())
+        } else {
+            Err(ApiError::new(
+                StatusCode::FORBIDDEN,
+                KEK_MISMATCH,
+                format!("kek.key differs from member {member}'s"),
+            ))
+        }
+    }
+
+    /// Whether `check` is a seal of [`KEK_CHECK`] that this member's
+    /// key-encryption key opens.
+    fn opens(&self, check: &HeaderValue) -> Result<bool, ApiError> {
+        let sealed = hex::decode(check.as_bytes()).map_err(|_| {
+            ApiError::new(
+                StatusCode::BAD_REQUEST,
+                "malformed",
+                "the request's key-encryption key check is not hex",
+            )
+        })?;
+        let opened = self.kek.unseal(&sealed, KEK_CHECK_CONTEXT);
+        // Logged when it changes, rather than on every request refused.
+        let unavailable = matches!(opened, Err(KekError::Unavailable(_)));
+        let was = self.kek_unavailable.swap(unavailable, Ordering::Relaxed);
+        if was && !unavailable {
+            tracing::info!("the key-encryption key is available again");
+        }
+        match opened {
+            Ok(secret) => Ok(*secret == KEK_CHECK),
+            Err(KekError::Rejected) => Ok(false),
+            // Not a verdict on the sender's key: the sender backs off, as
+            // from a member that is down, and the seal is checked again when
+            // it next sends it.
+            Err(KekError::Unavailable(reason)) => {
+                if !was {
+                    tracing::error!(
+                        %reason,
+                        "the key-encryption key is unavailable; refusing the Raft requests \
+                         of members whose seal is not checked yet"
+                    );
+                }
+                Err(ApiError::new(
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    KEK_UNAVAILABLE,
+                    "this member's key-encryption key is unavailable",
+                ))
+            }
+        }
+    }
+
+    fn checked(&self) -> MutexGuard<'_, BTreeMap<NodeId, (HeaderValue, bool)>> {
+        // The map holds plain values, so a poisoned one is still usable.
+        self.checked.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
+    /// Notes whether `member` refused this member's seal in answer to an
+    /// RPC, and logs when that changes.
+    fn answered(&self, member: NodeId, refused: bool) {
+        let mut refused_by = self.refused_by.lock().unwrap_or_else(|e| e.into_inner());
+        if refused {
+            if refused_by.insert(member) {
+                tracing::error!(
+                    member,
+                    "kek.key differs from member {member}'s; it refuses this member's Raft \
+                     requests until every member holds the same key"
+                );
+            }
+        } else if refused_by.remove(&member) {
+            tracing::info!(member, "member {member} accepts this member's kek.key now");
+        }
     }
 
     /// Every member as Raft knows it: by id, at its Raft port.
@@ -280,9 +519,9 @@ impl Cluster {
         }
     }
 
-    /// Sends the request in `parts` and `body` to the member whose public
-    /// API is at `api`, and returns its answer: the status, the body, and
-    /// the body's type and `Retry-After`, if any.
+    /// Sends the request in `parts` and `body` to the member whose API
+    /// address is `api`, and returns its answer: the status, the body, and
+    /// the body's type, `Date` and `Retry-After`, if any.
     async fn relay(&self, api: &str, parts: &Parts, body: Bytes) -> reqwest::Result<Response> {
         let path = parts.uri.path_and_query().map_or("/", |path| path.as_str());
         let mut request = self
@@ -298,7 +537,9 @@ impl Cluster {
         }
         let answer = request.send().await?;
         let status = answer.status();
-        let kept: Vec<_> = [header::CONTENT_TYPE, header::RETRY_AFTER]
+        // The leader's `Date` too: clients plan by it, as the mint rotates by
+        // the leader's clock, not this member's.
+        let kept: Vec<_> = [header::CONTENT_TYPE, header::DATE, header::RETRY_AFTER]
             .into_iter()
             .filter_map(|name| {
                 let value = answer.headers().get(&name)?.clone();
@@ -449,7 +690,8 @@ fn issuer_of(path: &str, body: &[u8]) -> Option<PublicKey> {
     Some(*note.issuer())
 }
 
-/// Accepts Raft requests from members only.
+/// Accepts Raft requests from members only, and only from those that hold
+/// this member's key-encryption key.
 pub(crate) async fn members_only(
     State(state): State<AppState>,
     request: Request,
@@ -463,7 +705,9 @@ pub(crate) async fn members_only(
         )
         .into_response();
     };
-    match check_bearer(request.headers(), cluster.token(), "cluster") {
+    let checked = check_bearer(request.headers(), cluster.token(), "cluster")
+        .and_then(|()| cluster.check_member(request.headers()));
+    match checked {
         Ok(()) => next.run(request).await,
         Err(error) => error.into_response(),
     }
@@ -477,6 +721,7 @@ pub(crate) async fn append(
     Json(rpc): Json<AppendEntriesRequest<TypeConfig>>,
 ) -> Result<Answer<AppendEntriesResponse<NodeId>, RaftError<NodeId>>, ApiError> {
     let replica = state.replica_at(&mint)?;
+    from_another(&state, &rpc.vote)?;
     Ok(Json(replica.raft().append_entries(rpc).await))
 }
 
@@ -486,6 +731,7 @@ pub(crate) async fn vote(
     Json(rpc): Json<VoteRequest<NodeId>>,
 ) -> Result<Answer<VoteResponse<NodeId>, RaftError<NodeId>>, ApiError> {
     let replica = state.replica_at(&mint)?;
+    from_another(&state, &rpc.vote)?;
     Ok(Json(replica.raft().vote(rpc).await))
 }
 
@@ -496,6 +742,7 @@ pub(crate) async fn snapshot(
 ) -> Result<Answer<SnapshotResponse<NodeId>, Fatal<NodeId>>, ApiError> {
     let replica = state.replica_at(&mint)?;
     let (vote, snapshot) = decode_snapshot(&body)?;
+    from_another(&state, &vote)?;
     Ok(Json(
         replica.raft().install_full_snapshot(vote, snapshot).await,
     ))
@@ -506,6 +753,7 @@ pub(crate) async fn registry_append(
     Json(rpc): Json<AppendEntriesRequest<RegistryConfig>>,
 ) -> Result<Answer<AppendEntriesResponse<NodeId>, RaftError<NodeId>>, ApiError> {
     let registry = state.registry().ok_or_else(not_member)?;
+    from_another(&state, &rpc.vote)?;
     Ok(Json(registry.raft().append_entries(rpc).await))
 }
 
@@ -514,6 +762,7 @@ pub(crate) async fn registry_vote(
     Json(rpc): Json<VoteRequest<NodeId>>,
 ) -> Result<Answer<VoteResponse<NodeId>, RaftError<NodeId>>, ApiError> {
     let registry = state.registry().ok_or_else(not_member)?;
+    from_another(&state, &rpc.vote)?;
     Ok(Json(registry.raft().vote(rpc).await))
 }
 
@@ -523,6 +772,7 @@ pub(crate) async fn registry_snapshot(
 ) -> Result<Answer<SnapshotResponse<NodeId>, Fatal<NodeId>>, ApiError> {
     let registry = state.registry().ok_or_else(not_member)?;
     let (vote, snapshot) = decode_snapshot(&body)?;
+    from_another(&state, &vote)?;
     Ok(Json(
         registry.raft().install_full_snapshot(vote, snapshot).await,
     ))
@@ -534,6 +784,26 @@ fn not_member() -> ApiError {
         "unknown_mint",
         "this server is not a cluster member",
     )
+}
+
+/// Refuses a Raft RPC whose `vote` names this member as its sender, as one
+/// does that this member sent itself, dialing another member at an address
+/// in `cluster.json` that leads back here under another spelling. Answered,
+/// it would count as that member's vote or append and let this member make
+/// a majority alone; refused, that member is unreachable from this one.
+fn from_another(state: &AppState, vote: &Vote<NodeId>) -> Result<(), ApiError> {
+    let node = state.cluster().ok_or_else(not_member)?.node();
+    if vote.leader_id().voted_for() != Some(node) {
+        return Ok(());
+    }
+    Err(ApiError::new(
+        StatusCode::MISDIRECTED_REQUEST,
+        "misdirected",
+        format!(
+            "member {node} sent this Raft request to itself: its cluster.json gives another \
+             member an address that leads back to it"
+        ),
+    ))
 }
 
 /// A snapshot as it crosses the network.
@@ -632,11 +902,21 @@ where
 {
     type Network = Connection<C>;
 
+    /// Dials `target` at its Raft address in `cluster.json`, not at `node`,
+    /// the one the group's membership kept from when it formed, so a member
+    /// that moved is reached where it is now. `node` serves only for a
+    /// member `cluster.json` does not list.
     async fn new_client(&mut self, target: NodeId, node: &BasicNode) -> Connection<C> {
+        let raft = self
+            .cluster
+            .config
+            .members
+            .get(&target)
+            .map_or(&node.addr, |member| &member.raft);
         Connection {
             cluster: self.cluster.clone(),
             target,
-            base: format!("http://{}/{}", node.addr, self.path),
+            base: format!("http://{raft}/{}", self.path),
             config: PhantomData,
         }
     }
@@ -692,6 +972,8 @@ impl<C> Connection<C> {
         };
         let answer = request
             .bearer_auth(self.cluster.token())
+            .header(MEMBER, self.cluster.node())
+            .header(KEK_CHECK_HEADER, self.cluster.kek_check.clone())
             .timeout(ttl)
             .send()
             .await
@@ -700,8 +982,22 @@ impl<C> Connection<C> {
         if !status.is_success() {
             let text = answer.text().await.unwrap_or_default();
             let error = std::io::Error::other(format!("{route}: {status} {text}"));
+            let code = serde_json::from_str::<serde_json::Value>(&text)
+                .map(|body| body["error"].clone())
+                .unwrap_or_default();
+            if status == StatusCode::FORBIDDEN && code == KEK_MISMATCH {
+                self.cluster.answered(self.target, true);
+                // As good as down until one of the two starts again with the
+                // other's key, so openraft backs off as it does for one.
+                return Err(Failure::Unreachable(Unreachable::new(&error)));
+            }
+            if status == StatusCode::SERVICE_UNAVAILABLE && code == KEK_UNAVAILABLE {
+                // As good as down until its key-encryption key is back.
+                return Err(Failure::Unreachable(Unreachable::new(&error)));
+            }
             return Err(Failure::Network(NetworkError::new(&error)));
         }
+        self.cluster.answered(self.target, false);
         answer.json().await.map_err(failed)
     }
 
@@ -753,5 +1049,140 @@ where
             closed = cancel => return Err(closed.into()),
         };
         answer.map_err(|error| RemoteError::new(self.target, error).into())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+
+    use worgl::FileKek;
+    use zeroize::Zeroizing;
+
+    use super::*;
+
+    /// A file KEK that counts what it unseals, and can be made unavailable.
+    #[derive(Debug)]
+    struct Counted {
+        kek: FileKek,
+        unsealed: AtomicUsize,
+        available: AtomicBool,
+    }
+
+    impl Kek for Counted {
+        fn seal(&self, secret: &[u8; 32], context: &[u8]) -> Result<Vec<u8>, KekError> {
+            self.kek.seal(secret, context)
+        }
+
+        fn unseal(&self, sealed: &[u8], context: &[u8]) -> Result<Zeroizing<[u8; 32]>, KekError> {
+            if !self.available.load(Ordering::Relaxed) {
+                return Err(KekError::Unavailable("the KMS is down".into()));
+            }
+            self.unsealed.fetch_add(1, Ordering::Relaxed);
+            self.kek.unseal(sealed, context)
+        }
+    }
+
+    /// Member `node` of a three-member cluster, holding `kek`.
+    fn member(node: NodeId, kek: Arc<dyn Kek>) -> (tempfile::TempDir, Arc<Cluster>) {
+        let dir = tempfile::tempdir().unwrap();
+        crate::init_state(dir.path()).unwrap();
+        let members = (1..=3)
+            .map(|id| {
+                let member = Member {
+                    api: format!("127.0.0.1:{}", 8080 + id),
+                    raft: format!("127.0.0.1:{}", 7080 + id),
+                };
+                (id, member)
+            })
+            .collect();
+        join_cluster(dir.path(), &ClusterConfig { node, members }).unwrap();
+        let cluster = Cluster::open(dir.path(), kek).unwrap();
+        (dir, cluster)
+    }
+
+    /// The headers of `sender`'s RPCs.
+    fn sent_by(sender: &Cluster) -> HeaderMap {
+        let mut headers = HeaderMap::new();
+        headers.insert(MEMBER, sender.node().into());
+        headers.insert(KEK_CHECK_HEADER, sender.kek_check.clone());
+        headers
+    }
+
+    #[test]
+    fn a_member_unseals_each_members_check_once_and_refuses_another_kek() {
+        let shared = [1; 32];
+        let counted = Arc::new(Counted {
+            kek: FileKek::from_bytes(&shared),
+            unsealed: AtomicUsize::new(0),
+            available: AtomicBool::new(true),
+        });
+        let unsealed = || counted.unsealed.load(Ordering::Relaxed);
+        let (_one_dir, one) = member(1, counted.clone());
+        let (_two_dir, two) = member(2, Arc::new(FileKek::from_bytes(&shared)));
+        let (_three_dir, three) = member(3, Arc::new(FileKek::from_bytes(&[2; 32])));
+
+        // Member 2 holds the same key, which is checked once.
+        for _ in 0..3 {
+            one.check_member(&sent_by(&two)).unwrap();
+        }
+        assert_eq!(unsealed(), 1);
+
+        // Member 3 does not: every request is refused, naming it, and each
+        // side refuses the other's.
+        for _ in 0..3 {
+            let error = one.check_member(&sent_by(&three)).unwrap_err();
+            assert_eq!(error.status(), StatusCode::FORBIDDEN);
+            assert_eq!(error.code(), KEK_MISMATCH);
+            assert_eq!(error.message, "kek.key differs from member 3's");
+        }
+        assert_eq!(unsealed(), 2);
+        let error = three.check_member(&sent_by(&one)).unwrap_err();
+        assert_eq!(error.message, "kek.key differs from member 1's");
+
+        // Started again with the shared key, it sends a new seal, which opens.
+        let (_fixed_dir, fixed) = member(3, Arc::new(FileKek::from_bytes(&shared)));
+        one.check_member(&sent_by(&fixed)).unwrap();
+        assert_eq!(unsealed(), 3);
+
+        // A key that cannot be used refuses a new seal without a verdict on
+        // it, and still takes the seals it checked before.
+        counted.available.store(false, Ordering::Relaxed);
+        let (_restarted_dir, restarted) = member(2, Arc::new(FileKek::from_bytes(&shared)));
+        let error = one.check_member(&sent_by(&restarted)).unwrap_err();
+        assert_eq!(error.status(), StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(error.code(), KEK_UNAVAILABLE);
+        one.check_member(&sent_by(&fixed)).unwrap();
+        counted.available.store(true, Ordering::Relaxed);
+        one.check_member(&sent_by(&restarted)).unwrap();
+
+        // A request must name a member and carry a seal, in hex.
+        let mut headers = sent_by(&two);
+        headers.insert(MEMBER, 9.into());
+        assert_eq!(one.check_member(&headers).unwrap_err().code(), "malformed");
+        headers.insert(MEMBER, 2.into());
+        headers.insert(KEK_CHECK_HEADER, HeaderValue::from_static("not hex"));
+        assert_eq!(one.check_member(&headers).unwrap_err().code(), "malformed");
+        headers.remove(KEK_CHECK_HEADER);
+        assert_eq!(one.check_member(&headers).unwrap_err().code(), "malformed");
+    }
+
+    #[tokio::test]
+    async fn a_relayed_answer_keeps_the_leaders_date() {
+        // A leader whose clock is far from this member's.
+        const DATE: &str = "Sun, 06 Nov 1994 08:49:37 GMT";
+        let answer = || async { ([(header::DATE, DATE)], Json("answered")) };
+        let leader = axum::Router::new().route("/v1/info", axum::routing::get(answer));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let api = listener.local_addr().unwrap().to_string();
+        tokio::spawn(async move { axum::serve(listener, leader).await.unwrap() });
+
+        let (_dir, cluster) = member(2, Arc::new(FileKek::from_bytes(&[1; 32])));
+        let request = axum::http::Request::get("/v1/info").body(()).unwrap();
+        let (parts, ()) = request.into_parts();
+        let response = cluster.relay(&api, &parts, Bytes::new()).await.unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(response.headers()[header::DATE], DATE);
+        assert_eq!(response.headers()[header::CONTENT_TYPE], "application/json");
     }
 }

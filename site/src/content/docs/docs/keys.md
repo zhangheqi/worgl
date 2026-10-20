@@ -110,8 +110,41 @@ A KMS-backed key is not available yet.
 |---|---|---|
 | Operator token | `operator.token` | Creating and listing mints: `/v1/admin/mints`. |
 | Admin token | `mints/<mint>/admin.token` | Rotating, pausing and resuming that mint only. |
-| Cluster token | `cluster.token`, on cluster members | The members' Raft port. |
+| Cluster token | `cluster.token`, on cluster members | The members' Raft port, shown with a member's seal of a fixed value under `kek.key`, which crosses beside it in the clear, and with it every mint's log, so it is as strong as the issuer keys. See [Keep the members private](../running-a-cluster/#keep-the-members-private). |
 
 Routes with a token take `Authorization: Bearer <token>`. A missing or wrong
 token is answered `401 admin_unauthorized`. The server refuses to start if a
 token is shorter than 32 characters.
+
+### Replacing a token
+
+A server reads its tokens once and never again: when it starts, or, for a
+mint created while it runs, when it adds the mint. To replace one, write a
+new one of at least 32 characters over its file, which keeps its mode, 0600,
+and restart the server:
+
+```sh
+openssl rand -hex 32 > server/mints/<mint>/admin.token
+```
+
+On a cluster, write the same new token into the file on every member, then
+restart them all. A member that does not lead a mint passes the
+`Authorization` header on to the leader, which checks it against the token
+it read, so until every member has restarted, the old token still works
+whenever an unchanged member leads.
+
+A member that writes a mint's directory from the cluster's registry, as one
+that was away when the mint was created does when it returns, gets the
+mint's first admin token: the registry holds that one, sealed, and never
+learns of a replacement. Write the new token there too and restart that
+member.
+
+The key-encryption key cannot be replaced yet: nothing seals again what it
+has sealed.
+
+If an admin token leaks, pause its mint at once, then replace the token.
+The token rotates its mint on request with no limit on how often, so as
+many rotations in a row as the mint has layers expire every outstanding
+note; a paused mint refuses them. It also resumes a paused mint as readily
+as it pauses one, until it is replaced. See
+[Pausing a mint](../pausing/).

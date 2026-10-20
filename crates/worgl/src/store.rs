@@ -30,8 +30,12 @@
 //! memory as it is made, and all of them reach the disk in one log entry and
 //! one flush when the batch commits. Nothing a batch returns may be handed
 //! out before then. If the flush fails, the issuer is ahead of its log and
-//! refuses all further changes until it is reopened, which restores exactly
-//! what reached the disk.
+//! refuses all further changes until
+//! [`recover`](PersistentIssuer::recover) rebuilds it from the disk or the
+//! store is reopened, either of which restores exactly what reached the
+//! disk. If the log could not even be cut back after the failed write, the
+//! store is stopped instead: the file may not hold what the store knows of
+//! it, so only reopening the store reads it again. See [`StoreState`].
 //!
 //! Given a [`Kek`], a [`PersistentIssuer`] also seals each new generation
 //! key into the log entry of the rotation that certifies it, for replicas
@@ -62,6 +66,7 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::SystemTime;
 
+use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use thiserror::Error;
 
@@ -226,7 +231,8 @@ pub struct FileStore {
     events: u64,
     /// What `keys.bin` holds.
     keys: KeyRing,
-    /// When the files were written before the store opened.
+    /// When the files were written before the store opened, or before it
+    /// last reread them.
     written: Written,
     /// By when, by the system's wall clock, the issuer had made every
     /// receipt it holds, if known: when the store last logged a transfer or
@@ -316,69 +322,20 @@ impl FileStore {
     ) -> Result<(Self, Issuer), StoreError> {
         let dir = dir.as_ref().to_path_buf();
         let lock = lock(&dir)?;
-        // Before anything here writes the log again.
-        let log_written = modified(&dir.join(log::LOG));
-        let ring = read_keys(&dir, &key)?;
-        let mut keys = ring.clone();
-        let mut bytes = fs::read(dir.join(SNAPSHOT))?;
-        if bytes.starts_with(ISSUER_SNAPSHOT_MAGIC) {
-            journal::convert(&dir, key.clone(), ring.clone(), &bytes, policy.clone())?;
-            bytes = fs::read(dir.join(SNAPSHOT))?;
-        } else if dir.join(journal::JOURNAL).exists() {
-            // Left over from a conversion that stopped once the snapshot held it.
-            fs::remove_file(dir.join(journal::JOURNAL))?;
-            sync_dir(&dir)?;
-        }
-        // After a conversion, whose snapshot holds what the journal did.
-        let mut written = Written {
-            snapshot: modified(&dir.join(SNAPSHOT)),
-            log: log_written,
-            replayed: 0,
-        };
-        let (mut applied, mut membership, snapshot) = parse_snapshot(&bytes)?;
-        let mut issuer = Issuer::restore(key, ring, snapshot, policy)?;
-        drop(bytes);
-
-        let (mut log, entries) = FileLog::open(&dir, issuer.public_key())?;
-        if let Some(purged) = log.purged()
-            && applied.is_none_or(|applied| purged.index > applied.index)
-        {
-            return Err(StoreError::Corrupt {
-                offset: 0,
-                reason: format!(
-                    "entry {} was purged but the snapshot lacks it",
-                    purged.index
-                ),
-            });
-        }
-        let mut events = 0;
-        let mut unsealed = false;
-        for entry in entries {
-            // Entries up to the snapshot's are left over from a compaction
-            // that stopped before purging them.
-            if applied.is_some_and(|applied| entry.id.index <= applied.index) {
-                continue;
-            }
-            unsealed |= unseal_keys(&mut issuer, &entry, kek)?;
-            written.replayed += receipts_made(&entry);
-            events += replay(&mut issuer, &entry, &mut membership)?;
-            applied = Some(entry.id);
-        }
-        if unsealed {
-            keys.extend(issuer.key_ring());
-            write_keys(&dir, &keys)?;
-        }
-        if let Some(applied) = applied
-            && log.next_index() <= applied.index
-        {
-            // The log ends before the snapshot's entry, so the next entry
-            // must follow that one, not the log's last.
-            log.purge(applied)?;
-        }
-        // A rotation that was planned but never logged leaves its key
-        // behind. The file may only lose it once no logged event needs
-        // replaying, though; otherwise the next compaction removes it.
-        issuer.retire_keys();
+        let (
+            OnDisk {
+                log,
+                applied,
+                membership,
+                events,
+                mut keys,
+                written,
+            },
+            issuer,
+        ) = read_store(&dir, key, policy, kek)?;
+        // The file may only lose a key that signs no generation once no
+        // logged event needs replaying; otherwise the next compaction
+        // removes it.
         if events == 0 && issuer.key_ring().len() < keys.len() {
             keys = issuer.key_ring().clone();
             write_keys(&dir, &keys)?;
@@ -397,6 +354,28 @@ impl FileStore {
             },
             issuer,
         ))
+    }
+
+    /// Reads the snapshot, log and key ring again, as opening does, in
+    /// place of what the store knew of them, and returns the issuer they
+    /// restore. Unlike opening, it leaves in `keys.bin` a key that signs no
+    /// generation, for the next compaction to remove.
+    fn reload(
+        &mut self,
+        key: IssuerKey,
+        policy: Policy,
+        kek: Option<&dyn Kek>,
+    ) -> Result<Issuer, StoreError> {
+        let (on_disk, issuer) = read_store(&self.dir, key, policy, kek)?;
+        OnDisk {
+            log: self.log,
+            applied: self.applied,
+            membership: self.membership,
+            events: self.events,
+            keys: self.keys,
+            written: self.written,
+        } = on_disk;
+        Ok(issuer)
     }
 
     /// Logs an event with its sequence number and flushes it to disk.
@@ -525,6 +504,97 @@ impl FileStore {
     pub fn dir(&self) -> &Path {
         &self.dir
     }
+}
+
+/// What a store's files hold, with its log replayed onto its snapshot.
+struct OnDisk {
+    log: FileLog,
+    applied: Option<LogId>,
+    membership: Option<(LogId, Vec<u8>)>,
+    events: u64,
+    /// What `keys.bin` holds.
+    keys: KeyRing,
+    written: Written,
+}
+
+/// Reads the store in `dir`, whose lock the caller holds, converting one
+/// from before the log, and replays its log onto its snapshot.
+fn read_store(
+    dir: &Path,
+    key: IssuerKey,
+    policy: Policy,
+    kek: Option<&dyn Kek>,
+) -> Result<(OnDisk, Issuer), StoreError> {
+    // Before anything here writes the log again.
+    let log_written = modified(&dir.join(log::LOG));
+    let ring = read_keys(dir, &key)?;
+    let mut keys = ring.clone();
+    let mut bytes = fs::read(dir.join(SNAPSHOT))?;
+    if bytes.starts_with(ISSUER_SNAPSHOT_MAGIC) {
+        journal::convert(dir, key.clone(), ring.clone(), &bytes, policy.clone())?;
+        bytes = fs::read(dir.join(SNAPSHOT))?;
+    } else if dir.join(journal::JOURNAL).exists() {
+        // Left over from a conversion that stopped once the snapshot held it.
+        fs::remove_file(dir.join(journal::JOURNAL))?;
+        sync_dir(dir)?;
+    }
+    // After a conversion, whose snapshot holds what the journal did.
+    let mut written = Written {
+        snapshot: modified(&dir.join(SNAPSHOT)),
+        log: log_written,
+        replayed: 0,
+    };
+    let (mut applied, mut membership, snapshot) = parse_snapshot(&bytes)?;
+    let mut issuer = Issuer::restore(key, ring, snapshot, policy)?;
+    drop(bytes);
+
+    let (mut log, entries) = FileLog::open(dir, issuer.public_key())?;
+    if let Some(purged) = log.purged()
+        && applied.is_none_or(|applied| purged.index > applied.index)
+    {
+        return Err(StoreError::Corrupt {
+            offset: 0,
+            reason: format!(
+                "entry {} was purged but the snapshot lacks it",
+                purged.index
+            ),
+        });
+    }
+    let mut events = 0;
+    let mut unsealed = false;
+    for entry in entries {
+        // Entries up to the snapshot's are left over from a compaction
+        // that stopped before purging them.
+        if applied.is_some_and(|applied| entry.id.index <= applied.index) {
+            continue;
+        }
+        unsealed |= unseal_keys(&mut issuer, &entry, kek)?;
+        written.replayed += receipts_made(&entry);
+        events += replay(&mut issuer, &entry, &mut membership)?;
+        applied = Some(entry.id);
+    }
+    if unsealed {
+        keys.extend(issuer.key_ring());
+        write_keys(dir, &keys)?;
+    }
+    if let Some(applied) = applied
+        && log.next_index() <= applied.index
+    {
+        // The log ends before the snapshot's entry, so the next entry
+        // must follow that one, not the log's last.
+        log.purge(applied)?;
+    }
+    // A rotation that was planned but never logged leaves its key behind.
+    issuer.retire_keys();
+    let on_disk = OnDisk {
+        log,
+        applied,
+        membership,
+        events,
+        keys,
+        written,
+    };
+    Ok((on_disk, issuer))
 }
 
 /// Applies an entry after the snapshot's and returns how many events it held.
@@ -919,6 +989,26 @@ pub enum CommitError {
     Io(#[from] io::Error),
 }
 
+/// Whether a [`PersistentIssuer`] holds in memory what reached its disk.
+/// See [`PersistentIssuer::state`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum StoreState {
+    /// Memory holds what reached the disk, and changes are taken.
+    InStep,
+    /// A batch took effect in memory but did not reach the disk. Every
+    /// change is refused until [`recover`](PersistentIssuer::recover)
+    /// rebuilds the issuer from the disk, or the store is reopened. Until
+    /// then, [`issuer`](PersistentIssuer::issuer) still shows the batch's
+    /// changes.
+    Ahead,
+    /// A change to the log failed and could not be undone, as when the log
+    /// could not be cut back after a failed write, so the file may not hold
+    /// what the store knows of it. Every change is refused, and so is
+    /// recovery: only reopening the store reads the log again.
+    Stopped,
+}
+
 /// An [`Issuer`] whose every state change is logged before it takes effect.
 #[derive(Debug)]
 pub struct PersistentIssuer {
@@ -928,6 +1018,9 @@ pub struct PersistentIssuer {
     kek: Option<Arc<dyn Kek>>,
     /// Set when a batch took effect in memory but not on disk.
     ahead: bool,
+    /// Why the compaction at open failed, until it is
+    /// [taken](Self::take_compaction_error).
+    compaction_error: Option<io::Error>,
 }
 
 impl PersistentIssuer {
@@ -939,10 +1032,19 @@ impl PersistentIssuer {
             store,
             kek: None,
             ahead: false,
+            compaction_error: None,
         })
     }
 
     /// Opens an existing store, replays its log and compacts it.
+    ///
+    /// A compaction that fails, as on a full disk, does not fail the open:
+    /// the store opens from the snapshot and log as the compaction left
+    /// them, which together hold every event, the log keeps its entries
+    /// until the next [`compact`](Self::compact) purges them, and
+    /// [`take_compaction_error`](Self::take_compaction_error) tells why it
+    /// failed. Only one that leaves the store
+    /// [stopped](StoreState::Stopped) fails the open.
     pub fn open(dir: impl AsRef<Path>, key: IssuerKey, policy: Policy) -> Result<Self, StoreError> {
         Self::open_inner(dir, key, policy, None)
     }
@@ -965,16 +1067,23 @@ impl PersistentIssuer {
         policy: Policy,
         kek: Option<Arc<dyn Kek>>,
     ) -> Result<Self, StoreError> {
-        let (mut store, issuer) = FileStore::open_with_kek(dir, key, policy, kek.as_deref())?;
-        if !store.log.is_empty() {
-            store.compact(&issuer)?;
-        }
-        Ok(Self {
+        let (store, issuer) = FileStore::open_with_kek(dir, key, policy, kek.as_deref())?;
+        let mut opened = Self {
             issuer,
             store,
             kek,
             ahead: false,
-        })
+            compaction_error: None,
+        };
+        if !opened.store.log.is_empty()
+            && let Err(error) = opened.compact()
+        {
+            if opened.state() == StoreState::Stopped {
+                return Err(error.into());
+            }
+            opened.compaction_error = Some(error);
+        }
+        Ok(opened)
     }
 
     /// Seals the key of every later rotation with `kek` into the
@@ -1023,7 +1132,10 @@ impl PersistentIssuer {
         })
     }
 
-    /// The issuer, for reading state and verifying requests.
+    /// The issuer, for reading state and verifying requests. While the
+    /// store is [ahead](StoreState::Ahead), it holds a batch's changes that
+    /// never reached the disk, so [`recover`](Self::recover) first, or
+    /// refuse to answer reads from it.
     pub fn issuer(&self) -> &Issuer {
         &self.issuer
     }
@@ -1035,16 +1147,17 @@ impl PersistentIssuer {
 
     /// Mints a note once the mint is on disk.
     pub fn mint(&mut self, amount: u64, holder: PublicKey) -> Result<Note, CommitError> {
-        let event = self.issuer.plan_mint(amount, holder)?;
+        let event = self.planner()?.plan_mint(amount, holder)?;
         self.commit(&event)?;
         Ok(self.issuer.notes(&event).remove(0))
     }
 
     /// Mints at a verified mint authority's request once the mint is on disk.
     /// Resending the authority's last request returns the same note and
-    /// writes nothing.
+    /// writes nothing. While the store is not [in step](StoreState::InStep),
+    /// it is refused like every change, resent or not.
     pub fn authorized_mint(&mut self, mint: &VerifiedMint) -> Result<Note, CommitError> {
-        let mut notes = match self.issuer.plan_authorized_mint(mint)? {
+        let mut notes = match self.planner()?.plan_authorized_mint(mint)? {
             Plan::Replay(notes) => notes,
             Plan::Apply(event) => {
                 self.commit(&event)?;
@@ -1056,8 +1169,10 @@ impl PersistentIssuer {
 
     /// Carries out a verified transfer once it is on disk. A resent request
     /// that was already applied returns the same notes and writes nothing.
+    /// While the store is not [in step](StoreState::InStep), it is refused
+    /// like every change, resent or not.
     pub fn transfer(&mut self, transfer: &VerifiedTransfer) -> Result<Vec<Note>, CommitError> {
-        match self.issuer.plan_transfer(transfer)? {
+        match self.planner()?.plan_transfer(transfer)? {
             Plan::Replay(notes) => Ok(notes),
             Plan::Apply(event) => {
                 self.commit(&event)?;
@@ -1068,8 +1183,10 @@ impl PersistentIssuer {
 
     /// Carries out a verified burn once it is on disk and returns the value
     /// destroyed. A resent burn that was already applied writes nothing.
+    /// While the store is not [in step](StoreState::InStep), it is refused
+    /// like every change, resent or not.
     pub fn burn(&mut self, burn: &VerifiedBurn) -> Result<u128, CommitError> {
-        if let Plan::Apply(event) = self.issuer.plan_burn(burn)? {
+        if let Plan::Apply(event) = self.planner()?.plan_burn(burn)? {
             self.commit(&event)?;
         }
         Ok(burn.value())
@@ -1090,9 +1207,11 @@ impl PersistentIssuer {
     }
 
     /// Pauses the issuer once the pause is on disk, or resumes it if
-    /// `paused` is false. Writes nothing if it already is.
+    /// `paused` is false. Writes nothing if it already is. While the store
+    /// is not [in step](StoreState::InStep), it is refused like every
+    /// change, even where it would write nothing.
     pub fn set_paused(&mut self, paused: bool) -> Result<(), CommitError> {
-        if let Some(event) = self.issuer.plan_pause(paused) {
+        if let Some(event) = self.planner()?.plan_pause(paused) {
             self.commit(&event)?;
         }
         Ok(())
@@ -1110,8 +1229,53 @@ impl PersistentIssuer {
         self.store.log_events()
     }
 
+    /// Takes the error of the compaction [`open`](Self::open) tried, if it
+    /// failed; later calls return `None`.
+    pub fn take_compaction_error(&mut self) -> Option<io::Error> {
+        self.compaction_error.take()
+    }
+
+    /// Whether memory holds what reached the disk. See [`StoreState`].
+    pub fn state(&self) -> StoreState {
+        if self.store.log.is_poisoned() {
+            StoreState::Stopped
+        } else if self.ahead {
+            StoreState::Ahead
+        } else {
+            StoreState::InStep
+        }
+    }
+
+    /// Rebuilds the issuer from the snapshot and log on disk, as reopening
+    /// the store would, once it is [ahead](StoreState::Ahead) of them, so
+    /// that it takes changes again. It keeps the lock the store holds and
+    /// writes no snapshot. A store in step is left as it is, and a
+    /// [stopped](StoreState::Stopped) one refuses, since only reopening it
+    /// reads its log again.
+    ///
+    /// If the issuer was given a clock by [`set_clock`](Self::set_clock),
+    /// the rebuilt one keeps it, and counts the receipts it rereads as made
+    /// by the times of their files, as on opening.
+    ///
+    /// If it fails, as when a file cannot be read, the store stays ahead
+    /// and this can be tried again.
+    pub fn recover(&mut self) -> Result<(), StoreError> {
+        if self.state() != StoreState::Ahead {
+            // Nothing to do in step; the reason it refuses when stopped.
+            return Ok(self.check_in_step()?);
+        }
+        let key = self.issuer.issuer_key().clone();
+        let policy = self.issuer.policy().clone();
+        let clock = self.issuer.clock().cloned();
+        self.issuer = self.store.reload(key, policy, self.kek.as_deref())?;
+        if let Some(clock) = clock {
+            self.set_clock(clock);
+        }
+        self.ahead = false;
+        Ok(())
+    }
+
     fn rotate_due(&mut self, due: Option<u64>) -> Result<RotationReport, CommitError> {
-        self.check_in_step()?;
         let (report, sealed) = self.plan_rotate(due)?;
         self.commit_sealed(&Event::Rotate(report), sealed.as_slice())?;
         Ok(report)
@@ -1123,10 +1287,11 @@ impl PersistentIssuer {
         &mut self,
         due: Option<u64>,
     ) -> Result<(RotationReport, Option<SealedKey>), CommitError> {
+        let issuer = self.planner()?;
         let next = GenerationKey::try_generate().map_err(io::Error::other)?;
         let report = match due {
-            Some(due) => self.issuer.plan_scheduled_rotation(next, due)?,
-            None => self.issuer.plan_rotate(next)?,
+            Some(due) => issuer.plan_scheduled_rotation(next, due)?,
+            None => issuer.plan_rotate(next)?,
         };
         let Event::Rotate(report) = report else {
             unreachable!("a rotation is planned as one")
@@ -1149,11 +1314,24 @@ impl PersistentIssuer {
         Ok((report, sealed))
     }
 
+    /// The issuer, to plan a change on, once the store is in step. Every
+    /// change outside a [`Batch`] is planned on it, so that while the store
+    /// is not in step the change is refused before it is planned: planning
+    /// answers a request that was already applied from what memory holds,
+    /// which may then not match the disk. A batch needs no check of its
+    /// own, since it starts only in step and stays so until it commits.
+    fn planner(&mut self) -> io::Result<&mut Issuer> {
+        self.check_in_step()?;
+        Ok(&mut self.issuer)
+    }
+
     fn commit(&mut self, event: &Event) -> Result<(), CommitError> {
         self.commit_sealed(event, &[])
     }
 
     fn commit_sealed(&mut self, event: &Event, keys: &[SealedKey]) -> Result<(), CommitError> {
+        // Also checked before planning; this keeps an event planned any
+        // other way off a log the store is not in step with.
         self.check_in_step()?;
         // Before it is logged, so the log never holds an event that does
         // not replay.
@@ -1169,14 +1347,18 @@ impl PersistentIssuer {
         Ok(())
     }
 
-    /// Refuses to go on once memory is ahead of the disk.
+    /// Refuses to go on once memory is ahead of the disk, or the log may
+    /// not hold what the store knows of it.
     fn check_in_step(&self) -> io::Result<()> {
-        if self.ahead {
-            return Err(io::Error::other(
-                "a batch took effect but was not written; reopen the store",
-            ));
+        match self.state() {
+            StoreState::InStep => Ok(()),
+            StoreState::Ahead => Err(io::Error::other(
+                "a batch took effect but was not written; recover or reopen the store",
+            )),
+            StoreState::Stopped => Err(io::Error::other(
+                "a change to the log failed and could not be undone; reopen the store",
+            )),
         }
-        Ok(())
     }
 }
 
@@ -1187,8 +1369,11 @@ impl PersistentIssuer {
 /// see earlier ones, and the issuer's [`Issuer::sequence`] moves ahead of the
 /// log until [`commit`](Self::commit). Notes and reports a batch returns
 /// must not leave the process until the commit succeeds. A batch dropped
-/// without committing, or whose commit fails, leaves the issuer refusing
-/// every further change until the store is reopened.
+/// without committing, or whose commit fails, leaves the issuer
+/// [ahead](StoreState::Ahead) of its disk, refusing every further change
+/// until it [recovers](PersistentIssuer::recover) or the store is reopened.
+/// If the log cannot be cut back after a failed write either, the store is
+/// [stopped](StoreState::Stopped) instead and only reopening it helps.
 #[derive(Debug)]
 pub struct Batch<'a> {
     owner: &'a mut PersistentIssuer,
@@ -2003,32 +2188,357 @@ mod tests {
         assert_eq!(issuer.sequence(), 1);
     }
 
+    /// A store whose policy lists `authority` as a mint authority.
+    fn fresh_with_authority(
+        dir: &Path,
+        authority: &MintKey,
+    ) -> (IssuerKey, Policy, PersistentIssuer) {
+        let key = IssuerKey::generate();
+        let policy = Policy {
+            mint_authorities: vec![authority.public_key()],
+            ..Policy::cash_like()
+        };
+        let issuer = Issuer::new(key.clone(), LEDGER, policy.clone()).unwrap();
+        (key, policy, PersistentIssuer::create(dir, issuer).unwrap())
+    }
+
+    /// A request of each kind that a store answers again from memory once
+    /// it has applied it.
+    struct Requests {
+        mint: VerifiedMint,
+        transfer: VerifiedTransfer,
+        burn: VerifiedBurn,
+    }
+
+    impl Requests {
+        /// Mints the notes that the transfer and the burn spend.
+        fn new(p: &mut PersistentIssuer, authority: &MintKey) -> Self {
+            let request = MintRequest::sign(
+                authority,
+                p.public_key(),
+                1,
+                8,
+                HolderKey::generate().public_key(),
+            );
+            let mint = p.issuer().verifier().verify_mint(&request).unwrap();
+            let alice = HolderKey::generate();
+            let note = p.mint(8, alice.public_key()).unwrap();
+            let output = Output {
+                amount: 8,
+                holder: HolderKey::generate().public_key(),
+            };
+            let request = TransferRequest::single(note, &alice, output).unwrap();
+            let transfer = p.issuer().verifier().verify(&request).unwrap();
+            let note = p.mint(4, alice.public_key()).unwrap();
+            let request = BurnRequest::single(note, &alice).unwrap();
+            let burn = p.issuer().verifier().verify_burn(&request).unwrap();
+            Self {
+                mint,
+                transfer,
+                burn,
+            }
+        }
+
+        fn stage(&self, batch: &mut Batch<'_>) {
+            batch.authorized_mint(&self.mint).unwrap();
+            batch.transfer(&self.transfer).unwrap();
+            assert_eq!(batch.burn(&self.burn).unwrap(), 4);
+        }
+
+        /// Asserts that `p` refuses each of them, applied or not.
+        fn assert_refused(&self, p: &mut PersistentIssuer) {
+            assert!(matches!(
+                p.authorized_mint(&self.mint),
+                Err(CommitError::Io(_))
+            ));
+            assert!(matches!(
+                p.transfer(&self.transfer),
+                Err(CommitError::Io(_))
+            ));
+            assert!(matches!(p.burn(&self.burn), Err(CommitError::Io(_))));
+        }
+    }
+
     #[test]
     fn a_batch_that_does_not_reach_the_disk_stops_all_changes() {
+        // Dropped without committing, or refused by the log.
+        for refused in [false, true] {
+            let dir = tempfile::tempdir().unwrap();
+            let authority = MintKey::generate();
+            let (key, policy, mut p) = fresh_with_authority(dir.path(), &authority);
+            let requests = Requests::new(&mut p, &authority);
+            p.set_paused(true).unwrap();
+            let on_disk = p.issuer().snapshot();
+            let sequence = p.issuer().sequence();
+
+            let mut batch = p.batch().unwrap();
+            batch.set_paused(false);
+            requests.stage(&mut batch);
+            if refused {
+                // A sealed key too large for any record.
+                batch.keys.push(SealedKey {
+                    generation: 0,
+                    public: key.public_key(),
+                    sealed: vec![0; MAX_PAYLOAD],
+                });
+                assert!(batch.commit().is_err());
+            } else {
+                drop(batch);
+            }
+            assert_eq!(p.state(), StoreState::Ahead);
+            assert_eq!(
+                p.issuer().sequence(),
+                sequence + 4,
+                "the batch took effect in memory"
+            );
+            // The batch's own requests sent again are refused too, rather
+            // than answered from memory, as is resuming again.
+            requests.assert_refused(&mut p);
+            assert!(matches!(p.set_paused(false), Err(CommitError::Io(_))));
+            assert!(matches!(
+                p.mint(2, HolderKey::generate().public_key()),
+                Err(CommitError::Io(_))
+            ));
+            // Rotations are refused before a key is made and saved for them.
+            let keys = fs::read(dir.path().join(KEYS)).unwrap();
+            assert!(matches!(p.rotate(), Err(CommitError::Io(_))));
+            assert!(matches!(p.rotate_scheduled(1), Err(CommitError::Io(_))));
+            assert_eq!(fs::read(dir.path().join(KEYS)).unwrap(), keys);
+            assert!(p.batch().is_err());
+            assert!(
+                p.compact().is_err(),
+                "a snapshot would save unwritten changes"
+            );
+            assert_eq!(p.state(), StoreState::Ahead);
+            drop(p);
+            let mut p = PersistentIssuer::open(dir.path(), key, policy).unwrap();
+            assert_eq!(p.issuer().snapshot(), on_disk);
+
+            // An empty batch writes nothing and does no harm.
+            p.batch().unwrap().commit().unwrap();
+            drop(p.batch().unwrap());
+            p.set_paused(false).unwrap();
+            p.mint(2, HolderKey::generate().public_key()).unwrap();
+        }
+    }
+
+    #[test]
+    fn a_change_after_a_lost_batch_is_refused_before_it_is_planned() {
         let dir = tempfile::tempdir().unwrap();
-        let (key, mut p) = fresh(dir.path());
+        let (_, mut p) = fresh(dir.path());
         let mut batch = p.batch().unwrap();
-        mint_and_pay(&mut batch);
+        batch.set_paused(true);
         drop(batch);
-        assert_eq!(p.issuer().sequence(), 2, "the batch took effect in memory");
+        // Planned on memory, which is paused while the disk is not, a mint
+        // or a rotation would be refused as paused, and pausing again
+        // would write nothing.
         assert!(matches!(
             p.mint(2, HolderKey::generate().public_key()),
             Err(CommitError::Io(_))
         ));
-        assert!(p.batch().is_err());
-        assert!(
-            p.compact().is_err(),
-            "a snapshot would save unwritten changes"
-        );
+        assert!(matches!(p.rotate(), Err(CommitError::Io(_))));
+        assert!(matches!(p.set_paused(true), Err(CommitError::Io(_))));
+    }
+
+    #[test]
+    fn requests_resent_after_a_lost_batch_are_made_once_the_store_recovers() {
+        // Recovered in place, or reopened.
+        for reopen in [false, true] {
+            let dir = tempfile::tempdir().unwrap();
+            let authority = MintKey::generate();
+            let (key, policy, mut p) = fresh_with_authority(dir.path(), &authority);
+            let requests = Requests::new(&mut p, &authority);
+            let mut batch = p.batch().unwrap();
+            requests.stage(&mut batch);
+            drop(batch);
+            // Answered from memory, they would hand out notes and report a
+            // burn that are gone once the store is rebuilt from its disk,
+            // and the notes' serials would then be issued to others.
+            requests.assert_refused(&mut p);
+            if reopen {
+                drop(p);
+                p = PersistentIssuer::open(dir.path(), key.clone(), policy.clone()).unwrap();
+            } else {
+                p.recover().unwrap();
+            }
+
+            // Sent again now, each is made and reaches the disk; sent once
+            // more, it is answered as made.
+            let minted = p.authorized_mint(&requests.mint).unwrap();
+            let paid = p.transfer(&requests.transfer).unwrap();
+            assert_eq!(p.burn(&requests.burn).unwrap(), 4);
+            assert_eq!(p.transfer(&requests.transfer).unwrap(), paid);
+            drop(p);
+            let p = PersistentIssuer::open(dir.path(), key, policy).unwrap();
+            let issuer = p.issuer();
+            assert!(matches!(
+                issuer.status(&minted),
+                Ok(NoteStatus::Live { .. })
+            ));
+            assert_eq!(issuer.mint_sequence(&authority.public_key()), Some(1));
+            assert!(matches!(
+                issuer.status(&paid[0]),
+                Ok(NoteStatus::Live { .. })
+            ));
+            for spent in [requests.transfer.inputs(), requests.burn.inputs()] {
+                assert_eq!(issuer.status(&spent[0]), Ok(NoteStatus::Spent));
+            }
+            assert_eq!(issuer.supply().burned, 4);
+        }
+    }
+
+    #[test]
+    fn recovering_after_a_failed_append_rebuilds_what_reached_the_disk() {
+        let dir = tempfile::tempdir().unwrap();
+        let (key, mut p) = fresh(dir.path());
+        let holder = HolderKey::generate();
+        p.mint(8, holder.public_key()).unwrap();
+        let on_disk = p.issuer().snapshot();
+
+        let mut batch = p.batch().unwrap();
+        let lost = mint_and_pay(&mut batch);
+        batch.rotate().unwrap();
+        // A sealed key too large for any record, so the log refuses the
+        // batch's entry.
+        batch.keys.push(SealedKey {
+            generation: 0,
+            public: holder.public_key(),
+            sealed: vec![0; MAX_PAYLOAD],
+        });
+        assert!(batch.commit().is_err());
+        assert_eq!(p.state(), StoreState::Ahead);
+        assert!(matches!(
+            p.issuer().status(&lost),
+            Ok(NoteStatus::Live { .. })
+        ));
+        assert!(matches!(
+            p.mint(2, holder.public_key()),
+            Err(CommitError::Io(_))
+        ));
+        assert!(p.compact().is_err());
+
+        // Recovering fails while a file cannot be read, and leaves the
+        // store ahead, to be tried again.
+        let (snapshot, moved) = (dir.path().join(SNAPSHOT), dir.path().join("moved"));
+        fs::rename(&snapshot, &moved).unwrap();
+        assert!(p.recover().is_err());
+        assert_eq!(p.state(), StoreState::Ahead);
+        fs::rename(&moved, &snapshot).unwrap();
+
+        let files =
+            || [SNAPSHOT, log::LOG, KEYS].map(|name| fs::read(dir.path().join(name)).unwrap());
+        let written = files();
+        p.recover().unwrap();
+        assert_eq!(p.state(), StoreState::InStep);
+        assert_eq!(files(), written, "recovering writes nothing");
+        assert_eq!(p.issuer().snapshot(), on_disk);
+        assert_eq!(p.issuer().status(&lost), Ok(NoteStatus::Unissued));
+        // The rotation's key was saved but never logged: the ring drops it,
+        // and the next compaction erases it from the file.
+        assert_eq!(p.issuer().key_ring().len(), 4);
+        assert_eq!(KeyRing::from_bytes(&written[2]).unwrap().len(), 5);
+        // A reopen restores the same, from a copy of the files, which
+        // nothing writes to now.
+        let copy = tempfile::tempdir().unwrap();
+        copy_store(dir.path(), copy.path());
+        let reopened =
+            PersistentIssuer::open(copy.path(), key.clone(), Policy::cash_like()).unwrap();
+        assert_eq!(reopened.issuer().snapshot(), p.issuer().snapshot());
+
+        // Once in step, recovering does nothing, and changes are taken again.
+        p.recover().unwrap();
+        let mut batch = p.batch().unwrap();
+        let paid = mint_and_pay(&mut batch);
+        batch.commit().unwrap();
+        let expected = p.issuer().snapshot();
         drop(p);
         let p = PersistentIssuer::open(dir.path(), key, Policy::cash_like()).unwrap();
-        assert_eq!(p.issuer().sequence(), 0);
+        assert_eq!(p.issuer().snapshot(), expected);
+        assert!(matches!(
+            p.issuer().status(&paid),
+            Ok(NoteStatus::Live { .. })
+        ));
+    }
 
-        // An empty batch writes nothing and does no harm.
-        let mut p = p;
-        p.batch().unwrap().commit().unwrap();
-        drop(p.batch().unwrap());
-        p.mint(2, HolderKey::generate().public_key()).unwrap();
+    #[test]
+    fn a_log_that_cannot_be_cut_back_after_a_failed_write_stops_the_store() {
+        for batched in [false, true] {
+            let dir = tempfile::tempdir().unwrap();
+            let authority = MintKey::generate();
+            let (key, policy, mut p) = fresh_with_authority(dir.path(), &authority);
+            let holder = HolderKey::generate().public_key();
+            let requests = Requests::new(&mut p, &authority);
+            let on_disk = p.issuer().snapshot();
+
+            // Neither the write nor the cut-back after it gets through a
+            // read-only handle.
+            p.store.log.lose_write_access().unwrap();
+            if batched {
+                let mut batch = p.batch().unwrap();
+                requests.stage(&mut batch);
+                assert!(batch.commit().is_err());
+            } else {
+                assert!(matches!(p.mint(2, holder), Err(CommitError::Io(_))));
+            }
+            assert_eq!(p.state(), StoreState::Stopped);
+            assert!(p.recover().is_err());
+            assert_eq!(p.state(), StoreState::Stopped);
+            requests.assert_refused(&mut p);
+            assert!(matches!(p.mint(2, holder), Err(CommitError::Io(_))));
+            assert!(p.batch().is_err());
+            assert!(p.compact().is_err());
+            drop(p);
+
+            // Reopening reads the log again.
+            let mut p = PersistentIssuer::open(dir.path(), key, policy).unwrap();
+            assert_eq!(p.issuer().snapshot(), on_disk);
+            p.mint(2, holder).unwrap();
+        }
+    }
+
+    #[test]
+    fn a_store_whose_compaction_fails_opens_from_its_snapshot_and_log() {
+        // A snapshot, and the log purged after it, are written to a
+        // temporary file first, which cannot be made where a directory has
+        // its name, as it cannot on a full disk. Either way the log keeps
+        // every entry.
+        for (blocked, snapshot_written) in [(SNAPSHOT_TMP, false), (log::LOG_TMP, true)] {
+            let dir = tempfile::tempdir().unwrap();
+            let (key, mut p) = fresh(dir.path());
+            activity(&mut p);
+            let expected = p.issuer().snapshot();
+            drop(p);
+            let read = |name| fs::read(dir.path().join(name)).unwrap();
+            let (snapshot, logged) = (read(SNAPSHOT), read(log::LOG));
+            let blocked = dir.path().join(blocked);
+            fs::create_dir(&blocked).unwrap();
+
+            let mut p =
+                PersistentIssuer::open(dir.path(), key.clone(), Policy::cash_like()).unwrap();
+            assert_eq!(p.state(), StoreState::InStep);
+            assert!(p.take_compaction_error().is_some());
+            assert!(p.take_compaction_error().is_none());
+            assert_eq!(p.issuer().snapshot(), expected);
+            assert_eq!(read(log::LOG), logged);
+            assert_eq!(read(SNAPSHOT) != snapshot, snapshot_written);
+            let since_snapshot = if snapshot_written { 0 } else { 4 };
+            assert_eq!(p.log_events(), since_snapshot);
+            p.mint(2, HolderKey::generate().public_key()).unwrap();
+            assert!(p.compact().is_err());
+            assert_eq!(p.state(), StoreState::InStep);
+
+            // Once the files can be written, the next compaction goes
+            // through.
+            fs::remove_dir(&blocked).unwrap();
+            p.compact().unwrap();
+            assert_eq!(p.log_events(), 0);
+            assert!(p.store.log().is_empty());
+            let expected = p.issuer().snapshot();
+            drop(p);
+            let (store, issuer) = FileStore::open(dir.path(), key, Policy::cash_like()).unwrap();
+            assert_eq!(issuer.snapshot(), expected);
+            assert!(store.log().is_empty());
+        }
     }
 
     #[test]

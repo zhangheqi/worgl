@@ -39,8 +39,10 @@ batching transfers blurs this.
 
 The SDKs and `worgl` spread the transfers of one payment at random gaps, 2
 to 60 seconds apart by default, and spread refreshes across the rotation
-period. Closer spacing, `worgl refresh --now`, or a spacing of zero in your
-own code lets the mint link the notes by when they arrive. Outputs are
+period. A refresh made once the rotation's time has come, before the mint
+makes it, has no time left to spread over and sends everything at once.
+Closer spacing, `worgl refresh --now`, or a spacing of zero in your own code
+lets the mint link the notes by when they arrive. Outputs are
 shuffled too, so the payee's notes are not always first.
 
 ## What each party sees
@@ -53,8 +55,15 @@ shuffled too, so the payee's notes are not always first.
 | Anyone holding the log | What the mint saw, change by change, with every mint's authority and signature. No secret keys. | The same as the mint. |
 
 The mint stores no notes, only one bit each, plus a bounded list of recent
-transfers so that resent requests get the same answer. The log keeps every
-change since the last snapshot, so treat it as you would the mint's view.
+transfers so that resent requests get the same answer. The log keeps recent
+changes, so treat it as you would the mint's view. How much lineage it keeps
+depends on the setup (see
+[When the log is purged](../audit/#when-the-log-is-purged)). A server on its
+own purges it at every rotation and restart, so it keeps at most the changes
+since the last one. A cluster member keeps the entries since its last
+snapshot and up to 1,000 before it: on a quiet mint they can reach back many
+periods, and on a busy one each can hold many changes. A member sent the
+leader's snapshot keeps none from before that snapshot.
 
 Worgl's server does not log where requests come from, but like any HTTP
 server it sees each connection's address, and so does a proxy in front of

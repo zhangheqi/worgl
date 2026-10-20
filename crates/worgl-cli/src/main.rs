@@ -9,17 +9,18 @@ mod vault;
 use std::collections::BTreeMap;
 use std::collections::btree_map::Entry;
 use std::fs;
-use std::io::{self, Read};
+use std::io::{self, Read, Write};
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context, Result, bail};
 use clap::{Parser, Subcommand};
-use worgl::{MintKey, MintRequest, Note, PublicKey};
-use worgl_client::{Client, Purse, Submitted};
+use worgl::{MintKey, MintRequest, Note, PublicKey, TransferRequest};
+use worgl_client::{Client, Outcome, Purse, Submitted};
 use worgl_sdk::{
-    MintView, NoteState, Payment, PaymentRequest, REFRESH_MARGIN_SECS, ScheduledTransfer, Spacing,
+    Holder, MadePayment, MintView, NoteState, PayError, Payment, PaymentRequest,
+    REFRESH_MARGIN_SECS, ScheduledTransfer, Spacing,
 };
 use zeroize::Zeroizing;
 
@@ -132,14 +133,58 @@ enum Command {
         notes: PathBuf,
     },
     /// Resend the transfers not yet seen answered and take in their change.
+    /// Keeps the payee's notes from the answers to a payment, in case the
+    /// payee has not submitted it, and drops or cancels a transfer the mint
+    /// refused for good. Fails while a refused transfer is kept outgoing.
     Settle {
         /// Seconds between resends, as MIN..MAX.
         #[arg(long, default_value = "2..60", value_parser = parse_spacing)]
         spacing: Spacing,
     },
+    /// List the payments not yet done with, the transfers not yet seen
+    /// answered and the notes kept for payees. Names each payment and
+    /// transfer by an id, for `export`, `cancel` and `forget`.
+    Outgoing,
+    /// Write a payment again, as `pay` wrote it, for a payee who lost it,
+    /// unless a transfer of it was cancelled or dropped. With `--notes`,
+    /// write instead the payee's notes that `settle` or `refresh` kept from
+    /// the mint's answers, for the payee to keep with `accept`, and stop
+    /// keeping them.
+    Export {
+        /// The payment, by its id or one of its transfers' as `outgoing`
+        /// lists them; the first digits will do.
+        payment: String,
+        /// Write the notes kept for the payee.
+        #[arg(long)]
+        notes: bool,
+        /// Where to write it.
+        #[arg(long, short, default_value = "-")]
+        out: PathBuf,
+    },
+    /// Take back the note of an outgoing transfer the mint never applied,
+    /// such as a payment the payee will never submit. Its change is still
+    /// kept if handed back. Only for a transfer nobody will submit: if the
+    /// mint applies it, or already had, the payee's notes and the note taken
+    /// back claim the same value, and the mint refuses whichever is spent
+    /// second.
+    Cancel {
+        /// The transfer, by its id as `outgoing` lists it; the first digits
+        /// will do.
+        transfer: String,
+    },
+    /// Drop an outgoing transfer whose note is gone. Its change is still
+    /// kept if handed back. `settle` drops a transfer the mint refuses as
+    /// spent or expired by itself; this is for one it keeps, such as one
+    /// refused as unissued by a mint that lost its state.
+    Forget {
+        /// The transfer, by its id as `outgoing` lists it; the first digits
+        /// will do.
+        transfer: String,
+    },
     /// Pay the notes that die at the next rotation back to the purse, each at
     /// a random moment before it, and resend the transfers not yet seen
-    /// answered that must land before it. Waits until the last is done.
+    /// answered that must land before it, as `settle` does. Waits until the
+    /// last is done.
     Refresh {
         /// The mint's issuer key.
         mint: PublicKey,
@@ -243,19 +288,46 @@ async fn run(cli: Cli) -> Result<()> {
             out,
         } => {
             let request: PaymentRequest = read_json(&request)?;
-            // For the deadline; read first, so nothing fails once the payment is out.
-            let view = purse.client().view(&request.mint).await?;
-            let payment = purse.pay(&request, spacing).await?;
-            write(&out, &serde_json::to_string_pretty(&payment)?)?;
+            // For the deadline, by the mint's clock; read first, so nothing
+            // fails once the payment is out.
+            let (view, now) = purse.client().view_and_time(&request.mint).await?;
+            let payment = match purse.pay(&request, spacing).await {
+                Err(error @ worgl_client::Error::Pay(PayError::Paid(key))) => {
+                    let holder = purse.holder();
+                    let kept = holder
+                        .payments()
+                        .find(|made| made.request.outputs.iter().any(|o| o.holder == key));
+                    return Err(match kept {
+                        Some(made) => {
+                            let id = payment_id(&made.request);
+                            anyhow::Error::from(error).context(format!(
+                                "payment {id} pays this request already; `worgl export {id} \
+                                 -o FILE` writes it again"
+                            ))
+                        }
+                        None => error.into(),
+                    });
+                }
+                result => result?,
+            };
+            let id = payment_id(&request);
+            serde_json::to_string_pretty(&payment)
+                .map_err(anyhow::Error::from)
+                .and_then(|json| write(&out, &json))
+                .with_context(|| {
+                    format!(
+                        "the payment is recorded in the purse; write it again with \
+                         `worgl export {id} -o FILE`"
+                    )
+                })?;
             eprintln!(
-                "Paid {} in {} transfer(s). Send the payment to the payee, then keep the \
-                 change they send back with `worgl accept`, or run `worgl settle` once \
-                 they have submitted it.",
+                "Paid {} in {} transfer(s), payment {id}. Send the payment to the payee, then \
+                 keep the change they send back with `worgl accept`, or run `worgl settle` \
+                 once they have submitted it.",
                 request.amount(),
                 payment.transfers.len()
             );
-            let now = unix_now();
-            if let Some(by) = settle_by(&view, &payment, now) {
+            if let Some(by) = settle_by(&view, &payment) {
                 let when = match by.saturating_sub(now) {
                     0 => "now".to_owned(),
                     left => format!("within {}", duration(left)),
@@ -279,15 +351,34 @@ async fn run(cli: Cli) -> Result<()> {
             if !submitted.theirs.is_empty() {
                 eprintln!("Send the notes to the payer, who keeps the change with `worgl accept`.");
             }
-            finish(&submitted, "Received")
+            finish(&submitted, "Received", Fail::OnAny)
         }
         Command::Submit { payment, out } => {
             let payment: Payment = read_json(&payment)?;
             announce(&payment.transfers);
             let submitted = purse.submit(&payment.transfers).await?;
-            write(&out, &serde_json::to_string_pretty(&submitted.theirs)?)?;
+            let written = serde_json::to_string_pretty(&submitted.theirs)
+                .map_err(anyhow::Error::from)
+                .and_then(|json| write(&out, &json));
+            if let Err(error) = written {
+                // The submit kept them for a payment the purse made: they stay.
+                let holder = purse.holder();
+                let kept = holder
+                    .payments()
+                    .find(|made| made.owed.iter().any(|note| submitted.theirs.contains(note)));
+                return Err(match kept {
+                    Some(made) => error.context(format!(
+                        "the payee's notes are kept in the purse; write them with `worgl export \
+                         {} --notes -o FILE`",
+                        payment_id(&made.request)
+                    )),
+                    None => error,
+                });
+            }
+            // Handed over: the purse need not keep them for the payee.
+            purse.forget_owed(&submitted.theirs)?;
             eprintln!("Send the notes to the payee, who keeps them with `worgl accept`.");
-            finish(&submitted, "Kept in change")
+            finish(&submitted, "Kept in change", Fail::OnAny)
         }
         Command::Accept { notes } => {
             let notes: Vec<Note> = read_json(&notes)?;
@@ -321,7 +412,72 @@ async fn run(cli: Cli) -> Result<()> {
             }
             announce(&resent);
             let submitted = purse.submit(&resent).await?;
-            finish(&submitted, "Took in")
+            kept_for_payees(&purse.holder(), &submitted);
+            finish(&submitted, "Took in", Fail::OnKept)
+        }
+        Command::Outgoing => {
+            outgoing(&purse.holder());
+            Ok(())
+        }
+        Command::Export {
+            payment,
+            notes,
+            out,
+        } => {
+            let holder = purse.holder();
+            let made = find_payment(&holder, &payment)?;
+            let id = payment_id(&made.request);
+            if !notes {
+                if made.request.check(&made.payment).is_err() {
+                    bail!(
+                        "payment {id} no longer pays its whole request, since a transfer of it \
+                         was cancelled or dropped, so the payee would refuse it; `worgl \
+                         outgoing` lists what it still has outgoing"
+                    );
+                }
+                write(&out, &serde_json::to_string_pretty(&made.payment)?)?;
+                eprintln!(
+                    "Wrote payment {id} again. Send it to the payee, who takes it with \
+                     `worgl receive`."
+                );
+                return Ok(());
+            }
+            if made.owed.is_empty() {
+                bail!("no notes are kept for the payee of payment {id}");
+            }
+            write(&out, &serde_json::to_string_pretty(&made.owed)?)?;
+            let value = purse.forget_owed(&made.owed)?;
+            eprintln!(
+                "Wrote {} note(s) worth {value} for the payee of payment {id}, who keeps them \
+                 with `worgl accept`. The purse no longer keeps them.",
+                made.owed.len()
+            );
+            Ok(())
+        }
+        Command::Cancel { transfer } => {
+            let request = find_transfer(&purse.holder(), &transfer)?;
+            if !purse.cancel(&request)? {
+                bail!("transfer {} is no longer outgoing", transfer_id(&request));
+            }
+            eprintln!(
+                "Cancelled transfer {}: its note of {} is back in the purse.",
+                transfer_id(&request),
+                spent(&request)
+            );
+            Ok(())
+        }
+        Command::Forget { transfer } => {
+            let request = find_transfer(&purse.holder(), &transfer)?;
+            if !purse.forget(&request)? {
+                bail!("transfer {} is no longer outgoing", transfer_id(&request));
+            }
+            eprintln!(
+                "Dropped transfer {} and its note of {}. Change handed back is still kept \
+                 with `worgl accept`.",
+                transfer_id(&request),
+                spent(&request)
+            );
+            Ok(())
         }
         Command::Refresh { mint, now } => {
             let mut plan = purse.plan_refresh(&mint).await?;
@@ -336,13 +492,8 @@ async fn run(cli: Cli) -> Result<()> {
             }
             announce(&plan);
             let submitted = purse.submit(&plan).await?;
-            if !submitted.theirs.is_empty() {
-                eprintln!(
-                    "Resent a payment the payee may not have submitted yet: if so, it gets its \
-                     notes with `worgl receive` while the mint keeps the answer."
-                );
-            }
-            finish(&submitted, "Refreshed")
+            kept_for_payees(&purse.holder(), &submitted);
+            finish(&submitted, "Refreshed", Fail::OnKept)
         }
         Command::Prune { mint } => {
             let lost = purse.prune(&mint).await?;
@@ -400,7 +551,8 @@ async fn run(cli: Cli) -> Result<()> {
 }
 
 async fn info(client: &Client, mint: &PublicKey) -> Result<()> {
-    let info = client.info(mint).await?;
+    // For the time to the next rotation, by the mint's clock.
+    let (info, now) = client.info_and_time(mint).await?;
     println!("mint        {}", info.issuer);
     println!(
         "state       {}",
@@ -410,7 +562,7 @@ async fn info(client: &Client, mint: &PublicKey) -> Result<()> {
         Some(schedule) => println!(
             "rotation    every {}, next in {}",
             duration(schedule.period_secs),
-            duration(schedule.next_at.saturating_sub(unix_now()))
+            duration(schedule.next_at.saturating_sub(now))
         ),
         None => println!("rotation    on request only"),
     }
@@ -434,7 +586,8 @@ async fn info(client: &Client, mint: &PublicKey) -> Result<()> {
 }
 
 async fn balance(purse: &Purse<Vault>, mint: &PublicKey) -> Result<()> {
-    let view = purse.client().view(mint).await?;
+    // For the time to the next rotation, by the mint's clock.
+    let (view, now) = purse.client().view_and_time(mint).await?;
     let balance = purse.holder().balance(&view);
     println!("spendable  {}", balance.spendable);
     println!(
@@ -453,13 +606,19 @@ async fn balance(purse: &Purse<Vault>, mint: &PublicKey) -> Result<()> {
         "expected   {}  (asked for, not yet received)",
         balance.expected
     );
+    if balance.unconfirmed > 0 {
+        println!(
+            "unconfirmed {}  (change of dropped or cancelled transfers, kept if handed back)",
+            balance.unconfirmed
+        );
+    }
     if balance.unknown > 0 {
         println!(
             "unknown    {}  (newer than the mint's info)",
             balance.unknown
         );
     }
-    if let Some(left) = view.until_rotation(unix_now()) {
+    if let Some(left) = view.until_rotation(now) {
         println!("next rotation in {}", duration(left));
     }
     Ok(())
@@ -498,6 +657,183 @@ async fn notes(purse: &Purse<Vault>) -> Result<()> {
     Ok(())
 }
 
+/// Lists the payments kept, with their transfers still outgoing, and the
+/// other outgoing transfers, by mint.
+fn outgoing(holder: &Holder) {
+    let pending: Vec<&TransferRequest> = holder.outgoing().collect();
+    let mut by_mint: BTreeMap<PublicKey, (Vec<&MadePayment>, Vec<&TransferRequest>)> =
+        BTreeMap::new();
+    for made in holder.payments() {
+        by_mint.entry(made.payment.mint).or_default().0.push(made);
+    }
+    for &request in &pending {
+        let paid = holder
+            .payments()
+            .any(|made| made.payment.transfers.iter().any(|t| t.request == *request));
+        if !paid && let Some(spend) = request.inputs.first() {
+            by_mint
+                .entry(*spend.note.issuer())
+                .or_default()
+                .1
+                .push(request);
+        }
+    }
+    if by_mint.is_empty() {
+        eprintln!("Nothing is outgoing.");
+    }
+    for (mint, (payments, others)) in by_mint {
+        println!("mint {mint}");
+        for made in payments {
+            let transfers = &made.payment.transfers;
+            let left: Vec<&TransferRequest> = transfers
+                .iter()
+                .map(|t| &t.request)
+                .filter(|request| pending.contains(request))
+                .collect();
+            // A transfer cancelled or dropped has left the payment.
+            let asked = made.request.amount();
+            let paying: u128 = made
+                .request
+                .outputs
+                .iter()
+                .filter(|wanted| transfers.iter().any(|t| t.request.outputs.contains(wanted)))
+                .map(|wanted| u128::from(wanted.amount))
+                .sum();
+            let pays = if paying < asked {
+                format!("{paying} of {asked}, the rest cancelled or dropped")
+            } else {
+                asked.to_string()
+            };
+            let mut line = format!(
+                "  payment {}  pays {pays}, {} of {} transfer(s) outgoing",
+                payment_id(&made.request),
+                left.len(),
+                transfers.len()
+            );
+            if !made.owed.is_empty() {
+                let value: u128 = made.owed.iter().map(|n| u128::from(n.amount())).sum();
+                line += &format!(
+                    ", {} note(s) worth {value} kept for the payee",
+                    made.owed.len()
+                );
+            }
+            println!("{line}");
+            for request in left {
+                println!(
+                    "    transfer {}  spends {}",
+                    transfer_id(request),
+                    spent(request)
+                );
+            }
+        }
+        for request in others {
+            println!(
+                "  transfer {}  spends {}",
+                transfer_id(request),
+                spent(request)
+            );
+        }
+    }
+}
+
+/// Says where the payees' notes from the answers went: kept for payments
+/// the purse made, or nowhere for one it has no record of.
+fn kept_for_payees(holder: &Holder, submitted: &Submitted) {
+    let kept = submitted
+        .theirs
+        .iter()
+        .filter(|note| holder.payments().any(|made| made.owed.contains(note)))
+        .count();
+    if kept > 0 {
+        eprintln!(
+            "Kept {kept} note(s) for payees from the mint's answers, in case a payee has not \
+             submitted its payment: `worgl outgoing` lists them, and `worgl export PAYMENT \
+             --notes` writes them for the payee."
+        );
+    }
+    if kept < submitted.theirs.len() {
+        eprintln!(
+            "Resent a payment the purse keeps no record of, such as one made by an earlier \
+             release: if the payee has not submitted it yet, it gets its notes with `worgl \
+             receive` while the mint keeps the answer."
+        );
+    }
+}
+
+/// A transfer's id as `outgoing` shows it: the first 12 hex digits of the
+/// id its mint gives it.
+fn transfer_id(request: &TransferRequest) -> String {
+    let mut id = match request.inputs.first() {
+        Some(spend) => request.id(spend.note.issuer()).to_string(),
+        None => String::new(),
+    };
+    id.truncate(12);
+    id
+}
+
+/// A payment's id as `outgoing` shows it: the first 12 hex digits of the
+/// first key its request asks to be paid to. It stays the same whatever
+/// becomes of the payment's transfers, and no two payments kept share that
+/// key, since `pay` refuses a key it has paid already.
+fn payment_id(request: &PaymentRequest) -> String {
+    let mut id = request
+        .outputs
+        .first()
+        .map_or_else(String::new, |o| o.holder.to_string());
+    id.truncate(12);
+    id
+}
+
+/// The value of the notes a transfer spends.
+fn spent(request: &TransferRequest) -> u128 {
+    request
+        .inputs
+        .iter()
+        .map(|spend| u128::from(spend.note.amount()))
+        .sum()
+}
+
+/// Whether `id` is the first digits of `full`.
+fn starts(full: &str, id: &str) -> bool {
+    let id = id.trim().to_ascii_lowercase();
+    !id.is_empty() && full.starts_with(&id)
+}
+
+/// Whether `id` names a transfer: its full id starts with it.
+fn names(request: &TransferRequest, id: &str) -> bool {
+    request
+        .inputs
+        .first()
+        .is_some_and(|spend| starts(&request.id(spend.note.issuer()).to_string(), id))
+}
+
+/// The outgoing transfer `id` names.
+fn find_transfer(holder: &Holder, id: &str) -> Result<TransferRequest> {
+    let found: Vec<&TransferRequest> = holder.outgoing().filter(|r| names(r, id)).collect();
+    match found.as_slice() {
+        [request] => Ok((*request).clone()),
+        [] => bail!("no outgoing transfer has the id {id}; `worgl outgoing` lists them"),
+        _ => bail!("several outgoing transfers have ids starting {id}; give more digits"),
+    }
+}
+
+/// The payment kept that `id` names, by its id or one of its transfers'.
+fn find_payment(holder: &Holder, id: &str) -> Result<MadePayment> {
+    let found: Vec<&MadePayment> = holder
+        .payments()
+        .filter(|made| {
+            let key = made.request.outputs.first().map(|o| o.holder.to_string());
+            key.is_some_and(|key| starts(&key, id))
+                || made.payment.transfers.iter().any(|t| names(&t.request, id))
+        })
+        .collect();
+    match found.as_slice() {
+        [made] => Ok((*made).clone()),
+        [] => bail!("no payment kept has the id {id}; `worgl outgoing` lists them"),
+        _ => bail!("several payments have ids starting {id}; give more digits"),
+    }
+}
+
 /// Says how long submitting will take.
 fn announce(transfers: &[ScheduledTransfer]) {
     let last = transfers.iter().map(|t| t.after_secs).max().unwrap_or(0);
@@ -515,12 +851,12 @@ fn announce(transfers: &[ScheduledTransfer]) {
 /// When to have settled a payment by: the refresh margin before the
 /// rotation that drops the first of the notes it spends, if the mint
 /// rotates on a schedule.
-fn settle_by(view: &MintView, payment: &Payment, now: u64) -> Option<u64> {
+fn settle_by(view: &MintView, payment: &Payment) -> Option<u64> {
     payment
         .transfers
         .iter()
         .flat_map(|t| &t.request.inputs)
-        .filter_map(|spend| view.expires_at(&spend.note, now))
+        .filter_map(|spend| view.expires_at(&spend.note))
         .min()
         .map(|at| at.saturating_sub(REFRESH_MARGIN_SECS))
 }
@@ -544,20 +880,46 @@ async fn split_expired(client: &Client, notes: Vec<Note>) -> Result<(Vec<Note>, 
     Ok((live, expired))
 }
 
-/// Reports what submitting came to, failing if anything was refused.
-fn finish(submitted: &Submitted, what: &str) -> Result<()> {
+/// Which refused transfers fail a command.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Fail {
+    /// Any, for `receive` and `submit`: the payment did not go through.
+    OnAny,
+    /// Those kept outgoing for the next `settle`, for `settle` and
+    /// `refresh`: one dropped or cancelled is done with.
+    OnKept,
+}
+
+/// Reports what submitting came to, failing if a refused transfer is left
+/// that `fail` counts.
+fn finish(submitted: &Submitted, what: &str, fail: Fail) -> Result<()> {
     eprintln!(
         "{what} {} in {} transfer(s).",
         submitted.value, submitted.answered
     );
     for refused in &submitted.refused {
-        eprintln!("refused: {}", refused.error);
+        eprintln!(
+            "transfer {} refused: {}",
+            transfer_id(&refused.request),
+            refused.error
+        );
         match refused.at_stake {
             Some(0) => eprintln!("possibly applied: the mint no longer has its answer"),
             Some(value) => eprintln!(
                 "possibly applied: the mint no longer has its answer, {value} may be lost"
             ),
             None => {}
+        }
+        match refused.outcome {
+            Outcome::Kept => {}
+            Outcome::Dropped => eprintln!(
+                "dropped: the note it spends is gone either way; its change is still kept if \
+                 handed back"
+            ),
+            Outcome::Cancelled => eprintln!(
+                "cancelled: the mint will not apply it, so the note it spends is back in the \
+                 purse"
+            ),
         }
     }
     if submitted
@@ -570,19 +932,34 @@ fn finish(submitted: &Submitted, what: &str) -> Result<()> {
              `worgl accept FILE`."
         );
     }
-    let possibly_applied = submitted
+    let left: Vec<_> = submitted
         .refused
         .iter()
-        .filter(|r| r.at_stake.is_some())
-        .count();
-    let others = submitted.refused.len() - possibly_applied;
-    if others > 0 {
-        bail!("{others} transfer(s) did not go through; try again later");
+        .filter(|r| fail == Fail::OnAny || r.outcome == Outcome::Kept)
+        .collect();
+    if left.is_empty() {
+        return Ok(());
     }
-    if possibly_applied > 0 {
-        bail!("{possibly_applied} transfer(s) possibly applied, but not answered");
+    if left.iter().all(|r| r.error.is_transient()) {
+        bail!(
+            "{} transfer(s) did not go through; try again later",
+            left.len()
+        );
     }
-    Ok(())
+    if fail == Fail::OnKept {
+        bail!(
+            "{} transfer(s) refused and kept outgoing: `worgl settle` sends them again, and \
+             `worgl cancel` or `worgl forget` ends one that cannot go through",
+            left.len()
+        );
+    }
+    if left.iter().all(|r| r.at_stake.is_some()) {
+        bail!(
+            "{} transfer(s) possibly applied, but not answered",
+            left.len()
+        );
+    }
+    bail!("{} transfer(s) did not go through", left.len())
 }
 
 fn passphrase(purse: &Path) -> Result<Zeroizing<String>> {
@@ -659,11 +1036,48 @@ fn read_json<T: serde::de::DeserializeOwned>(path: &Path) -> Result<T> {
 
 fn write(path: &Path, text: &str) -> Result<()> {
     if path == Path::new("-") {
-        println!("{text}");
-        Ok(())
+        let mut stdout = io::stdout().lock();
+        writeln!(stdout, "{text}")
+            .and_then(|()| stdout.flush())
+            .context("writing to standard output")
     } else {
-        fs::write(path, format!("{text}\n")).with_context(|| format!("writing {}", path.display()))
+        let text = format!("{text}\n");
+        match fs::symlink_metadata(path) {
+            // A link, a device or a pipe, such as /dev/stdout, a link to
+            // /proc/self/fd/1: written in place, through the link.
+            Ok(found) if !found.is_file() => fs::write(path, text),
+            found => replace(path, &text, found.ok()),
+        }
+        .with_context(|| format!("writing {}", path.display()))
     }
+}
+
+/// Writes `text` to a file beside `path`, with the permissions of the file
+/// `existing` describes if there is one, and renames it over `path` once it
+/// is on disk, as the purse is saved: a failure leaves no half-written file.
+fn replace(path: &Path, text: &str, existing: Option<fs::Metadata>) -> io::Result<()> {
+    let name = path
+        .file_name()
+        .map_or_else(|| "out".into(), |name| name.to_string_lossy());
+    let temporary = path.with_file_name(format!(".{name}.new"));
+    let mut file = fs::File::create(&temporary)?;
+    if let Some(existing) = existing {
+        file.set_permissions(existing.permissions())?;
+    }
+    file.write_all(text.as_bytes())?;
+    file.sync_all()?;
+    drop(file);
+    fs::rename(&temporary, path)?;
+    // The rename is durable only once the directory is flushed too.
+    #[cfg(unix)]
+    {
+        let dir = match path.parent() {
+            Some(dir) if !dir.as_os_str().is_empty() => dir,
+            _ => Path::new("."),
+        };
+        fs::File::open(dir)?.sync_all()?;
+    }
+    Ok(())
 }
 
 fn duration(secs: u64) -> String {
@@ -673,12 +1087,6 @@ fn duration(secs: u64) -> String {
         3600..86_400 => format!("{} h {} min", secs / 3600, secs % 3600 / 60),
         _ => format!("{} d {} h", secs / 86_400, secs % 86_400 / 3600),
     }
-}
-
-fn unix_now() -> u64 {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map_or(0, |elapsed| elapsed.as_secs())
 }
 
 fn micros_now() -> u64 {

@@ -2860,6 +2860,7 @@ name = "worgl-client"
 version = "0.1.0"
 dependencies = [
  "axum",
+ "httpdate",
  "reqwest",
  "serde",
  "serde_json",
@@ -2931,6 +2932,7 @@ dependencies = [
  "http-body-util",
  "openraft",
  "reqwest",
+ "rustix",
  "serde",
  "serde_json",
  "subtle",
@@ -2941,6 +2943,7 @@ dependencies = [
  "tracing-subscriber",
  "worgl",
  "worgl-raft",
+ "zeroize",
 ]
 
 [[package]]

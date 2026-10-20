@@ -19,6 +19,7 @@ make every call below for you.
 | Method | Path | Token | Body | Answer |
 |---|---|---|---|---|
 | GET | `/healthz` | | | `ok` |
+| GET | `/readyz` | | | `ok`, or `503` naming the mints that do not serve |
 | POST | `/v1/verify` | | `{"note"}` | serial, amount, state, position, hops left |
 | POST | `/v1/transfer` | | `{"inputs": [{"note", "signature"}], "outputs": [{"amount", "holder"}]}` | `{"notes"}` |
 | POST | `/v1/burn` | | `{"inputs": [{"note", "signature"}]}` | `{"value"}` burned |
@@ -45,6 +46,25 @@ Errors answer with a status code and a body like
 code is stable; the message is for people. A `503 busy` answer also says in
 its `Retry-After` header how many seconds to wait before sending the request
 again. See [Error codes](../error-codes/).
+
+## Health and readiness
+
+`GET /healthz` answers `ok` for as long as the server runs, whatever its
+mints are doing. `GET /readyz` answers `ok` only while every mint serves.
+Otherwise it answers `503` with the `storage` code and every mint that does
+not, so one such mint makes the whole server answer `503`:
+
+```json
+{"error":"storage","message":"not every mint is serving","mints":[{"mint":"7e8e…5caf","state":"failing"}]}
+```
+
+| `state` | Meaning |
+|---|---|
+| `failing` | A change did not reach the mint's disk, as on a full disk, and none has since. The mint answers reads from what reached its disk, and changes are answered `500 storage` while the disk takes no writes. It serves again once a change reaches its disk, so it stays `failing` after the disk has room until a change comes. |
+| `ahead` | A change did not reach the mint's disk, and the mint could not reread its state from the disk since. It refuses changes, answers `verify` and `info` with `503 storage`, and tries again at its next request. |
+| `stopped` | A change to the mint's log failed and could not be undone, as when the log could not be cut back after a failed write, so only a restart serves the mint again. On a cluster member, also once the member's copy of the mint has stopped. |
+
+See [Running a server](../running-a-server/#when-the-disk-fills-up).
 
 ## Verify
 
@@ -115,8 +135,16 @@ value and destroys nothing more.
 | `layers` | Every layer, first to last: bits handed out (`issued`), notes still `live`, `capacity` and the live notes' `value`. |
 | `supply` | Value `minted`, `destroyed` by rotations and `burned`; `outstanding = minted − destroyed − burned`. |
 | `policy` | The rules in force. See [Policy fields](../policy/). |
-| `rotation` | `{"period_secs", "next_at"}`, or `null` when the mint rotates only on request. `next_at` is a Unix time in seconds. |
+| `rotation` | `{"period_secs", "next_at"}`, or `null` when the mint rotates only on request. `next_at` is the Unix time, in seconds, of the next scheduled rotation, read with `layers`: an answer that shows a rotation's layers names the rotation after it. |
 | `paused` | Whether the mint is paused. |
+
+The answer's `Date` header is the server's time when it answered. The SDKs'
+purses and `worgl` count the time left before `next_at` from it, not by the
+client's clock, and a cluster member that passes the request on to the
+leader relays the leader's. A browser page reads it on an answer from
+another origin only if the answer carries
+`Access-Control-Expose-Headers: Date`, which the server does not send: the
+proxy that adds CORS headers in front of it must add that one too.
 
 ## Keys
 
@@ -144,6 +172,9 @@ post; see [Mint authorities and keys](../keys/).
 {"dropped":0,"created":4,"destroyed_notes":0,"destroyed_value":0,"key":{"generation":4,"key":"5de1…c4ce","signature":"9699…8e08"}}
 ```
 
+Unlike a transfer, a rotation sent again is made again; see
+[Sending a request again](../error-codes/#sending-a-request-again).
+
 `pause` and `resume` answer `{"paused": true}` and `{"paused": false}`. See
 [Pausing a mint](../pausing/).
 
@@ -164,4 +195,6 @@ rotates only on request. `GET /v1/admin/mints` lists every mint's issuer key.
 
 Any member takes any request and passes it on to the member that leads the
 mint. While a mint has no leader its requests are answered `503 no_leader`;
-see [Running a cluster](../running-a-cluster/).
+see [Running a cluster](../running-a-cluster/). Clients need one address
+that covers every member, such as a proxy in front of them; see
+[The address clients use](../running-a-cluster/#the-address-clients-use).

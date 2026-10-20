@@ -14,6 +14,19 @@
 //! flush each. Reads never see a change before it is on disk. Mints share
 //! nothing but the process, and an idle mint holds no thread.
 //!
+//! If a flush fails, as on a full disk, every change in the batch is
+//! refused, and the mint rereads its state from the disk, which needs
+//! nothing written, so that it answers from what reached the disk, and
+//! takes changes again once the disk takes writes. A mint that cannot
+//! reread its state is ahead of its disk: it refuses changes and answers
+//! reads of its ledger (`verify` and `info`) with `503 storage`, and tries
+//! again at its next request. If its log could not even be cut back after
+//! the failed write, the mint is stopped: it refuses changes and those
+//! reads until the server is restarted. `/healthz` answers `ok` while the
+//! server runs; `/readyz` answers `ok` only while every mint serves: not
+//! while a mint is failing, as it is from a failed flush until a batch
+//! reaches its disk, nor while it is ahead or stopped.
+//!
 //! # API
 //!
 //! All bodies are JSON. Keys and signatures are hex, notes are unpadded
@@ -22,6 +35,7 @@
 //! | method | path                       | token    | body                  | answer                 |
 //! |--------|----------------------------|----------|-----------------------|------------------------|
 //! | GET    | `/healthz`                 |          |                       | `ok`                   |
+//! | GET    | `/readyz`                  |          |                       | `ok`, or 503           |
 //! | POST   | `/v1/verify`               |          | `{"note": …}`         | [`Verified`]           |
 //! | POST   | `/v1/transfer`             |          | [`TransferRequest`]   | `{"notes": [...]}`     |
 //! | POST   | `/v1/burn`                 |          | [`BurnRequest`]       | `{"value": …}`         |
@@ -44,6 +58,11 @@
 //! stable strings listed on [`ApiError::code`]; `503 busy` also says in
 //! `Retry-After` how many seconds to wait before sending the request again.
 //!
+//! `/readyz` answers `503` with code `storage` while any mint is failing,
+//! ahead or stopped, as a cluster member's copy of a mint is once it has
+//! stopped, and `mints`, a list of `{"mint", "state"}` naming each such mint
+//! and `failing`, `ahead` or `stopped`.
+//!
 //! # Clusters
 //!
 //! A server can also be one member of a cluster that replicates every mint
@@ -55,14 +74,22 @@
 //! fails and none reflects less than an earlier one. While a mint has no
 //! leader, as for a few seconds after its leader fails or is cut off from
 //! the other members, its requests are answered `503 no_leader`, and
-//! sending them again is safe. Members also serve [`raft_router`] on a port
-//! of their own, for each other only. Creating a mint goes through the
-//! cluster's registry, from which every member writes and serves the new
-//! mint; a creation answered `503 timeout` may have made a mint, so list the
-//! mints before creating another. A mint's policy and rotation period are
-//! not replicated: each member reads its own from the mint's directory, and
-//! the leader carries out requests and scheduled rotations under its own, so
-//! they must be the same on every member.
+//! sending them again is safe. A rotation answered `503 timeout` may still
+//! be made after a read that does not show it, so before rotating again,
+//! read the mint's info once it has carried out a change sent after that
+//! answer. Members also serve [`raft_router`] on a port of their own, for
+//! each other only. They talk to each other in plain HTTP, Raft's RPCs with
+//! one shared token and each member's key-encryption key seal, and the
+//! requests they pass on with their clients' tokens, so every member's
+//! addresses must be on a network only the members and a proxy in front of
+//! them can reach (see [`cluster`]).
+//! Creating a mint goes through the cluster's registry, from which every
+//! member writes and serves the new mint; a creation answered `503 timeout`
+//! may have made a mint, so list the mints before creating another. A
+//! mint's policy and rotation period are not replicated: each member reads
+//! its own from the mint's directory, and the leader carries out requests
+//! and scheduled rotations under its own, so they must be the same on every
+//! member.
 
 pub mod cluster;
 pub mod files;
@@ -95,7 +122,7 @@ use worgl_raft::{NodeId, Replica, ReplicaError};
 use cluster::{Cluster, RAFT_BODY_LIMIT};
 pub use cluster::{ClusterConfig, Member, is_member, join_cluster};
 pub use mints::{CreateError, CreatedMint, MintSpec, create_mint, init_state};
-use mints::{Hosted, Mint};
+use mints::{Hosted, Mint, Readiness};
 
 /// Largest request body accepted, in bytes.
 pub const BODY_LIMIT: usize = 64 * 1024;
@@ -130,15 +157,17 @@ pub struct AppState {
 pub struct RotationSchedule {
     /// Seconds between rotations.
     pub period_secs: u64,
-    /// Unix time, in seconds, of the next scheduled rotation. A paused mint
-    /// skips it.
+    /// Unix time, in seconds, of the next scheduled rotation, read with the
+    /// layers of the info that reports it: the one after the rotation that
+    /// made them. A paused mint skips it.
     pub next_at: u64,
 }
 
 impl AppState {
     /// Opens the server state in `dir`, made by [`init_state`], and every
     /// mint in it, starting their committers and rotation clocks. Fails if
-    /// any mint does not open, rather than serve without it.
+    /// `kek.key` is missing or any mint does not open, rather than serve
+    /// without it.
     /// `compact_every` is how many logged events trigger a fresh snapshot
     /// of a mint; rotations always do. Must be called within a Tokio runtime.
     pub fn open(dir: &Path, compact_every: u64) -> anyhow::Result<Self> {
@@ -170,7 +199,7 @@ impl AppState {
     /// runtime.
     pub async fn open_member(dir: &Path, compact_every: u64) -> anyhow::Result<Self> {
         let (operator_token, kek) = Self::read_state(dir)?;
-        let cluster = Cluster::open(dir)?;
+        let cluster = Cluster::open(dir, kek.clone())?;
         let registry = cluster::open_registry(dir, &cluster).await?;
         let records = registry.records();
         // Mints created while this member was away.
@@ -494,6 +523,7 @@ pub(crate) fn check_bearer(headers: &HeaderMap, token: &str, which: &str) -> Res
 pub fn router(state: AppState) -> Router {
     let mut router = Router::new()
         .route("/healthz", get(|| async { "ok" }))
+        .route("/readyz", get(readyz))
         .route("/v1/verify", post(verify))
         .route("/v1/transfer", post(transfer))
         .route("/v1/burn", post(burn))
@@ -518,6 +548,17 @@ pub fn router(state: AppState) -> Router {
 /// `Authorization: Bearer <cluster token>`. Serve them on a port of their
 /// own that only the members can reach.
 ///
+/// Each request also carries `x-worgl-member`, the sender's id, and
+/// `x-worgl-kek-check`, in hex, the sender's key-encryption key's seal of 32
+/// zero bytes under the context `worgl/cluster/kek-check/v1`. A member
+/// refuses one whose seal its own key does not open with `403 kek_mismatch`
+/// (see [`cluster`]), one whose seal it cannot check while its key is
+/// unavailable with `503 kek_unavailable`, and one that lacks either header,
+/// names no member in its `cluster.json` or carries a seal that is not hex
+/// with `400 malformed`. Past those checks, it refuses one whose Raft vote
+/// names the receiving member itself as its sender with `421 misdirected`
+/// (see [`cluster`]).
+///
 /// | method | path                       | body                              |
 /// |--------|----------------------------|-----------------------------------|
 /// | POST   | `/raft/{mint}/append`      | openraft's `AppendEntriesRequest` |
@@ -540,6 +581,46 @@ pub fn raft_router(state: AppState) -> Router {
             cluster::members_only,
         ))
         .with_state(state)
+}
+
+/// A mint that does not serve, as `GET /readyz` names it.
+#[derive(Serialize)]
+struct Unready {
+    mint: PublicKey,
+    state: Readiness,
+}
+
+/// Answer of `GET /readyz` while a mint does not serve: an error body with
+/// every such mint.
+#[derive(Serialize)]
+struct UnreadyBody {
+    error: &'static str,
+    message: &'static str,
+    mints: Vec<Unready>,
+}
+
+/// Answers `ok` while every mint serves, and `503 storage` with the mints
+/// that are failing, ahead or stopped otherwise.
+async fn readyz(State(state): State<AppState>) -> Response {
+    let mut mints: Vec<_> = state
+        .hosted()
+        .iter()
+        .map(|(key, mint)| Unready {
+            mint: *key,
+            state: mint.readiness(),
+        })
+        .filter(|mint| mint.state != Readiness::Serving)
+        .collect();
+    if mints.is_empty() {
+        return "ok".into_response();
+    }
+    mints.sort_unstable_by_key(|mint| mint.mint);
+    let body = UnreadyBody {
+        error: "storage",
+        message: "not every mint is serving",
+        mints,
+    };
+    (StatusCode::SERVICE_UNAVAILABLE, Json(body)).into_response()
 }
 
 /// Answer of `GET /v1/mints/{mint}/info`.
@@ -855,7 +936,13 @@ impl ApiError {
     /// again after the seconds its `Retry-After` header gives), `storage`,
     /// `internal`, and on a cluster `no_leader` (nothing was done; send the
     /// request again) and `timeout` (the change may still be made: send the
-    /// same note request again, but list the mints before creating another).
+    /// same note request again, but before rotating again read the mint's
+    /// info once it has carried out a change sent after this answer, and
+    /// list the mints before creating another). A cluster's Raft port also
+    /// answers `misdirected` (a Raft request reached the member that sent
+    /// it), `kek_mismatch` (to a member that holds another key-encryption
+    /// key) and `kek_unavailable` (while its own key-encryption key cannot be
+    /// used).
     pub fn code(&self) -> &'static str {
         self.code
     }

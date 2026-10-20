@@ -36,8 +36,10 @@ use thiserror::Error;
 use crate::codec::{DecodeError, Reader, Writer};
 use crate::permutation::Permutation;
 
-/// The identity of a note: the generation of the layer it was issued into and
-/// its index within that layer, which names one bit of it.
+/// A note's number in its ledger: the generation of the layer it was issued
+/// into and its index within that layer, which names one bit of it. A serial
+/// is unique within one ledger only, so notes of different issuers may share
+/// one.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
 pub struct Serial {
     /// Generation of the layer the note was issued into. Never reused.
@@ -146,7 +148,7 @@ pub enum LedgerError {
     #[error("no layer at position {0}")]
     NoSuchPosition(u32),
     /// Every bit of the layer has been handed out for this generation.
-    #[error("layer at position {position} is full until the next rotation")]
+    #[error("layer at position {position} is full until a rotation drops it")]
     LayerFull {
         /// Position of the full layer.
         position: u32,

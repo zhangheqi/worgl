@@ -54,9 +54,11 @@ now and, left alone, dies in the `(k + 1)`-th rotation from now. Those two
 numbers always add up to `n`, so the layer a note is minted into trades
 spending room for lifetime.
 
-A layer hands out each of its bits once per generation, so `layer_size`
-caps how many notes can land in one layer per rotation period. A full layer
-refuses with `layer_full` until the next rotation.
+A layer hands out each of its bits once per generation and gets none back
+when notes are spent or burned. So `layer_size` caps how many notes can land
+in one generation over its life, about `n − 1` rotation periods, however
+little value is outstanding. A full layer refuses with `layer_full` until a
+rotation drops it.
 
 ## Rotation
 

@@ -43,7 +43,7 @@ Errors answer with a status code and a body like:
 | `overdrawn` | 409 | The inputs spend more from a layer than the mint counts as live in it. This happens only after the mint's state was rolled back, as by a restore from a backup, and it handed out the same serials again. See [Backups](../backups/#why-a-lost-state-matters). |
 | `stale_mint` | 409 | A mint request reuses a sequence number, or goes below one, that its authority already used. |
 | `stale_rotation` | 409 | A scheduled rotation is due no later than the last one logged, which already covered it. |
-| `layer_full` | 503 | The layer the outputs would land in has too few free bits left until the next rotation. |
+| `layer_full` | 503 | The layer the outputs would land in has too few free bits left, and gets none back until a rotation drops it. |
 | `paused` | 503 | The mint is paused. Its notes keep their places until it resumes. |
 | `busy` | 503 | The mint holds `receipt_capacity` receipts, all younger than `receipt_min_age_secs` or, for a while after a restart, counted so, and takes no new transfer or burn until the oldest may go. The `Retry-After` header says in how many seconds. Nothing was done. |
 
@@ -51,29 +51,51 @@ Errors answer with a status code and a body like:
 
 | Code | Status | Meaning |
 |---|---|---|
-| `storage` | 500 | The mint could not record the change, so nothing was applied; or, on a cluster, this member's copy of the mint has stopped. |
+| `storage` | 500 or 503 | With 500: the mint could not record the change, so nothing was applied; but if its log could not even be cut back after the failed write, the change may have been applied. Once the server has been restarted, send a transfer, burn or mint request again, but check the mint's info before sending a rotation again, which would rotate a second time. On a cluster, 500 also means this member's copy of the mint has stopped. With 503: a read of a mint whose last change did not reach its disk and that could not reread its state from the disk, which it tries again at its next request; or, if its log could not be cut back after the failed write, a read before the server is restarted. See [Running a server](../running-a-server/#when-the-disk-fills-up). `GET /readyz` answers 503 `storage` too while any mint is failing, ahead or stopped. |
 | `internal` | 500 | Something else went wrong on the server. |
 | `no_leader` | 503 | On a cluster: no member leading the mint, or the cluster's registry, could be reached, or the leader changed while the request was carried out. Nothing was done. |
 | `timeout` | 503 | On a cluster: the mint's group or the registry did not answer in time. The change may still be made. |
+| `kek_mismatch` | 403 | Only on a cluster member's Raft port, which clients never use: the member that sent the Raft request holds another `kek.key`. See [Running a cluster](../running-a-cluster/#the-key-encryption-key). |
+| `kek_unavailable` | 503 | Only on a cluster member's Raft port: the member could not use its own key-encryption key to check the sender's. The sender tries again later. |
+| `misdirected` | 421 | Only between cluster members, at a Raft port: a member's Raft request reached that member itself, because its `cluster.json` gives another member an address that leads back to it. See [Moving a member](../running-a-cluster/#moving-a-member). |
 
 ## Sending a request again
 
-Transfers, burns and mint requests are safe to send again unchanged. The
-mint answers a resent transfer or burn from its record of recent ones, and
-the latest mint request of an authority with the same note, so nothing
-happens twice.
+Transfers, burns and mint requests are safe to send again unchanged, and
+so are pauses and resumes. The mint answers a resent transfer or burn from
+its record of recent ones, and the latest mint request of an authority with
+the same note, and a pause of a paused mint or a resume of a running one
+changes nothing, so nothing happens twice.
 
-- After `no_leader` or `timeout`, send the same request again.
+- After `no_leader` or `timeout`, send the same transfer, burn, mint, pause
+  or resume request again.
 - After `busy`, send the same request again once the seconds its
   `Retry-After` header gives have passed. Both SDKs wait that long before
   their next try, up to 30 seconds.
+- A rotation (`POST /v1/mints/{mint}/rotate`) is made again each time it is
+  sent, and each one drops a layer, so note the last layer's `generation`
+  in `info` before you rotate. One answered `no_leader` was not made. One
+  answered `timeout`, or not answered at all, may have been, and may still
+  be made after an `info` read that does not show it, until the mint has
+  carried out a change sent after that answer. To make one with the admin
+  token, pause the mint, or resume it if it is paused; a transfer, burn or
+  mint request sent after the answer counts too. Once the mint has carried
+  it out, read `info`, and rotate again only if the last layer's
+  `generation` is still the one you noted, resuming the mint first if you
+  paused it.
 - A creation of a mint (`POST /v1/admin/mints`) answered `no_leader` made
   nothing, so send it again. One answered `timeout` may have made a mint the
   answer never named: list the mints before creating another.
+- Sending a rotation or a creation to another member of a cluster is sending
+  it again, so check first there too.
 - `paused`, `busy`, `layer_full`, `storage` and `internal` may go away
   later. Both SDKs count them, and any other 5xx status, as worth trying
   again: `Error::is_transient` in Rust and `isTransient(error)` in
-  TypeScript.
+  TypeScript. `layer_full` on a transfer is the exception, though both SDKs
+  still count it as transient and a purse retries it like the others: sent
+  again unchanged, its outputs would land in the same full generation after
+  every rotation, so it is refused every time. See
+  [Layer size](../choosing-a-period/#layer-size).
 - A transfer or burn sent again is answered as before for at least
   `receipt_min_age_secs` (128 seconds by default), and while it is among the
   last `receipt_capacity` (1,048,576 by default) the mint took. One sent
@@ -93,3 +115,15 @@ happens twice.
   answer and can hand the notes over: `worgl receive` writes the payer's
   change, and `worgl submit` the payee's notes, each kept with
   `worgl accept` (`Purse::accept` or `purse.accept` in the SDKs).
+- A purse acts on the refusal of a transfer it made. One refused as `spent`
+  or `expired` with status 409 is dropped, since the note it spends is gone
+  either way, but the keys of its change are kept, so change handed over
+  later is still taken in. One refused as `policy` while the policy the mint
+  publishes refuses it too is cancelled and its note taken back. Any other
+  refusal leaves it outgoing, to send again: `unknown_mint` and `unissued`,
+  for one, say nothing about the transfer, only about the server, and the
+  mint never answers `unauthorized` or `duplicate_input` to a transfer a
+  purse signed, so those come from something else, such as a gateway.
+  `Refused::outcome` in Rust and `outcome` in TypeScript say what was done,
+  and `worgl` prints it (see
+  [Refused transfers](../command-line/#refused-transfers)).

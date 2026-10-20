@@ -3,9 +3,10 @@
 use std::collections::HashSet;
 
 use proptest::prelude::*;
-use worgl::{Issuer, IssuerKey, LedgerConfig, Note, Policy};
+use worgl::{HolderKey, Issuer, IssuerKey, LedgerConfig, Note, Output, Policy};
 use worgl_sdk::{
-    CheckError, Holder, MintInfo, MintView, NoteState, PayError, Payment, Schedule, Spacing,
+    CheckError, Holder, MintInfo, MintView, NoteState, PayError, Payment, PaymentRequest,
+    REFRESH_MARGIN_SECS, Schedule, Spacing,
 };
 
 fn issuer(layers: u32) -> Issuer {
@@ -545,32 +546,296 @@ fn cancelling_returns_the_note() {
         .pay(&view(&mint), &request, Spacing::default())
         .unwrap();
     assert_eq!(alice.balance(&view(&mint)).spendable, 0);
-    alice.cancel(&payment.transfers[0].request);
+    assert!(alice.cancel(&payment.transfers[0].request));
+    assert!(!alice.cancel(&payment.transfers[0].request));
     let balance = alice.balance(&view(&mint));
+    // The change keys stay, in case the mint applied it after all.
     assert_eq!(
-        (balance.spendable, balance.outgoing, balance.expected),
-        (8, 0, 0)
+        (
+            balance.spendable,
+            balance.outgoing,
+            balance.expected,
+            balance.unconfirmed
+        ),
+        (8, 0, 0, 5)
     );
+    assert_eq!(alice.payments().count(), 0);
 }
 
 #[test]
-fn a_view_follows_the_schedule() {
+fn a_transfer_cancelled_or_forgotten_leaves_its_payment() {
+    let mut mint = issuer(4);
+    let (mut alice, mut bob) = (Holder::new(), Holder::new());
+    fund(&mut mint, &mut alice, &[4, 4]);
+    let request = bob.request(&view(&mint), 6).unwrap();
+    let payment = alice
+        .pay(&view(&mint), &request, Spacing::default())
+        .unwrap();
+    let [first, second] = &payment.transfers[..] else {
+        panic!("{payment:?}")
+    };
+
+    // Never handed out again with the payment, which no longer pays the
+    // whole request.
+    assert!(alice.cancel(&first.request));
+    let [made] = alice.payments().collect::<Vec<_>>()[..] else {
+        panic!("the payment is kept while a transfer is outgoing")
+    };
+    assert_eq!(made.payment.transfers, std::slice::from_ref(second));
+    assert!(matches!(
+        made.request.check(&made.payment),
+        Err(CheckError::Missing(_))
+    ));
+    assert_eq!(alice.balance(&view(&mint)).spendable, 4);
+    let reloaded = Holder::from_json(&alice.to_json()).unwrap();
+    assert_eq!(reloaded.payments().next().unwrap().payment, made.payment);
+
+    assert!(alice.forget(&second.request));
+    assert_eq!(alice.payments().count(), 0);
+}
+
+/// A payee's request, by hand, for notes of `amounts` to fresh keys.
+fn asking(mint: &Issuer, amounts: &[u64]) -> PaymentRequest {
+    PaymentRequest {
+        mint: *mint.public_key(),
+        outputs: amounts
+            .iter()
+            .map(|&amount| Output {
+                amount,
+                holder: HolderKey::generate().public_key(),
+            })
+            .collect(),
+    }
+}
+
+#[test]
+fn a_request_for_notes_the_mint_would_not_make_is_refused_before_signing() {
+    let mut mint = issuer(4);
+    let mut alice = Holder::new();
+    fund(&mut mint, &mut alice, &[1024, 512]);
+    let before = alice.to_json();
+    for (amounts, refused) in [
+        (vec![3], 3),
+        (vec![0], 0),
+        (vec![511, 511, 511], 511),
+        (vec![4, 6], 6),
+    ] {
+        let request = asking(&mint, &amounts);
+        assert_eq!(
+            alice.pay(&view(&mint), &request, Spacing::default()),
+            Err(PayError::Denomination(refused))
+        );
+        assert_eq!(alice.to_json(), before, "nothing changes");
+    }
+    let balance = alice.balance(&view(&mint));
+    assert_eq!((balance.spendable, balance.outgoing), (1536, 0));
+}
+
+#[test]
+fn a_request_already_paid_is_refused() {
+    let mut mint = issuer(4);
+    let (mut alice, mut bob) = (Holder::new(), Holder::new());
+    fund(&mut mint, &mut alice, &[8, 8]);
+    let request = bob.request(&view(&mint), 3).unwrap();
+    let payment = alice
+        .pay(&view(&mint), &request, Spacing::default())
+        .unwrap();
+    let now = view(&mint);
+    let paid_twice = |alice: &mut Holder| {
+        let before = alice.to_json();
+        let error = alice.pay(&now, &request, Spacing::default()).unwrap_err();
+        assert!(
+            matches!(error, PayError::Paid(key) if request.outputs.iter().any(|o| o.holder == key)),
+            "{error}"
+        );
+        assert_eq!(alice.to_json(), before);
+    };
+    // While the transfer is outgoing.
+    paid_twice(&mut alice);
+
+    // Once it is done with, among the keys paid last, even after a reload.
+    let answer = mint.transfer(&payment.transfers[0].request).unwrap();
+    bob.absorb(&answer);
+    alice.take_answers(&bob.theirs(&answer));
+    assert_eq!(alice.outgoing().count(), 0);
+    assert_eq!(alice.payments().count(), 0);
+    paid_twice(&mut alice);
+    let mut alice = Holder::from_json(&alice.to_json()).unwrap();
+    paid_twice(&mut alice);
+
+    // A request asking twice for one key is refused too.
+    let mut twice = asking(&mint, &[1, 2]);
+    twice.outputs[1].holder = twice.outputs[0].holder;
+    assert_eq!(
+        alice.pay(&view(&mint), &twice, Spacing::default()),
+        Err(PayError::Paid(twice.outputs[0].holder))
+    );
+    // A new request is paid.
+    let again = bob.request(&view(&mint), 3).unwrap();
+    assert!(alice.pay(&view(&mint), &again, Spacing::default()).is_ok());
+}
+
+#[test]
+fn a_dropped_transfer_still_takes_in_its_change() {
+    // Two receipts stand in for a mint whose receipts many transfers pushed out.
+    let mut policy = Policy::cash_like();
+    policy.receipt_capacity = 2;
+    let mut mint = issuer_with(4, policy);
+    let (mut alice, mut bob, mut carol) = (Holder::new(), Holder::new(), Holder::new());
+    fund(&mut mint, &mut alice, &[8]);
+    fund(&mut mint, &mut carol, &[1, 1, 1]);
+    let request = bob.request(&view(&mint), 3).unwrap();
+    let payment = alice
+        .pay(&view(&mint), &request, Spacing::default())
+        .unwrap();
+    let transfer = &payment.transfers[0].request;
+    let answer = mint.transfer(transfer).unwrap();
+    bob.absorb(&answer);
+    for _ in 0..3 {
+        let paid = Holder::new().request(&view(&mint), 1).unwrap();
+        let payment = carol.pay(&view(&mint), &paid, Spacing::default()).unwrap();
+        mint.transfer(&payment.transfers[0].request).unwrap();
+    }
+    assert!(matches!(
+        mint.transfer(transfer),
+        Err(worgl::Error::Spent(_))
+    ));
+
+    // Refused as spent: the note is gone, so the transfer is dropped.
+    assert!(alice.forget(transfer));
+    assert!(!alice.forget(transfer));
+    let balance = alice.balance(&view(&mint));
+    assert_eq!(
+        (balance.outgoing, balance.expected, balance.unconfirmed),
+        (0, 0, 5)
+    );
+    assert_eq!(alice.payments().count(), 0);
+    assert_eq!(alice.at_stake(transfer), Some(5));
+    // The change keys are this holder's, not the counterparty's.
+    assert!(
+        alice
+            .theirs(&answer)
+            .iter()
+            .all(|n| request.outputs.iter().any(|o| o.holder == *n.holder()))
+    );
+
+    // Kept across a save, in format 2, and taken in once handed back.
+    let json = alice.to_json();
+    assert!(json.contains("\"format\":2"), "{json}");
+    let mut alice = Holder::from_json(&json).unwrap();
+    assert_eq!(alice.take_answers(&bob.theirs(&answer)), 5);
+    let balance = alice.balance(&view(&mint));
+    assert_eq!((balance.frozen, balance.unconfirmed), (5, 0));
+    assert!(alice.to_json().contains("\"format\":1"));
+}
+
+#[test]
+fn a_resend_that_carries_out_a_payment_keeps_the_payees_notes() {
+    let mut mint = issuer(4);
+    let (mut alice, mut bob) = (Holder::new(), Holder::new());
+    fund(&mut mint, &mut alice, &[8]);
+    let request = bob.request(&view(&mint), 5).unwrap();
+    let payment = alice
+        .pay(&view(&mint), &request, Spacing::default())
+        .unwrap();
+    let [made] = alice.payments().collect::<Vec<_>>()[..] else {
+        panic!("one payment is kept")
+    };
+    assert_eq!((&made.request, &made.payment), (&request, &payment));
+    assert!(made.owed.is_empty());
+
+    // Bob never submits; Alice's resend carries the payment out.
+    let resend = alice.resend(Spacing::default());
+    let answer = mint.transfer(&resend[0].request).unwrap();
+    assert_eq!(alice.settle(&resend[0].request, &answer), 3);
+    assert_eq!(alice.outgoing().count(), 0);
+    let owed = alice.payments().next().unwrap().owed.clone();
+    assert_eq!(owed, alice.theirs(&answer));
+    assert_eq!(owed.len(), request.outputs.len());
+    // Settling the same answer again keeps nothing twice.
+    alice.settle(&resend[0].request, &answer);
+    assert_eq!(alice.payments().next().unwrap().owed, owed);
+    let json = alice.to_json();
+    assert!(json.contains("\"format\":2"), "{json}");
+    let mut alice = Holder::from_json(&json).unwrap();
+
+    // Handed to Bob, who checks and keeps them; Alice keeps them no more.
+    assert!(owed.iter().all(|n| n.verify(mint.keys()).is_ok()));
+    assert_eq!(bob.take_answers(&owed), 5);
+    assert_eq!(alice.forget_owed(&owed), 5);
+    assert_eq!(alice.payments().count(), 0);
+    assert_eq!(alice.forget_owed(&owed), 0);
+}
+
+#[test]
+fn pruning_drops_change_and_owed_notes_that_can_no_longer_arrive() {
+    let mut mint = issuer(4);
+    let (mut alice, mut bob) = (Holder::new(), Holder::new());
+    fund(&mut mint, &mut alice, &[8, 8]);
+    // One payment carried out by Alice's resend, one forgotten.
+    let request = bob.request(&view(&mint), 5).unwrap();
+    let payment = alice
+        .pay(&view(&mint), &request, Spacing::default())
+        .unwrap();
+    let transfer = &payment.transfers[0].request;
+    alice.settle(transfer, &mint.transfer(transfer).unwrap());
+    let request = bob.request(&view(&mint), 5).unwrap();
+    let payment = alice
+        .pay(&view(&mint), &request, Spacing::default())
+        .unwrap();
+    alice.forget(&payment.transfers[0].request);
+    assert_eq!(alice.balance(&view(&mint)).unconfirmed, 3);
+
+    // The notes and change sit one layer past the spent notes: the last.
+    for _ in 0..3 {
+        mint.rotate().unwrap();
+        assert_eq!(alice.prune(&view(&mint)), 0);
+        assert_eq!(alice.payments().count(), 1);
+        assert_eq!(alice.balance(&view(&mint)).unconfirmed, 3);
+    }
+    mint.rotate().unwrap();
+    assert_eq!(alice.prune(&view(&mint)), 3, "the change taken in expired");
+    assert_eq!(alice.payments().count(), 0);
+    assert_eq!(alice.balance(&view(&mint)).unconfirmed, 0);
+}
+
+#[test]
+fn a_store_of_format_1_loads() {
+    let mut mint = issuer(4);
+    let (mut alice, mut bob) = (Holder::new(), Holder::new());
+    fund(&mut mint, &mut alice, &[8]);
+    let request = bob.request(&view(&mint), 3).unwrap();
+    alice
+        .pay(&view(&mint), &request, Spacing::default())
+        .unwrap();
+    // As the first release wrote it: no payments, nothing paid.
+    let mut saved: serde_json::Value = serde_json::from_str(&alice.to_json()).unwrap();
+    assert_eq!(saved["format"], 1);
+    let fields = saved.as_object_mut().unwrap();
+    for field in ["unconfirmed", "payments", "paid"] {
+        assert!(fields.remove(field).is_some(), "{field}");
+    }
+    let old = Holder::from_json(&saved.to_string()).unwrap();
+    assert_eq!(old.balance(&view(&mint)), alice.balance(&view(&mint)));
+    assert_eq!(old.outgoing().count(), 1);
+    assert_eq!(old.payments().count(), 0);
+}
+
+#[test]
+fn a_view_counts_down_to_the_next_rotation_and_no_further() {
     let mint = issuer(4);
     let mut v = view(&mint);
     v.schedule = Some(Schedule {
         period_secs: 100,
         next_at: 1_000,
     });
-    assert_eq!(v.at(999), v);
     assert_eq!(v.until_rotation(990), Some(10));
-    assert_eq!(v.at(1_000).oldest, v.oldest + 1);
-    let later = v.at(1_250);
-    assert_eq!(later.oldest, v.oldest + 3);
-    assert_eq!(later.schedule.unwrap().next_at, 1_300);
-    assert_eq!(v.until_rotation(1_250), Some(50));
+    // Past its time, the rotation is still to come as far as the view
+    // knows, however far the clock has gone.
+    assert_eq!(v.until_rotation(1_000), Some(0));
+    assert_eq!(v.until_rotation(1_250), Some(0));
 
     v.paused = true;
-    assert_eq!(v.at(5_000), v);
     assert_eq!(v.until_rotation(5_000), None);
 }
 
@@ -581,25 +846,89 @@ fn a_view_tells_when_a_note_expires() {
     fund(&mut mint, &mut alice, &[8]);
     let note = *alice.notes().next().unwrap();
     let mut v = view(&mint);
-    assert_eq!(v.expires_at(&note, 0), None);
+    assert_eq!(v.expires_at(&note), None);
 
     // Second to last of four layers: dropped by the third rotation.
-    v.schedule = Some(Schedule {
+    let schedule = Schedule {
         period_secs: 100,
         next_at: 1_000,
-    });
-    assert_eq!(v.expires_at(&note, 0), Some(1_200));
-    assert_eq!(v.expires_at(&note, 1_050), Some(1_200));
-    assert_eq!(v.expires_at(&note, 1_199), Some(1_200));
-    assert_eq!(v.expires_at(&note, 1_200), None);
+    };
+    v.schedule = Some(schedule);
+    assert_eq!(v.expires_at(&note), Some(1_200));
 
     let mut other = issuer(4);
     let stranger = other
         .mint(8, worgl::HolderKey::generate().public_key())
         .unwrap();
-    assert_eq!(v.expires_at(&stranger, 0), None);
+    assert_eq!(v.expires_at(&stranger), None);
     v.paused = true;
-    assert_eq!(v.expires_at(&note, 0), None);
+    assert_eq!(v.expires_at(&note), None);
+
+    // Once the mint has made those rotations, its info says the note is gone.
+    for _ in 0..3 {
+        mint.rotate().unwrap();
+    }
+    let mut later = view(&mint);
+    later.schedule = Some(Schedule {
+        next_at: 1_300,
+        ..schedule
+    });
+    assert_eq!(later.expires_at(&note), None);
+}
+
+#[test]
+fn a_refresh_planned_past_the_rotations_time_is_due_at_once() {
+    let mut mint = issuer(3);
+    let (mut alice, mut bob) = (Holder::new(), Holder::new());
+    // Minted into position 1 of 3, the notes are in the first layer after a
+    // rotation and die at the next.
+    fund(&mut mint, &mut alice, &[2, 4]);
+    mint.rotate().unwrap();
+    let request = bob.request(&view(&mint), 2).unwrap();
+    let payment = alice
+        .pay(&view(&mint), &request, Spacing::default())
+        .unwrap();
+    let mut v = view(&mint);
+    v.schedule = Some(Schedule {
+        period_secs: 3_600,
+        next_at: 10_000,
+    });
+
+    // Ahead of it, they are spread over the time left, less the margin.
+    let mut early = alice.clone();
+    let resends = early.due_resends(&v, 9_000);
+    let refreshes = early.refresh(&v, 9_000);
+    assert_eq!((resends.len(), refreshes.len()), (1, 1));
+    let window = 1_000 - REFRESH_MARGIN_SECS;
+    assert!(
+        resends
+            .iter()
+            .chain(&refreshes)
+            .all(|t| t.after_secs <= window)
+    );
+
+    // At or past its time, by a clock ahead of the mint's or because the
+    // mint has not rotated yet, the first layer still dies at the next
+    // rotation: everything is due at once.
+    for now in [10_000, 10_000 + 5 * 3_600 + 1] {
+        let mut late = alice.clone();
+        let resends = late.due_resends(&v, now);
+        let refreshes = late.refresh(&v, now);
+        assert_eq!((resends.len(), refreshes.len()), (1, 1), "{now}");
+        assert!(
+            resends.iter().chain(&refreshes).all(|t| t.after_secs == 0),
+            "{now}"
+        );
+        assert_eq!(resends[0].request, payment.transfers[0].request);
+    }
+    // The mint has not rotated, so it takes them.
+    let refreshes = alice.refresh(&v, 10_000);
+    let answer = mint.transfer(&refreshes[0].request).unwrap();
+    assert_eq!(alice.settle(&refreshes[0].request, &answer), 4);
+    assert_eq!(
+        mint.transfer(&payment.transfers[0].request).unwrap().len(),
+        1
+    );
 }
 
 proptest! {

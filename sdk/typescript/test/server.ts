@@ -24,7 +24,7 @@ export class TestServer {
   readonly token: string;
   readonly #mintKey: string;
   readonly #dir: string;
-  readonly #process: ChildProcess;
+  #process: ChildProcess;
   #faucet: ChildProcess | undefined;
   #sequence = 0;
 
@@ -39,9 +39,13 @@ export class TestServer {
 
   /**
    * Creates a state directory with one four-layer mint and serves it. The
-   * mint's policy fields not in `policy` take their cash-like defaults.
+   * mint's policy fields not in `policy` take their cash-like defaults. With
+   * `rotateEvery`, the mint also rotates every that many seconds.
    */
-  static async start(policy: Record<string, unknown> = {}): Promise<TestServer> {
+  static async start(
+    policy: Record<string, unknown> = {},
+    rotateEvery?: number,
+  ): Promise<TestServer> {
     const dir = mkdtempSync(join(tmpdir(), 'worgl-ts-'));
     const state = join(dir, 'state');
     execFileSync(binary, ['init', '--state', state], { stdio: 'ignore' });
@@ -52,6 +56,7 @@ export class TestServer {
       [
         'create-mint', '--state', state, '--layers', '4', '--layer-size', '1024',
         '--policy', policyFile,
+        ...(rotateEvery === undefined ? [] : ['--rotate-every', String(rotateEvery)]),
       ],
       { encoding: 'utf8' },
     );
@@ -136,6 +141,23 @@ export class TestServer {
 
   async rotate(): Promise<void> {
     await this.client().rotate(this.mint, this.token);
+  }
+
+  /**
+   * Stops serving, sets the fields in `policy` in the mint's policy on disk
+   * as its operator would, and serves again at the same address.
+   */
+  async restart(policy: Record<string, unknown>): Promise<void> {
+    const exited = new Promise((resolve) => this.#process.once('exit', resolve));
+    this.#process.kill();
+    await exited;
+    const state = join(this.#dir, 'state');
+    const file = join(state, 'mints', this.mint, 'policy.json');
+    writeFileSync(file, JSON.stringify({ ...JSON.parse(readFileSync(file, 'utf8')), ...policy }));
+    this.#process = spawn(binary, ['serve', '--state', state, '--listen', new URL(this.url).host], {
+      stdio: 'ignore',
+    });
+    await healthy(this.url, this.#process, 'worgl-server');
   }
 
   async stop(): Promise<void> {

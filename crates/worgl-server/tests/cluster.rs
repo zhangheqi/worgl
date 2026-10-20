@@ -8,14 +8,18 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
+use openraft::Vote;
+use openraft::raft::{AppendEntriesRequest, VoteRequest};
 use reqwest::{Method, StatusCode};
 use serde_json::{Value, json};
 use tokio::net::TcpListener;
 use tokio::sync::oneshot;
 use tokio::task::JoinHandle;
 use worgl::{
-    HolderKey, LedgerConfig, MintKey, MintRequest, Note, Output, Policy, PublicKey, TransferRequest,
+    FileKek, HolderKey, Kek, LedgerConfig, MintKey, MintRequest, Note, Output, Policy, PublicKey,
+    TransferRequest,
 };
+use worgl_raft::TypeConfig;
 use worgl_server::{
     AppState, ClusterConfig, Member, MintSpec, Verified, create_mint, init_state, join_cluster,
     raft_router, router,
@@ -172,6 +176,13 @@ impl Cluster {
     /// Makes the server state in `seed` the first member, as an operator
     /// would: join it to the cluster, then copy it to the other members.
     async fn from_seed(seed: tempfile::TempDir) -> Self {
+        Self::from_seed_with(seed, |_, _| {}).await
+    }
+
+    /// As [`from_seed`](Self::from_seed), with each member's directory
+    /// changed by `edit`, given its id, once every copy is made and before
+    /// any member starts.
+    async fn from_seed_with(seed: tempfile::TempDir, edit: impl Fn(u64, &Path)) -> Self {
         let mut listeners = Vec::new();
         let mut members = BTreeMap::new();
         for id in 1..=3 {
@@ -208,6 +219,9 @@ impl Cluster {
                 running: None,
             });
         }
+        for (server, (id, _, _)) in servers.iter().zip(&listeners) {
+            edit(*id, &server.dir);
+        }
         for (server, (_, api, raft)) in servers.iter_mut().zip(listeners) {
             server.start_on(api, raft).await;
         }
@@ -223,22 +237,28 @@ impl Cluster {
 
     /// The member leading `mint`, once every running member knows it.
     async fn leader(&self, mint: &PublicKey) -> usize {
-        self.agreed(|state| state.leader(mint)).await
+        self.leader_among(mint, &self.running()).await
+    }
+
+    /// The member leading `mint`, once each running member of `servers`
+    /// knows it.
+    async fn leader_among(&self, mint: &PublicKey, servers: &[usize]) -> usize {
+        self.agreed(servers, |state| state.leader(mint)).await
     }
 
     /// The member leading the registry, once every running member knows it.
     async fn registry_leader(&self) -> usize {
-        self.agreed(AppState::registry_leader).await
+        self.agreed(&self.running(), AppState::registry_leader)
+            .await
     }
 
-    /// The leader every running member names in `view`.
-    async fn agreed(&self, view: impl Fn(&AppState) -> Option<u64>) -> usize {
+    /// The leader each running member of `servers` names in `view`.
+    async fn agreed(&self, servers: &[usize], view: impl Fn(&AppState) -> Option<u64>) -> usize {
         let deadline = Instant::now() + PATIENCE;
         loop {
-            let views: Vec<_> = self
-                .servers
+            let views: Vec<_> = servers
                 .iter()
-                .filter_map(Server::state)
+                .filter_map(|&server| self.servers[server].state())
                 .map(&view)
                 .collect();
             if let Some(&Some(leader)) = views.first()
@@ -405,12 +425,46 @@ impl Cluster {
         answer["state"].as_str().unwrap().to_owned()
     }
 
+    /// Rotates `mint` through `server`.
+    async fn rotate(&self, server: usize, mint: &TestMint) -> (StatusCode, Value) {
+        let path = mint.path("rotate");
+        self.call(server, Method::POST, &path, Some(&mint.token), Value::Null)
+            .await
+    }
+
     async fn info(&self, server: usize, mint: &TestMint) -> Value {
         let (status, answer) = self
             .call(server, Method::GET, &mint.path("info"), None, Value::Null)
             .await;
         assert_eq!(status, StatusCode::OK, "{answer}");
         answer
+    }
+
+    /// Writes every member's addresses as they are now into each member's
+    /// `cluster.json`, as an operator who moves a member would, and returns
+    /// the members whose addresses that changed, as each `join_cluster`
+    /// named them.
+    fn rejoin(&self) -> Vec<Vec<u64>> {
+        let members: BTreeMap<_, _> = (1..)
+            .zip(&self.servers)
+            .map(|(id, server)| {
+                let member = Member {
+                    api: server.api.to_string(),
+                    raft: server.raft.to_string(),
+                };
+                (id, member)
+            })
+            .collect();
+        (1..)
+            .zip(&self.servers)
+            .map(|(node, server)| {
+                let config = ClusterConfig {
+                    node,
+                    members: members.clone(),
+                };
+                join_cluster(&server.dir, &config).unwrap()
+            })
+            .collect()
     }
 
     /// Stops every member that runs.
@@ -649,6 +703,33 @@ async fn a_new_leader_takes_over_from_a_stopped_one() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn readiness_names_a_mint_whose_copy_on_a_member_has_stopped() {
+    let (seed, mint) = seed(None);
+    let cluster = Cluster::from_seed(seed).await;
+    cluster.leader(&mint.key).await;
+    for server in 0..3 {
+        let (status, _) = cluster
+            .call_once(server, Method::GET, "/readyz", None, &Value::Null)
+            .await;
+        assert_eq!(status, StatusCode::OK);
+    }
+
+    // The member's replicas stop, as a storage failure stops one, while its
+    // public port still answers.
+    cluster.servers[0].state().unwrap().shutdown().await;
+    let (status, answer) = cluster
+        .call_once(0, Method::GET, "/readyz", None, &Value::Null)
+        .await;
+    assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE, "{answer}");
+    assert_eq!(answer["error"], "storage");
+    assert_eq!(
+        answer["mints"],
+        json!([{"mint": mint.key, "state": "stopped"}])
+    );
+    cluster.stop().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_mint_that_ran_alone_carries_on_in_a_cluster() {
     let (seed, mint) = seed(None);
     let alice = HolderKey::generate();
@@ -852,6 +933,203 @@ async fn a_new_registry_leader_creates_mints() {
     cluster.stop().await;
 }
 
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_member_that_moves_is_reached_at_its_new_raft_address() {
+    let (seed, mint) = seed(None);
+    let mut cluster = Cluster::from_seed(seed).await;
+    cluster.leader(&mint.key).await;
+    cluster.registry_leader().await;
+
+    // The third member moves to a new Raft port. While it is away the
+    // others go on, in the mint's group and the registry's, so it comes
+    // back behind them in groups that formed with its old port.
+    cluster.servers[2].stop().await;
+    let alice = HolderKey::generate();
+    let note = cluster.mint(0, &mint, 8, &alice).await;
+    let (paid, _) = cluster.pay(1, &note, &alice).await;
+    let created = cluster.create(0).await;
+    let raft = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    cluster.servers[2].raft = raft.local_addr().unwrap();
+    assert_eq!(cluster.rejoin(), [[3], [3], [3]]);
+    assert_eq!(cluster.rejoin(), vec![Vec::<u64>::new(); 3]);
+    for server in 0..2 {
+        cluster.servers[server].stop().await;
+        cluster.servers[server].restart().await;
+    }
+    let api = TcpListener::bind(cluster.servers[2].api).await.unwrap();
+    cluster.servers[2].start_on(api, raft).await;
+
+    // Only a leader that reaches it at the new port can bring it up to
+    // date, as it is when it writes the mint the registry gained.
+    cluster.hosts(&created).await;
+    cluster.leader(&mint.key).await;
+    cluster.leader(&created.key).await;
+
+    // With the first member stopped, every group needs the moved one for a
+    // majority.
+    cluster.servers[0].stop().await;
+    let bob = HolderKey::generate();
+    let fresh = cluster.mint(1, &mint, 4, &bob).await;
+    let (last, _) = cluster.pay(2, &fresh, &bob).await;
+    let other = cluster.mint(2, &created, 8, &bob).await;
+    let another = cluster.create(1).await;
+    cluster.hosts(&another).await;
+    for server in cluster.running() {
+        assert_eq!(cluster.state_of(server, &paid).await, "live");
+        assert_eq!(cluster.state_of(server, &fresh).await, "spent");
+        assert_eq!(cluster.state_of(server, &last).await, "live");
+        assert_eq!(cluster.state_of(server, &other).await, "live");
+    }
+    cluster.stop().await;
+}
+
+#[tokio::test]
+async fn two_members_at_one_address_are_refused() {
+    let (seed, _) = seed(None);
+    let members: BTreeMap<_, _> = (1..=3)
+        .map(|id| {
+            let member = Member {
+                api: format!("member{id}:8080"),
+                raft: format!("member{id}:7080"),
+            };
+            (id, member)
+        })
+        .collect();
+    let config = ClusterConfig { node: 1, members };
+    join_cluster(seed.path(), &config).unwrap();
+    let file = seed.path().join("cluster.json");
+    let written = fs::read(&file).unwrap();
+
+    // A rewrite that gives the third member the first one's Raft address,
+    // with which the first would dial itself as the third, or its API
+    // address.
+    let mut same_raft = config.clone();
+    same_raft.members.get_mut(&3).unwrap().raft = config.members[&1].raft.clone();
+    let mut same_api = config.clone();
+    same_api.members.get_mut(&3).unwrap().api = config.members[&1].api.clone();
+    for (typo, kind) in [(same_raft, "Raft"), (same_api, "API")] {
+        let refused = format!("members 1 and 3 have the same {kind} address");
+        let error = join_cluster(seed.path(), &typo).unwrap_err();
+        assert!(error.to_string().contains(&refused), "{error}");
+        assert_eq!(fs::read(&file).unwrap(), written);
+        // Written by hand, it keeps the member from starting.
+        fs::write(&file, serde_json::to_vec(&typo).unwrap()).unwrap();
+        let opened = AppState::open_member(seed.path(), 1000).await;
+        let error = opened.err().unwrap();
+        assert!(format!("{error:#}").contains(&refused), "{error:#}");
+        fs::write(&file, &written).unwrap();
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_member_dialed_as_another_does_not_answer_itself() {
+    let (seed, mint) = seed(None);
+    // The first member runs alone. Nothing listens at the second's
+    // addresses, and the third's Raft address leads to the first under
+    // another name, which the check of `cluster.json` cannot tell.
+    let api = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let raft = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let mut nowhere = Vec::new();
+    for _ in 0..3 {
+        nowhere.push(TcpListener::bind("127.0.0.1:0").await.unwrap());
+    }
+    let nowhere: Vec<_> = nowhere
+        .into_iter()
+        .map(|listener| listener.local_addr().unwrap().to_string())
+        .collect();
+    let mut server = Server {
+        dir: seed.path().to_owned(),
+        api: api.local_addr().unwrap(),
+        raft: raft.local_addr().unwrap(),
+        running: None,
+    };
+    let first = Member {
+        api: server.api.to_string(),
+        raft: server.raft.to_string(),
+    };
+    let second = Member {
+        api: nowhere[0].clone(),
+        raft: nowhere[1].clone(),
+    };
+    let third = Member {
+        api: nowhere[2].clone(),
+        raft: format!("localhost:{}", server.raft.port()),
+    };
+    let members = BTreeMap::from([(1, first), (2, second), (3, third)]);
+    join_cluster(seed.path(), &ClusterConfig { node: 1, members }).unwrap();
+    server.start_on(api, raft).await;
+
+    // Every election it starts goes unanswered, so it starts another, as it
+    // would not once it had counted itself as the third member.
+    let votes = [
+        seed.path()
+            .join("mints")
+            .join(mint.key.to_string())
+            .join("vote.json"),
+        seed.path().join("registry").join("vote.json"),
+    ];
+    let term = |vote: &Path| {
+        let vote: Value = serde_json::from_slice(&fs::read(vote).ok()?).ok()?;
+        vote["leader_id"]["term"].as_u64()
+    };
+    let deadline = Instant::now() + PATIENCE;
+    for vote in &votes {
+        while term(vote) < Some(2) {
+            assert!(Instant::now() < deadline, "one election only in {vote:?}");
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+    }
+    let state = server.state().unwrap();
+    assert_eq!(state.leader(&mint.key), None);
+    assert_eq!(state.registry_leader(), None);
+    let client = reqwest::Client::new();
+    let alice = HolderKey::generate();
+    let answer = client
+        .post(format!("http://{}{}", server.api, mint.path("mint")))
+        .json(&mint.request(8, &alice))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(answer.status(), StatusCode::SERVICE_UNAVAILABLE);
+    assert_eq!(answer.json::<Value>().await.unwrap()["error"], "no_leader");
+
+    // Its Raft port refuses what says it comes from itself, for the mint's
+    // group and the registry's, once past the key check, as an RPC it sent
+    // itself would be.
+    let token = read_token(&seed.path().join("cluster.token"));
+    let check = kek_check(seed.path());
+    let vote = Vote::new_committed(9, 1);
+    let ballot = VoteRequest::new(vote, None);
+    let append = AppendEntriesRequest::<TypeConfig> {
+        vote,
+        prev_log_id: None,
+        entries: Vec::new(),
+        leader_commit: None,
+    };
+    let rpcs = [
+        ("vote", serde_json::to_value(ballot).unwrap()),
+        ("append", serde_json::to_value(append).unwrap()),
+    ];
+    for group in [mint.key.to_string(), "registry".into()] {
+        for (route, rpc) in &rpcs {
+            let answer = client
+                .post(format!("http://{}/raft/{group}/{route}", server.raft))
+                .bearer_auth(&token)
+                .header("x-worgl-member", "1")
+                .header("x-worgl-kek-check", &check)
+                .json(rpc)
+                .send()
+                .await
+                .unwrap();
+            let status = answer.status();
+            let answer: Value = answer.json().await.unwrap();
+            assert_eq!(status, StatusCode::MISDIRECTED_REQUEST, "{route}: {answer}");
+            assert_eq!(answer["error"], "misdirected");
+        }
+    }
+    server.stop().await;
+}
+
 /// Waits until no store holds the mint directory `dir` open.
 async fn released(dir: &Path) {
     let deadline = Instant::now() + PATIENCE;
@@ -897,5 +1175,258 @@ async fn the_leader_rotates_on_schedule_and_its_successor_carries_on() {
         "{} rotations in {elapsed} s",
         reached - generation
     );
+    cluster.stop().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_member_without_its_kek_neither_joins_nor_starts() {
+    let member = Member {
+        api: "127.0.0.1:8080".into(),
+        raft: "127.0.0.1:7080".into(),
+    };
+    let config = ClusterConfig {
+        node: 1,
+        members: BTreeMap::from([(1, member)]),
+    };
+
+    // A copy made without kek.key fails to join, and writes nothing.
+    let (copy, _) = seed(None);
+    fs::remove_file(copy.path().join("kek.key")).unwrap();
+    let error = join_cluster(copy.path(), &config).unwrap_err();
+    assert!(error.to_string().contains("kek.key is missing"), "{error}");
+    for file in ["cluster.json", "cluster.token", "kek.key"] {
+        assert!(!copy.path().join(file).exists(), "{file} was written");
+    }
+
+    // A member that lost its kek.key after joining does not start.
+    let (member, _) = seed(None);
+    join_cluster(member.path(), &config).unwrap();
+    fs::remove_file(member.path().join("kek.key")).unwrap();
+    let error = AppState::open_member(member.path(), 1000)
+        .await
+        .err()
+        .unwrap();
+    assert!(error.to_string().contains("kek.key is missing"), "{error}");
+    assert!(!member.path().join("kek.key").exists());
+}
+
+/// The key-encryption key check that a member holding the `kek.key` in
+/// `dir` sends with its Raft requests, as [`raft_router`] describes it.
+fn kek_check(dir: &Path) -> String {
+    let kek = FileKek::open(&dir.join("kek.key")).unwrap();
+    hex::encode(kek.seal(&[0; 32], b"worgl/cluster/kek-check/v1").unwrap())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_member_with_another_kek_is_refused_and_cannot_take_a_mint_down() {
+    let (seed, mint) = seed(None);
+    let shared = fs::read(seed.path().join("kek.key")).unwrap();
+    // Member 3 holds a key of its own, as one that ran its own `init` would.
+    let mut cluster = Cluster::from_seed_with(seed, |id, dir| {
+        if id == 3 {
+            fs::remove_file(dir.join("kek.key")).unwrap();
+            FileKek::create(&dir.join("kek.key")).unwrap();
+        }
+    })
+    .await;
+    let odd = 2;
+    let good = [0, 1];
+
+    // Each side refuses the other's Raft requests, naming the sender, before
+    // reading them; a member holding the same key gets past the check.
+    let token = read_token(&cluster.servers[0].dir.join("cluster.token"));
+    let vote = |to: usize, from: usize| {
+        let url = format!("http://{}/raft/{}/vote", cluster.servers[to].raft, mint.key);
+        let request = cluster
+            .client
+            .post(url)
+            .bearer_auth(&token)
+            .header("x-worgl-member", (from + 1).to_string())
+            .header("x-worgl-kek-check", kek_check(&cluster.servers[from].dir))
+            .json(&json!({}));
+        async move { request.send().await.unwrap() }
+    };
+    for (to, from) in [(0, odd), (odd, 0)] {
+        let answer = vote(to, from).await;
+        assert_eq!(answer.status(), StatusCode::FORBIDDEN);
+        let answer: Value = answer.json().await.unwrap();
+        assert_eq!(answer["error"], "kek_mismatch");
+        let differs = format!("kek.key differs from member {}'s", from + 1);
+        assert_eq!(answer["message"], differs.as_str());
+    }
+    assert_eq!(vote(0, 1).await.status(), StatusCode::UNPROCESSABLE_ENTITY);
+
+    // The members that share a key serve the mint without member 3, which
+    // hears of no leader.
+    let leader = cluster.leader_among(&mint.key, &good).await;
+    let alice = HolderKey::generate();
+    let note = cluster.mint(leader, &mint, 8, &alice).await;
+    let generation = last_generation(&cluster.info(leader, &mint).await);
+    let state = cluster.servers[odd].state().unwrap();
+    assert_eq!(state.leader(&mint.key), None);
+
+    // Left with one other member, member 3 never leads, so a rotation sent
+    // through it is not made and seals nothing the other has to open.
+    let other = 1 - leader;
+    cluster.servers[leader].stop().await;
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while Instant::now() < deadline {
+        for server in [other, odd] {
+            let state = cluster.servers[server].state().unwrap();
+            assert_ne!(state.leader(&mint.key), Some(3));
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    let path = mint.path("rotate");
+    let (status, answer) = cluster
+        .call_once(odd, Method::POST, &path, Some(&mint.token), &Value::Null)
+        .await;
+    assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE, "{answer}");
+    assert_eq!(answer["error"], "no_leader");
+
+    // The mint is back once the stopped member is: no replica stopped, no
+    // rotation was made, and the two rotate as before.
+    cluster.servers[leader].restart().await;
+    cluster.leader_among(&mint.key, &good).await;
+    assert_eq!(
+        last_generation(&cluster.info(other, &mint).await),
+        generation
+    );
+    let (status, report) = cluster.rotate(other, &mint).await;
+    assert_eq!(status, StatusCode::OK, "{report}");
+    for server in good {
+        let info = cluster.info(server, &mint).await;
+        assert_eq!(last_generation(&info), generation + 1);
+        assert_eq!(cluster.state_of(server, &note).await, "live");
+    }
+
+    // Given the shared key, member 3 catches up, unsealing the rotation's
+    // key, and carries the mint with one other member.
+    cluster.servers[odd].stop().await;
+    fs::write(cluster.servers[odd].dir.join("kek.key"), &shared).unwrap();
+    cluster.servers[odd].restart().await;
+    let leader = cluster.leader(&mint.key).await;
+    let away = if leader == odd { 0 } else { leader };
+    cluster.servers[away].stop().await;
+    let (paid, _) = cluster.pay(odd, &note, &alice).await;
+    for server in cluster.running() {
+        assert_eq!(cluster.state_of(server, &note).await, "spent");
+        assert_eq!(cluster.state_of(server, &paid).await, "live");
+        let info = cluster.info(server, &mint).await;
+        assert_eq!(last_generation(&info), generation + 1);
+    }
+    cluster.stop().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_registry_leader_restarted_with_another_kek_adds_no_mint() {
+    let (seed, mint) = seed(None);
+    let shared = fs::read(seed.path().join("kek.key")).unwrap();
+    let mut cluster = Cluster::from_seed(seed).await;
+    let odd = cluster.registry_leader().await;
+    let mut others = (0..3).filter(|&server| server != odd);
+    let (good, away) = (others.next().unwrap(), others.next().unwrap());
+
+    // With another member away, the registry's leader restarts with a key of
+    // its own, and takes up its term as leader again.
+    cluster.servers[away].stop().await;
+    cluster.servers[odd].stop().await;
+    let kek = cluster.servers[odd].dir.join("kek.key");
+    fs::remove_file(&kek).unwrap();
+    FileKek::create(&kek).unwrap();
+    cluster.servers[odd].restart().await;
+    let leader = cluster.agreed(&[odd], AppState::registry_leader).await;
+    assert_eq!(leader, odd);
+
+    // No majority answers it, so it creates no mint: a record sealed under
+    // its key does not reach even its own log.
+    let spec = json!({
+        "ledger": LEDGER,
+        "policy": {"mint_authorities": [MintKey::generate().public_key()]},
+    });
+    let (status, answer) = cluster
+        .call_once(
+            odd,
+            Method::POST,
+            "/v1/admin/mints",
+            Some(&cluster.operator),
+            &spec,
+        )
+        .await;
+    assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE, "{answer}");
+
+    // Given the shared key, it rejoins the other, then the member that was
+    // away comes back. They create mints as before, and each starts again
+    // with every mint.
+    cluster.servers[odd].stop().await;
+    fs::write(&kek, &shared).unwrap();
+    cluster.servers[odd].restart().await;
+    cluster
+        .agreed(&[odd, good], AppState::registry_leader)
+        .await;
+    cluster.servers[away].restart().await;
+    let created = cluster.create(good).await;
+    cluster.hosts(&created).await;
+    let mut mints = vec![mint.key, created.key];
+    mints.sort_unstable();
+    for server in 0..3 {
+        cluster.servers[server].stop().await;
+        cluster.servers[server].restart().await;
+        assert_eq!(cluster.servers[server].state().unwrap().mints(), mints);
+    }
+    cluster.stop().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_mint_leader_restarted_with_another_kek_makes_no_rotation() {
+    let (seed, mint) = seed(None);
+    let shared = fs::read(seed.path().join("kek.key")).unwrap();
+    let mut cluster = Cluster::from_seed(seed).await;
+    let odd = cluster.leader(&mint.key).await;
+    let generation = last_generation(&cluster.info(odd, &mint).await);
+    let mut others = (0..3).filter(|&server| server != odd);
+    let (good, away) = (others.next().unwrap(), others.next().unwrap());
+
+    // With another member away, the mint's leader restarts with a key of its
+    // own, and takes up its term as leader again. Nothing has changed the
+    // mint yet, so the copy it restarts with is up to date, and a rotation it
+    // planned would apply once committed rather than be skipped as stale.
+    cluster.servers[away].stop().await;
+    cluster.servers[odd].stop().await;
+    let kek = cluster.servers[odd].dir.join("kek.key");
+    fs::remove_file(&kek).unwrap();
+    FileKek::create(&kek).unwrap();
+    cluster.servers[odd].restart().await;
+    assert_eq!(cluster.leader_among(&mint.key, &[odd]).await, odd);
+
+    // No majority answers it, so it makes no rotation: a generation key
+    // sealed under its kek.key does not reach even its own log.
+    let path = mint.path("rotate");
+    let (status, answer) = cluster
+        .call_once(odd, Method::POST, &path, Some(&mint.token), &Value::Null)
+        .await;
+    assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE, "{answer}");
+
+    // Given the shared key, it rejoins the other, then the member that was
+    // away comes back. The mint is at the generation it was, mints and
+    // rotates as before, and each member starts again with the note live.
+    cluster.servers[odd].stop().await;
+    fs::write(&kek, &shared).unwrap();
+    cluster.servers[odd].restart().await;
+    cluster.leader_among(&mint.key, &[odd, good]).await;
+    cluster.servers[away].restart().await;
+    let leader = cluster.leader(&mint.key).await;
+    let info = cluster.info(leader, &mint).await;
+    assert_eq!(last_generation(&info), generation);
+    let note = cluster.mint(leader, &mint, 8, &HolderKey::generate()).await;
+    let (status, report) = cluster.rotate(leader, &mint).await;
+    assert_eq!(status, StatusCode::OK, "{report}");
+    for server in 0..3 {
+        cluster.servers[server].stop().await;
+        cluster.servers[server].restart().await;
+        let info = cluster.info(server, &mint).await;
+        assert_eq!(last_generation(&info), generation + 1);
+        assert_eq!(cluster.state_of(server, &note).await, "live");
+    }
     cluster.stop().await;
 }

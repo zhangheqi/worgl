@@ -33,7 +33,9 @@
 //!    [`Holder::take_answers`], which settles the transfers they answer.
 //!    Without them, it resends its outgoing transfers at the times
 //!    [`Holder::resend`] gives and records each answer with
-//!    [`Holder::settle`], which works while the mint keeps its answers.
+//!    [`Holder::settle`], which works while the mint keeps its answers, and
+//!    keeps the payee's notes from it in [`Holder::payments`], in case the
+//!    payee has not submitted.
 //!
 //! ```
 //! use worgl::{Issuer, IssuerKey, LedgerConfig, Policy};
@@ -82,8 +84,9 @@
 //!
 //! A mint's info, read into a [`MintView`], tells the store which notes can
 //! move now: a note that just arrived sits in the last layer and is frozen
-//! until the next rotation. [`Holder::refresh`] keeps notes alive by paying
-//! the ones about to expire to the holder itself.
+//! until the next rotation. The view holds the info's layers, which no clock
+//! moves, so read the info again after a rotation. [`Holder::refresh`] keeps
+//! notes alive by paying the ones about to expire to the holder itself.
 
 mod holder;
 mod mint;
@@ -91,7 +94,8 @@ mod payment;
 mod random;
 
 pub use holder::{
-    Balance, Holder, LoadError, MAX_REQUESTED_NOTES, PayError, REFRESH_MARGIN_SECS, RequestError,
+    Balance, Holder, LoadError, MAX_REQUESTED_NOTES, MadePayment, PAID_KEYS_KEPT, PayError,
+    REFRESH_MARGIN_SECS, RequestError,
 };
 pub use mint::{MintInfo, MintView, NoLayers, NoteState, Schedule};
 pub use payment::{CheckError, Payment, PaymentRequest, ScheduledTransfer, Spacing};
