@@ -40,23 +40,23 @@
 //!
 //! Members send each other Raft's RPCs as HTTP requests to their Raft ports,
 //! with the cluster token. A mint applies whatever its group's log holds,
-//! and whoever shows the token, with a member's seal of its key-encryption
-//! key (see below), can append to that log as if they led, so the token is
-//! as strong as the mints' issuer keys. Members dial each other in plain
-//! HTTP only and nothing between them is encrypted yet, so the token and
-//! the seals cross in the clear, and every member's addresses must be
-//! reachable only by the members and a proxy in front of them, as over
-//! WireGuard between their hosts.
+//! and whoever shows the token, with a member's seal of a fixed value
+//! under its key-encryption key (see below), can append to that log as if
+//! they led, so the token is as strong as the mints' issuer keys. Members
+//! dial each other in plain HTTP only and nothing between them is
+//! encrypted yet, so the token and the seals cross in the clear, and every
+//! member's addresses must be reachable only by the members and a proxy in
+//! front of them, as over WireGuard between their hosts.
 //!
 //! A member dials the others at the addresses its `cluster.json` held when
 //! it started, for every group alike, not at those a group's membership
 //! kept from when it formed. So a member moves to new addresses once every
 //! member's `cluster.json` gives them and every member has restarted;
 //! [`join_cluster`] says which members' addresses it changes. A member's
-//! Raft port refuses, as `421 misdirected`, an RPC that names that member
-//! as its sender, so one whose `cluster.json` gives another member an
-//! address that leads back to it, under whatever spelling, finds that
-//! member unreachable instead of counting its own votes and appends as
+//! Raft port refuses, as `421 misdirected`, an RPC whose Raft vote names
+//! that member as its sender, so one whose `cluster.json` gives another
+//! member an address that leads back to it, under whatever spelling, finds
+//! that member unreachable instead of counting its own votes and appends as
 //! that member's.
 //!
 //! Every member must hold the same key-encryption key, since each unseals

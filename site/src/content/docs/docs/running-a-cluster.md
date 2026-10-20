@@ -52,9 +52,10 @@ lead, and each mint creation, on to the leader's API address with its
 `Authorization` header, so mint admin and operator tokens cross too.
 
 A mint applies whatever its group's log holds without asking who wrote it,
-and the cluster token, shown with a member's seal of its key-encryption key
-(see [The key-encryption key](#the-key-encryption-key)), lets anyone who
-reaches a Raft port append to that log as if they led. Both cross the
+and the cluster token, shown with a member's seal of a fixed value under
+its key-encryption key (see
+[The key-encryption key](#the-key-encryption-key)), lets anyone who reaches
+a Raft port append to that log as if they led. Both cross the
 network in the clear with every Raft message. With them anyone can append
 events the mints will sign notes for, so the cluster token is as strong as
 the mints' issuer keys.

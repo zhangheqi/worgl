@@ -60,9 +60,10 @@
 //! read the mint's info once it has carried out a change sent after that
 //! answer. Members also serve [`raft_router`] on a port of their own, for
 //! each other only. They talk to each other in plain HTTP, Raft's RPCs with
-//! one shared token and the requests they pass on with their clients'
-//! tokens, so every member's addresses must be on a network only the
-//! members and a proxy in front of them can reach (see [`cluster`]).
+//! one shared token and each member's key-encryption key seal, and the
+//! requests they pass on with their clients' tokens, so every member's
+//! addresses must be on a network only the members and a proxy in front of
+//! them can reach (see [`cluster`]).
 //! Creating a mint goes through the cluster's registry, from which every
 //! member writes and serves the new mint; a creation answered `503 timeout`
 //! may have made a mint, so list the mints before creating another. A
@@ -533,7 +534,9 @@ pub fn router(state: AppState) -> Router {
 /// (see [`cluster`]), one whose seal it cannot check while its key is
 /// unavailable with `503 kek_unavailable`, and one that lacks either header,
 /// names no member in its `cluster.json` or carries a seal that is not hex
-/// with `400 malformed`.
+/// with `400 malformed`. Past those checks, it refuses one whose Raft vote
+/// names the receiving member itself as its sender with `421 misdirected`
+/// (see [`cluster`]).
 ///
 /// | method | path                       | body                              |
 /// |--------|----------------------------|-----------------------------------|
