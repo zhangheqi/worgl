@@ -11,10 +11,12 @@
 //! - every replica holds one history, before and after a restart of all,
 //! - every answered mint, transfer and rotation is in it,
 //! - no note was spent twice, and no note a client holds was spent by
-//!   anyone else, and
+//!   anyone else,
 //! - supply balances: what was minted is what is live plus what rotations
 //!   destroyed, and live notes are exactly the clients' plus at most the
-//!   mints that got no clear answer.
+//!   mints that got no clear answer, and
+//! - no leader ever found a replica lacking entries it had acknowledged,
+//!   which openraft warns of and then mends.
 //!
 //! `WORGL_SIM_SEEDS=n` runs seeds 0 to n − 1 (32 by default), and
 //! `WORGL_SIM_SEED=s` runs seed `s` alone. The fault schedule follows from
@@ -22,6 +24,7 @@
 //! a few tries to fail again.
 
 use std::collections::{BTreeMap, BTreeSet};
+use std::fmt::Debug;
 use std::future::Future;
 use std::io;
 use std::panic::{AssertUnwindSafe, catch_unwind};
@@ -40,6 +43,10 @@ use openraft::raft::{
 use openraft::{BasicNode, RaftNetwork, RaftNetworkFactory, Snapshot, SnapshotPolicy, Vote};
 use tempfile::TempDir;
 use tokio::time::{Instant, sleep};
+use tracing::field::{Field, Visit};
+use tracing::level_filters::LevelFilter;
+use tracing::span::{Attributes, Id, Record};
+use tracing::{Event, Level, Metadata, Subscriber};
 use worgl::{
     Error, FileKek, FileStore, HolderKey, Issuer, IssuerKey, LedgerConfig, Note, NoteStatus,
     Output, Policy, Serial, TransferRequest,
@@ -111,14 +118,18 @@ fn simulate(seed: u64) -> Result<(), String> {
         .start_paused(true)
         .build()
         .unwrap();
-    let outcome = catch_unwind(AssertUnwindSafe(|| {
-        runtime.block_on(run(seed, log.clone()))
-    }));
+    let reverted = Reverted::default();
+    let outcome = tracing::subscriber::with_default(reverted.clone(), || {
+        catch_unwind(AssertUnwindSafe(|| {
+            runtime.block_on(run(seed, log.clone()))
+        }))
+    });
     drop(runtime);
-    let error = match outcome {
-        Ok(Ok(())) => return Ok(()),
-        Ok(Err(error)) => error,
-        Err(panic) => panic
+    let error = match (outcome, reverted.take()) {
+        (_, Some(warning)) => format!("a replica lost entries it had acknowledged: {warning}"),
+        (Ok(Ok(())), None) => return Ok(()),
+        (Ok(Err(error)), None) => error,
+        (Err(panic), None) => panic
             .downcast_ref::<String>()
             .cloned()
             .or_else(|| panic.downcast_ref::<&str>().map(|s| (*s).to_owned()))
@@ -128,6 +139,63 @@ fn simulate(seed: u64) -> Result<(), String> {
         "seed {seed}: {error}\nlast faults:\n{}\nrun again with WORGL_SIM_SEED={seed}",
         log.tail(30)
     ))
+}
+
+/// Catches the warning openraft logs, built with
+/// `loosen-follower-log-revert`, when a leader finds that a replica lacks
+/// entries it had acknowledged. openraft then sends them again, so the
+/// other checks could miss a replica losing what it had flushed. A run's
+/// tasks all run on the thread that runs it, so that thread's default
+/// subscriber sees every event they log.
+#[derive(Clone, Default)]
+struct Reverted(Arc<Mutex<Option<String>>>);
+
+impl Reverted {
+    fn take(&self) -> Option<String> {
+        self.0.lock().unwrap().take()
+    }
+}
+
+impl Subscriber for Reverted {
+    fn enabled(&self, metadata: &Metadata<'_>) -> bool {
+        metadata.is_event() && *metadata.level() == Level::WARN
+    }
+
+    fn max_level_hint(&self) -> Option<LevelFilter> {
+        Some(LevelFilter::WARN)
+    }
+
+    fn new_span(&self, _: &Attributes<'_>) -> Id {
+        Id::from_u64(1)
+    }
+
+    fn record(&self, _: &Id, _: &Record<'_>) {}
+
+    fn record_follows_from(&self, _: &Id, _: &Id) {}
+
+    fn event(&self, event: &Event<'_>) {
+        let mut message = Message::default();
+        event.record(&mut message);
+        if message.0.contains("follower log is reverted") {
+            self.0.lock().unwrap().get_or_insert(message.0);
+        }
+    }
+
+    fn enter(&self, _: &Id) {}
+
+    fn exit(&self, _: &Id) {}
+}
+
+/// An event's message.
+#[derive(Default)]
+struct Message(String);
+
+impl Visit for Message {
+    fn record_debug(&mut self, field: &Field, value: &dyn Debug) {
+        if field.name() == "message" {
+            self.0 = format!("{value:?}");
+        }
+    }
 }
 
 /// What the fault schedule did, for the report of a failed run.
