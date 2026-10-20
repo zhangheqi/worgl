@@ -83,13 +83,19 @@ export class MintError extends Error {
  * Whether trying again later may succeed: the request did not complete, or
  * the mint was paused, busy or failed to store the change. Transfers are
  * safe to resend.
+ *
+ * `layer_full` does not count, though the mint answers it with 503: a
+ * transfer refused so is refused every time, since its notes would land in
+ * the same full generation after every rotation until the note it spends
+ * expires. A mint request refused so may pass after the next rotation,
+ * which brings a newer generation to the mint layer.
  */
 export function isTransient(error: unknown): boolean {
   if (error instanceof MintError) {
-    return (
-      ['paused', 'busy', 'storage', 'internal', 'layer_full'].includes(error.code) ||
-      error.status >= 500
-    );
+    if (error.code === 'layer_full') {
+      return false;
+    }
+    return ['paused', 'busy', 'storage', 'internal'].includes(error.code) || error.status >= 500;
   }
   // fetch rejects with a TypeError when the request never completed, and
   // with a DOMException when it timed out.

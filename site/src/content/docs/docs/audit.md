@@ -78,7 +78,7 @@ A member that needs entries the leader has already purged, such as one that
 was down for a long time, is sent the leader's snapshot instead, and
 installing it purges the member's whole log up to the snapshot's last entry.
 Members purge on their own, so two members' exports can start at different
-entries; an entry with the same index and term is the same on both.
+entries; an entry with the same index, term and node is the same on both.
 
 Nothing keeps the purged entries. A full audit trail would need an archive
 of the log, which Worgl does not have yet. How long entries stay also

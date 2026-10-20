@@ -101,15 +101,20 @@ export interface Balance {
  *   {@link isTransient} accepts or `frozen`, and after one that shows nothing
  *   about the transfer: `unknown_mint` or `unissued` from a server that is
  *   not the mint's or lost its state, `spent` or `expired` with another
- *   status than the mint's 409, or `unauthorized` or `duplicate_input`,
- *   which the mint never answers to a transfer a holder signed.
+ *   status than the mint's 409, `layer_full` with another than its 503, or
+ *   `unauthorized` or `duplicate_input`, which the mint never answers to a
+ *   transfer a holder signed.
  * - `dropped`: refused as `spent` or `expired`, with the mint's status 409,
  *   so the note it spends is gone and the purse forgot the transfer
  *   ({@link Purse.forget}). Change the counterparty hands over later is still
  *   taken in by {@link Purse.accept}.
- * - `cancelled`: refused as `policy`, when the policy the mint publishes now
- *   refuses it too. The purse cancelled it and took its note back
- *   ({@link Purse.cancel}).
+ * - `cancelled`: refused as `layer_full`, with the mint's status 503, or as
+ *   `policy`, when the policy the mint publishes now refuses it too. The
+ *   purse cancelled it and took its note back ({@link Purse.cancel}). The
+ *   mint checks the note before the layer the new notes would land in, so
+ *   after `layer_full` the note is live and the transfer was never applied,
+ *   and it never will be: that layer gets no bits back before the note's
+ *   own is dropped.
  */
 export type Outcome = 'kept' | 'dropped' | 'cancelled';
 
@@ -607,22 +612,27 @@ export class Purse {
         return { atStake, outcome };
       });
     }
-    if (code !== 'policy') {
+    let cancel: boolean;
+    if (code === 'layer_full') {
+      // The mint answers so with 503, after finding every note spent live.
+      // Any other answer shows nothing about the notes.
+      cancel = error instanceof MintError && error.status === 503;
+    } else if (code === 'policy') {
+      // The mint checks its policy before its receipts, so a transfer applied
+      // under a looser policy is refused too: its change keys stay. Cancel
+      // only if the policy published now agrees.
+      try {
+        cancel = breaksPolicy(await this.client.infoText(transferMint(transfer)), transfer);
+      } catch {
+        cancel = false;
+      }
+    } else {
       // Anything else may pass later or shows nothing about the transfer:
       // `unknown_mint` or `unissued` from a server that is not the mint's or
       // lost its state, or `unauthorized` or `duplicate_input`, which the
       // mint never answers to a transfer a holder signed, so they come from
       // another server or version.
       return { atStake: undefined, outcome: 'kept' };
-    }
-    // The mint checks its policy before its receipts, so a transfer applied
-    // under a looser policy is refused too: its change keys stay. Cancel only
-    // if the policy published now agrees.
-    let cancel: boolean;
-    try {
-      cancel = breaksPolicy(await this.client.infoText(transferMint(transfer)), transfer);
-    } catch {
-      cancel = false;
     }
     if (!cancel) {
       return { atStake: undefined, outcome: 'kept' };

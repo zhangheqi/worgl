@@ -152,14 +152,15 @@ rather than open without them.
 | Refused as | What they do |
 |---|---|
 | `spent` or `expired`, with HTTP status 409 | Drop it: the note it spends is gone, whether the transfer was applied or not. Its change keys stay, so change the payee hands back is still kept with `accept`. |
+| `layer_full`, with HTTP status 503 | Cancel it, keeping its change keys: the mint checks that the note it spends is live before it looks for room, so it never applied the transfer, and the layer its notes would land in gets no room back before that note expires. |
 | `policy` | Cancel it if the policy the mint publishes now refuses it too, keeping its change keys: the mint checks its policy before its record of answers, so a transfer applied under a looser policy is refused this way too. Keep it otherwise. |
-| `paused`, `busy`, `layer_full`, `storage`, `internal`, another 5xx status, or no answer | Keep it, for the next `settle`: this may pass later. |
+| `paused`, `busy`, `storage`, `internal`, another 5xx status, or no answer | Keep it, for the next `settle`: this may pass later. |
 | `frozen` | Keep it: the note it spends moves after the next rotation. |
-| Anything else, such as `unknown_mint`, `unissued` or `unauthorized` | Keep it: the refusal shows nothing about the transfer, such as a server that is not the mint's, or one that lost its state. The mint answers `spent` and `expired` with 409 and never refuses a transfer the purse signed as `unauthorized` or `duplicate_input`, so such answers come from something else, such as a gateway or another version. `cancel` or `forget` ends it once you know which applies. |
+| Anything else, such as `unknown_mint`, `unissued` or `unauthorized` | Keep it: the refusal shows nothing about the transfer, such as a server that is not the mint's, or one that lost its state. The mint answers `spent` and `expired` with 409 and `layer_full` with 503, and never refuses a transfer the purse signed as `unauthorized` or `duplicate_input`, so such answers come from something else, such as a gateway or another version. `cancel` or `forget` ends it once you know which applies. |
 
 They exit with status 0 when no refused transfer is kept, and with 1 while
 one is. The error ends with "try again later" only when every transfer kept
-was refused by something the third row lists.
+was refused by something the row for `paused` lists.
 `receive` and `submit` exit with 1 on any refusal, since the payment did not
 go through.
 

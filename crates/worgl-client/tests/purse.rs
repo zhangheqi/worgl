@@ -1,7 +1,7 @@
 //! The client and purse against a real server on a local port.
 
 use std::io;
-use std::net::SocketAddr;
+use std::net::{SocketAddr, UdpSocket};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
@@ -37,10 +37,54 @@ const QUICK: Retry = Retry {
     first_delay: Duration::from_millis(10),
 };
 
+/// A port on 127.0.0.1 kept for one test while this lives, so that a
+/// server there can stop and start again on it.
+///
+/// It is below the ports the kernel picks for a bind to port 0 or an
+/// outgoing connection, so no other socket takes it while the server is
+/// stopped, and until the server is back a connection to it is refused.
+/// Tests, in this process or another, claim such a port by binding a UDP
+/// socket to it, which only one of them can, and leave the TCP port free.
+struct Port {
+    address: SocketAddr,
+    _claim: UdpSocket,
+}
+
+impl Port {
+    fn new() -> Self {
+        let ephemeral = first_ephemeral_port();
+        for port in (1024..ephemeral).rev() {
+            let address = SocketAddr::from(([127, 0, 0, 1], port));
+            // Claimed by another test, or used by another program.
+            let Ok(claim) = UdpSocket::bind(address) else {
+                continue;
+            };
+            if std::net::TcpListener::bind(address).is_ok() {
+                return Self {
+                    address,
+                    _claim: claim,
+                };
+            }
+        }
+        panic!("no port below {ephemeral} is free");
+    }
+}
+
+/// The first port the kernel picks itself: on Linux the start of
+/// `net.ipv4.ip_local_port_range`, and elsewhere 49152, where macOS starts.
+fn first_ephemeral_port() -> u16 {
+    if cfg!(target_os = "linux") {
+        let range = std::fs::read_to_string("/proc/sys/net/ipv4/ip_local_port_range").unwrap();
+        range.split_whitespace().next().unwrap().parse().unwrap()
+    } else {
+        49152
+    }
+}
+
 /// A server on a local port with one mint.
 struct Server {
     url: String,
-    address: SocketAddr,
+    port: Port,
     mint: PublicKey,
     token: String,
     authority: MintKey,
@@ -70,15 +114,20 @@ impl Server {
     }
 
     async fn start_with(policy: Policy) -> Self {
-        Self::create(policy, None).await
+        Self::create(policy, None, 1024).await
     }
 
     /// A server whose mint rotates every `period` seconds, besides on request.
     async fn rotating_every(period: u64) -> Self {
-        Self::create(Policy::cash_like(), Some(period)).await
+        Self::create(Policy::cash_like(), Some(period), 1024).await
     }
 
-    async fn create(mut policy: Policy, rotate_every: Option<u64>) -> Self {
+    /// A server whose mint's layers hold `layer_size` notes each.
+    async fn with_layer_size(layer_size: u32) -> Self {
+        Self::create(Policy::cash_like(), None, layer_size).await
+    }
+
+    async fn create(mut policy: Policy, rotate_every: Option<u64>, layer_size: u32) -> Self {
         let dir = tempfile::tempdir().unwrap();
         init_state(dir.path()).unwrap();
         let state = AppState::open(dir.path(), 1000).unwrap();
@@ -88,18 +137,18 @@ impl Server {
             .create_mint(MintSpec {
                 ledger: LedgerConfig {
                     layers: 4,
-                    layer_size: 1024,
+                    layer_size,
                 },
                 policy,
                 rotate_every,
             })
             .await
             .unwrap();
-        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let address = listener.local_addr().unwrap();
+        let port = Port::new();
+        let listener = TcpListener::bind(port.address).await.unwrap();
         Self {
-            url: format!("http://{address}"),
-            address,
+            url: format!("http://{}", port.address),
+            port,
             mint: created.mint,
             token: created.token,
             authority,
@@ -128,7 +177,7 @@ impl Server {
         // Each committer lets go of its store once it sees its mint dropped.
         for _ in 0..200 {
             if let Ok(state) = AppState::open(self.dir.path(), 1000) {
-                let listener = TcpListener::bind(self.address).await.unwrap();
+                let listener = TcpListener::bind(self.port.address).await.unwrap();
                 self.serving = Some(serve(listener, state));
                 return;
             }
@@ -293,10 +342,8 @@ async fn errors_say_what_went_wrong() {
     }
 
     // Nothing listening: the request never completed, so it may be retried.
-    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
-    let closed = format!("http://{}", listener.local_addr().unwrap());
-    drop(listener);
-    let error = Client::new(&closed)
+    let closed = Port::new();
+    let error = Client::new(&format!("http://{}", closed.address))
         .unwrap()
         .info(&server.mint)
         .await
@@ -490,11 +537,13 @@ async fn a_refusal_the_mint_would_not_give_drops_or_cancels_nothing() {
     let request = bob.request(&server.mint, 5).await.unwrap();
     alice.pay(&request, NOW).await.unwrap();
 
-    // The mint answers `spent` and `expired` with 409, and never answers
-    // `unauthorized` or `duplicate_input` to a transfer a holder signed.
+    // The mint answers `spent` and `expired` with 409 and `layer_full` with
+    // 503, and never answers `unauthorized` or `duplicate_input` to a
+    // transfer a holder signed.
     for (status, code) in [
         (401, "spent"),
         (401, "expired"),
+        (502, "layer_full"),
         (403, "unauthorized"),
         (400, "duplicate_input"),
     ] {
@@ -570,6 +619,102 @@ async fn a_transfer_the_policy_now_refuses_is_cancelled() {
     let spends = payment.transfers[0].request.inputs[0].note;
     assert_eq!(alice.holder().notes().collect::<Vec<_>>(), [&spends]);
     assert_eq!(alice.holder().payments().count(), 0);
+}
+
+/// A server that passes each transfer on to `server` and its answer back,
+/// and returns its URL and how many transfers it was sent. It serves
+/// nothing else.
+async fn counting(server: &Server) -> (String, Arc<AtomicUsize>) {
+    let tries = Arc::new(AtomicUsize::new(0));
+    let (counted, client) = (tries.clone(), server.client());
+    let relay = move |Json(request): Json<TransferRequest>| {
+        let (tries, client) = (counted.clone(), client.clone());
+        async move {
+            tries.fetch_add(1, Ordering::SeqCst);
+            match client.transfer(&request).await {
+                Ok(notes) => Json(json!({ "notes": notes })).into_response(),
+                Err(Error::Refused(refusal)) => {
+                    let status = StatusCode::from_u16(refusal.status).unwrap();
+                    let body = json!({"error": refusal.code, "message": refusal.message});
+                    (status, Json(body)).into_response()
+                }
+                Err(error) => panic!("{error}"),
+            }
+        }
+    };
+    let app = axum::Router::new().route("/v1/transfer", axum::routing::post(relay));
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let url = format!("http://{}", listener.local_addr().unwrap());
+    tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+    (url, tries)
+}
+
+#[tokio::test]
+async fn a_transfer_into_a_full_layer_is_sent_once_and_cancelled() {
+    // Layers of 64 notes. Carol's 64 notes of 1, paid from Dave's four of
+    // 16, fill the last layer, where a hop from the mint layer lands.
+    let server = Server::with_layer_size(64).await;
+    let (alice, bob) = (server.purse(), server.purse());
+    let (carol, dave) = (server.purse(), server.purse());
+    server.fund(&dave, 64, 16).await;
+    let asked = carol.request_at_most(&server.mint, 64, 1).await.unwrap();
+    let paid = dave.pay(&asked, NOW).await.unwrap();
+    all_answered(&carol.receive(&asked, &paid).await.unwrap(), 4);
+
+    server.fund(&alice, 8, 8).await;
+    let request = bob.request(&server.mint, 5).await.unwrap();
+    let payment = alice.pay(&request, NOW).await.unwrap();
+    let received = bob.receive(&request, &payment).await.unwrap();
+    let [refused] = received.refused.as_slice() else {
+        panic!("{:?}", received.refused)
+    };
+    assert_eq!(refused.error.code(), Some("layer_full"));
+    assert!(!refused.error.is_transient());
+    assert_eq!(refused.outcome, Outcome::Kept);
+
+    // After a rotation the hop lands in the same full generation, one
+    // position down. Alice's purse sends it once and cancels it: the mint
+    // never applied it, so the note is hers again.
+    server.rotate().await;
+    let (url, tries) = counting(&server).await;
+    let relayed = Purse::new(
+        Client::new(&url).unwrap(),
+        alice.holder(),
+        MemoryStore::new(),
+    )
+    .with_retry(QUICK);
+    let settled = relayed.settle(NOW).await.unwrap();
+    assert_eq!(tries.load(Ordering::SeqCst), 1);
+    let [refused] = settled.refused.as_slice() else {
+        panic!("{:?}", settled.refused)
+    };
+    assert_eq!(refused.error.code(), Some("layer_full"));
+    assert_eq!(refused.outcome, Outcome::Cancelled);
+    let spends = payment.transfers[0].request.inputs[0].note;
+    assert_eq!(relayed.holder().notes().collect::<Vec<_>>(), [&spends]);
+    assert!(matches!(
+        server.client().verify(&spends).await.unwrap().status,
+        NoteStatus::Live { position: 1, .. }
+    ));
+    let alice = Purse::new(server.client(), relayed.holder(), MemoryStore::new()).with_retry(QUICK);
+    let balance = alice.balance(&server.mint).await.unwrap();
+    assert_eq!(
+        (balance.spendable, balance.outgoing, balance.unconfirmed),
+        (8, 0, 3)
+    );
+
+    // Its refresh, once the note dies at the next rotation, goes the same
+    // way.
+    server.rotate().await;
+    let plan = alice.plan_refresh(&server.mint).await.unwrap();
+    let refreshed = alice.submit(&now(&plan)).await.unwrap();
+    let [refused] = refreshed.refused.as_slice() else {
+        panic!("{:?}", refreshed.refused)
+    };
+    assert_eq!(refused.error.code(), Some("layer_full"));
+    assert_eq!(refused.outcome, Outcome::Cancelled);
+    assert_eq!(alice.holder().notes().collect::<Vec<_>>(), [&spends]);
+    assert_eq!(alice.holder().outgoing().count(), 0);
 }
 
 #[tokio::test]

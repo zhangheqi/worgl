@@ -105,8 +105,8 @@ pub struct Refused {
     /// The transfer.
     pub request: TransferRequest,
     /// The last error. [`Error::is_transient`] tells whether submitting it
-    /// again later may work; a refusal such as `spent` or `expired` will
-    /// not.
+    /// again later may work; a refusal such as `spent`, `expired` or
+    /// `layer_full` will not.
     pub error: Error,
     /// For a transfer refused as `spent` or `expired` that this purse made
     /// or is paid by, what it may lose ([`Holder::at_stake`]), as it stood
@@ -127,18 +127,22 @@ pub enum Outcome {
     /// later, one [`Error::is_transient`] accepts or `frozen`, and after one
     /// that shows nothing about the transfer: `unknown_mint` or `unissued`
     /// from a server that is not the mint's or lost its state, `spent` or
-    /// `expired` with another status than the mint's 409, or `unauthorized`
-    /// or `duplicate_input`, which the mint never answers to a transfer a
-    /// holder signed.
+    /// `expired` with another status than the mint's 409, `layer_full` with
+    /// another than its 503, or `unauthorized` or `duplicate_input`, which
+    /// the mint never answers to a transfer a holder signed.
     Kept,
     /// Refused as `spent` or `expired`, with the mint's status 409: the note
     /// it spends is gone, so the purse [forgot](Holder::forget) the
     /// transfer. Change the counterparty hands over later is still taken in
     /// by [`accept`](Purse::accept).
     Dropped,
-    /// Refused as `policy`, when the policy the mint publishes now refuses
-    /// it too: the purse [cancelled](Holder::cancel) the transfer and took
-    /// its note back.
+    /// Refused as `layer_full`, with the mint's status 503, or as `policy`,
+    /// when the policy the mint publishes now refuses it too: the purse
+    /// [cancelled](Holder::cancel) the transfer and took its note back. The
+    /// mint checks the note before the layer the new notes would land in, so
+    /// after `layer_full` the note is live and the transfer was never
+    /// applied, and it never will be: that layer gets no bits back before
+    /// the note's own is dropped.
     Cancelled,
 }
 
@@ -469,6 +473,11 @@ impl<S: Store> Purse<S> {
                     };
                     Ok((at_stake, outcome))
                 });
+            }
+            // The mint answers so with 503, after finding every note spent
+            // live. Any other answer shows nothing about the notes.
+            Some("layer_full") => {
+                matches!(error, Error::Refused(refusal) if refusal.status == 503)
             }
             // The mint checks its policy before its receipts, so a transfer
             // applied under a looser policy is refused too: its change keys

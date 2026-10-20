@@ -3,7 +3,7 @@
 import assert from 'node:assert/strict';
 import { mkdtempSync, readdirSync, rmSync, statSync, writeFileSync } from 'node:fs';
 import { createServer as createHttpServer } from 'node:http';
-import { type AddressInfo, createServer } from 'node:net';
+import { type AddressInfo } from 'node:net';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { after, before, describe, test } from 'node:test';
@@ -23,7 +23,7 @@ import {
   isTransient,
 } from '../src/index.ts';
 import { FileStore } from '../src/node.ts';
-import { TestServer } from './server.ts';
+import { keptPort, TestServer } from './server.ts';
 
 /** Fast retries, so a refused transfer does not hold a test up. */
 const quick = { retry: { attempts: 2, firstDelayMs: 10 } };
@@ -116,12 +116,7 @@ describe('client', () => {
     });
     assert.throws(() => new Client('ftp://example.com'), TypeError);
 
-    const port = await new Promise<number>((resolve) => {
-      const probe = createServer().listen(0, '127.0.0.1', () => {
-        const address = probe.address();
-        probe.close(() => resolve(typeof address === 'object' && address ? address.port : 0));
-      });
-    });
+    const port = await keptPort();
     await assert.rejects(new Client(`http://127.0.0.1:${port}`).info(server.mint), (error) =>
       isTransient(error),
     );
@@ -288,11 +283,13 @@ describe('purse', () => {
     const request = await bob.request(server.mint, 5n);
     await alice.pay(request, NO_SPACING);
 
-    // The mint answers `spent` and `expired` with 409, and never answers
-    // `unauthorized` or `duplicate_input` to a transfer a holder signed.
+    // The mint answers `spent` and `expired` with 409 and `layer_full` with
+    // 503, and never answers `unauthorized` or `duplicate_input` to a
+    // transfer a holder signed.
     const answers = [
       [401, 'spent'],
       [401, 'expired'],
+      [502, 'layer_full'],
       [403, 'unauthorized'],
       [400, 'duplicate_input'],
     ] as const;
@@ -352,6 +349,68 @@ describe('purse', () => {
       // Bob's submission is refused the same way.
       const received = await bob.receive(request, payment);
       assert.equal(received.refused[0]?.outcome, 'kept');
+    } finally {
+      await own.stop();
+    }
+  });
+
+  test('a transfer into a full layer is sent once and cancelled', async () => {
+    // Layers of 64 notes. Carol's 64 notes of 1, paid from Dave's four of 16,
+    // fill the last layer, where a hop from the mint layer lands.
+    const own = await TestServer.start({}, undefined, 64);
+    try {
+      let tries = 0;
+      const fetch: typeof globalThis.fetch = (input, init) => {
+        if (String(input).endsWith('/v1/transfer')) {
+          tries += 1;
+        }
+        return globalThis.fetch(input, init);
+      };
+      const open = () => Purse.open(own.client(), quick);
+      const [bob, carol, dave] = [await open(), await open(), await open()];
+      const alice = await Purse.open(new Client(own.url, { fetch }), quick);
+      await own.fund(dave, 64n, 16n);
+      const asked = await carol.requestAtMost(own.mint, 64n, 1n);
+      allAnswered(await carol.receive(asked, await dave.pay(asked, NO_SPACING)), 4);
+
+      await own.fund(alice, 8n, 8n);
+      const held = alice.notes();
+      const request = await bob.request(own.mint, 5n);
+      const payment = await alice.pay(request, NO_SPACING);
+      const received = await bob.receive(request, payment);
+      assert.equal(received.refused.length, 1);
+      const error = received.refused[0]!.error;
+      assert.ok(error instanceof MintError);
+      assert.equal(error.code, 'layer_full');
+      assert.equal(isTransient(error), false);
+      assert.equal(received.refused[0]!.outcome, 'kept');
+
+      // After a rotation the hop lands in the same full generation, one
+      // position down. Alice's purse sends it once and cancels it: the mint
+      // never applied it, so the note is hers again.
+      await own.rotate();
+      tries = 0;
+      const settled = await alice.settle(NO_SPACING);
+      assert.equal(tries, 1);
+      assert.equal(settled.refused.length, 1);
+      const refused = settled.refused[0]!;
+      assert.ok(refused.error instanceof MintError);
+      assert.equal(refused.error.code, 'layer_full');
+      assert.equal(refused.outcome, 'cancelled');
+      assert.deepEqual(alice.notes(), held);
+      assert.equal((await own.client().verify(held[0]!)).live?.position, 1);
+      const balance = await alice.balance(own.mint);
+      assert.deepEqual([balance.spendable, balance.outgoing, balance.unconfirmed], [8n, 0n, 3n]);
+
+      // Its refresh, once the note dies at the next rotation, goes the same
+      // way.
+      await own.rotate();
+      const refreshed = await alice.submit(now(await alice.planRefresh(own.mint)));
+      assert.equal(tries, 2);
+      assert.equal(refreshed.refused.length, 1);
+      assert.equal(refreshed.refused[0]!.outcome, 'cancelled');
+      assert.deepEqual(alice.notes(), held);
+      assert.deepEqual(alice.outgoing(), []);
     } finally {
       await own.stop();
     }

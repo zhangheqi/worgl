@@ -66,15 +66,20 @@ impl Error {
     /// Whether trying again later may succeed: the request did not complete,
     /// or the mint was paused, busy or failed to store the change. Transfers
     /// and burns are safe to resend.
+    ///
+    /// `layer_full` does not count, though the mint answers it with 503: a
+    /// transfer refused so is refused every time, since its notes would land
+    /// in the same full generation after every rotation until the note it
+    /// spends expires. A mint request refused so may pass after the next
+    /// rotation, which brings a newer generation to the mint layer.
     pub fn is_transient(&self) -> bool {
         match self {
             Self::Http(error) => !error.is_decode() && !error.is_builder(),
-            Self::Refused(refusal) => {
-                matches!(
-                    refusal.code.as_str(),
-                    "paused" | "busy" | "storage" | "internal" | "layer_full"
-                ) || refusal.status >= 500
-            }
+            Self::Refused(refusal) => match refusal.code.as_str() {
+                "paused" | "busy" | "storage" | "internal" => true,
+                "layer_full" => false,
+                _ => refusal.status >= 500,
+            },
             _ => false,
         }
     }
