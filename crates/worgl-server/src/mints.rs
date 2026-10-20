@@ -50,9 +50,9 @@ use serde::{Deserialize, Serialize};
 use tokio::runtime::{Handle, RuntimeFlavor};
 use tokio::sync::{mpsc, oneshot, watch};
 use worgl::{
-    BurnRequest, CommitError, Error, Issuer, IssuerKey, KeySet, LedgerConfig, MintRequest, Note,
-    NoteError, PersistentIssuer, Policy, PublicKey, RotationReport, SetupError, TransferRequest,
-    VerifiedBurn, VerifiedMint, VerifiedTransfer, Verifier,
+    BurnRequest, Clock, CommitError, Error, Issuer, IssuerKey, KeySet, LedgerConfig, MintRequest,
+    Note, NoteError, PersistentIssuer, Policy, PublicKey, RotationReport, SetupError,
+    TransferRequest, VerifiedBurn, VerifiedMint, VerifiedTransfer, Verifier,
 };
 use worgl::{FileKek, Kek, KeyRing};
 use worgl_raft::registry::Records;
@@ -83,6 +83,10 @@ const QUEUE: usize = 4096;
 /// How long a replica that does not lead waits for its leader to log a
 /// scheduled rotation before looking again.
 const FOLLOWER_WAIT: Duration = Duration::from_secs(1);
+
+/// Transfers and burns a second, sustained, below which a mint's receipt
+/// policy is worth a warning when the mint starts.
+const LOW_CEILING: u32 = 1_000;
 
 /// What a mint is created with.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -477,6 +481,7 @@ pub(crate) fn load(dir: &Path, kek: Arc<dyn Kek>) -> Result<Loaded> {
     } = read_files(dir)?;
     let mut issuer = PersistentIssuer::open_with_kek(dir, key, policy, kek)
         .with_context(|| format!("opening {}", dir.display()))?;
+    issuer.set_clock(Clock::monotonic());
     if settings.paused {
         // An older server paused it in mint.json. Log the pause first, so a
         // crash before the file is rewritten loses nothing.
@@ -622,6 +627,11 @@ impl Mint {
             settings,
         } = loaded;
         let (changes, queue) = mpsc::channel(QUEUE);
+        let policy = match &store {
+            Store::Local(issuer) => issuer.issuer().policy().clone(),
+            Store::Replicated(replica) => replica.read_local(|issuer| issuer.policy().clone()),
+        };
+        warn_if_capped(&key, &policy);
         let (backend, logged) = match store {
             Store::Local(issuer) => {
                 let compact_every = compact_every.max(1);
@@ -962,6 +972,26 @@ impl Inner {
                 );
             }
         }
+    }
+}
+
+/// Warns when the mint's receipts cap the transfers and burns it takes, as
+/// the defaults of an older server can: it then keeps `receipt_capacity`
+/// receipts, each for at least `receipt_min_age_secs`.
+fn warn_if_capped(mint: &PublicKey, policy: &Policy) {
+    let (capacity, min_age) = (policy.receipt_capacity, policy.receipt_min_age_secs);
+    if capacity == 0 || min_age == 0 {
+        return;
+    }
+    let ceiling = capacity / min_age;
+    if ceiling < LOW_CEILING {
+        tracing::warn!(
+            %mint,
+            receipt_capacity = capacity,
+            receipt_min_age_secs = min_age,
+            "the mint takes at most {ceiling} transfers and burns a second, sustained; raise \
+             receipt_capacity in its policy.json to take more"
+        );
     }
 }
 

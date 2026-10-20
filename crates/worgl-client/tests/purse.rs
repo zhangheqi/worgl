@@ -1,10 +1,18 @@
 //! The client and purse against a real server on a local port.
 
 use std::io;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::time::Duration;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
+use std::time::{Duration, Instant};
 
-use worgl::{LedgerConfig, MintKey, MintRequest, Note, NoteStatus, Policy, PublicKey};
+use axum::Json;
+use axum::http::{StatusCode, header};
+use axum::response::IntoResponse;
+use serde_json::json;
+use worgl::{
+    HolderKey, Issuer, IssuerKey, LedgerConfig, MintKey, MintRequest, Note, NoteStatus, Output,
+    Policy, PublicKey, TransferRequest,
+};
 use worgl_client::{Client, Error, MemoryStore, Purse, Retry, Store, Submitted};
 use worgl_sdk::{ScheduledTransfer, Spacing};
 use worgl_server::{AppState, MintSpec, init_state, router};
@@ -33,10 +41,10 @@ struct Server {
 
 impl Server {
     async fn start() -> Self {
-        Self::with_policy(Policy::cash_like()).await
+        Self::start_with(Policy::cash_like()).await
     }
 
-    async fn with_policy(mut policy: Policy) -> Self {
+    async fn start_with(mut policy: Policy) -> Self {
         let dir = tempfile::tempdir().unwrap();
         init_state(dir.path()).unwrap();
         let state = AppState::open(dir.path(), 1000).unwrap();
@@ -264,10 +272,12 @@ async fn the_payer_can_submit_and_hand_the_notes_over() {
 
 #[tokio::test]
 async fn the_payee_hands_back_change_the_mint_no_longer_answers_for() {
-    // Two receipts stand in for a mint whose receipts many transfers pushed out.
+    // Two receipts, kept no minimum time, stand in for a mint whose receipts
+    // many transfers pushed out.
     let mut policy = Policy::cash_like();
     policy.receipt_capacity = 2;
-    let server = Server::with_policy(policy).await;
+    policy.receipt_min_age_secs = 0;
+    let server = Server::start_with(policy).await;
     let (alice, bob, carol) = (server.purse(), server.purse(), server.purse());
     server.fund(&alice, 8, 8).await;
     server.fund(&carol, 3, 1).await;
@@ -402,6 +412,116 @@ async fn a_paused_mint_is_retried_then_reported() {
     let retried = bob.receive(&request, &payment).await.unwrap();
     all_answered(&retried, 1);
     assert_eq!(retried.value, 8);
+}
+
+#[tokio::test]
+async fn a_busy_mint_is_waited_out_as_it_asks() {
+    // The mint keeps one receipt, for at least 3 s.
+    let server = Server::start_with(Policy {
+        receipt_capacity: 1,
+        receipt_min_age_secs: 3,
+        ..Policy::cash_like()
+    })
+    .await;
+    let (alice, bob) = (server.purse(), server.purse());
+    server.fund(&alice, 8, 4).await;
+    let first = bob.request(&server.mint, 4).await.unwrap();
+    let paid = alice.pay(&first, NOW).await.unwrap();
+    all_answered(&bob.receive(&first, &paid).await.unwrap(), 1);
+
+    // The next transfer would push that receipt out while it is young.
+    let second = bob.request(&server.mint, 4).await.unwrap();
+    let payment = alice.pay(&second, NOW).await.unwrap();
+    let request = &payment.transfers[0].request;
+    let error = server.client().transfer(request).await.unwrap_err();
+    assert_eq!(error.code(), Some("busy"));
+    assert!(error.is_transient());
+    let asked = error.retry_after().unwrap();
+    assert!((1..=3).contains(&asked.as_secs()), "{asked:?}");
+
+    // The purse waits as long as the mint asks, not its own 10 ms, and the
+    // transfer then goes through.
+    let started = Instant::now();
+    all_answered(&bob.receive(&second, &payment).await.unwrap(), 1);
+    assert!(started.elapsed() >= Duration::from_secs(1));
+}
+
+/// A server whose answers to `/v1/transfer` are `busy`, asking for a
+/// second's wait, and then `503 no_leader`, asking for the same. Returns its
+/// URL and how many transfers it was sent.
+async fn busy_then_leaderless() -> (String, Arc<AtomicUsize>) {
+    let tries = Arc::new(AtomicUsize::new(0));
+    let counted = tries.clone();
+    let app = axum::Router::new().route(
+        "/v1/transfer",
+        axum::routing::post(move || {
+            let tries = counted.clone();
+            async move {
+                let unavailable = StatusCode::SERVICE_UNAVAILABLE;
+                let wait = [(header::RETRY_AFTER, "1")];
+                if tries.fetch_add(1, Ordering::SeqCst) == 0 {
+                    let body = json!({"error": "busy", "message": "busy"});
+                    (unavailable, wait, Json(body)).into_response()
+                } else {
+                    let body = json!({"error": "no_leader", "message": "no leader"});
+                    (unavailable, wait, Json(body)).into_response()
+                }
+            }
+        }),
+    );
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let url = format!("http://{}", listener.local_addr().unwrap());
+    tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+    (url, tries)
+}
+
+#[tokio::test]
+async fn a_busy_answer_stretches_the_next_wait_only() {
+    let (url, tries) = busy_then_leaderless().await;
+    let retry = Retry {
+        attempts: 3,
+        first_delay: Duration::from_millis(10),
+    };
+    let purse = Purse::new(
+        Client::new(&url).unwrap(),
+        Default::default(),
+        MemoryStore::new(),
+    )
+    .with_retry(retry);
+    let mut issuer = Issuer::new(
+        IssuerKey::generate(),
+        LedgerConfig {
+            layers: 2,
+            layer_size: 64,
+        },
+        Policy::cash_like(),
+    )
+    .unwrap();
+    let alice = HolderKey::generate();
+    let note = issuer.mint(8, alice.public_key()).unwrap();
+    let output = Output {
+        amount: 8,
+        holder: HolderKey::generate().public_key(),
+    };
+    let request = TransferRequest::single(note, &alice, output).unwrap();
+
+    let started = Instant::now();
+    let transfers = [ScheduledTransfer {
+        after_secs: 0,
+        request,
+    }];
+    let submitted = purse.submit(&transfers).await.unwrap();
+    let waited = started.elapsed();
+    assert_eq!(tries.load(Ordering::SeqCst), 3);
+    let error = &submitted.refused[0].error;
+    assert_eq!(error.code(), Some("no_leader"));
+    assert_eq!(error.retry_after(), Some(Duration::from_secs(1)));
+    // A second as busy asked, then 20 ms: the second's wait does not
+    // double, and no_leader's Retry-After does not stretch it.
+    assert!(
+        waited >= Duration::from_secs(1) && waited < Duration::from_millis(1900),
+        "{waited:?}"
+    );
 }
 
 #[tokio::test]

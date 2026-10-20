@@ -17,6 +17,9 @@ use crate::store::{FileStore, Locked, Store};
 /// Later times are submitted at this delay.
 pub const MAX_DELAY_SECS: u64 = 365 * 24 * 60 * 60;
 
+/// Longest a mint's `Retry-After` makes a purse wait before a retry.
+const MAX_RETRY_AFTER: Duration = Duration::from_secs(30);
+
 /// A [`Holder`] connected to a server and a [`Store`]: it reads mint info
 /// itself, submits transfers at their scheduled times, retries what failed
 /// on the way, and saves after every change.
@@ -45,10 +48,19 @@ pub struct Purse<S: Store = FileStore> {
 }
 
 /// How a purse resends a transfer that failed on the way: a lost
-/// connection, a timeout, or a mint that was paused or could not store it.
-/// Resending is safe, since the mint answers an identical transfer with the
-/// identical notes, before or after a rotation, for as long as it remembers
-/// the transfer (see [`Purse::settle`]).
+/// connection, a timeout, or a mint that was paused, busy or could not
+/// store it. Resending is safe, since the mint answers an identical
+/// transfer with the identical notes, before or after a rotation, for as
+/// long as it remembers the transfer (see [`Purse::settle`]).
+///
+/// When the mint answers `busy`, the next wait is as long as its
+/// `Retry-After` asks, up to 30 seconds, if that is longer; the waits after
+/// it double from where they were. A `Retry-After` on any other answer,
+/// such as a proxy's, changes no wait. The mint answers `busy` only to a
+/// request it did not apply, so with the default and [`Client::new`]'s
+/// 30-second timeout the last try still ends within 127 seconds of any the
+/// mint may have applied, inside the 128 seconds a mint keeps each answer
+/// by default, and is answered as before.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Retry {
     /// Tries in all, the first included.
@@ -377,7 +389,7 @@ impl<S: Store> Purse<S> {
         loop {
             match self.client.transfer(request).await {
                 Err(error) if error.is_transient() && attempt < self.retry.attempts => {
-                    sleep(delay).await;
+                    sleep(next_wait(delay, &error)).await;
                     delay = delay.saturating_mul(2);
                     attempt += 1;
                 }
@@ -412,5 +424,20 @@ impl<S: Store> Purse<S> {
         // A panic in another task holding the lock should not take the
         // purse down with it.
         self.holder.lock().unwrap_or_else(|e| e.into_inner())
+    }
+}
+
+/// The wait before the next try after `error`: `delay`, or after `busy`
+/// what the mint's `Retry-After` asks if that is longer, up to
+/// [`MAX_RETRY_AFTER`]. It stretches this wait only, never the ones after.
+///
+/// Only `busy` stretches it: the mint answers so only to a request it did
+/// not apply. Another answer, such as a proxy's, may come after the mint
+/// applied the try, and longer waits could take the last try past the
+/// time the mint keeps the receipt for.
+fn next_wait(delay: Duration, error: &Error) -> Duration {
+    match error.retry_after() {
+        Some(asked) if error.code() == Some("busy") => delay.max(asked.min(MAX_RETRY_AFTER)),
+        _ => delay,
     }
 }

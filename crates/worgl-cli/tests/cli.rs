@@ -291,9 +291,11 @@ async fn the_payer_can_submit_and_hand_the_notes_over() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn the_payee_hands_back_the_change() {
-    // Two receipts stand in for a mint whose receipts many transfers pushed out.
+    // Two receipts, kept no minimum time, stand in for a mint whose receipts
+    // many transfers pushed out.
     let mut policy = Policy::cash_like();
     policy.receipt_capacity = 2;
+    policy.receipt_min_age_secs = 0;
     let setup = Setup::with(policy, None).await;
     let mint = setup.mint.to_string();
     setup.ok("alice.worgl", &["init"]).await;
