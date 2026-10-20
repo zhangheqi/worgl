@@ -125,6 +125,63 @@ they are a majority, but until the odd member is fixed the cluster cannot
 lose another. To fix it, stop it, copy `kek.key` from a member the others
 accept, and start it again; it catches up from the others.
 
+## Backups and a failed member
+
+Back up the members' directories as any server's (see
+[Backups](../backups/)), but restore them only together: every member from
+a copy of one moment, with every member stopped, before any of them starts.
+Take the copies one of two ways:
+
+- Copy every member's directory with every member stopped, and restore
+  each member from its own copy.
+- Copy one member's directory, with that member stopped, once it holds
+  every change another member holds, and restore all three from it. Each
+  then needs its own `cluster.json`: run `join-cluster` on each with its
+  own `--node`, as when the cluster started.
+
+A member holds every change another holds when, for each mint, the last
+entry `export-log` prints on the other, run first, is among those it
+prints, and the last `log_id` in the other's `registry/log.json`, its copy
+of the registry's log, is in its own. Every change the cluster answered is
+on at least two of the three members, so such a member holds every change
+answered before the check. A member that was away, cut off or behind may
+lack changes the other two made, and restoring all three from its copy
+undoes them.
+
+Never restore one member on its own. A member restored from an older copy
+has forgotten what it acknowledged to the others, and nothing prevents
+that. If it helps a member that also lacks those changes become leader, the
+cluster loses changes it answered, and a note paid away can be spent again.
+A leader that had counted the member as holding entries the copy lacks logs
+a warning containing `follower log is reverted`; a leader elected since has
+nothing to compare with, and logs nothing.
+
+To replace a member whose directory is lost, copy one that runs instead:
+
+1. Stop one of the two members still running, once it holds every change
+   the other holds. Until it is back, the other alone is not a majority, so
+   the mints take no changes.
+2. Copy its whole state directory to the machine that takes the failed
+   member's place, at the failed member's addresses, and run `join-cluster`
+   on the copy with the failed member's id.
+3. Start both. The new member catches up from the others.
+
+```sh
+# On the new machine, with the copy in ./server, if member 3 failed:
+$S join-cluster --state ./server --node 3 $MEMBERS
+$S serve        --state ./server --listen 0.0.0.0:8080
+```
+
+Deleting a member's mint logs and `vote.json` files so that it receives
+snapshots from the others does not work: a member does not start with a
+mint whose `log.bin` is missing, or whose snapshot holds entries its group
+wrote while its `vote.json` is missing. Never delete a mint's directory or
+`registry/` on a member either. When it starts, the member writes a mint's
+directory again from the registry's record, if the registry holds the
+mint, and opens an empty registry in place of `registry/`; either way it
+rejoins the group having forgotten what it acknowledged, as if restored
+from an empty copy.
+
 ## Changing the rules
 
 Each member reads a mint's `policy.json` and `mint.json`, its rules and
