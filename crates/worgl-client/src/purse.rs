@@ -9,7 +9,7 @@ use tokio::time::{Instant, sleep, sleep_until};
 use worgl::{KeySet, Note, PublicKey, TransferRequest};
 use worgl_sdk::{Balance, Holder, Payment, PaymentRequest, ScheduledTransfer, Spacing};
 
-use crate::client::{Client, unix_now};
+use crate::client::Client;
 use crate::error::Error;
 use crate::store::{FileStore, Locked, Store};
 
@@ -353,9 +353,15 @@ impl<S: Store> Purse<S> {
     /// [`Holder::due_resends`]); if the save fails, only the refreshes are
     /// undone. Submit the transfers at their times with
     /// [`submit`](Self::submit).
+    ///
+    /// The times are planned by the server's clock, from the `Date` of its
+    /// info answer ([`Client::view_and_time`]), so this machine's clock,
+    /// slow or fast, moves none of them past the rotation. When the answer
+    /// has no `Date`, they are planned by this machine's clock instead. Once
+    /// the rotation's time has come and the mint has not made it yet, they
+    /// are all due at once.
     pub async fn plan_refresh(&self, mint: &PublicKey) -> Result<Vec<ScheduledTransfer>, Error> {
-        let view = self.client.view(mint).await?;
-        let now = unix_now();
+        let (view, now) = self.client.view_and_time(mint).await?;
         let (mut transfers, resends) = self.change_or_restore(|holder| {
             // Before the refreshes join the outgoing transfers.
             let resends = holder.due_resends(&view, now);
@@ -381,6 +387,8 @@ impl<S: Store> Purse<S> {
     /// and returns the value lost. It also stops waiting for unconfirmed
     /// change that would sit in a dropped layer, and stops keeping notes
     /// owed to payees once their layer is dropped (see [`Holder::prune`]).
+    /// The info alone decides, not this machine's clock: a note goes, with
+    /// its key, only once the mint has dropped its layer.
     pub async fn prune(&self, mint: &PublicKey) -> Result<u128, Error> {
         let view = self.client.view(mint).await?;
         self.change(|holder| Ok(holder.prune(&view)), |_, _| {})

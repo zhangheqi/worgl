@@ -5,8 +5,8 @@ use std::collections::HashSet;
 use proptest::prelude::*;
 use worgl::{HolderKey, Issuer, IssuerKey, LedgerConfig, Note, Output, Policy};
 use worgl_sdk::{
-    CheckError, Holder, MintInfo, MintView, NoteState, PayError, Payment, PaymentRequest, Schedule,
-    Spacing,
+    CheckError, Holder, MintInfo, MintView, NoteState, PayError, Payment, PaymentRequest,
+    REFRESH_MARGIN_SECS, Schedule, Spacing,
 };
 
 fn issuer(layers: u32) -> Issuer {
@@ -822,23 +822,20 @@ fn a_store_of_format_1_loads() {
 }
 
 #[test]
-fn a_view_follows_the_schedule() {
+fn a_view_counts_down_to_the_next_rotation_and_no_further() {
     let mint = issuer(4);
     let mut v = view(&mint);
     v.schedule = Some(Schedule {
         period_secs: 100,
         next_at: 1_000,
     });
-    assert_eq!(v.at(999), v);
     assert_eq!(v.until_rotation(990), Some(10));
-    assert_eq!(v.at(1_000).oldest, v.oldest + 1);
-    let later = v.at(1_250);
-    assert_eq!(later.oldest, v.oldest + 3);
-    assert_eq!(later.schedule.unwrap().next_at, 1_300);
-    assert_eq!(v.until_rotation(1_250), Some(50));
+    // Past its time, the rotation is still to come as far as the view
+    // knows, however far the clock has gone.
+    assert_eq!(v.until_rotation(1_000), Some(0));
+    assert_eq!(v.until_rotation(1_250), Some(0));
 
     v.paused = true;
-    assert_eq!(v.at(5_000), v);
     assert_eq!(v.until_rotation(5_000), None);
 }
 
@@ -849,25 +846,89 @@ fn a_view_tells_when_a_note_expires() {
     fund(&mut mint, &mut alice, &[8]);
     let note = *alice.notes().next().unwrap();
     let mut v = view(&mint);
-    assert_eq!(v.expires_at(&note, 0), None);
+    assert_eq!(v.expires_at(&note), None);
 
     // Second to last of four layers: dropped by the third rotation.
-    v.schedule = Some(Schedule {
+    let schedule = Schedule {
         period_secs: 100,
         next_at: 1_000,
-    });
-    assert_eq!(v.expires_at(&note, 0), Some(1_200));
-    assert_eq!(v.expires_at(&note, 1_050), Some(1_200));
-    assert_eq!(v.expires_at(&note, 1_199), Some(1_200));
-    assert_eq!(v.expires_at(&note, 1_200), None);
+    };
+    v.schedule = Some(schedule);
+    assert_eq!(v.expires_at(&note), Some(1_200));
 
     let mut other = issuer(4);
     let stranger = other
         .mint(8, worgl::HolderKey::generate().public_key())
         .unwrap();
-    assert_eq!(v.expires_at(&stranger, 0), None);
+    assert_eq!(v.expires_at(&stranger), None);
     v.paused = true;
-    assert_eq!(v.expires_at(&note, 0), None);
+    assert_eq!(v.expires_at(&note), None);
+
+    // Once the mint has made those rotations, its info says the note is gone.
+    for _ in 0..3 {
+        mint.rotate().unwrap();
+    }
+    let mut later = view(&mint);
+    later.schedule = Some(Schedule {
+        next_at: 1_300,
+        ..schedule
+    });
+    assert_eq!(later.expires_at(&note), None);
+}
+
+#[test]
+fn a_refresh_planned_past_the_rotations_time_is_due_at_once() {
+    let mut mint = issuer(3);
+    let (mut alice, mut bob) = (Holder::new(), Holder::new());
+    // Minted into position 1 of 3, the notes are in the first layer after a
+    // rotation and die at the next.
+    fund(&mut mint, &mut alice, &[2, 4]);
+    mint.rotate().unwrap();
+    let request = bob.request(&view(&mint), 2).unwrap();
+    let payment = alice
+        .pay(&view(&mint), &request, Spacing::default())
+        .unwrap();
+    let mut v = view(&mint);
+    v.schedule = Some(Schedule {
+        period_secs: 3_600,
+        next_at: 10_000,
+    });
+
+    // Ahead of it, they are spread over the time left, less the margin.
+    let mut early = alice.clone();
+    let resends = early.due_resends(&v, 9_000);
+    let refreshes = early.refresh(&v, 9_000);
+    assert_eq!((resends.len(), refreshes.len()), (1, 1));
+    let window = 1_000 - REFRESH_MARGIN_SECS;
+    assert!(
+        resends
+            .iter()
+            .chain(&refreshes)
+            .all(|t| t.after_secs <= window)
+    );
+
+    // At or past its time, by a clock ahead of the mint's or because the
+    // mint has not rotated yet, the first layer still dies at the next
+    // rotation: everything is due at once.
+    for now in [10_000, 10_000 + 5 * 3_600 + 1] {
+        let mut late = alice.clone();
+        let resends = late.due_resends(&v, now);
+        let refreshes = late.refresh(&v, now);
+        assert_eq!((resends.len(), refreshes.len()), (1, 1), "{now}");
+        assert!(
+            resends.iter().chain(&refreshes).all(|t| t.after_secs == 0),
+            "{now}"
+        );
+        assert_eq!(resends[0].request, payment.transfers[0].request);
+    }
+    // The mint has not rotated, so it takes them.
+    let refreshes = alice.refresh(&v, 10_000);
+    let answer = mint.transfer(&refreshes[0].request).unwrap();
+    assert_eq!(alice.settle(&refreshes[0].request, &answer), 4);
+    assert_eq!(
+        mint.transfer(&payment.transfers[0].request).unwrap().len(),
+        1
+    );
 }
 
 proptest! {

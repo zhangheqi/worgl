@@ -38,7 +38,15 @@ the mint answers with the same notes while it keeps its answers.
 - `purse.refresh(mint)` pays the notes about to expire back to the purse,
   each at a random moment before the next rotation, and resends the
   outgoing transfers that must land before it. `planRefresh` and `submit`
-  split it for applications with their own scheduler.
+  split it for applications with their own scheduler. The moments are
+  counted by the server's clock, from the `Date` of its info answer
+  (`client.infoTextAndTime`), so this machine's clock, slow or fast, moves
+  none past the rotation. A browser reads that `Date` from a mint on
+  another origin only if the answer carries
+  `Access-Control-Expose-Headers: Date`, so the proxy that adds the CORS
+  headers must send it too; without it, the browser's clock counts the
+  moments. `purse.prune(mint)` drops the notes whose layer the mint's info
+  says it has dropped, never by this machine's clock.
 - When the payer submits instead (`purse.submit(payment.transfers)`), it
   hands `submitted.theirs`, the payee's notes, to the payee, who checks their
   signatures against the mint's keys and keeps them with

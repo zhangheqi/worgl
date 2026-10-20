@@ -4,7 +4,7 @@ use std::io;
 use std::net::SocketAddr;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use axum::Json;
 use axum::http::{StatusCode, header};
@@ -26,6 +26,10 @@ const NOW: Spacing = Spacing {
     min_secs: 0,
     max_secs: 0,
 };
+
+/// A day, in seconds: a period whose rotations, at midnight UTC, no test
+/// waits for.
+const DAY: u64 = 86_400;
 
 /// Fast retries, so a refused transfer does not hold a test up.
 const QUICK: Retry = Retry {
@@ -65,7 +69,16 @@ impl Server {
         Self::start_with(Policy::cash_like()).await
     }
 
-    async fn start_with(mut policy: Policy) -> Self {
+    async fn start_with(policy: Policy) -> Self {
+        Self::create(policy, None).await
+    }
+
+    /// A server whose mint rotates every `period` seconds, besides on request.
+    async fn rotating_every(period: u64) -> Self {
+        Self::create(Policy::cash_like(), Some(period)).await
+    }
+
+    async fn create(mut policy: Policy, rotate_every: Option<u64>) -> Self {
         let dir = tempfile::tempdir().unwrap();
         init_state(dir.path()).unwrap();
         let state = AppState::open(dir.path(), 1000).unwrap();
@@ -78,7 +91,7 @@ impl Server {
                     layer_size: 1024,
                 },
                 policy,
-                rotate_every: None,
+                rotate_every,
             })
             .await
             .unwrap();
@@ -170,6 +183,40 @@ fn now(transfers: &[ScheduledTransfer]) -> Vec<ScheduledTransfer> {
 fn all_answered(submitted: &Submitted, count: usize) {
     assert!(submitted.refused.is_empty(), "{:?}", submitted.refused);
     assert_eq!(submitted.answered, count);
+}
+
+fn unix_now() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap()
+        .as_secs()
+}
+
+/// A server that answers `server`'s mint info as a machine whose clock is
+/// `skew` seconds behind the server's would read it, and returns a client
+/// for it: the next rotation and the answer's `Date` move on by `skew`,
+/// which is negative for a clock ahead. It serves nothing else.
+async fn skewed(server: &Server, skew: i64) -> Client {
+    let (real, mint) = (server.client(), server.mint);
+    let info = move || async move {
+        let mut info = real.info(&mint).await.unwrap();
+        let rotation = info.rotation.as_mut().unwrap();
+        rotation.next_at = rotation.next_at.checked_add_signed(skew).unwrap();
+        let shift = Duration::from_secs(skew.unsigned_abs());
+        let date = if skew < 0 {
+            SystemTime::now() - shift
+        } else {
+            SystemTime::now() + shift
+        };
+        let date = httpdate::fmt_http_date(date);
+        ([(axum::http::header::DATE, date)], axum::Json(info))
+    };
+    let route = format!("/v1/mints/{mint}/info");
+    let app = axum::Router::new().route(&route, axum::routing::get(info));
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let url = format!("http://{}", listener.local_addr().unwrap());
+    tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+    Client::new(&url).unwrap()
 }
 
 #[tokio::test]
@@ -617,6 +664,68 @@ async fn refreshing_keeps_notes_alive_across_rotations() {
     assert_eq!(kept.prune(&server.mint).await.unwrap(), 0);
     assert_eq!(idle.prune(&server.mint).await.unwrap(), 4);
     assert_eq!(idle.holder().notes().count(), 0);
+}
+
+#[tokio::test]
+async fn a_clock_ahead_of_the_mints_drops_nothing_live() {
+    let server = Server::rotating_every(DAY).await;
+    let alice = server.purse();
+    server.fund(&alice, 12, 8).await;
+    server.rotate().await;
+    server.rotate().await;
+    let notes: Vec<Note> = alice.holder().notes().copied().collect();
+
+    // Ten periods ahead, the clock has passed the next rotation by far, but
+    // the mint has not made it.
+    let ahead = Purse::new(
+        skewed(&server, -10 * DAY as i64).await,
+        alice.holder(),
+        MemoryStore::new(),
+    );
+    let info = server.client().info(&server.mint).await.unwrap();
+    let view = ahead.client().view(&server.mint).await.unwrap();
+    assert_eq!(view.oldest, info.layers[0].generation);
+    assert_eq!(ahead.prune(&server.mint).await.unwrap(), 0);
+    assert_eq!(ahead.holder().notes().count(), 2);
+    assert_eq!(ahead.balance(&server.mint).await.unwrap().expiring, 12);
+    for note in &notes {
+        let status = server.client().verify(note).await.unwrap().status;
+        assert!(matches!(status, NoteStatus::Live { position: 0, .. }));
+    }
+
+    // They die at the next rotation the mint makes, so they are refreshed,
+    // and the mint takes the refreshes.
+    let plan = ahead.plan_refresh(&server.mint).await.unwrap();
+    assert_eq!(plan.len(), 2);
+    let back = Purse::new(server.client(), ahead.holder(), MemoryStore::new()).with_retry(QUICK);
+    let refreshed = back.submit(&now(&plan)).await.unwrap();
+    all_answered(&refreshed, 2);
+    assert_eq!(refreshed.value, 12);
+}
+
+#[tokio::test]
+async fn a_clock_behind_the_mints_still_refreshes_before_the_rotation() {
+    let server = Server::rotating_every(DAY).await;
+    let alice = server.purse();
+    server.fund(&alice, 8, 2).await;
+    server.rotate().await;
+    server.rotate().await;
+
+    // A year behind, the clock would put the next rotation a year further.
+    let behind = Purse::new(
+        skewed(&server, 365 * DAY as i64).await,
+        alice.holder(),
+        MemoryStore::new(),
+    );
+    let plan = behind.plan_refresh(&server.mint).await.unwrap();
+    let info = server.client().info(&server.mint).await.unwrap();
+    let left = info.rotation.unwrap().next_at.saturating_sub(unix_now());
+    let times: Vec<u64> = plan.iter().map(|t| t.after_secs).collect();
+    assert_eq!(times.len(), 4);
+    assert!(
+        times.iter().all(|&after| after < left),
+        "{times:?} with {left} s left"
+    );
 }
 
 #[tokio::test]

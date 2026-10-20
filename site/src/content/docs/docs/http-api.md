@@ -135,8 +135,16 @@ value and destroys nothing more.
 | `layers` | Every layer, first to last: bits handed out (`issued`), notes still `live`, `capacity` and the live notes' `value`. |
 | `supply` | Value `minted`, `destroyed` by rotations and `burned`; `outstanding = minted − destroyed − burned`. |
 | `policy` | The rules in force. See [Policy fields](../policy/). |
-| `rotation` | `{"period_secs", "next_at"}`, or `null` when the mint rotates only on request. `next_at` is a Unix time in seconds. |
+| `rotation` | `{"period_secs", "next_at"}`, or `null` when the mint rotates only on request. `next_at` is the Unix time, in seconds, of the next scheduled rotation, read with `layers`: an answer that shows a rotation's layers names the rotation after it. |
 | `paused` | Whether the mint is paused. |
+
+The answer's `Date` header is the server's time when it answered. The SDKs'
+purses and `worgl` count the time left before `next_at` from it, not by the
+client's clock, and a cluster member that passes the request on to the
+leader relays the leader's. A browser page reads it on an answer from
+another origin only if the answer carries
+`Access-Control-Expose-Headers: Date`, which the server does not send: the
+proxy that adds CORS headers in front of it must add that one too.
 
 ## Keys
 

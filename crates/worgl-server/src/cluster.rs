@@ -521,7 +521,7 @@ impl Cluster {
 
     /// Sends the request in `parts` and `body` to the member whose API
     /// address is `api`, and returns its answer: the status, the body, and
-    /// the body's type and `Retry-After`, if any.
+    /// the body's type, `Date` and `Retry-After`, if any.
     async fn relay(&self, api: &str, parts: &Parts, body: Bytes) -> reqwest::Result<Response> {
         let path = parts.uri.path_and_query().map_or("/", |path| path.as_str());
         let mut request = self
@@ -537,7 +537,9 @@ impl Cluster {
         }
         let answer = request.send().await?;
         let status = answer.status();
-        let kept: Vec<_> = [header::CONTENT_TYPE, header::RETRY_AFTER]
+        // The leader's `Date` too: clients plan by it, as the mint rotates by
+        // the leader's clock, not this member's.
+        let kept: Vec<_> = [header::CONTENT_TYPE, header::DATE, header::RETRY_AFTER]
             .into_iter()
             .filter_map(|name| {
                 let value = answer.headers().get(&name)?.clone();
@@ -1163,5 +1165,24 @@ mod tests {
         assert_eq!(one.check_member(&headers).unwrap_err().code(), "malformed");
         headers.remove(KEK_CHECK_HEADER);
         assert_eq!(one.check_member(&headers).unwrap_err().code(), "malformed");
+    }
+
+    #[tokio::test]
+    async fn a_relayed_answer_keeps_the_leaders_date() {
+        // A leader whose clock is far from this member's.
+        const DATE: &str = "Sun, 06 Nov 1994 08:49:37 GMT";
+        let answer = || async { ([(header::DATE, DATE)], Json("answered")) };
+        let leader = axum::Router::new().route("/v1/info", axum::routing::get(answer));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let api = listener.local_addr().unwrap().to_string();
+        tokio::spawn(async move { axum::serve(listener, leader).await.unwrap() });
+
+        let (_dir, cluster) = member(2, Arc::new(FileKek::from_bytes(&[1; 32])));
+        let request = axum::http::Request::get("/v1/info").body(()).unwrap();
+        let (parts, ()) = request.into_parts();
+        let response = cluster.relay(&api, &parts, Bytes::new()).await.unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(response.headers()[header::DATE], DATE);
+        assert_eq!(response.headers()[header::CONTENT_TYPE], "application/json");
     }
 }

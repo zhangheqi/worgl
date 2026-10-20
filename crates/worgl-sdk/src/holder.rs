@@ -30,8 +30,10 @@ const FORMAT: u32 = 2;
 
 /// Seconds before a scheduled rotation by which the transfers that
 /// [`Holder::refresh`] and [`Holder::due_resends`] plan are due, or half the
-/// time left when that is shorter. A payer should settle a payment this long
-/// before the rotation that drops a note it spends.
+/// time left when that is shorter. A plan made at or past the rotation's
+/// time, which the mint has not made yet as far as its info says, has them
+/// all due at once. A payer should settle a payment this long before the
+/// rotation that drops a note it spends.
 pub const REFRESH_MARGIN_SECS: u64 = 300;
 
 /// Seconds over which refreshes are spread when the mint has no schedule.
@@ -838,8 +840,8 @@ impl Holder {
 
     /// The [outgoing](Self::outgoing) transfers at `mint` to resend before
     /// its next rotation, each at its own random moment before it, as
-    /// [`refresh`](Self::refresh) spreads its transfers. Nothing in the store
-    /// changes.
+    /// [`refresh`](Self::refresh) spreads its transfers from the same `now`.
+    /// Nothing in the store changes.
     ///
     /// A transfer is due when the note it spends dies at that rotation:
     /// after it, a transfer the mint never applied can no longer be
@@ -889,6 +891,15 @@ impl Holder {
     /// Call it once per rotation period, after reading the mint's info.
     /// Submit each transfer at its time and [`settle`](Self::settle) the
     /// answer.
+    ///
+    /// `mint` alone says which notes are due: those in its first layer.
+    /// `now`, the Unix time by the mint's clock, says only when: the
+    /// transfers are spread over the time left before the next rotation,
+    /// less [`REFRESH_MARGIN_SECS`], and are all due at once when `now` is at
+    /// or past it, since the mint has not made it yet as far as `mint` knows.
+    /// A clock behind the mint's by more than that margin can spread them
+    /// past the rotation, where they fail, so take `now` from the mint, such
+    /// as from the `Date` of its answer.
     pub fn refresh(&mut self, mint: &MintView, now: u64) -> Vec<ScheduledTransfer> {
         let window = refresh_window(mint, now);
         let mut transfers = Vec::new();
@@ -934,6 +945,10 @@ impl Holder {
     /// lost. It also stops waiting for unconfirmed change of `mint` that
     /// would sit in a dropped layer, and stops keeping notes owed to payees
     /// once their layer is dropped; neither counts as lost.
+    ///
+    /// It goes by `mint` alone, with no clock: with a view of the mint's
+    /// info, it removes a note, and its key for good, only once the mint has
+    /// dropped the note's layer.
     pub fn prune(&mut self, mint: &MintView) -> u128 {
         let mut lost = 0;
         self.notes.retain(|h| {
@@ -1040,7 +1055,7 @@ impl Holder {
 }
 
 /// Seconds from `now` over which to spread transfers that must land before
-/// `mint`'s next rotation.
+/// `mint`'s next rotation: none once that rotation is due.
 fn refresh_window(mint: &MintView, now: u64) -> u64 {
     match mint.until_rotation(now) {
         Some(left) => left.saturating_sub(REFRESH_MARGIN_SECS.min(left / 2)),

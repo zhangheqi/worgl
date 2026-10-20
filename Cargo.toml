@@ -37,6 +37,7 @@ ed25519-dalek = "3"
 getrandom = "0.4"
 hex = "0.4"
 http-body-util = "0.1"
+httpdate = "1"
 # With `loosen-follower-log-revert`, a leader that finds a follower lacks
 # entries the leader had counted it as holding, as after the member was
 # restored from an older copy of its directory, logs a warning ("follower

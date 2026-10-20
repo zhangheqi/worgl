@@ -1,5 +1,6 @@
 //! End-to-end tests of the HTTP API, in process, against real stores on disk.
 
+use std::collections::BTreeSet;
 use std::fs;
 use std::path::Path;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -875,6 +876,50 @@ async fn info_reports_the_rotation_schedule() {
     assert!(now < schedule.next_at && schedule.next_at <= now + 86_400);
     let other = server.add_mint(Policy::cash_like()).await;
     assert_eq!(server.info_of(&other).await.rotation, None);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn info_answers_its_layers_and_schedule_from_one_state() {
+    let server = Server::with_policy(Policy::cash_like(), Some(1)).await;
+    let first = server.info().await.layers[0].generation;
+    // Polled from all sides while the schedule rotates twice.
+    let mut pollers = Vec::new();
+    for _ in 0..8 {
+        let (app, path) = (server.app.clone(), server.path("info"));
+        pollers.push(tokio::spawn(async move {
+            let mut seen = BTreeSet::new();
+            loop {
+                let (code, answer) =
+                    call(app.clone(), Method::GET, path.clone(), None, Value::Null).await;
+                assert_eq!(code, StatusCode::OK, "{answer}");
+                let info: Info = serde_json::from_value(answer).unwrap();
+                let oldest = info.layers[0].generation;
+                seen.insert((oldest, info.rotation.unwrap().next_at));
+                if oldest >= first + 2 {
+                    return seen;
+                }
+            }
+        }));
+    }
+    let mut seen = BTreeSet::new();
+    for poller in pollers {
+        let answers = tokio::time::timeout(Duration::from_secs(10), poller)
+            .await
+            .expect("the schedule never rotated twice");
+        seen.extend(answers.unwrap());
+    }
+    // A rotation moves the first layer and the next rotation together, so no
+    // first layer comes with two schedules, nor one schedule with two.
+    let pairs: Vec<_> = seen.into_iter().collect();
+    for pair in pairs.windows(2) {
+        let [(oldest, next_at), (later, then)] = pair else {
+            unreachable!()
+        };
+        assert!(
+            oldest < later && next_at < then,
+            "answers mix layers and schedules: {pairs:?}"
+        );
+    }
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

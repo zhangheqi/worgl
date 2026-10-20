@@ -2860,6 +2860,7 @@ name = "worgl-client"
 version = "0.1.0"
 dependencies = [
  "axum",
+ "httpdate",
  "reqwest",
  "serde",
  "serde_json",

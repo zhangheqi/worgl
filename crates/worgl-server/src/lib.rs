@@ -157,8 +157,9 @@ pub struct AppState {
 pub struct RotationSchedule {
     /// Seconds between rotations.
     pub period_secs: u64,
-    /// Unix time, in seconds, of the next scheduled rotation. A paused mint
-    /// skips it.
+    /// Unix time, in seconds, of the next scheduled rotation, read with the
+    /// layers of the info that reports it: the one after the rotation that
+    /// made them. A paused mint skips it.
     pub next_at: u64,
 }
 

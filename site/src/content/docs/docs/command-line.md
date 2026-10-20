@@ -59,12 +59,12 @@ and leave the payment unsubmitted. Without the change, the payer runs
 transfers again, and the mint answers with the same notes for as long as it
 keeps its answers (see [Error codes](../error-codes/)). On a mint that
 rotates on a schedule, `pay` says by when to settle: before the rotation
-that drops a note the payment spends. `refresh` resends a payment still
-outgoing in the period before it (see
-[Keeping notes alive](#keeping-notes-alive)). A resend the mint no longer
-answers is reported as possibly applied, with the value that may be lost,
-and dropped (see [Refused transfers](#refused-transfers)): the change can
-then only come from the payee, and `accept` still keeps it.
+that drops a note the payment spends, with the time left counted by the
+server's clock. `refresh` resends a payment still outgoing in the period
+before it (see [Keeping notes alive](#keeping-notes-alive)). A resend the
+mint no longer answers is reported as possibly applied, with the value that
+may be lost, and dropped (see [Refused transfers](#refused-transfers)): the
+change can then only come from the payee, and `accept` still keeps it.
 
 `pay` prints the payment's id, and the purse keeps the payment until it is
 done with (see [Payments kept](#payments-kept)). If `pay` cannot write the
@@ -184,15 +184,22 @@ another one took in. The lock is a file beside the purse,
 
 A note left alone dies when its layer is dropped. Run `worgl refresh MINT`
 once per rotation period: it pays the notes that would die at the next
-rotation to fresh keys of the purse, spread over the time left. It also
-resends the transfers not yet seen answered whose spent note dies at that
-rotation, or died at the last one. The change of a payment the payee has
-submitted then comes back while the mint still has the answer. A payment the
-payee has not submitted yet still goes through: `refresh` keeps the payee's
-notes from the answer and says so, for `worgl export PAYMENT --notes` (see
-[Payments kept](#payments-kept)), unless the purse has no record of the
-payment, such as one made by an earlier release. The payee can also get
-them by running `worgl receive` while the mint keeps the answer (see
-[Error codes](../error-codes/)).
-`worgl info` and `worgl balance` say when the next rotation is.
-`worgl prune` clears out notes that died anyway.
+rotation to fresh keys of the purse, spread over the time left. The time
+left is counted by the server's clock, from the `Date` of its answer (by
+yours only if the answer has none), so a clock of yours that runs slow or
+fast moves none of them past the rotation; once the rotation's time has
+come and the mint has not made it yet, they all go at once. It also resends
+the transfers not yet seen answered whose spent note dies at that rotation,
+or died at the last one. The change of a payment
+the payee has submitted then comes back while the mint still has the answer.
+A payment the payee has not submitted yet still goes through: `refresh` keeps
+the payee's notes from the answer and says so, for
+`worgl export PAYMENT --notes` (see [Payments kept](#payments-kept)), unless
+the purse has no record of the payment, such as one made by an earlier
+release. The payee can also get them by running `worgl receive` while the
+mint keeps the answer (see [Error codes](../error-codes/)).
+`worgl info` and `worgl balance` say when the next rotation is, by the
+server's clock too.
+`worgl prune` drops the notes whose layer the mint's info says it has
+dropped, keys and all. It goes by the info alone, not by your clock, so it
+drops no note the mint still holds live.
