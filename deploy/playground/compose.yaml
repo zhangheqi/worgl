@@ -89,7 +89,8 @@ services:
       - caddy-config:/config
 
 networks:
-  # The members' Raft ports must not reach the internet; nothing on this
+  # The members' Raft and API ports, which carry the cluster token and the
+  # requests members pass on, must not reach the internet; nothing on this
   # network does.
   cluster:
     internal: true

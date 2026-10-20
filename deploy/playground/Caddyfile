@@ -16,6 +16,13 @@
 		respond "not found" 404
 	}
 
+	# So are a mint's rotations, pauses and resumes, which its admin token
+	# allows: send them to a member from inside it (see README.md).
+	@mint_admin path /v1/mints/*/rotate /v1/mints/*/pause /v1/mints/*/resume
+	handle @mint_admin {
+		respond "not found" 404
+	}
+
 	handle {
 		reverse_proxy member1:8080 member2:8080 member3:8080 {
 			lb_policy round_robin

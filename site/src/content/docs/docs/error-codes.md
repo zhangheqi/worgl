@@ -55,21 +55,37 @@ Errors answer with a status code and a body like:
 | `internal` | 500 | Something else went wrong on the server. |
 | `no_leader` | 503 | On a cluster: no member leading the mint, or the cluster's registry, could be reached, or the leader changed while the request was carried out. Nothing was done. |
 | `timeout` | 503 | On a cluster: the mint's group or the registry did not answer in time. The change may still be made. |
+| `misdirected` | 421 | Only between cluster members, at a Raft port: a member's Raft request reached that member itself, because its `cluster.json` gives another member an address that leads back to it. See [Moving a member](../running-a-cluster/#moving-a-member). |
 
 ## Sending a request again
 
-Transfers, burns and mint requests are safe to send again unchanged. The
-mint answers a resent transfer or burn from its record of recent ones, and
-the latest mint request of an authority with the same note, so nothing
-happens twice.
+Transfers, burns and mint requests are safe to send again unchanged, and
+so are pauses and resumes. The mint answers a resent transfer or burn from
+its record of recent ones, and the latest mint request of an authority with
+the same note, and a pause of a paused mint or a resume of a running one
+changes nothing, so nothing happens twice.
 
-- After `no_leader` or `timeout`, send the same request again.
+- After `no_leader` or `timeout`, send the same transfer, burn, mint, pause
+  or resume request again.
 - After `busy`, send the same request again once the seconds its
   `Retry-After` header gives have passed. Both SDKs wait that long before
   their next try, up to 30 seconds.
+- A rotation (`POST /v1/mints/{mint}/rotate`) is made again each time it is
+  sent, and each one drops a layer, so note the last layer's `generation`
+  in `info` before you rotate. One answered `no_leader` was not made. One
+  answered `timeout`, or not answered at all, may have been, and may still
+  be made after an `info` read that does not show it, until the mint has
+  carried out a change sent after that answer. To make one with the admin
+  token, pause the mint, or resume it if it is paused; a transfer, burn or
+  mint request sent after the answer counts too. Once the mint has carried
+  it out, read `info`, and rotate again only if the last layer's
+  `generation` is still the one you noted, resuming the mint first if you
+  paused it.
 - A creation of a mint (`POST /v1/admin/mints`) answered `no_leader` made
   nothing, so send it again. One answered `timeout` may have made a mint the
   answer never named: list the mints before creating another.
+- Sending a rotation or a creation to another member of a cluster is sending
+  it again, so check first there too.
 - `paused`, `busy`, `layer_full`, `storage` and `internal` may go away
   later. Both SDKs count them, and any other 5xx status, as worth trying
   again: `Error::is_transient` in Rust and `isTransient(error)` in
