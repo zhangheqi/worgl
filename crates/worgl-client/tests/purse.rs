@@ -249,6 +249,14 @@ async fn the_payer_can_submit_and_hand_the_notes_over() {
     let submitted = alice.submit(&payment.transfers).await.unwrap();
     all_answered(&submitted, 2);
     assert_eq!(submitted.value, 2);
+    // What Alice hands over is Bob's notes only, none of her change.
+    assert_eq!(submitted.theirs.len(), request.outputs.len());
+    assert!(submitted.theirs.iter().all(|n| {
+        request
+            .outputs
+            .iter()
+            .any(|o| o.holder == *n.holder() && o.amount == n.amount())
+    }));
 
     // A note with a forged signature is refused, and nothing is taken in.
     let mut forged = submitted.notes[0].to_bytes();
@@ -260,6 +268,102 @@ async fn the_payer_can_submit_and_hand_the_notes_over() {
 
     assert_eq!(bob.accept(&submitted.notes).await.unwrap(), 6);
     assert_eq!(bob.accept(&submitted.notes).await.unwrap(), 0);
+}
+
+#[tokio::test]
+async fn the_payee_hands_back_change_the_mint_no_longer_answers_for() {
+    // Two receipts, kept no minimum time, stand in for a mint whose receipts
+    // many transfers pushed out.
+    let mut policy = Policy::cash_like();
+    policy.receipt_capacity = 2;
+    policy.receipt_min_age_secs = 0;
+    let server = Server::start_with(policy).await;
+    let (alice, bob, carol) = (server.purse(), server.purse(), server.purse());
+    server.fund(&alice, 8, 8).await;
+    server.fund(&carol, 3, 1).await;
+
+    let request = bob.request(&server.mint, 3).await.unwrap();
+    let payment = alice.pay(&request, NOW).await.unwrap();
+    let received = bob.receive(&request, &payment).await.unwrap();
+    all_answered(&received, 1);
+    assert_eq!(received.value, 3);
+    assert_eq!(
+        received.theirs.len(),
+        received.notes.len() - request.outputs.len()
+    );
+
+    // Other holders' transfers push Alice's receipt out.
+    for _ in 0..3 {
+        let dave = server.purse();
+        let asked = dave.request(&server.mint, 1).await.unwrap();
+        let paid = carol.pay(&asked, NOW).await.unwrap();
+        all_answered(&dave.receive(&asked, &paid).await.unwrap(), 1);
+    }
+    let settled = alice.settle(NOW).await.unwrap();
+    assert_eq!(settled.answered, 0);
+    let [refused] = settled.refused.as_slice() else {
+        panic!("{:?}", settled.refused)
+    };
+    assert_eq!(refused.error.code(), Some("spent"));
+    assert_eq!(refused.at_stake, Some(5));
+    assert_eq!(alice.balance(&server.mint).await.unwrap().outgoing, 8);
+
+    // A forged note is refused and settles nothing.
+    let mut forged = received.theirs[0].to_bytes();
+    let last = forged.len() - 1;
+    forged[last] ^= 1;
+    let forged = Note::from_bytes(&forged).unwrap();
+    assert!(matches!(alice.accept(&[forged]).await, Err(Error::Note(_))));
+    assert_eq!(alice.holder().outgoing().count(), 1);
+
+    // The change Bob hands back recovers it and settles the transfer.
+    assert_eq!(alice.accept(&received.theirs).await.unwrap(), 5);
+    let balance = alice.balance(&server.mint).await.unwrap();
+    assert_eq!(
+        (balance.frozen, balance.outgoing, balance.expected),
+        (5, 0, 0)
+    );
+    assert_eq!(alice.holder().outgoing().count(), 0);
+}
+
+#[tokio::test]
+async fn refreshing_resends_what_the_next_rotation_would_cut_off() {
+    let server = Server::start().await;
+    let alice = Purse::new(server.client(), Default::default(), Flaky::default());
+    let bob = server.purse();
+    server.fund(&alice, 12, 8).await;
+    server.rotate().await;
+    server.rotate().await;
+    // Alice pays with her 4, which dies at the next rotation like her 8.
+    let request = bob.request(&server.mint, 3).await.unwrap();
+    let payment = alice.pay(&request, NOW).await.unwrap();
+
+    // A plan that fails to save takes back the refresh, not the payment.
+    alice.store().failing.store(true, Ordering::Relaxed);
+    assert!(matches!(
+        alice.plan_refresh(&server.mint).await,
+        Err(Error::Store(_))
+    ));
+    let holder = alice.holder();
+    let outgoing: Vec<_> = holder.outgoing().collect();
+    assert_eq!(outgoing, [&payment.transfers[0].request]);
+    let balance = alice.balance(&server.mint).await.unwrap();
+    assert_eq!(
+        (balance.spendable, balance.outgoing, balance.expected),
+        (8, 4, 1)
+    );
+    alice.store().failing.store(false, Ordering::Relaxed);
+
+    let plan = alice.plan_refresh(&server.mint).await.unwrap();
+    assert_eq!(plan.len(), 2);
+    let done = alice.submit(&now(&plan)).await.unwrap();
+    all_answered(&done, 2);
+    assert_eq!(done.value, 9);
+    assert_eq!(alice.holder().outgoing().count(), 0);
+    // Bob, submitting later, gets the same notes.
+    let received = bob.receive(&request, &payment).await.unwrap();
+    all_answered(&received, 1);
+    assert_eq!(received.value, 3);
 }
 
 #[tokio::test]

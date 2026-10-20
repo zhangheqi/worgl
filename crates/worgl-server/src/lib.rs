@@ -78,7 +78,10 @@
 //! of their own, for each other only. Creating a mint goes through the
 //! cluster's registry, from which every member writes and serves the new
 //! mint; a creation answered `503 timeout` may have made a mint, so list the
-//! mints before creating another.
+//! mints before creating another. A mint's policy and rotation period are
+//! not replicated: each member reads its own from the mint's directory, and
+//! the leader carries out requests and scheduled rotations under its own, so
+//! they must be the same on every member.
 
 pub mod cluster;
 pub mod files;
