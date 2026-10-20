@@ -42,8 +42,9 @@ Request bodies are limited to 64 KiB.
 
 Errors answer with a status code and a body like
 `{"error": "spent", "message": "note 3:17 is already spent"}`. The `error`
-code is stable; the message is for people. See
-[Error codes](../error-codes/).
+code is stable; the message is for people. A `503 busy` answer also says in
+its `Retry-After` header how many seconds to wait before sending the request
+again. See [Error codes](../error-codes/).
 
 ## Verify
 
@@ -68,10 +69,13 @@ every output; see [Note format](../note-format/#transfers). The answer is
 `{"notes": [...]}`, one per output, in order. The outputs land one layer past
 the furthest input.
 
-Sending the same request again is safe: the mint remembers recent transfers
-by the hash of their signed message and answers a resent one with the same
-notes, even after a rotation has dropped its inputs' layer, until those
-notes expire.
+Sending the same request again is safe: the mint keeps a receipt of recent
+transfers by the hash of their signed message and answers a resent one with
+the same notes, even after a rotation has dropped its inputs' layer, until
+those notes expire. It keeps each receipt for at least the policy's
+`receipt_min_age_secs`; while it holds `receipt_capacity` receipts all
+younger than that, or for a while after a restart counted so, it answers a
+new transfer or burn `503 busy` and does nothing.
 
 ## Burn
 
@@ -98,7 +102,7 @@ value and destroys nothing more.
     {"position": 3, "generation": 3, "issued": 4, "live": 4, "capacity": 1048576, "value": 8}
   ],
   "supply": {"minted": 8, "destroyed": 0, "burned": 0, "outstanding": 8},
-  "policy": {"mint_layer": null, "max_inputs": 1, "max_outputs": 16, "denominations": "powers_of_two", "receipt_capacity": 65536, "mint_authorities": ["b192…5673"]},
+  "policy": {"mint_layer": null, "max_inputs": 1, "max_outputs": 16, "denominations": "powers_of_two", "receipt_capacity": 1048576, "receipt_min_age_secs": 128, "mint_authorities": ["b192…5673"]},
   "rotation": null,
   "paused": false
 }

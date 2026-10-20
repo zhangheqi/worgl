@@ -41,7 +41,9 @@ This is the example in `worgl-client`'s crate documentation, which CI
 compiles. A `Purse` wraps a holder, a `Client` and a `Store`. It reads mint
 info by itself, submits each transfer at its time, retries what fails on the
 way (a resent transfer gets the same answer), and saves after every change,
-before handing out anything that depends on it.
+before handing out anything that depends on it. After a `busy` answer it
+waits as long as the mint's `Retry-After` asks, up to 30 seconds, before the
+next try.
 
 `Purse::open` keeps the purse in a JSON file. The file holds every note's
 secret key, and the notes are bearer, so keep it private and encrypted at
@@ -95,8 +97,9 @@ the last one. The answer to a payment's transfer keeps the payee's notes, in
 whether the payee submitted the payment or the resend carried it out.
 
 `Client` errors keep the mint's stable code, such as `spent` or `frozen`, in
-`Error::code`, and `Error::is_transient` says whether trying again later may
-work. See [Error codes](../error-codes/).
+`Error::code`, `Error::is_transient` says whether trying again later may
+work, and `Error::retry_after` how long a `busy` mint asked to wait first.
+See [Error codes](../error-codes/).
 
 `Spacing` sets the seconds between transfers that belong together, as a
 range the purse picks from at random. `Spacing::default()` spreads them; a

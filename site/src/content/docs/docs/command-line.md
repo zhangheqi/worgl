@@ -155,7 +155,7 @@ rather than open without them.
 |---|---|
 | `spent` or `expired`, with HTTP status 409 | Drop it: the note it spends is gone, whether the transfer was applied or not. Its change keys stay, so change the payee hands back is still kept with `accept`. |
 | `policy` | Cancel it if the policy the mint publishes now refuses it too, keeping its change keys: the mint checks its policy before its record of answers, so a transfer applied under a looser policy is refused this way too. Keep it otherwise. |
-| `paused`, `layer_full`, `storage`, `internal`, another 5xx status, or no answer | Keep it, for the next `settle`: this may pass later. |
+| `paused`, `busy`, `layer_full`, `storage`, `internal`, another 5xx status, or no answer | Keep it, for the next `settle`: this may pass later. |
 | `frozen` | Keep it: the note it spends moves after the next rotation. |
 | Anything else, such as `unknown_mint`, `unissued` or `unauthorized` | Keep it: the refusal shows nothing about the transfer, such as a server that is not the mint's, or one that lost its state. The mint answers `spent` and `expired` with 409 and never refuses a transfer the purse signed as `unauthorized` or `duplicate_input`, so such answers come from something else, such as a gateway or another version. `cancel` or `forget` ends it once you know which applies. |
 

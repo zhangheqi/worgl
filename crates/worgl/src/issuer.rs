@@ -25,8 +25,23 @@
 //! nothing per note: the live value in each layer, the value ever minted, the
 //! value destroyed by rotations and the value burned on purpose. They satisfy
 //! `outstanding = minted − destroyed − burned` at all times.
+//!
+//! It also keeps a receipt of each recent transfer and burn, so the identical
+//! request sent again is answered as before instead of refused as spent: with
+//! the same notes, signed again, or for a burn with nothing more. It keeps the
+//! last [`receipt_capacity`](Policy::receipt_capacity) of them, a transfer's
+//! only until the notes it issued expire. Given a [`Clock`] (see
+//! [`Issuer::set_clock`]), it also keeps each for at least
+//! [`receipt_min_age_secs`](Policy::receipt_min_age_secs), and refuses as
+//! [`Error::Busy`] a new transfer or burn whose receipt would push out a
+//! younger one. Only planning decides anything by the clock: applying an
+//! event stamps its receipt with the time, but the stamps stay out of
+//! snapshots and out of whether an event applies, so replicas keep the same
+//! receipts, by count.
 
 use std::collections::{BTreeMap, HashMap, VecDeque};
+use std::fmt;
+use std::sync::Arc;
 
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -42,20 +57,21 @@ use crate::note::{Note, NoteError, read_key};
 use crate::permutation::Permutation;
 use crate::policy::Policy;
 use crate::transfer::{
-    BurnRequest, TransferId, TransferRequest, VerifiedBurn, VerifiedTransfer, Verifier,
+    BurnRequest, Output, TransferId, TransferRequest, VerifiedBurn, VerifiedTransfer, Verifier,
 };
 
 const SNAPSHOT_MAGIC: &[u8; 8] = b"WORGLSNP";
 /// Version 2 added the burned value, version 3 records whether serial
 /// indexes are permuted, version 4 keeps each mint authority's last mint,
 /// version 5 the certificates of the generation keys, version 6 whether the
-/// issuer is paused and when its last scheduled rotation was due, and
-/// version 7 the keys of the last generations dropped. Older snapshots still
-/// restore, with nothing burned, with bits as indexes, with no mint
-/// authorities, with every generation signed by the issuer key, running,
-/// with no rotation scheduled and with no dropped generation's key, as they
-/// always had.
-const SNAPSHOT_VERSION: u16 = 7;
+/// issuer is paused and when its last scheduled rotation was due, version 7
+/// the keys of the last generations dropped, and version 8 keeps in a
+/// transfer's receipt where its notes went instead of the notes. Older
+/// snapshots still restore, with nothing burned, with bits as indexes, with
+/// no mint authorities, with every generation signed by the issuer key,
+/// running, with no rotation scheduled and with no dropped generation's key,
+/// as they always had, and each receipt is read from the notes it kept.
+const SNAPSHOT_VERSION: u16 = 8;
 
 /// A note created by a mint or transfer.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
@@ -378,41 +394,163 @@ pub struct LayerSummary {
     pub value: u128,
 }
 
+/// Seconds on a clock that never goes back, by which an [`Issuer`] keeps
+/// each receipt for at least its policy's
+/// [`receipt_min_age_secs`](Policy::receipt_min_age_secs). See
+/// [`Issuer::set_clock`]. Cloning it is cheap, and clones read the same
+/// clock.
+#[derive(Clone)]
+pub struct Clock(Arc<dyn Fn() -> u64 + Send + Sync>);
+
+impl Clock {
+    /// A clock that reads `now`, which must never go back.
+    pub fn new(now: impl Fn() -> u64 + Send + Sync + 'static) -> Self {
+        Self(Arc::new(now))
+    }
+
+    /// The system's monotonic clock, in whole seconds. It reads the Unix time
+    /// when it is made and counts on from there however the wall clock is
+    /// set later, so [`Issuer::set_clock`] can count receipts as made before
+    /// it. Not on `wasm32-unknown-unknown`, which has no clock to read.
+    #[cfg(not(all(target_arch = "wasm32", target_os = "unknown")))]
+    pub fn monotonic() -> Self {
+        let start = std::time::Instant::now();
+        let base = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_or(0, |since| since.as_secs());
+        Self::new(move || base.saturating_add(start.elapsed().as_secs()))
+    }
+
+    /// The time now, in seconds.
+    pub fn now(&self) -> u64 {
+        (self.0)()
+    }
+}
+
+impl fmt::Debug for Clock {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("Clock").finish_non_exhaustive()
+    }
+}
+
+/// What the issuer keeps of a transfer or burn it applied, to answer the
+/// identical request again. A transfer's outputs took consecutive bits of one
+/// layer, and the request's id commits to their amounts and holders, so where
+/// they went is all it takes to sign the same notes again.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct Receipt {
+    /// The generation the outputs went to; 0 for a burn.
+    generation: u64,
+    /// The bit the first output took, the others taking the bits after it;
+    /// 0 for a burn.
+    first: u32,
+    /// How many outputs there were; 0 for a burn.
+    outputs: u8,
+    /// When the issuer made the receipt, by its clock, or 0 without one.
+    /// Each issuer keeps its own: snapshots leave it out.
+    at: u64,
+}
+
+impl Receipt {
+    /// A burn's receipt.
+    const BURN: Self = Self {
+        generation: 0,
+        first: 0,
+        outputs: 0,
+        at: 0,
+    };
+
+    /// The receipt of the transfer that issued `issued`, or of a burn if
+    /// that is empty, as snapshots before version 8 kept it: `None` unless
+    /// the notes took consecutive bits the ledger handed out in a live
+    /// layer.
+    fn of_notes(ledger: &Ledger, issued: &[Issued]) -> Option<Self> {
+        let Some(head) = issued.first() else {
+            return Some(Self::BURN);
+        };
+        let receipt = Self {
+            generation: head.serial.generation,
+            first: ledger.bit_of(head.serial)?,
+            outputs: u8::try_from(issued.len()).ok()?,
+            at: 0,
+        };
+        let consecutive = |receipt: &Self| {
+            (receipt.first..)
+                .zip(issued)
+                .all(|(bit, i)| ledger.serial_of(receipt.generation, bit) == i.serial)
+        };
+        (receipt.fits(ledger) && consecutive(&receipt)).then_some(receipt)
+    }
+
+    /// Whether the ledger handed out the bits the receipt names: none for a
+    /// burn, whose generation and first bit are 0, and bits of a live layer
+    /// for a transfer.
+    fn fits(&self, ledger: &Ledger) -> bool {
+        if self.outputs == 0 {
+            return self.generation == 0 && self.first == 0;
+        }
+        let Some(layer) = ledger
+            .position(self.generation)
+            .and_then(|position| ledger.layer(position))
+        else {
+            return false;
+        };
+        self.first
+            .checked_add(u32::from(self.outputs))
+            .is_some_and(|end| end <= layer.issued)
+    }
+}
+
+/// The receipts an issuer keeps, by request id, oldest first.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 struct Receipts {
     order: VecDeque<TransferId>,
-    issued: HashMap<TransferId, Vec<Issued>>,
+    held: HashMap<TransferId, Receipt>,
 }
 
 impl Receipts {
-    fn insert(&mut self, capacity: usize, id: TransferId, issued: Vec<Issued>) {
+    fn insert(&mut self, capacity: usize, id: TransferId, receipt: Receipt) {
         if capacity == 0 {
             return;
         }
-        if self.issued.insert(id, issued).is_none() {
+        if self.held.insert(id, receipt).is_none() {
+            // Push the oldest out first, so the queue never outgrows
+            // `capacity`.
+            self.shrink_to(capacity - 1);
             self.order.push_back(id);
         }
-        self.shrink_to(capacity);
     }
 
     fn shrink_to(&mut self, capacity: usize) {
         while self.order.len() > capacity {
             if let Some(oldest) = self.order.pop_front() {
-                self.issued.remove(&oldest);
+                self.held.remove(&oldest);
             }
+        }
+    }
+
+    /// Seconds until one more receipt would push out none younger than
+    /// `min_age` at `now`: 0 while there is room for it or the oldest is
+    /// old enough.
+    fn wait(&self, capacity: usize, min_age: u32, now: u64) -> u32 {
+        match self.order.front() {
+            Some(oldest) if self.order.len() >= capacity => {
+                let age = now.saturating_sub(self.held[oldest].at);
+                min_age.saturating_sub(u32::try_from(age).unwrap_or(u32::MAX))
+            }
+            _ => 0,
         }
     }
 
     /// Forgets transfers whose notes have expired. Burns issued nothing, so
     /// they stay until newer requests push them out.
     fn prune(&mut self, oldest_generation: u64) {
-        let issued = &mut self.issued;
+        let held = &mut self.held;
         self.order.retain(|id| {
-            let alive = issued[id]
-                .first()
-                .is_none_or(|i| i.serial.generation >= oldest_generation);
+            let receipt = held[id];
+            let alive = receipt.outputs == 0 || receipt.generation >= oldest_generation;
             if !alive {
-                issued.remove(id);
+                held.remove(id);
             }
             alive
         });
@@ -448,6 +586,8 @@ pub struct Issuer {
     paused: bool,
     /// When the last scheduled rotation was due.
     last_due: Option<u64>,
+    /// What receipts are stamped by, if anything.
+    clock: Option<Clock>,
 }
 
 impl Issuer {
@@ -486,6 +626,7 @@ impl Issuer {
             authorities: BTreeMap::new(),
             paused: false,
             last_due: None,
+            clock: None,
         })
     }
 
@@ -518,6 +659,39 @@ impl Issuer {
     /// epoch, if one was ever logged.
     pub fn last_scheduled_rotation(&self) -> Option<u64> {
         self.last_due
+    }
+
+    /// Gives the issuer a clock, by which it keeps each receipt for at least
+    /// the policy's [`receipt_min_age_secs`](Policy::receipt_min_age_secs):
+    /// from now on [`plan_transfer`](Self::plan_transfer) and
+    /// [`plan_burn`](Self::plan_burn) refuse a request as [`Error::Busy`]
+    /// when its receipt would push out a younger one. Without a clock it
+    /// keeps receipts by count alone.
+    ///
+    /// The receipts it holds now count as made `age` seconds ago. Each was
+    /// made no later than now, so 0 is always safe; a larger age is safe
+    /// only if every one of them is at least that old, since a receipt
+    /// counted older than it is may be pushed out while its client still
+    /// resends. Counted younger than they are, `receipt_capacity` receipts
+    /// hold every new transfer and burn back until they reach the minimum
+    /// age. Call it once, when the issuer is made or restored; copies of it
+    /// share the clock.
+    pub fn set_clock(&mut self, clock: Clock, age: u64) {
+        self.set_clock_split(clock, age, 0, 0);
+    }
+
+    /// Gives the issuer a clock as [`set_clock`](Self::set_clock) does, but
+    /// counts only the receipts before the newest `newer` as made `age`
+    /// seconds ago, and those `newer` as made `newer_age` seconds ago.
+    pub(crate) fn set_clock_split(&mut self, clock: Clock, age: u64, newer: usize, newer_age: u64) {
+        let now = clock.now();
+        let Receipts { order, held } = &mut self.receipts;
+        let older = order.len().saturating_sub(newer);
+        for (index, id) in order.iter().enumerate() {
+            let age = if index < older { age } else { newer_age };
+            held.get_mut(id).expect("every receipt queued is held").at = now.saturating_sub(age);
+        }
+        self.clock = Some(clock);
     }
 
     /// Position of the layer new money lands in.
@@ -696,7 +870,11 @@ impl Issuer {
 
     /// Plans a verified transfer against the ledger: every input must be
     /// live and outside the last layer, and the layer one past the furthest
-    /// input must have room for every output.
+    /// input must have room for every output. With a clock (see
+    /// [`set_clock`](Self::set_clock)), a transfer whose receipt would push
+    /// out one younger than the policy's
+    /// [`receipt_min_age_secs`](Policy::receipt_min_age_secs) is then
+    /// refused as [`Error::Busy`]; a resend of one applied before is not.
     ///
     /// The transfer's shape is checked against this issuer's policy again,
     /// which is cheap, in case it was verified under a different one.
@@ -711,8 +889,10 @@ impl Issuer {
         let inputs: Vec<u64> = transfer.inputs.iter().map(Note::amount).collect();
         let outputs: Vec<u64> = transfer.outputs.iter().map(|o| o.amount).collect();
         self.policy.check_transfer(&inputs, &outputs)?;
-        if let Some(issued) = self.receipts.issued.get(&transfer.id) {
-            return Ok(Plan::Replay(self.sign_all(issued)));
+        if let Some(receipt) = self.receipts.held.get(&transfer.id)
+            && usize::from(receipt.outputs) == transfer.outputs.len()
+        {
+            return Ok(Plan::Replay(self.replay(receipt, &transfer.outputs)));
         }
         let last = self.ledger.last_position();
         let mut furthest = 0;
@@ -738,6 +918,7 @@ impl Issuer {
             })
             .collect::<Option<Vec<_>>>()
             .ok_or(Error::LayerFull { position })?;
+        self.check_room()?;
         Ok(Plan::Apply(Event::Transfer {
             id: transfer.id,
             spent: spent(&transfer.inputs),
@@ -747,6 +928,8 @@ impl Issuer {
 
     /// Plans a verified burn against the ledger: every input must be live.
     /// Notes frozen in the last layer can be burned, since nothing moves.
+    /// A burn needs room for its receipt as a transfer does (see
+    /// [`plan_transfer`](Self::plan_transfer)).
     pub fn plan_burn(&self, burn: &VerifiedBurn) -> Result<Plan, Error> {
         self.check_running()?;
         if burn.issuer != self.public {
@@ -756,7 +939,12 @@ impl Issuer {
             });
         }
         self.policy.check_burn(burn.inputs.len())?;
-        if self.receipts.issued.contains_key(&burn.id) {
+        if self
+            .receipts
+            .held
+            .get(&burn.id)
+            .is_some_and(|receipt| receipt.outputs == 0)
+        {
             return Ok(Plan::Replay(Vec::new()));
         }
         for note in &burn.inputs {
@@ -768,6 +956,7 @@ impl Issuer {
                 Status::Unissued => return Err(Error::Unissued(serial)),
             }
         }
+        self.check_room()?;
         Ok(Plan::Apply(Event::Burn {
             id: burn.id,
             spent: spent(&burn.inputs),
@@ -825,6 +1014,25 @@ impl Issuer {
     fn check_running(&self) -> Result<(), Error> {
         if self.paused {
             return Err(Error::Paused);
+        }
+        Ok(())
+    }
+
+    /// Refuses as [`Error::Busy`] a new receipt that would push out one
+    /// younger than the policy's minimum age, if the issuer has a clock.
+    fn check_room(&self) -> Result<(), Error> {
+        let Some(clock) = &self.clock else {
+            return Ok(());
+        };
+        let wait = self.receipts.wait(
+            self.policy.receipt_capacity as usize,
+            self.policy.receipt_min_age_secs,
+            clock.now(),
+        );
+        if wait > 0 {
+            return Err(Error::Busy {
+                retry_after_secs: wait,
+            });
         }
         Ok(())
     }
@@ -957,14 +1165,17 @@ impl Issuer {
     /// issuer public key, the event sequence number, the ledger (see
     /// [`Ledger::to_bytes`]), a byte that is 1 if serial indexes are permuted
     /// and 0 if they are the bits, the live value of each layer as `u128`, value
-    /// minted, destroyed and burned as `u128`, the remembered receipts, each
-    /// mint authority's last request and note (sorted by authority key), the
-    /// certificates of the live generations' keys (oldest first), a byte that
-    /// is 1 if the issuer is paused, a byte that is 1 if a scheduled rotation
-    /// was logged followed by the time it was due as `u64` (0 if none), the
-    /// oldest generation, live or dropped, whose notes still verify as `u64`,
-    /// the certificates of the dropped generations' keys from it on (oldest
-    /// first), and finally the SHA-256 of everything before it.
+    /// minted, destroyed and burned as `u128`, the receipts (oldest first, as
+    /// a `u32` count and for each the request's id, the generation and first
+    /// bit its outputs took as `u64` and `u32`, and their count as `u8`, all
+    /// three 0 for a burn), each mint authority's last request and note
+    /// (sorted by authority key), the certificates of the live generations'
+    /// keys (oldest first), a byte that is 1 if the issuer is paused, a byte
+    /// that is 1 if a scheduled rotation was logged followed by the time it
+    /// was due as `u64` (0 if none), the oldest generation, live or dropped,
+    /// whose notes still verify as `u64`, the certificates of the dropped
+    /// generations' keys from it on (oldest first), and finally the SHA-256
+    /// of everything before it. When receipts were made is not part of it.
     pub fn snapshot(&self) -> Vec<u8> {
         let mut w = Writer::default();
         w.bytes(SNAPSHOT_MAGIC)
@@ -979,11 +1190,11 @@ impl Issuer {
         w.u128(self.minted).u128(self.destroyed).u128(self.burned);
         w.u32(self.receipts.order.len() as u32);
         for id in &self.receipts.order {
-            let issued = &self.receipts.issued[id];
-            w.bytes(&id.to_bytes()).u32(issued.len() as u32);
-            for i in issued {
-                write_issued(&mut w, i);
-            }
+            let receipt = &self.receipts.held[id];
+            w.bytes(&id.to_bytes())
+                .u64(receipt.generation)
+                .u32(receipt.first)
+                .u8(receipt.outputs);
         }
         w.u32(self.authorities.len() as u32);
         for (authorization, issued) in self.authorities.values() {
@@ -1072,8 +1283,19 @@ impl Issuer {
         let mut receipts = Receipts::default();
         for _ in 0..r.u32()? {
             let id = TransferId::from_bytes(r.array()?);
-            let issued = read_list(&mut r, 52, read_issued)?;
-            if receipts.issued.insert(id, issued).is_some() {
+            let receipt = if version >= 8 {
+                let receipt = Receipt {
+                    generation: r.u64()?,
+                    first: r.u32()?,
+                    outputs: r.u8()?,
+                    at: 0,
+                };
+                Some(receipt).filter(|receipt| receipt.fits(&ledger))
+            } else {
+                Receipt::of_notes(&ledger, &read_list(&mut r, 52, read_issued)?)
+            };
+            let receipt = receipt.ok_or(DecodeError::Invalid("receipt"))?;
+            if receipts.held.insert(id, receipt).is_some() {
                 return Err(DecodeError::Invalid("duplicate receipt").into());
             }
             receipts.order.push_back(id);
@@ -1169,6 +1391,7 @@ impl Issuer {
             authorities,
             paused,
             last_due,
+            clock: None,
         })
     }
 
@@ -1183,6 +1406,25 @@ impl Issuer {
         let certificates = self.recent.certificates();
         let live = self.keys.oldest();
         &certificates[..certificates.partition_point(|c| c.generation < live)]
+    }
+
+    /// The notes of the transfer `receipt` keeps, signed again: its outputs,
+    /// in order, took the bits from the receipt's first on.
+    fn replay(&self, receipt: &Receipt, outputs: &[Output]) -> Vec<Note> {
+        let issued: Vec<Issued> = (receipt.first..)
+            .zip(outputs)
+            .map(|(bit, output)| Issued {
+                serial: self.ledger.serial_of(receipt.generation, bit),
+                amount: output.amount,
+                holder: output.holder,
+            })
+            .collect();
+        self.sign_all(&issued)
+    }
+
+    /// The time by the issuer's clock, or 0 without one.
+    fn now(&self) -> u64 {
+        self.clock.as_ref().map_or(0, Clock::now)
     }
 
     /// Signs notes of live generations, each with its generation's key.
@@ -1235,6 +1477,9 @@ impl Issuer {
                 "a transfer spends and issues at least one note".into(),
             ));
         }
+        // As many as a policy can allow, and a receipt can count.
+        let outputs = u8::try_from(issued.len())
+            .map_err(|_| ApplyError("a transfer issues at most 255 notes".into()))?;
         self.check_spent(spent)?;
         let total_in: u128 = spent.iter().map(|s| u128::from(s.amount)).sum();
         let total_out: u128 = issued.iter().map(|i| u128::from(i.amount)).sum();
@@ -1244,13 +1489,24 @@ impl Issuer {
             )));
         }
         let position = self.check_issued(issued)?;
+        let receipt = Receipt {
+            generation: issued[0].serial.generation,
+            // The outputs take the next bits, from the count handed out on.
+            first: self
+                .ledger
+                .layer(position)
+                .expect("checked in the ledger above")
+                .issued,
+            outputs,
+            at: self.now(),
+        };
 
         self.spend(spent);
         for i in issued {
             self.allocate(position, i);
         }
         let capacity = self.policy.receipt_capacity as usize;
-        self.receipts.insert(capacity, id, issued.to_vec());
+        self.receipts.insert(capacity, id, receipt);
         Ok(())
     }
 
@@ -1262,7 +1518,11 @@ impl Issuer {
         self.spend(spent);
         self.burned += spent.iter().map(|s| u128::from(s.amount)).sum::<u128>();
         let capacity = self.policy.receipt_capacity as usize;
-        self.receipts.insert(capacity, id, Vec::new());
+        let receipt = Receipt {
+            at: self.now(),
+            ..Receipt::BURN
+        };
+        self.receipts.insert(capacity, id, receipt);
         Ok(())
     }
 
@@ -1449,6 +1709,7 @@ impl Issuer {
 #[cfg(test)]
 mod tests {
     use std::collections::BTreeSet;
+    use std::sync::atomic::{AtomicU64, Ordering};
 
     use super::*;
     use crate::keys::{HolderKey, MintKey};
@@ -1462,12 +1723,54 @@ mod tests {
         Issuer::new(IssuerKey::generate(), config, policy).unwrap()
     }
 
+    /// Where the receipts start in a snapshot: after the magic, the version,
+    /// the issuer key, the sequence number, the ledger, the serial order
+    /// byte, the layers' values and the three totals.
+    fn receipts_at(i: &Issuer) -> usize {
+        let layers = i.ledger.config().layers as usize;
+        8 + 2 + 32 + 8 + i.ledger.to_bytes().len() + 1 + 16 * layers + 48
+    }
+
+    /// The receipts as snapshots before version 8 wrote them: each request's
+    /// id and the notes it issued, none for a burn.
+    fn notes_section(receipts: &[(TransferId, Vec<Note>)]) -> Vec<u8> {
+        let mut w = Writer::default();
+        w.u32(receipts.len() as u32);
+        for (id, notes) in receipts {
+            w.bytes(&id.to_bytes()).u32(notes.len() as u32);
+            for note in notes {
+                let issued = Issued {
+                    serial: note.serial(),
+                    amount: note.amount(),
+                    holder: *note.holder(),
+                };
+                write_issued(&mut w, &issued);
+            }
+        }
+        w.finish()
+    }
+
+    /// The snapshot as version 7 wrote it, without its checksum: version 8
+    /// kept the notes of each receipt, which are `receipts`, the issuer's
+    /// own, oldest first.
+    fn version_7_body(i: &Issuer, receipts: &[(TransferId, Vec<Note>)]) -> Vec<u8> {
+        let ids: Vec<TransferId> = receipts.iter().map(|(id, _)| *id).collect();
+        assert!(i.receipts.order.iter().eq(&ids));
+        let mut body = i.snapshot();
+        body.truncate(body.len() - 32);
+        let at = receipts_at(i);
+        let end = at + 4 + 45 * receipts.len();
+        assert_eq!(body[at..at + 4], (receipts.len() as u32).to_be_bytes());
+        body.splice(at..end, notes_section(receipts));
+        body[8..10].copy_from_slice(&7u16.to_be_bytes());
+        body
+    }
+
     /// The snapshot as version 6 wrote it, without its checksum: version 7
     /// added the oldest generation that still verifies and the dropped
     /// generations' keys.
-    fn version_6_body(i: &Issuer) -> Vec<u8> {
-        let mut body = i.snapshot();
-        body.truncate(body.len() - 32);
+    fn version_6_body(i: &Issuer, receipts: &[(TransferId, Vec<Note>)]) -> Vec<u8> {
+        let mut body = version_7_body(i, receipts);
         let since = body.len() - 12 - 104 * i.dropped_keys().len();
         assert_eq!(body[since..since + 8], i.recent.oldest().to_be_bytes());
         body.truncate(since);
@@ -1475,13 +1778,27 @@ mod tests {
         body
     }
 
-    /// The snapshot as version 5 wrote it, without its checksum: version 6
-    /// added the pause and schedule, which must be unset.
+    /// The snapshot as version 5 wrote it, without its checksum, of an issuer
+    /// that holds no receipts: version 6 added the pause and schedule, which
+    /// must be unset.
     fn version_5_body(i: &Issuer) -> Vec<u8> {
-        let mut body = version_6_body(i);
+        let mut body = version_6_body(i, &[]);
         assert_eq!(body.split_off(body.len() - 10), [0; 10]);
         body[8..10].copy_from_slice(&5u16.to_be_bytes());
         body
+    }
+
+    /// `body` with its checksum.
+    fn sealed(mut body: Vec<u8>) -> Vec<u8> {
+        let checksum: [u8; 32] = Sha256::digest(&body).into();
+        body.extend_from_slice(&checksum);
+        body
+    }
+
+    /// Restores `body`, sealed with its checksum, under `i`'s key and key
+    /// ring.
+    fn restore_body(i: &Issuer, body: Vec<u8>, policy: Policy) -> Result<Issuer, SetupError> {
+        Issuer::restore(i.key.clone(), i.key_ring().clone(), &sealed(body), policy)
     }
 
     fn without_generation_keys(i: &mut Issuer) {
@@ -1501,6 +1818,36 @@ mod tests {
             holder: HolderKey::generate().public_key(),
         };
         TransferRequest::single(note, key, output).unwrap()
+    }
+
+    /// A request that splits `note` into `parts` notes of equal amounts,
+    /// each to a fresh key.
+    fn split(note: Note, key: &HolderKey, parts: u64) -> TransferRequest {
+        let outputs = (0..parts)
+            .map(|_| Output {
+                amount: note.amount() / parts,
+                holder: HolderKey::generate().public_key(),
+            })
+            .collect();
+        TransferRequest::sign(&[(note, key)], outputs).unwrap()
+    }
+
+    /// Keeps 4 receipts, each for at least 100 s.
+    fn floor() -> Policy {
+        Policy {
+            receipt_capacity: 4,
+            receipt_min_age_secs: 100,
+            ..Policy::cash_like()
+        }
+    }
+
+    /// Gives `i` a clock that reads `start` until the test moves it, with
+    /// the receipts it holds `age` seconds old.
+    fn fake_clock(i: &mut Issuer, start: u64, age: u64) -> Arc<AtomicU64> {
+        let now = Arc::new(AtomicU64::new(start));
+        let read = Arc::clone(&now);
+        i.set_clock(Clock::new(move || read.load(Ordering::SeqCst)), age);
+        now
     }
 
     fn pay(issuer: &mut Issuer, note: Note, key: &HolderKey) -> Result<(Note, HolderKey), Error> {
@@ -2809,12 +3156,12 @@ mod tests {
         let alice = HolderKey::generate();
         let note = i.mint(8, alice.public_key()).unwrap();
         let request = payment(note, &alice);
-        i.transfer(&request).unwrap();
+        let paid = i.transfer(&request).unwrap();
         for _ in 0..3 {
             i.rotate().unwrap();
         }
         assert_eq!(i.dropped_keys().len(), 3);
-        let mut body = version_6_body(&i);
+        let mut body = version_6_body(&i, &[(request.id(&i.public), paid)]);
         let checksum: [u8; 32] = Sha256::digest(&body).into();
         body.extend_from_slice(&checksum);
         let mut restored = Issuer::restore(
@@ -2912,7 +3259,7 @@ mod tests {
         // which every replica shares, and not on the dropped ones kept: a
         // replica restored from a version 6 snapshot keeps none.
         let event = i.plan_rotate(second.clone()).unwrap();
-        let mut body = version_6_body(&i);
+        let mut body = version_6_body(&i, &[]);
         let checksum: [u8; 32] = Sha256::digest(&body).into();
         body.extend_from_slice(&checksum);
         let mut upgraded = Issuer::restore(
@@ -2936,5 +3283,364 @@ mod tests {
         )
         .unwrap();
         assert_eq!(restored.snapshot(), i.snapshot());
+    }
+
+    #[test]
+    fn a_resent_split_gets_the_same_notes_from_where_they_went() {
+        for permuted in [true, false] {
+            let mut i = issuer(4, Policy::cash_like());
+            if !permuted {
+                i.ledger = Ledger::new(i.ledger.config()).unwrap();
+            }
+            let key = HolderKey::generate();
+            // The outputs share their layer with notes paid before and after.
+            let before = i.mint(4, key.public_key()).unwrap();
+            pay(&mut i, before, &key).unwrap();
+            let note = i.mint(16, key.public_key()).unwrap();
+            let request = split(note, &key, 4);
+            let paid = i.transfer(&request).unwrap();
+            let after = i.mint(4, key.public_key()).unwrap();
+            pay(&mut i, after, &key).unwrap();
+            let indexes: Vec<u32> = paid.iter().map(|n| n.serial().index).collect();
+            assert_eq!(indexes == [1, 2, 3, 4], !permuted, "{indexes:?}");
+
+            let sequence = i.sequence();
+            assert_eq!(i.transfer(&request), Ok(paid.clone()));
+            assert_eq!(i.sequence(), sequence, "a replay changes nothing");
+            i.rotate().unwrap();
+            assert_eq!(i.transfer(&request), Ok(paid.clone()));
+
+            // The snapshot keeps where the outputs went, the second of three
+            // receipts, and a restored issuer signs them again.
+            let snapshot = i.snapshot();
+            let at = receipts_at(&i) + 4 + 45;
+            let mut receipt = Writer::default();
+            receipt
+                .bytes(&request.id(&i.public).to_bytes())
+                .u64(paid[0].serial().generation)
+                .u32(1)
+                .u8(4);
+            assert_eq!(snapshot[at..at + 45], receipt.finish());
+            let restored = Issuer::restore(
+                i.key.clone(),
+                i.key_ring().clone(),
+                &snapshot,
+                Policy::cash_like(),
+            )
+            .unwrap();
+            assert_eq!(restored.snapshot(), snapshot);
+            let verified = restored.verifier().verify(&request).unwrap();
+            assert_eq!(restored.plan_transfer(&verified), Ok(Plan::Replay(paid)));
+        }
+    }
+
+    #[test]
+    fn version_7_and_6_receipts_restore_from_their_notes() {
+        let mut i = issuer(4, Policy::cash_like());
+        let key = HolderKey::generate();
+        let first = payment(i.mint(4, key.public_key()).unwrap(), &key);
+        let first_paid = i.transfer(&first).unwrap();
+        let note = i.mint(16, key.public_key()).unwrap();
+        let request = split(note, &key, 4);
+        let paid = i.transfer(&request).unwrap();
+        let burned = i.mint(8, key.public_key()).unwrap();
+        let burn = BurnRequest::single(burned, &key).unwrap();
+        i.burn(&burn).unwrap();
+        let receipts = vec![
+            (first.id(&i.public), first_paid.clone()),
+            (request.id(&i.public), paid.clone()),
+            (burn.id(&i.public), Vec::new()),
+        ];
+        for body in [version_7_body(&i, &receipts), version_6_body(&i, &receipts)] {
+            let mut restored = restore_body(&i, body, Policy::cash_like()).unwrap();
+            assert_eq!(restored.snapshot(), i.snapshot());
+            let sequence = restored.sequence();
+            assert_eq!(restored.transfer(&first), Ok(first_paid.clone()));
+            assert_eq!(restored.transfer(&request), Ok(paid.clone()));
+            assert_eq!(restored.burn(&burn), Ok(8));
+            assert_eq!(restored.sequence(), sequence, "a replay changes nothing");
+        }
+
+        // Notes that are not the bits handed out from the first one's on
+        // are refused.
+        let refused = |notes: Vec<Note>| {
+            let mut receipts = receipts.clone();
+            receipts[1].1 = notes;
+            restore_body(&i, version_7_body(&i, &receipts), Policy::cash_like()).unwrap_err()
+        };
+        let invalid = SetupError::Snapshot(DecodeError::Invalid("receipt"));
+        assert_eq!(refused(vec![paid[1], paid[0], paid[2], paid[3]]), invalid);
+        let generation = paid[0].serial().generation;
+        let holder = key.public_key();
+        let unissued = i.ledger.serial_of(generation, 5);
+        for serial in [
+            unissued,
+            Serial::new(generation, 64),
+            Serial::new(generation + 1, 0),
+        ] {
+            let note = Note::issue(i.public, &i.key, serial, 1, holder);
+            let mut notes = paid.clone();
+            notes.push(note);
+            assert_eq!(refused(notes), invalid, "{serial}");
+            assert_eq!(refused(vec![note]), invalid, "{serial}");
+        }
+    }
+
+    #[test]
+    fn receipts_naming_bits_the_ledger_never_handed_out_are_refused() {
+        let mut i = issuer(4, Policy::cash_like());
+        let key = HolderKey::generate();
+        let note = i.mint(16, key.public_key()).unwrap();
+        let paid = i.transfer(&split(note, &key, 4)).unwrap();
+        let burned = i.mint(8, key.public_key()).unwrap();
+        i.burn(&BurnRequest::single(burned, &key).unwrap()).unwrap();
+        let generation = paid[0].serial().generation;
+
+        // The transfer's receipt, then the burn's: each an id, then the
+        // generation, the first bit and the count of the outputs.
+        let transfer = receipts_at(&i) + 4;
+        let burn = transfer + 45;
+        let snapshot = i.snapshot();
+        let mut fields = Writer::default();
+        fields.u64(generation).u32(0).u8(4);
+        assert_eq!(snapshot[transfer + 32..transfer + 45], fields.finish());
+        assert_eq!(snapshot[burn + 32..burn + 45], [0; 13]);
+        let with = |at: usize, bytes: &[u8]| {
+            let mut body = snapshot[..snapshot.len() - 32].to_vec();
+            body[at..at + bytes.len()].copy_from_slice(bytes);
+            restore_body(&i, body, Policy::cash_like())
+        };
+        assert!(with(transfer, &snapshot[transfer..transfer + 32]).is_ok());
+
+        let invalid = SetupError::Snapshot(DecodeError::Invalid("receipt"));
+        let edits: [(&str, usize, Vec<u8>); 8] = [
+            (
+                "a generation not in the ledger",
+                transfer + 32,
+                99u64.to_be_bytes().to_vec(),
+            ),
+            (
+                "bits past those handed out",
+                transfer + 40,
+                1u32.to_be_bytes().to_vec(),
+            ),
+            ("more outputs than were issued", transfer + 44, vec![5]),
+            (
+                "a first bit that overflows",
+                transfer + 40,
+                u32::MAX.to_be_bytes().to_vec(),
+            ),
+            ("a transfer kept as a burn", transfer + 44, vec![0]),
+            (
+                "a burn with a generation",
+                burn + 32,
+                generation.to_be_bytes().to_vec(),
+            ),
+            (
+                "a burn with a first bit",
+                burn + 40,
+                1u32.to_be_bytes().to_vec(),
+            ),
+            ("a burn with outputs", burn + 44, vec![1]),
+        ];
+        for (what, at, bytes) in edits {
+            assert_eq!(with(at, &bytes).unwrap_err(), invalid, "{what}");
+        }
+        assert_eq!(
+            with(burn, &snapshot[transfer..transfer + 32]).unwrap_err(),
+            SetupError::Snapshot(DecodeError::Invalid("duplicate receipt"))
+        );
+    }
+
+    #[test]
+    fn a_full_table_of_young_receipts_holds_new_transfers_back() {
+        let mut i = issuer(4, floor());
+        let now = fake_clock(&mut i, 0, 0);
+        let alice = HolderKey::generate();
+        let bob = HolderKey::generate();
+        let to = |holder: &HolderKey| Output {
+            amount: 8,
+            holder: holder.public_key(),
+        };
+        let notes: Vec<Note> = (0..6)
+            .map(|_| i.mint(8, alice.public_key()).unwrap())
+            .collect();
+        let requests: Vec<TransferRequest> = notes
+            .iter()
+            .map(|note| TransferRequest::single(*note, &alice, to(&bob)).unwrap())
+            .collect();
+        // Receipts made at 0, 10, 20 and 30 s fill the table.
+        let mut paid = Vec::new();
+        for (t, request) in (0..).step_by(10).zip(&requests[..4]) {
+            now.store(t, Ordering::SeqCst);
+            paid.push(i.transfer(request).unwrap());
+        }
+
+        // At 40 s the oldest is 40 s old, so a fifth waits 60 s more, and
+        // nothing is done meanwhile.
+        now.store(40, Ordering::SeqCst);
+        let sequence = i.sequence();
+        let busy = |retry_after_secs| Err(Error::Busy { retry_after_secs });
+        assert_eq!(i.transfer(&requests[4]), busy(60));
+        assert!(matches!(i.status(&notes[4]), Ok(NoteStatus::Live { .. })));
+        // A resend is answered, and a spent or frozen input refused as such.
+        assert_eq!(i.transfer(&requests[0]), Ok(paid[0].clone()));
+        let again = TransferRequest::single(notes[0], &alice, to(&alice)).unwrap();
+        assert_eq!(i.transfer(&again), Err(Error::Spent(notes[0].serial())));
+        let frozen = paid[1][0];
+        let onward = TransferRequest::single(frozen, &bob, to(&alice)).unwrap();
+        assert_eq!(i.transfer(&onward), Err(Error::Frozen(frozen.serial())));
+        now.store(99, Ordering::SeqCst);
+        assert_eq!(i.transfer(&requests[4]), busy(1));
+        assert_eq!(i.sequence(), sequence);
+
+        // At 100 s the oldest may go: the fifth applies, and the first's
+        // resend finds no receipt.
+        now.store(100, Ordering::SeqCst);
+        assert!(i.transfer(&requests[4]).is_ok());
+        assert_eq!(
+            i.transfer(&requests[0]),
+            Err(Error::Spent(notes[0].serial()))
+        );
+        assert_eq!(i.transfer(&requests[1]), Ok(paid[1].clone()));
+        // The next waits for the receipt made at 10 s.
+        assert_eq!(i.transfer(&requests[5]), busy(10));
+    }
+
+    #[test]
+    fn a_full_table_of_young_receipts_holds_new_burns_back() {
+        let policy = Policy {
+            max_inputs: 2,
+            ..floor()
+        };
+        let mut i = issuer(4, policy);
+        let now = fake_clock(&mut i, 0, 0);
+        let key = HolderKey::generate();
+        let notes: Vec<Note> = (0..5)
+            .map(|_| i.mint(8, key.public_key()).unwrap())
+            .collect();
+        let burns: Vec<BurnRequest> = notes
+            .iter()
+            .map(|note| BurnRequest::single(*note, &key).unwrap())
+            .collect();
+        for (t, burn) in (0..).step_by(10).zip(&burns[..4]) {
+            now.store(t, Ordering::SeqCst);
+            assert_eq!(i.burn(burn), Ok(8));
+        }
+
+        now.store(40, Ordering::SeqCst);
+        let sequence = i.sequence();
+        assert_eq!(
+            i.burn(&burns[4]),
+            Err(Error::Busy {
+                retry_after_secs: 60
+            })
+        );
+        assert_eq!(i.burn(&burns[0]), Ok(8));
+        let with_spent = BurnRequest::sign(&[(notes[4], &key), (notes[0], &key)]).unwrap();
+        assert_eq!(i.burn(&with_spent), Err(Error::Spent(notes[0].serial())));
+        assert_eq!(i.sequence(), sequence);
+        assert_eq!(i.supply().burned, 32);
+
+        now.store(100, Ordering::SeqCst);
+        assert_eq!(i.burn(&burns[4]), Ok(8));
+        assert_eq!(i.burn(&burns[0]), Err(Error::Spent(notes[0].serial())));
+        assert_eq!(i.burn(&burns[1]), Ok(8));
+        assert_eq!(i.supply().burned, 40);
+    }
+
+    #[test]
+    fn a_full_layer_is_refused_as_full_before_the_floor_is_checked() {
+        let mut i = issuer(4, floor());
+        fake_clock(&mut i, 0, 0);
+        let key = HolderKey::generate();
+        // Four splits into 16 fill the table and the last layer's 64 bits.
+        for _ in 0..4 {
+            let note = i.mint(16, key.public_key()).unwrap();
+            i.transfer(&split(note, &key, 16)).unwrap();
+        }
+        let note = i.mint(16, key.public_key()).unwrap();
+        assert_eq!(
+            i.transfer(&payment(note, &key)),
+            Err(Error::LayerFull { position: 3 })
+        );
+    }
+
+    #[test]
+    fn without_a_clock_or_a_floor_receipts_are_kept_by_count_alone() {
+        let key = HolderKey::generate();
+        let unfloored = Policy {
+            receipt_min_age_secs: 0,
+            ..floor()
+        };
+        for (clock, policy) in [(false, floor()), (true, unfloored)] {
+            let mut i = issuer(4, policy);
+            if clock {
+                fake_clock(&mut i, 0, 0);
+            }
+            let notes: Vec<Note> = (0..5)
+                .map(|_| i.mint(8, key.public_key()).unwrap())
+                .collect();
+            let requests: Vec<TransferRequest> =
+                notes.iter().map(|note| payment(*note, &key)).collect();
+            let paid: Vec<Vec<Note>> = requests.iter().map(|r| i.transfer(r).unwrap()).collect();
+            assert_eq!(
+                i.transfer(&requests[0]),
+                Err(Error::Spent(notes[0].serial()))
+            );
+            assert_eq!(i.transfer(&requests[1]), Ok(paid[1].clone()));
+        }
+
+        // With no receipts kept, nothing waits for one to age.
+        let mut i = issuer(
+            4,
+            Policy {
+                receipt_capacity: 0,
+                ..floor()
+            },
+        );
+        fake_clock(&mut i, 0, 0);
+        for _ in 0..5 {
+            let note = i.mint(8, key.public_key()).unwrap();
+            let request = payment(note, &key);
+            i.transfer(&request).unwrap();
+            assert_eq!(i.transfer(&request), Err(Error::Spent(note.serial())));
+        }
+    }
+
+    #[test]
+    fn a_restored_issuer_counts_its_receipts_as_old_as_it_is_told() {
+        let mut i = issuer(4, floor());
+        let key = HolderKey::generate();
+        let notes: Vec<Note> = (0..5)
+            .map(|_| i.mint(8, key.public_key()).unwrap())
+            .collect();
+        for note in &notes[..4] {
+            i.transfer(&payment(*note, &key)).unwrap();
+        }
+        let fifth = payment(notes[4], &key);
+        let snapshot = i.snapshot();
+        for (age, wait) in [(0, 100), (30, 70), (100, 0), (1000, 0)] {
+            let mut restored =
+                Issuer::restore(i.key.clone(), i.key_ring().clone(), &snapshot, floor()).unwrap();
+            let now = fake_clock(&mut restored, 1000, age);
+            let verified = restored.verifier().verify(&fifth).unwrap();
+            let planned = restored.plan_transfer(&verified);
+            if wait > 0 {
+                let busy = Error::Busy {
+                    retry_after_secs: wait,
+                };
+                assert_eq!(planned, Err(busy), "{age}");
+            } else {
+                assert!(matches!(planned, Ok(Plan::Apply(_))), "{age}");
+            }
+            now.store(1000 + u64::from(wait), Ordering::SeqCst);
+            assert!(matches!(
+                restored.plan_transfer(&verified),
+                Ok(Plan::Apply(_))
+            ));
+            // When the receipts were made stays out of the snapshot.
+            assert_eq!(restored.snapshot(), snapshot);
+        }
     }
 }
