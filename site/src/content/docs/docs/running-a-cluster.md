@@ -243,13 +243,14 @@ registry, its log holds the other's last entry or starts after it:
 An entry with the same index, term and node is the same on both members,
 and so is every entry before it, so a member whose log holds the other's
 last entry holds every entry the other holds. A member purges only entries
-its snapshot holds, and a snapshot holds only entries the cluster answered,
-which are the same on every member, so a member whose log starts after the
-other's last entry lacks only entries the cluster never answered. Every
-change the cluster answered is on at least two of the three members, so
-such a member holds every change answered before the check. A member that
-was away, cut off or behind may lack changes the other two made, and
-restoring all three from its copy undoes them.
+its snapshot holds, and a snapshot holds only entries the cluster has
+carried out, which are the same on every member, so a member whose log
+starts after the other's last entry lacks only entries the cluster never
+carried out, and so never answered. Every change the cluster answered is on
+at least two of the three members, so such a member holds every change
+answered before the check. A member that was away, cut off or behind may
+lack changes the other two made, and restoring all three from its copy
+undoes them.
 
 An export that prints nothing tells nothing: that member has purged its
 whole log, as after installing the leader's snapshot. Use another member in
