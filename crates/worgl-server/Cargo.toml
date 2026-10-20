@@ -1,13 +1,15 @@
 [package]
 name = "worgl-server"
-description = "HTTP issuer for the worgl crate"
+description = "HTTP server that hosts many Worgl mints, alone or as a replicated cluster"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
 repository.workspace = true
+homepage.workspace = true
 authors.workspace = true
-publish = false
+keywords = ["token", "issuer", "credits", "server", "raft"]
+categories = ["web-programming::http-server", "cryptography"]
 
 [dependencies]
 anyhow.workspace = true
