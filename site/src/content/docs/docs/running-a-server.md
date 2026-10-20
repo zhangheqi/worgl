@@ -6,19 +6,16 @@ description: Create a state directory and its mints, serve them over HTTP, chang
 `worgl-server` hosts any number of mints in one process. Each mint is one
 issuer, with its own key, ledger, policy, rotation period and directory.
 
-## Build
-
-Nothing is on crates.io yet. Build from the repository:
+## Install
 
 ```sh
-cargo build --release
-./target/release/worgl-server init        --state ./server
-./target/release/worgl-server create-mint --state ./server --layers 4 --layer-size 1048576 --rotate-every 86400
-./target/release/worgl-server serve       --state ./server --listen 127.0.0.1:8080
+cargo install worgl-server --locked
+worgl-server init        --state ./server
+worgl-server create-mint --state ./server --layers 4 --layer-size 1048576 --rotate-every 86400
+worgl-server serve       --state ./server --listen 127.0.0.1:8080
 ```
 
-Or install it from git with
-`cargo install --git https://github.com/zhangheqi/worgl worgl-server --locked`.
+Or build it in a clone with `cargo build --release -p worgl-server`.
 
 ## Commands
 
@@ -131,7 +128,7 @@ answer carries the new mint's issuer key and admin token as
 Sign a request with the mint key and post it to the mint:
 
 ```sh
-./target/release/worgl-server sign-mint --key ./server/mints/<mint>/mint.key --issuer <mint> \
+worgl-server sign-mint --key ./server/mints/<mint>/mint.key --issuer <mint> \
     --sequence 1 --amount 8 --holder <holder public key> \
   | curl -sd @- -H 'content-type: application/json' http://127.0.0.1:8080/v1/mints/<mint>/mint
 ```

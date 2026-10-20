@@ -12,14 +12,12 @@ It is `worgl-client`'s purse, so it keeps the same privacy rules as the
 
 ## Install
 
-Nothing is on crates.io yet. Install it from git:
-
 ```sh
-cargo install --git https://github.com/zhangheqi/worgl worgl-cli --locked
+cargo install worgl-cli --locked
 ```
 
-Or build it in a clone with `cargo build --release -p worgl-cli`, as the
-[quickstart](../quickstart/) does.
+The crate is `worgl-cli` and the command it installs is `worgl`. Or build it
+in a clone with `cargo build --release -p worgl-cli`.
 
 ## Settings
 

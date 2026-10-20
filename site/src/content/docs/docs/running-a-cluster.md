@@ -13,7 +13,7 @@ three hold it on disk.
 Every member starts from a copy of one state directory:
 
 ```sh
-S=./target/release/worgl-server
+S=worgl-server
 MEMBERS="--member 1=10.0.0.1:8080,10.0.0.1:7080 --member 2=10.0.0.2:8080,10.0.0.2:7080 --member 3=10.0.0.3:8080,10.0.0.3:7080"
 $S init         --state ./server
 $S join-cluster --state ./server --node 1 $MEMBERS

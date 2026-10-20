@@ -3,25 +3,21 @@ title: Quickstart
 description: Run a server on your machine, create a mint, mint a note and move it between two purses with the worgl command.
 ---
 
-You will build the server and the `worgl` command, run a server with one
+You will install the server and the `worgl` command, run a server with one
 mint, mint a note into Alice's purse and pay part of it to Bob. Most of the
 time goes on compiling.
 
 ## Before you start
 
-You need git, `curl` and Rust 1.89 or later. Nothing is published on
-crates.io yet, so you build from the repository.
+You need `curl` and Rust 1.89 or later.
 
-## 1. Build
+## 1. Install
 
 ```sh
-git clone https://github.com/zhangheqi/worgl
-cd worgl
-cargo build --release --locked -p worgl-server -p worgl-cli
-export PATH="$PWD/target/release:$PATH"
+cargo install --locked worgl-server worgl-cli
 ```
 
-That builds two programs: `worgl-server`, which hosts mints, and `worgl`, a
+That installs two programs: `worgl-server`, which hosts mints, and `worgl`, a
 purse on the command line.
 
 ## 2. Create a mint

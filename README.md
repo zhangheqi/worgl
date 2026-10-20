@@ -49,8 +49,8 @@ the source of the website's docs pages.
 
 ## The workspace
 
-Eight crates and a TypeScript package. Nothing is published on crates.io or
-npm yet; depend on them from git.
+Eight crates and a TypeScript package. All the crates but `worgl-faucet` and
+`worgl-wasm` are on crates.io; the TypeScript package is not on npm yet.
 
 - [`worgl`](crates/worgl): the library. Ledger, note format, transfer
   protocol, policy, issuer state machine and crash-safe storage.
