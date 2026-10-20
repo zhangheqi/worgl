@@ -38,7 +38,18 @@ getrandom = "0.4"
 hex = "0.4"
 http-body-util = "0.1"
 httpdate = "1"
-openraft = { version = "0.9.25", features = ["serde", "storage-v2", "generic-snapshot-data"] }
+# With `loosen-follower-log-revert`, a leader that finds a follower lacks
+# entries the leader had counted it as holding, as after the member was
+# restored from an older copy of its directory, logs a warning ("follower
+# log is reverted"), searches that log again from the start and sends what
+# it lacks, as entries or as a snapshot. Without it openraft takes this for
+# a bug: a leader built with debug assertions panics, and a release build
+# can send entries that do not follow the follower's log, as after a purge,
+# which stops the follower's replica. It does not make restoring one member
+# on its own safe; see the Backups page of the docs. Tests no longer panic
+# on it either, so the simulation fails a run in which the warning is
+# logged: there it means a replica lost entries it had flushed.
+openraft = { version = "0.9.25", features = ["serde", "storage-v2", "generic-snapshot-data", "loosen-follower-log-revert"] }
 proptest = "1"
 reqwest = { version = "0.13", default-features = false, features = ["http2", "json", "rustls"] }
 rpassword = "7"
