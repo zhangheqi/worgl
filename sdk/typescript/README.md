@@ -58,12 +58,14 @@ the mint answers with the same notes while it keeps its answers.
   the other side hands the notes over.
 - Each refused transfer carries `outcome`, what the purse did with it. One
   it made that was refused as `spent` or `expired` with status 409 is
-  dropped, since its note is gone, and one refused as `policy` that the
-  policy the mint publishes refuses too is cancelled and its note taken
-  back; both keep the keys of its change, so `accept` still takes in change
-  handed over later. Any other refusal leaves it outgoing.
-  `purse.cancel(transfer)` and `purse.forget(transfer)` do the same by hand,
-  for a transfer from `purse.outgoing()`, which lists those not yet answered.
+  dropped, since its note is gone. One refused as `layer_full` with status
+  503, which the mint never applied and never will, is cancelled and its
+  note taken back, and so is one refused as `policy` that the policy the
+  mint publishes refuses too. All keep the keys of their change, so `accept`
+  still takes in change handed over later. Any other refusal leaves it
+  outgoing. `purse.cancel(transfer)` and `purse.forget(transfer)` do the
+  same by hand, for a transfer from `purse.outgoing()`, which lists those
+  not yet answered.
 - `purse.pay` refuses, before signing, a request for a note the mint does
   not make, or to a key the purse has paid already, such as one request
   twice. `purse.payments()` lists the payments it made and keeps, each with
@@ -75,7 +77,9 @@ the mint answers with the same notes while it keeps its answers.
   (`worgl-faucet`) for a note, to a fresh key like any other, and keeps it.
 - `Client` makes one call per route and rejects with a `MintError` carrying
   the mint's code (`spent`, `frozen`, `paused`…); `isTransient(error)` says
-  whether trying again may work.
+  whether trying again may work. It counts `layer_full` out: a transfer
+  refused so is refused every time, though a mint request may pass after
+  the next rotation.
 - Stores: `MemoryStore`, and `FileStore` from `worgl/node`, which replaces
   its file atomically, readable by its owner only. The JSON holds every
   note's secret key, so keep it private and encrypted at rest. Implement

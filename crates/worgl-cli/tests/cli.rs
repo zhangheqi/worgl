@@ -34,7 +34,16 @@ impl Setup {
     }
 
     /// A mint with `policy`, rotating every `rotate_every` seconds if given.
-    async fn with(mut policy: Policy, rotate_every: Option<u64>) -> Self {
+    async fn with(policy: Policy, rotate_every: Option<u64>) -> Self {
+        Self::create(policy, rotate_every, 1024).await
+    }
+
+    /// A mint whose layers hold `layer_size` notes each.
+    async fn with_layer_size(layer_size: u32) -> Self {
+        Self::create(Policy::cash_like(), None, layer_size).await
+    }
+
+    async fn create(mut policy: Policy, rotate_every: Option<u64>, layer_size: u32) -> Self {
         let dir = tempfile::tempdir().unwrap();
         let state = dir.path().join("state");
         init_state(&state).unwrap();
@@ -45,7 +54,7 @@ impl Setup {
             .create_mint(MintSpec {
                 ledger: LedgerConfig {
                     layers: 4,
-                    layer_size: 1024,
+                    layer_size,
                 },
                 policy,
                 rotate_every,
@@ -535,6 +544,82 @@ async fn a_payment_settled_too_late_is_dropped() {
     let alice = setup.balance("alice.worgl").await;
     assert!(alice.contains("outgoing   0"), "{alice}");
     assert!(alice.contains("unconfirmed 3"), "{alice}");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_transfer_into_a_full_layer_is_cancelled() {
+    // Layers of 64 notes. Carol's 64 notes of 1, paid from Dave's four of
+    // 16, fill the last layer, where a hop from the mint layer lands.
+    let setup = Setup::with_layer_size(64).await;
+    let mint = setup.mint.to_string();
+    for purse in ["alice.worgl", "bob.worgl", "carol.worgl", "dave.worgl"] {
+        setup.ok(purse, &["init"]).await;
+    }
+    let minted = [
+        "mint",
+        &mint,
+        "64",
+        "--authority-key",
+        "authority.key",
+        "--at-most",
+        "16",
+    ];
+    setup.ok("dave.worgl", &minted).await;
+    let asked = ["request", &mint, "64", "--at-most", "1", "-o", "fill.json"];
+    setup.ok("carol.worgl", &asked).await;
+    let pay = ["pay", "fill.json", "--spacing", "0..0", "-o", "filled.json"];
+    setup.ok("dave.worgl", &pay).await;
+    setup
+        .ok("carol.worgl", &["receive", "fill.json", "filled.json"])
+        .await;
+
+    setup.mint_into("alice.worgl", 8).await;
+    setup
+        .ok("bob.worgl", &["request", &mint, "5", "-o", "request.json"])
+        .await;
+    let pay = [
+        "pay",
+        "request.json",
+        "--spacing",
+        "0..0",
+        "-o",
+        "payment.json",
+    ];
+    setup.ok("alice.worgl", &pay).await;
+    let received = setup
+        .worgl("bob.worgl", &["receive", "request.json", "payment.json"])
+        .await;
+    assert!(!received.ok);
+    assert!(
+        received.stderr.contains("layer_full"),
+        "{}",
+        received.stderr
+    );
+    assert!(
+        received.stderr.contains("1 transfer(s) did not go through"),
+        "{}",
+        received.stderr
+    );
+    assert!(
+        !received.stderr.contains("try again later"),
+        "{}",
+        received.stderr
+    );
+
+    // The mint never applied it, and never will: settling cancels it.
+    let settled = setup
+        .ok("alice.worgl", &["settle", "--spacing", "0..0"])
+        .await;
+    assert!(
+        settled.stderr.contains(
+            "cancelled: the mint will not apply it, so the note it spends is back in the purse"
+        ),
+        "{}",
+        settled.stderr
+    );
+    let alice = setup.balance("alice.worgl").await;
+    assert!(alice.contains("spendable  8"), "{alice}");
+    assert!(alice.contains("outgoing   0"), "{alice}");
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
