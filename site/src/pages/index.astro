@@ -37,7 +37,7 @@ const expire = [...'expire.'];
           <p class="body">The holder keeps the note: the mint's key, a serial, an amount, the holder's one-time key and the mint's signature. The mint keeps none of it. It keeps one bit per note, 1 while the note is live and 0 once it is spent, so checking a note is a signature check and one bit read.</p>
         </NoteBytes>
         <div class="stats3">
-          <div><b>512 KiB</b><span>Four layers of 2²⁰ bits, holding over four million notes in flight. <a class="fig-link" href={README.efficiency}>README</a></span></div>
+          <div><b>512 KiB</b><span>Four layers of 2<sup>20</sup> bits, holding over four million notes in flight. <a class="fig-link" href={README.efficiency}>README</a></span></div>
           <div><b>0.65 µs</b><span>To map a serial to its bit and read it, in a release build. <a class="fig-link" href={README.efficiency}>README</a></span></div>
           <div><b>0 notes</b><span>Stored by the mint. It keeps bits, a few counters and recent receipts. <a class="fig-link" href={REPO}>README</a></span></div>
         </div>

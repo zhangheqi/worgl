@@ -157,3 +157,6 @@ starlight-theme-select select { border-radius: 0; }
 @media (prefers-reduced-motion: reduce) {
   .pagination-links a, .pagination-links a:hover { transition: none; transform: none; }
 }
+
+/* exponents as <sup>, as in global.css */
+sup { font-size: .7em; line-height: 0; vertical-align: .55em; }

@@ -5,6 +5,8 @@
 :root.hdr-night { --hdr-bg: var(--night); --hdr-fg: var(--on-night); --hdr-rule: var(--rule-night); }
 
 *, *::before, *::after { box-sizing: border-box; }
+/* exponents are written as <sup>: Instrument Sans has ² but not ⁰, so Unicode superscripts mix fonts. Kept off the line height. */
+sup { font-size: .7em; line-height: 0; vertical-align: .55em; }
 html { -webkit-text-size-adjust: 100%; text-size-adjust: 100%; }
 body { margin: 0; background: var(--paper); color: var(--ink); font-family: var(--f-sans); font-size: 17px; line-height: 1.55; -webkit-font-smoothing: antialiased; }
 /* paints the phone's top inset in the header's colour */

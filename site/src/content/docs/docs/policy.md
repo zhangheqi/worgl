@@ -42,7 +42,7 @@ on every member. See
 | Value | Allows |
 |---|---|
 | `"any"` | Any positive amount. |
-| `"powers_of_two"` | 1, 2, 4, 8 and so on up to 2⁶³. Every amount splits into at most one note of each size. |
+| `"powers_of_two"` | 1, 2, 4, 8 and so on up to 2<sup>63</sup>. Every amount splits into at most one note of each size. |
 | `{"list": [1, 2, 5, 10]}` | An explicit set, strictly ascending and without zero. |
 
 Input amounts are not checked against the denominations, so notes issued
