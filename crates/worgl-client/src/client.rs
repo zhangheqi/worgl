@@ -2,6 +2,7 @@
 
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
+use reqwest::header::RETRY_AFTER;
 use reqwest::{Method, RequestBuilder, Response};
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
@@ -271,9 +272,20 @@ impl Client {
 /// Reads an error answer, keeping what it says even without a code.
 async fn refusal(response: Response) -> Refusal {
     let status = response.status().as_u16();
+    // In seconds; the server never sends the date form.
+    let retry_after = response
+        .headers()
+        .get(RETRY_AFTER)
+        .and_then(|value| value.to_str().ok())
+        .and_then(|value| value.trim().parse().ok())
+        .map(Duration::from_secs);
     let text = response.text().await.unwrap_or_default();
     match serde_json::from_str::<Refusal>(&text) {
-        Ok(refusal) => Refusal { status, ..refusal },
+        Ok(refusal) => Refusal {
+            status,
+            retry_after,
+            ..refusal
+        },
         Err(_) => {
             let mut message = text.trim().to_owned();
             if message.len() > MESSAGE_LIMIT {
@@ -287,6 +299,7 @@ async fn refusal(response: Response) -> Refusal {
                 status,
                 code: "http".into(),
                 message,
+                retry_after,
             }
         }
     }

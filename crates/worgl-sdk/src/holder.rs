@@ -434,7 +434,9 @@ impl Holder {
     }
 
     /// Drops an outgoing transfer the mint refused because its note was
-    /// already spent or had expired. The note is gone either way.
+    /// already spent or had expired. The note is gone either way: had the
+    /// mint applied this transfer and still remembered it, it would have
+    /// answered with the notes (see [`resend`](Self::resend)).
     pub fn forget(&mut self, request: &TransferRequest) {
         self.outgoing.retain(|o| o.request != *request);
     }
@@ -460,7 +462,8 @@ impl Holder {
 
     /// Transfers not yet answered. Resend them after a crash or a timeout,
     /// with [`resend`](Self::resend): the mint answers an identical request
-    /// with the identical notes.
+    /// with the identical notes, before or after a rotation, for as long as
+    /// it remembers the transfer.
     pub fn outgoing(&self) -> impl Iterator<Item = &TransferRequest> {
         self.outgoing.iter().map(|o| &o.request)
     }
@@ -470,8 +473,10 @@ impl Holder {
     /// tell the mint their notes had one owner.
     ///
     /// The mint remembers the answers to its most recent transfers only
-    /// (the policy's `receipt_capacity`); resend before then, or a transfer
-    /// already applied is refused as spent and its change is lost.
+    /// (the policy's `receipt_capacity`), and each only until the notes it
+    /// issued expire; resend before many more have passed and while the
+    /// change is live, or a transfer already applied is refused as spent or
+    /// expired and its change is lost.
     pub fn resend(&self, spacing: Spacing) -> Vec<ScheduledTransfer> {
         let mut requests: Vec<TransferRequest> = self.outgoing().cloned().collect();
         random::shuffle(&mut requests);
