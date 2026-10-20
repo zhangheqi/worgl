@@ -23,6 +23,13 @@ curl -X POST -H "Authorization: Bearer $(cat server/mints/<mint>/admin.token)" \
 They answer `{"paused": true}` and `{"paused": false}`. From Rust,
 `worgl_client::Client` has `pause` and `resume`.
 
+The admin token that pauses a mint also resumes it. If that token may have
+leaked, pause at once all the same, since a paused mint refuses the
+rotations the token could request. Then replace the token, on every member
+of a cluster, and restart: see
+[Replacing a token](../keys/#replacing-a-token). The pause survives the
+restart, and after it the old token can no longer resume the mint.
+
 ## What everyone sees
 
 - The mint's `info` shows `"paused": true` to everyone, and `worgl info`

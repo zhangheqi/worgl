@@ -144,6 +144,9 @@ post; see [Mint authorities and keys](../keys/).
 {"dropped":0,"created":4,"destroyed_notes":0,"destroyed_value":0,"key":{"generation":4,"key":"5de1…c4ce","signature":"9699…8e08"}}
 ```
 
+Unlike a transfer, a rotation sent again is made again; see
+[Sending a request again](../error-codes/#sending-a-request-again).
+
 `pause` and `resume` answer `{"paused": true}` and `{"paused": false}`. See
 [Pausing a mint](../pausing/).
 
@@ -164,4 +167,6 @@ rotates only on request. `GET /v1/admin/mints` lists every mint's issuer key.
 
 Any member takes any request and passes it on to the member that leads the
 mint. While a mint has no leader its requests are answered `503 no_leader`;
-see [Running a cluster](../running-a-cluster/).
+see [Running a cluster](../running-a-cluster/). Clients need one address
+that covers every member, such as a proxy in front of them; see
+[The address clients use](../running-a-cluster/#the-address-clients-use).

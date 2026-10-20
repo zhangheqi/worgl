@@ -39,22 +39,30 @@
 //! the mint was created with, not later edits.
 //!
 //! Members send each other Raft's RPCs as HTTP requests to their Raft ports,
-//! with the cluster token. Nothing on that port is encrypted yet, so it must
-//! be reachable by the members only.
+//! with the cluster token. A mint applies whatever its group's log holds,
+//! and whoever shows the token can append to that log as if they led, so
+//! the token is as strong as the mints' issuer keys. Members dial each other
+//! in plain HTTP only and nothing between them is encrypted yet, so every
+//! member's addresses must be reachable only by the members and a proxy in
+//! front of them, as over WireGuard between their hosts.
 //!
 //! A member that does not lead a mint passes the requests for it on to the
-//! leader's public API and relays the answer. If it knows of no leader, or
-//! cannot connect to the one it knows of within a second, it answers `503
-//! no_leader`; if the leader does not answer, or the connection to it goes
-//! three seconds without a sign of life, `503 timeout`. A leader cut off
-//! from the other members answers `503 no_leader` too once its lease lapses
-//! (see [`worgl_raft::default_config`]), and gives up waiting on requests it
-//! took before as `503 timeout`, so no client waits on a member that cannot
-//! reach the others. Either way the client sends the same request again: a
-//! mint, transfer or burn the mint already carried out is answered as it
-//! was the first time. A request to create a mint goes to the registry's
-//! leader the same way, but is not answered as before if sent again: after
-//! a `503 timeout`, list the mints before creating another.
+//! leader's [`api`](Member::api) address, `Authorization` headers included,
+//! and relays the answer. If it knows of no leader, or cannot connect to the
+//! one it knows of within a second, it answers `503 no_leader`; if the
+//! leader does not answer, or the connection to it goes three seconds
+//! without a sign of life, `503 timeout`. A leader cut off from the other
+//! members answers `503 no_leader` too once its lease lapses (see
+//! [`worgl_raft::default_config`]), and gives up waiting on requests it took
+//! before as `503 timeout`, so no client waits on a member that cannot reach
+//! the others. Either way the client sends the same request again: a mint,
+//! transfer or burn the mint already carried out is answered as it was the
+//! first time. A rotation is not, and one answered `503 timeout` may still
+//! be made after a read that does not show it, so before rotating again,
+//! read the mint's info once it has carried out a change sent after that
+//! answer. A request to create a mint goes to the registry's leader the
+//! same way, and is not answered as before if sent again either: after a
+//! `503 timeout`, list the mints before creating another.
 
 use std::collections::BTreeMap;
 use std::future::Future;
@@ -134,12 +142,17 @@ pub struct ClusterConfig {
     pub members: BTreeMap<NodeId, Member>,
 }
 
-/// Where a member can be reached, each as `host:port`.
+/// Where the other members reach a member, each as `host:port`, in plain
+/// HTTP, so both must be on a network only the members and a proxy in front
+/// of them can reach.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Member {
-    /// Its public API, which other members pass requests on to.
+    /// The address other members pass API requests on to, `Authorization`
+    /// headers included, so a private one. Clients reach the API at an
+    /// address of their own, such as a proxy's in front of every member.
     pub api: String,
-    /// Its Raft port.
+    /// Its Raft port. The registry's group and each mint's keep the one this
+    /// held when they formed, even if it changes later.
     pub raft: String,
 }
 
@@ -280,8 +293,8 @@ impl Cluster {
         }
     }
 
-    /// Sends the request in `parts` and `body` to the member whose public
-    /// API is at `api`, and returns its answer: the status, the body, and
+    /// Sends the request in `parts` and `body` to the member whose API
+    /// address is `api`, and returns its answer: the status, the body, and
     /// the body's type and `Retry-After`, if any.
     async fn relay(&self, api: &str, parts: &Parts, body: Bytes) -> reqwest::Result<Response> {
         let path = parts.uri.path_and_query().map_or("/", |path| path.as_str());

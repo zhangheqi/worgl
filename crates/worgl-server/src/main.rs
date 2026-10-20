@@ -96,9 +96,10 @@ enum Command {
         /// This member's id.
         #[arg(long)]
         node: u64,
-        /// A member as ID=API,RAFT, where API is the host:port of its public
-        /// API and RAFT that of its Raft port. Give every member, this one
-        /// included.
+        /// A member as ID=API,RAFT, where API is the host:port other members
+        /// pass API requests on to and RAFT that of its Raft port, both on a
+        /// network only the members and a proxy in front of them can reach.
+        /// Give every member, this one included.
         #[arg(long = "member", value_parser = parse_member, required = true)]
         members: Vec<(u64, Member)>,
     },

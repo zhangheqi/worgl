@@ -55,14 +55,21 @@
 //! fails and none reflects less than an earlier one. While a mint has no
 //! leader, as for a few seconds after its leader fails or is cut off from
 //! the other members, its requests are answered `503 no_leader`, and
-//! sending them again is safe. Members also serve [`raft_router`] on a port
-//! of their own, for each other only. Creating a mint goes through the
-//! cluster's registry, from which every member writes and serves the new
-//! mint; a creation answered `503 timeout` may have made a mint, so list the
-//! mints before creating another. A mint's policy and rotation period are
-//! not replicated: each member reads its own from the mint's directory, and
-//! the leader carries out requests and scheduled rotations under its own, so
-//! they must be the same on every member.
+//! sending them again is safe. A rotation answered `503 timeout` may still
+//! be made after a read that does not show it, so before rotating again,
+//! read the mint's info once it has carried out a change sent after that
+//! answer. Members also serve [`raft_router`] on a port of their own, for
+//! each other only. They talk to each other in plain HTTP, Raft's RPCs with
+//! one shared token and the requests they pass on with their clients'
+//! tokens, so every member's addresses must be on a network only the
+//! members and a proxy in front of them can reach (see [`cluster`]).
+//! Creating a mint goes through the cluster's registry, from which every
+//! member writes and serves the new mint; a creation answered `503 timeout`
+//! may have made a mint, so list the mints before creating another. A
+//! mint's policy and rotation period are not replicated: each member reads
+//! its own from the mint's directory, and the leader carries out requests
+//! and scheduled rotations under its own, so they must be the same on every
+//! member.
 
 pub mod cluster;
 pub mod files;
@@ -855,7 +862,9 @@ impl ApiError {
     /// again after the seconds its `Retry-After` header gives), `storage`,
     /// `internal`, and on a cluster `no_leader` (nothing was done; send the
     /// request again) and `timeout` (the change may still be made: send the
-    /// same note request again, but list the mints before creating another).
+    /// same note request again, but before rotating again read the mint's
+    /// info once it has carried out a change sent after this answer, and
+    /// list the mints before creating another).
     pub fn code(&self) -> &'static str {
         self.code
     }
