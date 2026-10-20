@@ -48,12 +48,14 @@ use crate::transfer::{
 const SNAPSHOT_MAGIC: &[u8; 8] = b"WORGLSNP";
 /// Version 2 added the burned value, version 3 records whether serial
 /// indexes are permuted, version 4 keeps each mint authority's last mint,
-/// version 5 the certificates of the generation keys and version 6 whether
-/// the issuer is paused and when its last scheduled rotation was due. Older
-/// snapshots still restore, with nothing burned, with bits as indexes, with
-/// no mint authorities, with every generation signed by the issuer key,
-/// running and with no rotation scheduled, as they always had.
-const SNAPSHOT_VERSION: u16 = 6;
+/// version 5 the certificates of the generation keys, version 6 whether the
+/// issuer is paused and when its last scheduled rotation was due, and
+/// version 7 the keys of the last generations dropped. Older snapshots still
+/// restore, with nothing burned, with bits as indexes, with no mint
+/// authorities, with every generation signed by the issuer key, running,
+/// with no rotation scheduled and with no dropped generation's key, as they
+/// always had.
+const SNAPSHOT_VERSION: u16 = 7;
 
 /// A note created by a mint or transfer.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
@@ -424,7 +426,13 @@ pub struct Issuer {
     public: PublicKey,
     /// Public keys of the live generations.
     keys: KeySet,
-    /// Their secrets, and any key a planned rotation is about to certify.
+    /// Public keys of the live generations and of the last ones dropped, up
+    /// to one fewer than there are layers: the most rotations by which a
+    /// receipt outlives its inputs' generation. Requests are checked against
+    /// these.
+    recent: KeySet,
+    /// The live generations' secrets, and any key a planned rotation is
+    /// about to certify.
     ring: KeyRing,
     policy: Policy,
     ledger: Ledger,
@@ -464,6 +472,7 @@ impl Issuer {
         Ok(Self {
             public,
             key,
+            recent: keys.clone(),
             keys,
             ring,
             policy,
@@ -544,7 +553,7 @@ impl Issuer {
     /// A verifier for requests, bound to this issuer's keys and policy as
     /// they are now. A rotation adds a key, so get a new one after each.
     pub fn verifier(&self) -> Verifier {
-        Verifier::new(self.keys.clone(), self.policy.clone())
+        Verifier::new(self.keys.clone(), self.recent.clone(), self.policy.clone())
     }
 
     /// The public keys that sign the live generations' notes.
@@ -586,8 +595,8 @@ impl Issuer {
     }
 
     /// Checks a note's signature and looks up its state. O(1) after the
-    /// signature check. A note of a dropped generation is expired, and its
-    /// signature is no longer checked, because its key has been erased.
+    /// signature check. A note of a dropped generation is expired, whoever
+    /// signed it: its signature is not checked.
     pub fn status(&self, note: &Note) -> Result<NoteStatus, NoteError> {
         if note.issuer() == &self.public && note.serial().generation < self.keys.oldest() {
             return Ok(NoteStatus::Expired);
@@ -952,8 +961,10 @@ impl Issuer {
     /// mint authority's last request and note (sorted by authority key), the
     /// certificates of the live generations' keys (oldest first), a byte that
     /// is 1 if the issuer is paused, a byte that is 1 if a scheduled rotation
-    /// was logged followed by the time it was due as `u64` (0 if none), and
-    /// finally the SHA-256 of everything before it.
+    /// was logged followed by the time it was due as `u64` (0 if none), the
+    /// oldest generation, live or dropped, whose notes still verify as `u64`,
+    /// the certificates of the dropped generations' keys from it on (oldest
+    /// first), and finally the SHA-256 of everything before it.
     pub fn snapshot(&self) -> Vec<u8> {
         let mut w = Writer::default();
         w.bytes(SNAPSHOT_MAGIC)
@@ -987,7 +998,13 @@ impl Issuer {
         }
         w.u8(u8::from(self.paused))
             .u8(u8::from(self.last_due.is_some()))
-            .u64(self.last_due.unwrap_or(0));
+            .u64(self.last_due.unwrap_or(0))
+            .u64(self.recent.oldest());
+        let dropped = self.dropped_keys();
+        w.u32(dropped.len() as u32);
+        for certificate in dropped {
+            certificate.write(&mut w);
+        }
         let mut bytes = w.finish();
         let checksum: [u8; 32] = Sha256::digest(&bytes).into();
         bytes.extend_from_slice(&checksum);
@@ -999,7 +1016,9 @@ impl Issuer {
     /// policy to enforce from now on.
     ///
     /// The ring may hold more keys than the snapshot names, such as those of
-    /// rotations logged after it, but must hold every key it names.
+    /// rotations logged after it, but must hold the key of every live
+    /// generation it names. Dropped generations need none: only their public
+    /// keys are kept.
     pub fn restore(
         key: IssuerKey,
         ring: KeyRing,
@@ -1095,16 +1114,34 @@ impl Issuer {
         } else {
             (false, None)
         };
+        let oldest = ledger.oldest_generation();
+        let (since, dropped) = if version >= 7 {
+            (r.u64()?, read_list(&mut r, 104, KeyCertificate::read)?)
+        } else {
+            (oldest, Vec::new())
+        };
         r.finish()?;
         let public = key.public_key();
-        let keys = KeySet::new(public, ledger.oldest_generation(), certificates)?;
-        if keys
-            .certificates()
-            .last()
-            .is_some_and(|c| c.generation != ledger.newest_generation())
-        {
+        let live = certificates.first().is_none_or(|c| c.generation >= oldest)
+            && certificates
+                .last()
+                .is_none_or(|c| c.generation == ledger.newest_generation());
+        if !live {
             return Err(DecodeError::Invalid("generation keys").into());
         }
+        // At most one fewer dropped generation than there are layers, and
+        // their keys, if any, lead straight on to the live generations'.
+        let leads_on = dropped.last().is_none_or(|c| {
+            c.generation.checked_add(1) == Some(oldest)
+                && certificates.first().map(|c| c.generation) == Some(oldest)
+        });
+        if since > oldest || oldest - since > u64::from(ledger.last_position()) || !leads_on {
+            return Err(DecodeError::Invalid("dropped generation keys").into());
+        }
+        // One set checks each certificate once; the live set is its part
+        // from the oldest live generation on.
+        let recent = KeySet::new(public, since, [dropped, certificates].concat())?;
+        let keys = recent.rotated(oldest, None);
         if let Some(missing) = keys
             .certificates()
             .iter()
@@ -1119,6 +1156,7 @@ impl Issuer {
             public,
             key,
             keys,
+            recent,
             ring,
             policy,
             ledger,
@@ -1137,6 +1175,14 @@ impl Issuer {
     /// The serial the `k`-th next allocation in the layer at `position` would get.
     fn next_serial(&self, position: u32, k: u32) -> Option<Serial> {
         self.ledger.next_serial(position, k)
+    }
+
+    /// The certificates of the dropped generations whose public keys are
+    /// kept, oldest first.
+    fn dropped_keys(&self) -> &[KeyCertificate] {
+        let certificates = self.recent.certificates();
+        let live = self.keys.oldest();
+        &certificates[..certificates.partition_point(|c| c.generation < live)]
     }
 
     /// Signs notes of live generations, each with its generation's key.
@@ -1328,6 +1374,24 @@ impl Issuer {
             self.ring.remove(&dropped.key);
         }
         self.keys = self.keys.rotated(oldest, report.key);
+        // A receipt lasts until its outputs' generation is dropped. Outputs
+        // land at most `layers − 1` positions past an input, so an input's
+        // generation is dropped at most that many rotations before them:
+        // keep the public keys of that many dropped generations. A replica
+        // restored from a snapshot from before they were kept holds fewer for
+        // a while, so whether a rotation applies does not depend on them: a
+        // new key that a kept one names ends the kept keys there instead, and
+        // no key names two generations.
+        let mut since = oldest
+            .saturating_sub(u64::from(self.ledger.last_position()))
+            .max(self.recent.oldest());
+        if let Some(reused) = report
+            .key
+            .and_then(|key| self.recent.certificates().iter().find(|c| c.key == key.key))
+        {
+            since = since.max(reused.generation + 1);
+        }
+        self.recent = self.recent.rotated(since, report.key);
         if report.due.is_some() {
             self.last_due = report.due;
         }
@@ -1340,6 +1404,7 @@ impl Issuer {
     pub(crate) fn forget_generation_keys(&mut self) {
         self.keys = KeySet::new(self.public, self.ledger.oldest_generation(), Vec::new())
             .expect("an empty set is valid");
+        self.recent = self.keys.clone();
         self.ring = KeyRing::new(self.public);
     }
 
@@ -1397,11 +1462,23 @@ mod tests {
         Issuer::new(IssuerKey::generate(), config, policy).unwrap()
     }
 
+    /// The snapshot as version 6 wrote it, without its checksum: version 7
+    /// added the oldest generation that still verifies and the dropped
+    /// generations' keys.
+    fn version_6_body(i: &Issuer) -> Vec<u8> {
+        let mut body = i.snapshot();
+        body.truncate(body.len() - 32);
+        let since = body.len() - 12 - 104 * i.dropped_keys().len();
+        assert_eq!(body[since..since + 8], i.recent.oldest().to_be_bytes());
+        body.truncate(since);
+        body[8..10].copy_from_slice(&6u16.to_be_bytes());
+        body
+    }
+
     /// The snapshot as version 5 wrote it, without its checksum: version 6
     /// added the pause and schedule, which must be unset.
     fn version_5_body(i: &Issuer) -> Vec<u8> {
-        let mut body = i.snapshot();
-        body.truncate(body.len() - 32);
+        let mut body = version_6_body(i);
         assert_eq!(body.split_off(body.len() - 10), [0; 10]);
         body[8..10].copy_from_slice(&5u16.to_be_bytes());
         body
@@ -1409,6 +1486,21 @@ mod tests {
 
     fn without_generation_keys(i: &mut Issuer) {
         i.forget_generation_keys();
+    }
+
+    /// Makes this an issuer restored from a snapshot older than version 7,
+    /// which keeps no dropped generation's key.
+    fn without_dropped_keys(i: &mut Issuer) {
+        i.recent = i.keys.clone();
+    }
+
+    /// A request that pays `note` on to a fresh key.
+    fn payment(note: Note, key: &HolderKey) -> TransferRequest {
+        let output = Output {
+            amount: note.amount(),
+            holder: HolderKey::generate().public_key(),
+        };
+        TransferRequest::single(note, key, output).unwrap()
     }
 
     fn pay(issuer: &mut Issuer, note: Note, key: &HolderKey) -> Result<(Note, HolderKey), Error> {
@@ -2063,7 +2155,10 @@ mod tests {
         );
         assert_eq!(moved.verify(i.verifier().keys()), Ok(()));
 
-        // Once the note's generation is dropped, it is expired whoever signed it.
+        // Once the note's generation is dropped, it is expired whoever signed
+        // it. Its key's public half is kept for resent requests for as many
+        // rotations as there are layers, less one, so meanwhile a note it
+        // did not sign is refused as forged.
         i.rotate().unwrap();
         i.rotate().unwrap();
         assert!(generation < i.keys().oldest());
@@ -2075,8 +2170,16 @@ mod tests {
             holder: alice.public_key(),
         };
         let request = TransferRequest::single(note, &carol, output).unwrap();
-        assert_eq!(i.transfer(&request), Err(Error::Expired(note.serial())));
+        assert_eq!(
+            i.transfer(&request),
+            Err(Error::Note {
+                input: 0,
+                error: NoteError::BadSignature
+            })
+        );
         assert!(matches!(i.status(&moved), Ok(NoteStatus::Live { .. })));
+        i.rotate().unwrap();
+        assert_eq!(i.transfer(&request), Err(Error::Expired(note.serial())));
     }
 
     #[test]
@@ -2187,21 +2290,27 @@ mod tests {
         );
 
         // A certificate altered in the snapshot is caught even under a fixed
-        // checksum. The pause and schedule (10 bytes) follow the last one.
-        let mut body = snapshot[..snapshot.len() - 32].to_vec();
-        let last = body.len() - 11;
-        body[last] ^= 1;
-        let checksum: [u8; 32] = Sha256::digest(&body).into();
-        body.extend_from_slice(&checksum);
-        assert!(matches!(
-            Issuer::restore(
-                i.key.clone(),
-                i.key_ring().clone(),
-                &body,
-                Policy::cash_like()
-            ),
-            Err(SetupError::Snapshot(_))
-        ));
+        // checksum, a live generation's or a dropped one's. After the last
+        // live one come the pause and schedule (10 bytes), the oldest
+        // generation that verifies and the count of dropped ones (12), and
+        // the one dropped generation's certificate (104).
+        assert_eq!(i.dropped_keys().len(), 1);
+        let body = &snapshot[..snapshot.len() - 32];
+        for at in [body.len() - 127, body.len() - 1] {
+            let mut body = body.to_vec();
+            body[at] ^= 1;
+            let checksum: [u8; 32] = Sha256::digest(&body).into();
+            body.extend_from_slice(&checksum);
+            assert!(matches!(
+                Issuer::restore(
+                    i.key.clone(),
+                    i.key_ring().clone(),
+                    &body,
+                    Policy::cash_like()
+                ),
+                Err(SetupError::Snapshot(_))
+            ));
+        }
     }
 
     #[test]
@@ -2466,6 +2575,7 @@ mod tests {
         let mut i = issuer(4, Policy::cash_like());
         i.mint(8, HolderKey::generate().public_key()).unwrap();
         i.rotate().unwrap();
+        without_dropped_keys(&mut i);
         let mut body = version_5_body(&i);
         let checksum: [u8; 32] = Sha256::digest(&body).into();
         body.extend_from_slice(&checksum);
@@ -2478,6 +2588,353 @@ mod tests {
         .unwrap();
         assert!(!restored.is_paused());
         assert_eq!(restored.last_scheduled_rotation(), None);
+        assert_eq!(restored.snapshot(), i.snapshot());
+    }
+
+    #[test]
+    fn a_transfer_resent_after_its_input_was_dropped_gets_the_same_notes() {
+        let mut i = issuer(4, Policy::cash_like());
+        let alice = HolderKey::generate();
+        let note = i.mint(8, alice.public_key()).unwrap();
+        let request = payment(note, &alice);
+        // Applied, but the answer is lost.
+        let paid = i.transfer(&request).unwrap();
+        while i.ledger().oldest_generation() <= note.serial().generation {
+            i.rotate().unwrap();
+        }
+        assert!(matches!(
+            i.status(&paid[0]),
+            Ok(NoteStatus::Live { position: 0, .. })
+        ));
+        let sequence = i.sequence();
+        assert_eq!(i.transfer(&request), Ok(paid));
+        assert_eq!(i.sequence(), sequence, "a replay changes nothing");
+
+        // Its receipt goes when the notes it issued expire.
+        i.rotate().unwrap();
+        assert_eq!(i.transfer(&request), Err(Error::Expired(note.serial())));
+    }
+
+    #[test]
+    fn a_refresh_resent_across_the_rotation_gets_the_same_note() {
+        let mut i = issuer(4, Policy::cash_like());
+        let alice = HolderKey::generate();
+        let note = i.mint(8, alice.public_key()).unwrap();
+        i.rotate().unwrap();
+        i.rotate().unwrap();
+        assert!(matches!(
+            i.status(&note),
+            Ok(NoteStatus::Live { position: 0, .. })
+        ));
+        // Refreshed just before the rotation that drops the note, and resent
+        // after it.
+        let request = payment(note, &alice);
+        let refreshed = i.transfer(&request).unwrap();
+        i.rotate().unwrap();
+        assert_eq!(i.status(&note), Ok(NoteStatus::Expired));
+        assert_eq!(i.transfer(&request), Ok(refreshed));
+    }
+
+    #[test]
+    fn a_merge_resent_after_its_oldest_input_was_dropped_gets_the_same_note() {
+        let mut i = issuer(4, Policy::flexible());
+        let key = HolderKey::generate();
+        let old = i.mint(4, key.public_key()).unwrap();
+        i.rotate().unwrap();
+        i.rotate().unwrap();
+        let young = i.mint(4, key.public_key()).unwrap();
+        // The inputs sit as far apart as inputs can, and the output lands in
+        // the last layer.
+        assert!(matches!(
+            i.status(&old),
+            Ok(NoteStatus::Live { position: 0, .. })
+        ));
+        assert!(matches!(
+            i.status(&young),
+            Ok(NoteStatus::Live { position: 2, .. })
+        ));
+        let output = Output {
+            amount: 8,
+            holder: HolderKey::generate().public_key(),
+        };
+        let request = TransferRequest::sign(&[(old, &key), (young, &key)], vec![output]).unwrap();
+        let merged = i.transfer(&request).unwrap();
+        assert!(matches!(
+            i.status(&merged[0]),
+            Ok(NoteStatus::Live { position: 3, .. })
+        ));
+
+        // The merged note outlives the older input's generation by three
+        // rotations, one fewer than there are layers, and so does that
+        // generation's key.
+        for _ in 0..3 {
+            i.rotate().unwrap();
+            assert_eq!(i.transfer(&request), Ok(merged.clone()));
+        }
+        assert_eq!(i.status(&old), Ok(NoteStatus::Expired));
+        i.rotate().unwrap();
+        assert_eq!(i.status(&merged[0]), Ok(NoteStatus::Expired));
+        assert_eq!(i.transfer(&request), Err(Error::Expired(old.serial())));
+    }
+
+    #[test]
+    fn a_dropped_note_is_expired_whether_or_not_its_key_is_kept() {
+        let mut i = issuer(4, Policy::cash_like());
+        let alice = HolderKey::generate();
+        let note = i.mint(8, alice.public_key()).unwrap();
+        let request = payment(note, &alice);
+        let burn = BurnRequest::single(note, &alice).unwrap();
+        while i.ledger().oldest_generation() <= note.serial().generation {
+            i.rotate().unwrap();
+        }
+
+        // Its key is still kept, so the request verifies, but nothing was
+        // applied for it and the ledger says the note expired.
+        assert!(i.verifier().verify(&request).is_ok());
+        assert_eq!(i.status(&note), Ok(NoteStatus::Expired));
+        assert_eq!(i.transfer(&request), Err(Error::Expired(note.serial())));
+        assert_eq!(i.burn(&burn), Err(Error::Expired(note.serial())));
+        // The keys anyone is shown are still only the live generations'.
+        assert_eq!(i.keys().oldest(), i.ledger().oldest_generation());
+        assert_eq!(i.verifier().keys(), i.keys());
+
+        // Past the keys kept, it is expired before any signature is checked.
+        while i.recent.oldest() <= note.serial().generation {
+            i.rotate().unwrap();
+        }
+        assert_eq!(
+            i.verifier().verify(&request),
+            Err(Error::Expired(note.serial()))
+        );
+        assert_eq!(i.transfer(&request), Err(Error::Expired(note.serial())));
+        assert_eq!(i.burn(&burn), Err(Error::Expired(note.serial())));
+        let forged = Note::issue(i.public, &i.key, note.serial(), 8, alice.public_key());
+        let request = payment(forged, &alice);
+        assert_eq!(i.transfer(&request), Err(Error::Expired(note.serial())));
+    }
+
+    #[test]
+    fn a_burn_resent_after_its_input_was_dropped_burns_nothing_more() {
+        let mut i = issuer(4, Policy::cash_like());
+        let alice = HolderKey::generate();
+        let note = i.mint(8, alice.public_key()).unwrap();
+        let burn = BurnRequest::single(note, &alice).unwrap();
+        assert_eq!(i.burn(&burn), Ok(8));
+
+        // A burn issues nothing, so its receipt stays, and it is answered
+        // while the note's generation is live or one of the last three
+        // dropped.
+        while i.recent.oldest() <= note.serial().generation {
+            let sequence = i.sequence();
+            assert_eq!(i.burn(&burn), Ok(8));
+            assert_eq!(i.sequence(), sequence, "a replay changes nothing");
+            assert_eq!(i.supply().burned, 8);
+            i.rotate().unwrap();
+        }
+        assert_eq!(i.ledger().oldest_generation(), note.serial().generation + 4);
+        assert_eq!(i.burn(&burn), Err(Error::Expired(note.serial())));
+    }
+
+    #[test]
+    fn a_restored_issuer_keeps_the_dropped_generations_keys() {
+        let mut i = issuer(4, Policy::cash_like());
+        let alice = HolderKey::generate();
+        let note = i.mint(8, alice.public_key()).unwrap();
+        let request = payment(note, &alice);
+        let paid = i.transfer(&request).unwrap();
+        for _ in 0..3 {
+            i.rotate().unwrap();
+        }
+        assert_eq!(i.dropped_keys().len(), 3);
+        // Their secrets are erased all the same.
+        assert_eq!(i.key_ring().len(), 4);
+        assert!(
+            i.dropped_keys()
+                .iter()
+                .all(|c| i.key_ring().get(&c.key).is_none())
+        );
+
+        let snapshot = i.snapshot();
+        let restored = Issuer::restore(
+            i.key.clone(),
+            i.key_ring().clone(),
+            &snapshot,
+            Policy::cash_like(),
+        )
+        .unwrap();
+        assert_eq!(restored.snapshot(), snapshot);
+        assert_eq!(restored.dropped_keys(), i.dropped_keys());
+        assert_eq!(restored.keys(), i.keys());
+        // A verifier from the restored issuer lets the resend meet its receipt.
+        let verified = restored.verifier().verify(&request).unwrap();
+        assert_eq!(restored.plan_transfer(&verified), Ok(Plan::Replay(paid)));
+
+        // The keys restored must lead on to the live ones, start no later
+        // than the oldest live generation and no earlier than one fewer
+        // generations than there are layers before it.
+        let first = i.recent.certificates()[0];
+        i.rotate().unwrap();
+        let dropped = i.dropped_keys().to_vec();
+        assert_eq!(dropped[0].generation, 1);
+        let with = |since: u64, dropped: &[KeyCertificate]| {
+            let mut body = i.snapshot();
+            body.truncate(body.len() - 32 - 12 - 104 * 3);
+            let mut w = Writer::default();
+            w.u64(since).u32(dropped.len() as u32);
+            for certificate in dropped {
+                certificate.write(&mut w);
+            }
+            body.extend(w.finish());
+            let checksum: [u8; 32] = Sha256::digest(&body).into();
+            body.extend_from_slice(&checksum);
+            Issuer::restore(
+                i.key.clone(),
+                i.key_ring().clone(),
+                &body,
+                Policy::cash_like(),
+            )
+        };
+        assert_eq!(with(1, &dropped).unwrap().snapshot(), i.snapshot());
+        assert!(with(2, &dropped[1..]).is_ok());
+        assert!(with(4, &[]).is_ok());
+        assert!(with(1, &dropped[..2]).is_err());
+        assert!(with(2, &dropped).is_err());
+        assert!(with(5, &[]).is_err());
+        assert!(with(0, &[[first].as_slice(), dropped.as_slice()].concat()).is_err());
+    }
+
+    #[test]
+    fn version_6_snapshots_restore_keeping_no_dropped_generations_key() {
+        let mut i = issuer(4, Policy::cash_like());
+        let alice = HolderKey::generate();
+        let note = i.mint(8, alice.public_key()).unwrap();
+        let request = payment(note, &alice);
+        i.transfer(&request).unwrap();
+        for _ in 0..3 {
+            i.rotate().unwrap();
+        }
+        assert_eq!(i.dropped_keys().len(), 3);
+        let mut body = version_6_body(&i);
+        let checksum: [u8; 32] = Sha256::digest(&body).into();
+        body.extend_from_slice(&checksum);
+        let mut restored = Issuer::restore(
+            i.key.clone(),
+            i.key_ring().clone(),
+            &body,
+            Policy::cash_like(),
+        )
+        .unwrap();
+        assert_eq!(restored.dropped_keys(), &[]);
+        assert_eq!(restored.recent, restored.keys);
+        // So the resend is refused as it was before version 7.
+        assert_eq!(
+            restored.transfer(&request),
+            Err(Error::Expired(note.serial()))
+        );
+        without_dropped_keys(&mut i);
+        assert_eq!(restored.snapshot(), i.snapshot());
+
+        // From the next rotation on it keeps the keys of what it drops.
+        let next = restored.keys().certificates()[0];
+        restored.rotate().unwrap();
+        assert_eq!(restored.dropped_keys(), &[next]);
+    }
+
+    #[test]
+    fn a_dropped_generation_from_before_generation_keys_verifies_under_the_issuer_key() {
+        let mut i = issuer(4, Policy::cash_like());
+        without_generation_keys(&mut i);
+        let alice = HolderKey::generate();
+        let note = i.mint(8, alice.public_key()).unwrap();
+        let request = payment(note, &alice);
+        let paid = i.transfer(&request).unwrap();
+        // A rotation from before generation keys, then two with keys: the
+        // note's generation is dropped, and the issuer key signed it.
+        i.apply(&Event::Rotate(i.rotation())).unwrap();
+        let first = i.rotate().unwrap().key.unwrap();
+        i.rotate().unwrap();
+        assert!(note.serial().generation < i.keys().oldest());
+        assert!(note.serial().generation < first.generation);
+        assert_eq!(i.dropped_keys(), &[]);
+        assert_eq!(i.transfer(&request), Ok(paid.clone()));
+        let restored = Issuer::restore(
+            i.key.clone(),
+            i.key_ring().clone(),
+            &i.snapshot(),
+            Policy::cash_like(),
+        )
+        .unwrap();
+        assert_eq!(restored.snapshot(), i.snapshot());
+        let verified = restored.verifier().verify(&request).unwrap();
+        assert_eq!(restored.plan_transfer(&verified), Ok(Plan::Replay(paid)));
+
+        // Once the first generation with a key of its own is dropped too, the
+        // keys kept run from issuer-signed generations into certified ones.
+        while i.ledger().oldest_generation() <= first.generation {
+            i.rotate().unwrap();
+        }
+        assert_eq!(i.dropped_keys(), &[first]);
+        assert!(i.recent.oldest() < first.generation);
+        let restored = Issuer::restore(
+            i.key.clone(),
+            i.key_ring().clone(),
+            &i.snapshot(),
+            Policy::cash_like(),
+        )
+        .unwrap();
+        assert_eq!(restored.snapshot(), i.snapshot());
+        let issuer_signed = Serial::new(first.generation - 1, 0);
+        let keyed = Serial::new(first.generation, 0);
+        let holder = HolderKey::generate();
+        for (serial, verifies) in [(issuer_signed, true), (keyed, false)] {
+            let forged = Note::issue(i.public, &i.key, serial, 8, holder.public_key());
+            let burn = BurnRequest::single(forged, &holder).unwrap();
+            let verified = restored.verifier().verify_burn(&burn);
+            assert_eq!(verified.is_ok(), verifies, "{serial}");
+        }
+    }
+
+    #[test]
+    fn a_rotation_reusing_a_dropped_generations_key_applies_on_every_replica() {
+        let mut i = issuer(4, Policy::cash_like());
+        let second = i
+            .key_ring()
+            .get(i.keys().signer(1).unwrap())
+            .unwrap()
+            .clone();
+        for _ in 0..3 {
+            i.rotate().unwrap();
+        }
+        assert_eq!(i.dropped_keys().len(), 3);
+        assert_eq!(i.dropped_keys()[1].key, second.public_key());
+
+        // Whether it applies depends on the live generations' keys alone,
+        // which every replica shares, and not on the dropped ones kept: a
+        // replica restored from a version 6 snapshot keeps none.
+        let event = i.plan_rotate(second.clone()).unwrap();
+        let mut body = version_6_body(&i);
+        let checksum: [u8; 32] = Sha256::digest(&body).into();
+        body.extend_from_slice(&checksum);
+        let mut upgraded = Issuer::restore(
+            i.key.clone(),
+            i.key_ring().clone(),
+            &body,
+            Policy::cash_like(),
+        )
+        .unwrap();
+        upgraded.apply(&event).unwrap();
+        i.apply(&event).unwrap();
+        assert_eq!(upgraded.keys(), i.keys());
+        assert_eq!(i.keys().signer(7), Some(&second.public_key()));
+        let kept: Vec<u64> = i.dropped_keys().iter().map(|c| c.generation).collect();
+        assert_eq!(kept, [2, 3]);
+        let restored = Issuer::restore(
+            i.key.clone(),
+            i.key_ring().clone(),
+            &i.snapshot(),
+            Policy::cash_like(),
+        )
+        .unwrap();
         assert_eq!(restored.snapshot(), i.snapshot());
     }
 }

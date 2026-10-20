@@ -47,7 +47,8 @@ pub struct Purse<S: Store = FileStore> {
 /// How a purse resends a transfer that failed on the way: a lost
 /// connection, a timeout, or a mint that was paused or could not store it.
 /// Resending is safe, since the mint answers an identical transfer with the
-/// identical notes.
+/// identical notes, before or after a rotation, for as long as it remembers
+/// the transfer (see [`Purse::settle`]).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Retry {
     /// Tries in all, the first included.
@@ -248,9 +249,10 @@ impl<S: Store> Purse<S> {
     /// payee has had time to submit a payment, or after a restart. Planned
     /// refreshes still waiting for their time are resent too.
     ///
-    /// The mint keeps answers for its most recent transfers only: settle
-    /// before many more have passed, or a transfer already applied is
-    /// refused as `spent` and its change is lost.
+    /// The mint keeps the answers to its most recent transfers only, and
+    /// each only until the notes it issued expire: settle before many more
+    /// have passed and while the change is live, or a transfer already
+    /// applied is refused as `spent` or `expired` and its change is lost.
     pub async fn settle(&self, spacing: Spacing) -> Result<Submitted, Error> {
         let transfers = self.lock().resend(spacing);
         self.submit(&transfers).await

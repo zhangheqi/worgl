@@ -66,6 +66,12 @@ The key's secret is erased once its generation is dropped. A leaked
 generation key therefore forges notes for at most as many rotations as there
 are layers, and a leak exposes no key made after it.
 
+The mint keeps the public halves of the last `layers − 1` generations it
+dropped, in its snapshot but not in the published set. A transfer resent
+after its inputs' layer was dropped therefore still checks out and, while
+the mint remembers it, gets its notes again until those notes expire. A new
+spend of such a note is refused as `expired`.
+
 The certificates of the live generations are published at
 `GET /v1/mints/{mint}/keys`, so anyone who knows the issuer key can check a
 note offline. The mint checks notes against its own keys only, so a leaked
