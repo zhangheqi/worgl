@@ -103,8 +103,109 @@ Beside what any server's state directory holds (see
 `cluster.token`; and `registry/`, its copy of the cluster's registry. Each
 mint's directory also holds `vote.json`, the replica's Raft vote.
 
+## Backups and a failed member
+
+Back up the members' directories as any server's (see
+[Backups](../backups/)), but restore them only together: every member from
+a copy of one moment, with every member stopped, before any of them starts.
+Take the copies one of two ways:
+
+- Copy every member's directory with every member stopped, and restore
+  each member from its own copy.
+- Copy one member's directory, with that member stopped, once it holds
+  every change another member holds, and restore all three from it. Each
+  then needs its own `cluster.json`: run `join-cluster` on each with its
+  own `--node`, as when the cluster started.
+
+A member holds every change another holds when, for each mint, the last
+entry `export-log` prints on the other, run first, is among those it
+prints, and the last `log_id` in the other's `registry/log.json`, its copy
+of the registry's log, is in its own. Every change the cluster answered is
+on at least two of the three members, so such a member holds every change
+answered before the check. A member that was away, cut off or behind may
+lack changes the other two made, and restoring all three from its copy
+undoes them.
+
+Never restore one member on its own. A member restored from an older copy
+has forgotten what it acknowledged to the others, and nothing prevents
+that. If it helps a member that also lacks those changes become leader, the
+cluster loses changes it answered, and a note paid away can be spent again.
+A leader that had counted the member as holding entries the copy lacks logs
+a warning containing `follower log is reverted`; a leader elected since has
+nothing to compare with, and logs nothing.
+
+To replace a member whose directory is lost, copy one that runs instead:
+
+1. Stop one of the two members still running, once it holds every change
+   the other holds. Until it is back, the other alone is not a majority, so
+   the mints take no changes.
+2. Copy its whole state directory to the machine that takes the failed
+   member's place, at the failed member's addresses, and run `join-cluster`
+   on the copy with the failed member's id.
+3. Start both. The new member catches up from the others.
+
+```sh
+# On the new machine, with the copy in ./server, if member 3 failed:
+$S join-cluster --state ./server --node 3 $MEMBERS
+$S serve        --state ./server --listen 0.0.0.0:8080
+```
+
+Deleting a member's mint logs and `vote.json` files so that it receives
+snapshots from the others does not work: a member does not start with a
+mint whose `log.bin` is missing, or whose snapshot holds entries its group
+wrote while its `vote.json` is missing. Never delete a mint's directory or
+`registry/` on a member either. When it starts, the member writes a mint's
+directory again from the registry's record, if the registry holds the
+mint, and opens an empty registry in place of `registry/`; either way it
+rejoins the group having forgotten what it acknowledged, as if restored
+from an empty copy.
+
+## Changing the rules
+
+Each member reads a mint's `policy.json` and `mint.json`, its rules and
+rotation period, from its own directory when it starts serving the mint.
+Nothing replicates or compares them. The member leading the mint checks
+requests against its own policy and makes scheduled rotations on its own
+period, and the others apply what it logs, so the rules in force are those
+of whichever member leads. `GET /v1/mints/<mint>/info` on any member shows
+the leader's.
+
+Editing one member is therefore not enough: its rules hold only while it
+leads, and the lead moves, for instance when the leader restarts. A mint
+authority key removed from one member's policy goes on minting whenever a
+member that still lists it leads.
+
+To change a mint's rules:
+
+1. [Pause the mint](../pausing/). The pause is replicated, so the mint
+   refuses mints, transfers, burns and rotations while the members
+   disagree.
+2. Make the same edit to `policy.json`, and to `mint.json` if the period
+   changes, on every member. Compare the files, for instance with
+   `sha256sum`, to be sure they match.
+3. Restart the members one at a time, so that two are always up for the
+   cluster's other mints.
+4. Check that `info` shows the new policy and period, then resume the mint.
+
+A member that has no directory for a mint, because it was stopped or cut
+off from the others when the mint was created, writes one from the
+registry's record once it has the record, and serves the mint straight
+away. It gets the policy and period the mint was created with, not later
+edits. So if a member has no `mints/<mint>/` when you change the rules, keep
+the mint paused until it has written one, make the edit there too, restart
+it, and only then resume.
+
+`receipt_capacity` must match too, though the members apply the same log.
+Each member remembers as many recent transfers and burns as its own policy
+says, and the leader answers a resent one from what it remembers, so with
+different values one leader can answer a resend as before and another with
+`spent`. See
+[Sending a request again](../error-codes/#sending-a-request-again).
+
 ## Limits
 
+- A mint's rules are not replicated: each member keeps its own `policy.json`
+  and `mint.json`. See [Changing the rules](#changing-the-rules).
 - The Raft port speaks plain HTTP and checks only the cluster token, so keep
   it on a network that only the members can reach.
 - The members are fixed once the cluster starts: members cannot be added or

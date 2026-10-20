@@ -8,6 +8,11 @@ without touching stored state. It lives in the mint's `policy.json`, and
 `POST /v1/admin/mints` takes it as `policy`. Missing fields take their
 `cash_like` values.
 
+On a cluster, each member reads its own `policy.json`, and the rules in
+force are those of the member leading the mint, so keep the file the same
+on every member. See
+[Running a cluster](../running-a-cluster/#changing-the-rules).
+
 ```json
 {
   "mint_layer": null,
@@ -101,9 +106,10 @@ life that does. See
 
 ### mint_authorities
 
-Removing a key stops it minting. The mint keeps its sequence number, so
-adding it back cannot replay its old requests. The server never holds a mint
-authority key, so a mint whose list is empty cannot mint at all.
+Removing a key stops it minting; on a cluster, only once every member has
+restarted without it. The mint keeps its sequence number, so adding it back
+cannot replay its old requests. The server never holds a mint authority
+key, so a mint whose list is empty cannot mint at all.
 `create-mint` makes a key and lists it when the policy lists none, and
 `POST /v1/admin/mints` refuses a policy without one. See
 [Mint authorities and keys](../keys/).

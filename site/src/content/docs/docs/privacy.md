@@ -48,8 +48,8 @@ shuffled too, so the payee's notes are not always first.
 | Party | Sees | Cannot tell |
 |---|---|---|
 | The mint | Every note's serial, amount and one-time key; which notes each transfer spent and which it made; when each request arrived; which authority minted what. | Who holds a note. That two unrelated lineages share an owner, while holders keep the two rules. |
-| The payee | Its own new notes. The payer's transfers in the payment: the notes they spend, and the change, bound to fresh keys of the payer's. The mint's answers hold the change notes too, so the payee can ask `POST /v1/verify` whether they are still live. | The payer's other notes. Where the change goes once it is spent. |
-| The payer | The payee's fresh keys in the request, and, from the mint's answers, the payee's new notes. It cannot spend them, since they are bound to the payee's keys, but it can ask whether they are still live. | Where the value goes once the payee spends it. |
+| The payee | Its own new notes. The payer's transfers in the payment: the notes they spend, and the change, bound to fresh keys of the payer's. The mint's answers hold the change notes too, so the payee can ask `POST /v1/verify` whether they are still live, and it hands them back to the payer. | The payer's other notes. Where the change goes once it is spent. |
+| The payer | The payee's fresh keys in the request, and, from the mint's answers when it submits or resends the payment itself, the payee's new notes. It cannot spend them, since they are bound to the payee's keys, but it can ask whether they are still live. The change the payee hands back holds none of the payee's notes. | Where the value goes once the payee spends it. |
 | Anyone holding the log | What the mint saw, change by change, with every mint's authority and signature. No secret keys. | The same as the mint. |
 
 The mint stores no notes, only one bit each, plus a bounded list of recent
