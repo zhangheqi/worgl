@@ -41,7 +41,9 @@ This is the example in `worgl-client`'s crate documentation, which CI
 compiles. A `Purse` wraps a holder, a `Client` and a `Store`. It reads mint
 info by itself, submits each transfer at its time, retries what fails on the
 way (a resent transfer gets the same answer), and saves after every change,
-before handing out anything that depends on it.
+before handing out anything that depends on it. After a `busy` answer it
+waits as long as the mint's `Retry-After` asks, up to 30 seconds, before the
+next try.
 
 `Purse::open` keeps the purse in a JSON file. The file holds every note's
 secret key, and the notes are bearer, so keep it private and encrypted at
@@ -72,13 +74,15 @@ the answers to the payee, who checks their signatures and keeps them with
 | `plan_refresh(&mint)` | The same plan, for an application with its own scheduler to `submit`. |
 | `prune(&mint)` | Drops notes whose layer the mint has dropped, and returns the value lost. |
 
-The mint keeps answers for its most recent transfers only, so settle before
-many more have passed, or a transfer already applied is refused as `spent`
-and its change is lost.
+The mint keeps the answers to its most recent transfers only, and each only
+until the notes it issued expire, so settle before many more have passed and
+while the change is live, or a transfer already applied is refused as
+`spent` or `expired` and its change is lost.
 
 `Client` errors keep the mint's stable code, such as `spent` or `frozen`, in
-`Error::code`, and `Error::is_transient` says whether trying again later may
-work. See [Error codes](../error-codes/).
+`Error::code`, `Error::is_transient` says whether trying again later may
+work, and `Error::retry_after` how long a `busy` mint asked to wait first.
+See [Error codes](../error-codes/).
 
 `Spacing` sets the seconds between transfers that belong together, as a
 range the purse picks from at random. `Spacing::default()` spreads them; a

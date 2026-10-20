@@ -86,7 +86,7 @@ pub mod transfer;
 
 pub use codec::DecodeError;
 pub use error::{ApplyError, Error, SetupError};
-pub use issuer::{Event, Issuer, NoteStatus, Plan, RotationReport, Supply};
+pub use issuer::{Clock, Event, Issuer, NoteStatus, Plan, RotationReport, Supply};
 pub use kek::{FileKek, Kek, KekError, SealedKey};
 pub use keys::{GenerationKey, HolderKey, IssuerKey, MintKey, PublicKey, Signature};
 pub use keyset::{KeyCertificate, KeyRing, KeySet};

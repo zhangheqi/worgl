@@ -126,7 +126,13 @@ What each party to a payment sees is in the
   cloud VM the server went from about 4,000 transfers/s, whatever the
   number of clients, to about 8,800 with 8 concurrent clients and 17,000
   with 64, where signature checks become the limit. The library alone
-  commits about 41,000 transfers/s in batches of 256.
+  commits about 41,000 transfers/s in batches of 256. Sustained, one mint
+  takes at most `receipt_capacity / receipt_min_age_secs` transfers and
+  burns a second, about 8,192 at the defaults, since it keeps each answer
+  for a resend for at least 128 seconds. A burst of up to 1,048,576 is not
+  held back, except for up to 128 seconds after a restart if the mint
+  already holds that many answers, and mints on one server are not capped
+  together.
 
 ## How the design maps onto the code
 

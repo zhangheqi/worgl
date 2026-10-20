@@ -3,8 +3,8 @@
 //! The ledger only knows bits and layers. Everything here is a choice an
 //! operator can make differently without touching stored state: which amounts
 //! may exist, how many notes a transfer may consume and create, where new
-//! money lands, who may ask for it to be minted and how many recent transfers
-//! can be safely retried.
+//! money lands, who may ask for it to be minted, and how many recent transfers
+//! can be safely retried and for how long.
 //!
 //! The default, [`Policy::cash_like`], is chosen for privacy. A transfer that
 //! consumes several notes tells the issuer those notes had one owner, the
@@ -123,11 +123,26 @@ pub struct Policy {
     pub max_outputs: u8,
     /// Amounts a minted or transferred note may carry.
     pub denominations: Denominations,
-    /// How many recent transfers the issuer remembers, so that a client whose
-    /// response was lost can resend the identical request and get the same
-    /// notes back. 0 turns this off. Each entry costs about
-    /// `40 + 52 × outputs` bytes.
+    /// How many recent transfers and burns the issuer keeps a receipt of, so
+    /// that a client whose response was lost can resend the identical
+    /// request and get the same notes back. 0 turns this off. Each receipt
+    /// takes 45 bytes in a snapshot and about 150 in memory.
     pub receipt_capacity: u32,
+    /// Shortest time, in seconds, an issuer with a clock keeps a receipt
+    /// (see [`Issuer::set_clock`](crate::Issuer::set_clock)). While its
+    /// oldest receipt is younger and it holds `receipt_capacity` of them, it
+    /// refuses new transfers and burns as [`Busy`](crate::Error::Busy), so a
+    /// client resending within this time is answered as before. That caps
+    /// the transfers and burns it takes, sustained, at
+    /// `receipt_capacity / receipt_min_age_secs` a second; a burst of up to
+    /// `receipt_capacity` is not held back, unless the issuer already holds
+    /// that many and counts them as younger than they are, as a restored one
+    /// may. 0 turns this off, as does a `receipt_capacity` of 0.
+    ///
+    /// Replicas of one issuer must share this and `receipt_capacity`: the
+    /// one that plans a change counts the receipts it holds for all of
+    /// them.
+    pub receipt_min_age_secs: u32,
     /// Keys whose signed [`MintRequest`](crate::MintRequest)s the issuer
     /// accepts. Empty, the default, accepts none. Removing a key stops it
     /// minting; the issuer keeps its sequence number, so adding it back
@@ -143,7 +158,8 @@ impl Policy {
             max_inputs: 1,
             max_outputs: 16,
             denominations: Denominations::PowersOfTwo,
-            receipt_capacity: 65_536,
+            receipt_capacity: 1 << 20,
+            receipt_min_age_secs: 128,
             mint_authorities: Vec::new(),
         }
     }

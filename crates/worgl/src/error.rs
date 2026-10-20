@@ -83,6 +83,18 @@ pub enum Error {
     /// until it resumes.
     #[error("the issuer is paused")]
     Paused,
+    /// The issuer holds as many receipts as its policy allows, and the
+    /// oldest counts as younger than the policy's `receipt_min_age_secs`: a
+    /// new one would push out the answer to a request its client may still
+    /// resend. Nothing was done.
+    #[error(
+        "the issuer must keep the answers it holds for {retry_after_secs} s more before it takes \
+         another transfer or burn"
+    )]
+    Busy {
+        /// Seconds until the oldest receipt reaches the minimum age.
+        retry_after_secs: u32,
+    },
     /// A scheduled rotation is due no later than the last one logged, so
     /// that one already covered it.
     #[error("a rotation due at {due} is not after the last scheduled one, due at {last}")]
