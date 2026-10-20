@@ -47,13 +47,14 @@ use std::sync::{Arc, Mutex, RwLock};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context, Result, bail};
+use axum::http::StatusCode;
 use openraft::SnapshotPolicy;
 use serde::{Deserialize, Serialize};
 use tokio::runtime::{Handle, RuntimeFlavor};
 use tokio::sync::{mpsc, oneshot, watch};
 use worgl::{
     BurnRequest, Clock, CommitError, Error, Issuer, IssuerKey, KeySet, LedgerConfig, MintRequest,
-    Note, NoteError, PersistentIssuer, Policy, PublicKey, RotationReport, SetupError,
+    Note, NoteError, PersistentIssuer, Policy, PublicKey, RotationReport, SetupError, StoreState,
     TransferRequest, VerifiedBurn, VerifiedMint, VerifiedTransfer, Verifier,
 };
 use worgl::{FileKek, Kek, KeyRing};
@@ -485,6 +486,15 @@ pub(crate) fn load(dir: &Path, kek: Arc<dyn Kek>) -> Result<Loaded> {
     } = read_files(dir)?;
     let mut issuer = PersistentIssuer::open_with_kek(dir, key, policy, kek)
         .with_context(|| format!("opening {}", dir.display()))?;
+    if let Some(error) = issuer.take_compaction_error() {
+        // The store opened from the snapshot and log as they are.
+        tracing::warn!(
+            dir = %dir.display(),
+            %error,
+            "could not compact the log on opening; it keeps every event, and the next \
+             snapshot tries again"
+        );
+    }
     issuer.set_clock(Clock::monotonic());
     if settings.paused {
         // An older server paused it in mint.json. Log the pause first, so a
@@ -581,6 +591,24 @@ struct Job {
     reply: oneshot::Sender<Result<Done, ApiError>>,
 }
 
+/// Whether a mint serves, as `GET /readyz` names it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum Readiness {
+    /// The mint takes changes and answers reads.
+    Serving,
+    /// A batch did not reach the mint's disk, as on a full disk, and no
+    /// batch has since. The mint answers reads from what reached its disk,
+    /// and serves again once a batch does.
+    Failing,
+    /// The mint's store is [ahead](StoreState::Ahead) of its disk: a batch
+    /// did not reach it, and the mint could not reread its state from it.
+    Ahead,
+    /// The mint's store has [stopped](StoreState::Stopped), or on a cluster
+    /// member, the member's copy of the mint has.
+    Stopped,
+}
+
 /// A mint the server hosts.
 pub(crate) struct Mint {
     key: PublicKey,
@@ -601,6 +629,9 @@ enum Backend {
         /// signatures are checked. The issuer itself decides in the
         /// committer.
         paused: Arc<AtomicBool>,
+        /// Mirrors whether the mint serves, which also only changes under
+        /// the lock, so readiness checks do not wait on a commit.
+        readiness: Arc<RwLock<Readiness>>,
     },
     /// A replica of the mint's group, whose verifier changes as it applies
     /// rotations.
@@ -614,6 +645,9 @@ struct Inner {
     issuer: PersistentIssuer,
     verifier: Arc<RwLock<Verifier>>,
     paused: Arc<AtomicBool>,
+    readiness: Arc<RwLock<Readiness>>,
+    /// Set when a batch does not reach the disk, and cleared when one does.
+    failing: bool,
     compact_every: u64,
     /// Events logged at which the next snapshot is written.
     compact_at: u64,
@@ -641,19 +675,25 @@ impl Mint {
                 let compact_every = compact_every.max(1);
                 let verifier = Arc::new(RwLock::new(issuer.issuer().verifier()));
                 let paused = Arc::new(AtomicBool::new(issuer.issuer().is_paused()));
+                let readiness = Arc::new(RwLock::new(Readiness::Serving));
                 let logged = issuer.issuer().last_scheduled_rotation();
-                let inner = Arc::new(Mutex::new(Inner {
+                let inner = Inner {
                     issuer: *issuer,
                     verifier: verifier.clone(),
                     paused: paused.clone(),
+                    readiness: readiness.clone(),
+                    failing: false,
                     compact_every,
                     compact_at: compact_every,
-                }));
+                };
+                inner.mirror_readiness();
+                let inner = Arc::new(Mutex::new(inner));
                 tokio::spawn(run_committer(inner.clone(), queue));
                 let backend = Backend::Local {
                     inner,
                     verifier,
                     paused,
+                    readiness,
                 };
                 (backend, logged)
             }
@@ -721,6 +761,24 @@ impl Mint {
         }
     }
 
+    /// Whether the mint serves. A replica counts as
+    /// [`Stopped`](Readiness::Stopped) once its Raft node has stopped, and
+    /// as serving until then.
+    pub(crate) fn readiness(&self) -> Readiness {
+        match &self.backend {
+            Backend::Local { readiness, .. } => {
+                *readiness.read().unwrap_or_else(|e| e.into_inner())
+            }
+            Backend::Replicated { replica, .. } => {
+                if replica.raft().metrics().borrow().running_state.is_err() {
+                    Readiness::Stopped
+                } else {
+                    Readiness::Serving
+                }
+            }
+        }
+    }
+
     /// Whether this server makes the mint's changes: always for a store of
     /// its own, and only while it leads for a replica.
     fn leads(&self) -> bool {
@@ -770,7 +828,9 @@ impl Mint {
 
     /// Reads the issuer: with its store locked, on the blocking pool, for a
     /// mint of its own, and once the leader has confirmed it leads and is up
-    /// to date for a replica.
+    /// to date for a replica. A mint of its own whose last batch did not
+    /// reach its disk rereads its state from the disk first, and refuses
+    /// while that fails or its store has stopped.
     async fn read<T, F>(&self, read: F) -> Result<T, ApiError>
     where
         T: Send + 'static,
@@ -780,9 +840,11 @@ impl Mint {
             Backend::Local { inner, .. } => {
                 let inner = inner.clone();
                 tokio::task::spawn_blocking(move || {
-                    let inner = inner.lock().map_err(|_| {
+                    let mut inner = inner.lock().map_err(|_| {
                         ApiError::internal("issuer state is poisoned by an earlier panic")
                     })?;
+                    inner.recover();
+                    inner.check_in_step()?;
                     Ok(read(inner.issuer.issuer()))
                 })
                 .await
@@ -897,8 +959,20 @@ impl Mint {
 impl Inner {
     /// Carries out `changes` as one batch with one flush. A change the issuer
     /// refuses gets its error; if the flush fails, every other change gets a
-    /// storage error.
+    /// storage error, the issuer is rebuilt from what reached the disk, and
+    /// the mint is failing until a batch reaches it. If rebuilding failed
+    /// before, it is tried again first, and every change is refused while it
+    /// fails.
     fn commit(&mut self, changes: Vec<Change>) -> Vec<Result<Done, ApiError>> {
+        self.recover();
+        if self.issuer.state() == StoreState::Ahead {
+            let error = ApiError::new(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "storage",
+                "the issuer could not reread its state from its disk; nothing was applied",
+            );
+            return changes.iter().map(|_| Err(error.clone())).collect();
+        }
         let mut batch = match self.issuer.batch() {
             Ok(batch) => batch,
             Err(error) => {
@@ -934,16 +1008,52 @@ impl Inner {
                 }
             })
             .collect();
+        let writes = !batch.is_empty();
         if let Err(error) = batch.commit() {
-            tracing::error!(
-                mint = %self.issuer.public_key(),
-                "the mint refuses changes until the server is restarted"
-            );
+            if self.issuer.state() == StoreState::Stopped {
+                tracing::error!(
+                    mint = %self.issuer.public_key(),
+                    %error,
+                    "a batch did not reach the disk, and the log could not be cut back after \
+                     it, so what the log holds is unknown; the mint refuses changes and reads \
+                     of its ledger until the server is restarted"
+                );
+                self.mirror_readiness();
+                // A transfer, burn, mint or pause sent again is made at most
+                // once, but a rotation on request is made again.
+                let error = ApiError::new(
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    "storage",
+                    "the issuer could not record the change or undo it, so it may have been \
+                     applied; send the same request again once the server has been restarted",
+                );
+                let rotation = ApiError::new(
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    "storage",
+                    "the issuer could not record the rotation or undo it, so it may have been \
+                     made; once the server has been restarted, check the generation of the \
+                     mint's last layer before rotating again",
+                );
+                return results
+                    .into_iter()
+                    .map(|result| match result {
+                        Ok(Done::Rotated(_)) => Err(rotation.clone()),
+                        result => result.and(Err(error.clone())),
+                    })
+                    .collect();
+            }
             let error = ApiError::from(CommitError::Io(error));
+            // The batch took effect in memory only.
+            self.failing = true;
+            self.recover();
             return results
                 .into_iter()
                 .map(|result| result.and(Err(error.clone())))
                 .collect();
+        }
+        if writes && self.failing {
+            self.failing = false;
+            self.mirror_readiness();
         }
         let paused = self.issuer.issuer().is_paused();
         self.paused.store(paused, Ordering::Release);
@@ -969,13 +1079,80 @@ impl Inner {
                 // The log still holds every event, so nothing is lost.
                 // Try again after another batch rather than on every request.
                 self.compact_at = self.issuer.log_events() + self.compact_every;
-                tracing::error!(
-                    mint = %self.issuer.public_key(),
-                    %error,
-                    "snapshot failed; the log keeps growing"
-                );
+                if self.issuer.state() == StoreState::Stopped {
+                    tracing::error!(
+                        mint = %self.issuer.public_key(),
+                        %error,
+                        "snapshot failed, and the log could not be opened again after it was \
+                         rewritten; the mint refuses changes and reads of its ledger until the \
+                         server is restarted"
+                    );
+                    self.mirror_readiness();
+                } else {
+                    tracing::error!(
+                        mint = %self.issuer.public_key(),
+                        %error,
+                        "snapshot failed; the log keeps growing"
+                    );
+                }
             }
         }
+    }
+
+    /// Rebuilds the issuer from what reached the disk if the last batch did
+    /// not, which needs nothing written, so the mint answers from what
+    /// reached it. If that fails, the issuer stays ahead, and the next change
+    /// or read tries again.
+    fn recover(&mut self) {
+        if self.issuer.state() != StoreState::Ahead {
+            return;
+        }
+        let recovered = self.issuer.recover();
+        self.mirror_readiness();
+        match recovered {
+            Ok(()) => tracing::info!(
+                mint = %self.issuer.public_key(),
+                "reread the mint's state from the disk after a batch did not reach it"
+            ),
+            Err(error) => tracing::error!(
+                mint = %self.issuer.public_key(),
+                %error,
+                "a batch did not reach the disk, and the mint could not reread its state from \
+                 the disk; it refuses changes and reads of its ledger until it can, and tries \
+                 again at its next request"
+            ),
+        }
+    }
+
+    /// Refuses a read while the issuer may hold what never reached the disk.
+    fn check_in_step(&self) -> Result<(), ApiError> {
+        let message = match self.issuer.state() {
+            StoreState::InStep => return Ok(()),
+            StoreState::Ahead => {
+                "the mint's last change did not reach its disk, and the mint could not reread \
+                 its state from the disk; it tries again at its next request"
+            }
+            StoreState::Stopped => {
+                "a change to the mint's log failed and could not be undone; it answers again \
+                 once the server is restarted"
+            }
+        };
+        Err(ApiError::new(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "storage",
+            message,
+        ))
+    }
+
+    /// Mirrors whether the mint serves for readiness checks.
+    fn mirror_readiness(&self) {
+        let readiness = match self.issuer.state() {
+            StoreState::InStep if self.failing => Readiness::Failing,
+            StoreState::InStep => Readiness::Serving,
+            StoreState::Ahead => Readiness::Ahead,
+            StoreState::Stopped => Readiness::Stopped,
+        };
+        *self.readiness.write().unwrap_or_else(|e| e.into_inner()) = readiness;
     }
 }
 

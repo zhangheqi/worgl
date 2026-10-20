@@ -97,6 +97,7 @@ pub use note::{Note, NoteError};
 pub use policy::{Denominations, Policy, PolicyError};
 pub use store::{
     Batch, CommitError, FileStore, PersistentIssuer, SnapshotFile, StateFiles, StoreError,
+    StoreState,
 };
 pub use transfer::{
     BurnRequest, Output, Spend, TransferId, TransferRequest, VerifiedBurn, VerifiedTransfer,

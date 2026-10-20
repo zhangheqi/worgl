@@ -19,6 +19,7 @@ make every call below for you.
 | Method | Path | Token | Body | Answer |
 |---|---|---|---|---|
 | GET | `/healthz` | | | `ok` |
+| GET | `/readyz` | | | `ok`, or `503` naming the mints that do not serve |
 | POST | `/v1/verify` | | `{"note"}` | serial, amount, state, position, hops left |
 | POST | `/v1/transfer` | | `{"inputs": [{"note", "signature"}], "outputs": [{"amount", "holder"}]}` | `{"notes"}` |
 | POST | `/v1/burn` | | `{"inputs": [{"note", "signature"}]}` | `{"value"}` burned |
@@ -45,6 +46,25 @@ Errors answer with a status code and a body like
 code is stable; the message is for people. A `503 busy` answer also says in
 its `Retry-After` header how many seconds to wait before sending the request
 again. See [Error codes](../error-codes/).
+
+## Health and readiness
+
+`GET /healthz` answers `ok` for as long as the server runs, whatever its
+mints are doing. `GET /readyz` answers `ok` only while every mint serves.
+Otherwise it answers `503` with the `storage` code and every mint that does
+not, so one such mint makes the whole server answer `503`:
+
+```json
+{"error":"storage","message":"not every mint is serving","mints":[{"mint":"7e8e…5caf","state":"failing"}]}
+```
+
+| `state` | Meaning |
+|---|---|
+| `failing` | A change did not reach the mint's disk, as on a full disk, and none has since. The mint answers reads from what reached its disk, and changes are answered `500 storage` while the disk takes no writes. It serves again once a change reaches its disk, so it stays `failing` after the disk has room until a change comes. |
+| `ahead` | A change did not reach the mint's disk, and the mint could not reread its state from the disk since. It refuses changes, answers `verify` and `info` with `503 storage`, and tries again at its next request. |
+| `stopped` | A change to the mint's log failed and could not be undone, as when the log could not be cut back after a failed write, so only a restart serves the mint again. On a cluster member, also once the member's copy of the mint has stopped. |
+
+See [Running a server](../running-a-server/#when-the-disk-fills-up).
 
 ## Verify
 

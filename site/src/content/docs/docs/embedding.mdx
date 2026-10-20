@@ -59,8 +59,16 @@ stops two processes from writing the same store. See [Backups](../backups/).
 - `compact()` writes a fresh snapshot and purges the log up to it. Call it
   after rotations or whenever `log_events()` grows large.
 
-If a flush fails, the issuer is ahead of its log and refuses all further
-changes until it is reopened, which restores exactly what reached the disk.
+If a batch's flush fails, the issuer is ahead of its log: `issuer()` still
+shows the batch's changes, which never reached the disk, so do not answer
+reads from it, and every further change is refused, until `recover()`
+rebuilds it from the snapshot and log on disk or the store is reopened;
+either restores exactly what reached the disk. A single change whose flush
+fails is not applied at all. If the log could not even be cut back after a
+failed write, the store is stopped instead, and only reopening it reads the
+log again. `state()` tells which it is: `InStep`, `Ahead` or `Stopped`.
+Opening compacts the log, and if that fails, as on a full disk, opens from
+the snapshot and log as they are; `take_compaction_error()` then tells why.
 
 ## Checking signatures outside a lock
 

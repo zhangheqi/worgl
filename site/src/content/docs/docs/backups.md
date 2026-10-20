@@ -93,6 +93,14 @@ damaged record is dropped only when nothing readable follows it, which is
 the one place a crash can leave a torn write. Damage anywhere else stops the
 store from opening rather than silently losing acknowledged transfers.
 
+A write that fails, as on a full disk, is cut back off the log, and the
+changes in it are answered as not made. The mint then rereads its state
+from the disk, so that it answers from what reached it, and takes changes
+again once the disk has room. If even cutting the write back fails, the
+mint stops until the server is restarted. A restart with the disk still
+full opens from the snapshot and log as they are. See
+[When the disk fills up](../running-a-server/#when-the-disk-fills-up).
+
 ## On a cluster
 
 Each mint is kept on all three members, and a member that was away catches

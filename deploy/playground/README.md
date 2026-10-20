@@ -30,9 +30,10 @@ worgl playground        # keeps a note and prints the mint
   member's `cluster.json`. When it finds a member's state already there, it
   does nothing, so `up` again keeps the mint.
 - **member1** to **member3** serve the mint as a cluster. A member that
-  fails is skipped by Caddy and replaced as leader by the others within a
-  few seconds; while they elect, requests are answered `503 no_leader` and
-  can be sent again.
+  fails, or whose `/readyz` says its copy of the mint has stopped, is
+  skipped by Caddy and replaced as leader by the others within a few
+  seconds; while they elect, requests are answered `503 no_leader` and can
+  be sent again.
 - **faucet** hands out notes of 64, 10 an hour per address and 10,000 a
   day, counting clients by the address Caddy forwards. It keeps its counts
   in memory, so they start again when it restarts.

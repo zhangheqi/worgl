@@ -2931,6 +2931,7 @@ dependencies = [
  "http-body-util",
  "openraft",
  "reqwest",
+ "rustix",
  "serde",
  "serde_json",
  "subtle",

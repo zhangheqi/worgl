@@ -637,6 +637,17 @@ impl Issuer {
         &self.public
     }
 
+    /// The issuer key, for restoring the issuer again from its store.
+    pub(crate) fn issuer_key(&self) -> &IssuerKey {
+        &self.key
+    }
+
+    /// The clock given by [`set_clock`](Self::set_clock), if any, for giving
+    /// it to the issuer restored again from its store.
+    pub(crate) fn clock(&self) -> Option<&Clock> {
+        self.clock.as_ref()
+    }
+
     /// The policy in force.
     pub fn policy(&self) -> &Policy {
         &self.policy

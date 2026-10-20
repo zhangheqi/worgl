@@ -45,7 +45,7 @@ use crate::keys::{PUBLIC_KEY_LEN, PublicKey};
 use crate::store::{StoreError, checksum, sync_dir};
 
 pub(crate) const LOG: &str = "log.bin";
-const LOG_TMP: &str = "log.bin.tmp";
+pub(crate) const LOG_TMP: &str = "log.bin.tmp";
 const MAGIC: &[u8; 8] = b"WORGLLOG";
 const VERSION: u16 = 1;
 /// Magic, version, issuer key, last purged id and checksum.
@@ -405,6 +405,21 @@ impl FileLog {
     /// Bytes of the header and the records.
     pub fn bytes(&self) -> u64 {
         self.end
+    }
+
+    /// Whether a failed change could not be undone, as when the file could
+    /// not be cut back after a failed append. The file may then not match
+    /// what is in memory, and the log refuses all further changes.
+    pub(crate) fn is_poisoned(&self) -> bool {
+        self.poisoned
+    }
+
+    /// Swaps the log's handle for a read-only one, so that the next append
+    /// fails and so does cutting the file back after it.
+    #[cfg(test)]
+    pub(crate) fn lose_write_access(&mut self) -> io::Result<()> {
+        self.file = File::open(self.dir.join(LOG))?;
+        Ok(())
     }
 
     fn check_in_step(&self) -> io::Result<()> {
