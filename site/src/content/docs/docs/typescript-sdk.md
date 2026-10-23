@@ -77,8 +77,8 @@ run purses against a real server.
   (`client.infoTextAndTime`), so this machine's clock, slow or fast, moves
   none past the rotation. A browser reads that `Date` from a mint on
   another origin only if the answer carries
-  `Access-Control-Expose-Headers: Date`, so the proxy that adds the CORS
-  headers must send it too; without it, the browser's clock counts the
+  `Access-Control-Expose-Headers: Date`, as `worgl-server`'s do unless it
+  runs with `--no-cors`; without it, the browser's clock counts the
   moments. `purse.prune(mint)` drops the notes whose layer the mint's info
   says it has dropped, never by this machine's clock.
 - When the payer submits instead (`purse.submit(payment.transfers)`), it
