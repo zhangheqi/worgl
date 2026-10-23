@@ -96,8 +96,9 @@ impl Holder {
     }
 
     /// Takes in the notes, a JSON array, that pay keys this holder handed
-    /// out. Returns the value taken in. Check signatures first with
-    /// [`verify_notes`] unless the notes come straight from the mint.
+    /// out. Returns the value taken in. It checks no signatures: check them
+    /// first with [`verify_notes`]. An answer from a server goes to
+    /// [`settle`](Self::settle), which checks it.
     pub fn absorb(&mut self, notes: &str) -> Result<u128, JsError> {
         Ok(self.inner.absorb(&parse::<Vec<Note>>(notes)?))
     }
@@ -109,11 +110,16 @@ impl Holder {
         Ok(json(&self.inner.theirs(&parse::<Vec<Note>>(notes)?)))
     }
 
-    /// Records the mint's answer, a JSON array of notes, to a transfer.
-    /// Returns the value taken in.
-    pub fn settle(&mut self, transfer: &str, notes: &str) -> Result<u128, JsError> {
+    /// Records the mint's answer, a JSON array of notes, to a transfer, once
+    /// it checks out against `keys`, the key set of the transfer's mint as
+    /// `GET /v1/mints/{mint}/keys` returns it, read after the answer: one
+    /// note for each output, that output's, signed by the mint. Throws,
+    /// changing nothing, when it does not. Returns the value taken in.
+    pub fn settle(&mut self, keys: &str, transfer: &str, notes: &str) -> Result<u128, JsError> {
+        let keys = parse::<KeySet>(keys)?;
         let transfer = parse::<TransferRequest>(transfer)?;
-        Ok(self.inner.settle(&transfer, &parse::<Vec<Note>>(notes)?))
+        let notes = parse::<Vec<Note>>(notes)?;
+        self.inner.settle(&keys, &transfer, &notes).map_err(error)
     }
 
     /// Takes in notes, a JSON array, handed over from the mint's answers,

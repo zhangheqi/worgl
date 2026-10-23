@@ -70,6 +70,42 @@ async function skewed(
   };
 }
 
+/**
+ * A client of `server` that hands on the notes of an answer to a transfer as
+ * `tamper` changes them: a server that is not the mint's, or one between the
+ * purse and the mint.
+ */
+function tampering(server: TestServer, tamper: (notes: string[]) => string[]): Client {
+  const fetch: typeof globalThis.fetch = async (input, init) => {
+    const answer = await globalThis.fetch(input, init);
+    if (!String(input).endsWith('/v1/transfer') || !answer.ok) {
+      return answer;
+    }
+    const { notes } = (await answer.json()) as { notes: string[] };
+    return new Response(JSON.stringify({ notes: tamper(notes) }), {
+      headers: { 'content-type': 'application/json' },
+    });
+  };
+  return new Client(server.url, { fetch });
+}
+
+/**
+ * Checks that `lost`, which held what `purse` holds, kept nothing of the one
+ * answer in `submitted`, and reported it with an error that `why` matches.
+ */
+function keptNothing(lost: Purse, purse: Purse, submitted: Submitted, why: RegExp): void {
+  assert.deepEqual(
+    [submitted.answered, submitted.value, submitted.notes, submitted.theirs],
+    [0, 0n, [], []],
+  );
+  assert.equal(submitted.refused.length, 1);
+  const refused = submitted.refused[0]!;
+  assert.match(String(refused.error), why);
+  assert.equal(isTransient(refused.error), false);
+  assert.equal(refused.outcome, 'kept');
+  assert.equal(lost.toJson(), purse.toJson());
+}
+
 let server: TestServer;
 before(async () => {
   server = await TestServer.start();
@@ -275,6 +311,66 @@ describe('purse', () => {
     } finally {
       await other.stop();
     }
+  });
+
+  test("an answer that is not the mint's is not kept", async () => {
+    const [alice, bob] = [await purse(), await purse()];
+    await server.fund(alice, 8n, 8n);
+    // Genuine notes of the mint, for a key nobody here holds.
+    const stranger = (await (await purse()).request(server.mint, 1n)).notes[0]!.holder;
+    const strangers = new Map<bigint, string>();
+    for (const value of [1n, 2n, 4n]) {
+      strangers.set(value, await server.mintTo(value, stranger));
+    }
+    // Bob's 4 and 1, and Alice's change of 2 and 1.
+    const request = await bob.request(server.mint, 5n);
+    const payment = await alice.pay(request, NO_SPACING);
+
+    // A character of the signature changed.
+    const forged = (note: string) =>
+      note.slice(0, 190) + (note[190] === 'A' ? 'B' : 'A') + note.slice(191);
+    // A note's amount: its bytes 45 to 53, big-endian.
+    const amount = (note: string) => Buffer.from(note, 'base64url').readBigUInt64BE(45);
+    const tamperings = [
+      {
+        tamper: ([first, ...rest]: string[]) => [forged(first!), ...rest],
+        why: /note 0 of the answer is not signed by the mint: issuer signature does not verify/,
+      },
+      // A genuine note of the mint, of the amount asked for, to another key.
+      {
+        tamper: ([first, ...rest]: string[]) => [strangers.get(amount(first!))!, ...rest],
+        why: /note 0 of the answer is not the transfer's output 0/,
+      },
+    ];
+    for (const { tamper, why } of tamperings) {
+      // Neither the payer resending nor the payee submitting keeps any of it:
+      // the payer's transfer stays outgoing, for the next settle.
+      const open = (from: Purse) =>
+        Purse.open(tampering(server, tamper), { store: new MemoryStore(from.toJson()), ...quick });
+      const payer = await open(alice);
+      keptNothing(payer, alice, await payer.settle(NO_SPACING), why);
+      const payee = await open(bob);
+      keptNothing(payee, bob, await payee.receive(request, payment), why);
+    }
+
+    // Nor without the mint's keys to check an answer with.
+    const keyless: typeof globalThis.fetch = (input, init) =>
+      String(input).endsWith('/keys')
+        ? Promise.resolve(new Response('not here', { status: 404 }))
+        : globalThis.fetch(input, init);
+    const payer = await Purse.open(new Client(server.url, { fetch: keyless }), {
+      store: new MemoryStore(alice.toJson()),
+      ...quick,
+    });
+    keptNothing(payer, alice, await payer.settle(NO_SPACING), /not here \(http, HTTP 404\)/);
+
+    // The mint's own server answers them, and both keep their notes.
+    const received = await bob.receive(request, payment);
+    allAnswered(received, 1);
+    assert.equal(received.value, 5n);
+    const settled = await alice.settle(NO_SPACING);
+    allAnswered(settled, 1);
+    assert.equal(settled.value, 3n);
   });
 
   test('a refusal the mint would not give drops or cancels nothing', async () => {

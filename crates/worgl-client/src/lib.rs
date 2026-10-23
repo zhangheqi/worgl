@@ -9,8 +9,9 @@
 //!   [`Error::code`].
 //! - [`Purse`] puts a [`worgl_sdk::Holder`] on top: it reads mint info by
 //!   itself, submits transfers at the random times the holder gives them,
-//!   retries what failed on the way, and saves the holder to a [`Store`]
-//!   after every change, before anything that depends on it is handed out.
+//!   retries what failed on the way, checks each answer against the mint's
+//!   keys, and saves the holder to a [`Store`] after every change, before
+//!   anything that depends on it is handed out.
 //!
 //! The privacy rules come from the holder: a fresh key for every note, one
 //! note per transfer, and transfers of one payment, refreshes and resends

@@ -157,6 +157,7 @@ rather than open without them.
 | `paused`, `busy`, `storage`, `internal`, another 5xx status, or no answer | Keep it, for the next `settle`: this may pass later. |
 | `frozen` | Keep it: the note it spends moves after the next rotation. |
 | Anything else, such as `unknown_mint`, `unissued` or `unauthorized` | Keep it: the refusal shows nothing about the transfer, such as a server that is not the mint's, or one that lost its state. The mint answers `spent` and `expired` with 409 and `layer_full` with 503, and never refuses a transfer the purse signed as `unauthorized` or `duplicate_input`, so such answers come from something else, such as a gateway or another version. `cancel` or `forget` ends it once you know which applies. |
+| An answer that is not the mint's, or whose keys cannot be read | Keep it, and none of the answer's notes: the purse keeps an answer only once it holds one note for each of the transfer's outputs, that output's, signed by the mint, by the mint's keys read after it. A server that is not the mint's may have sent it. |
 
 They exit with status 0 when no refused transfer is kept, and with 1 while
 one is. The error ends with "try again later" only when every transfer kept

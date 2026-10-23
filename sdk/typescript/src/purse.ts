@@ -37,7 +37,8 @@ export const NO_SPACING: Spacing = { minSecs: 0, maxSecs: 0 };
  * a timeout, or a mint that was paused, busy or could not store it.
  * Resending is safe, since the mint answers an identical transfer with
  * identical notes, before or after a rotation, for as long as it remembers
- * the transfer (see {@link Purse.settle}).
+ * the transfer (see {@link Purse.settle}). The mint's keys, which the purse
+ * reads to check an answer with, are read again the same way.
  *
  * When the mint answers `busy`, the next wait is as long as its
  * `Retry-After` asks, up to 30 seconds, if that is longer; the waits after
@@ -103,7 +104,8 @@ export interface Balance {
  *   not the mint's or lost its state, `spent` or `expired` with another
  *   status than the mint's 409, `layer_full` with another than its 503, or
  *   `unauthorized` or `duplicate_input`, which the mint never answers to a
- *   transfer a holder signed.
+ *   transfer a holder signed. So it is, too, after an answer the purse kept
+ *   none of (see {@link Submitted.refused}).
  * - `dropped`: refused as `spent` or `expired`, with the mint's status 409,
  *   so the note it spends is gone and the purse forgot the transfer
  *   ({@link Purse.forget}). Change the counterparty hands over later is still
@@ -118,7 +120,7 @@ export interface Balance {
  */
 export type Outcome = 'kept' | 'dropped' | 'cancelled';
 
-/** A transfer that did not go through, and why. */
+/** A transfer that did not go through, or whose answer was not kept, and why. */
 export interface Refused {
   /** The transfer, as JSON. */
   request: string;
@@ -153,7 +155,11 @@ export interface Submitted {
    * are handed over.
    */
   theirs: string[];
-  /** Transfers the mint refused, or that kept failing on the way. */
+  /**
+   * Transfers the mint refused, that kept failing on the way, or whose answer
+   * the purse kept none of: one that is not the mint's, or that it could not
+   * read the mint's keys to check.
+   */
   refused: Refused[];
 }
 
@@ -246,7 +252,8 @@ export interface PurseOptions {
 /**
  * A holder connected to a server and a {@link Store}: it reads mint info
  * itself, submits transfers at their scheduled times, retries what failed
- * on the way, and saves after every change.
+ * on the way, checks each answer against the mint's keys, and saves after
+ * every change.
  *
  * The privacy rules come from the Rust core: a fresh key for every note,
  * one note per transfer, and transfers of one payment, refreshes and
@@ -553,12 +560,20 @@ export class Purse {
    * on the way, and records each answer, keeping the payee's notes for it
    * when the transfer is part of a payment this purse made. A payer that
    * submits its own payment hands them to the payee from
-   * {@link Submitted.theirs}, then calls {@link forgetOwed} with them. A
-   * refused transfer does not stop the others; it is listed in
-   * {@link Submitted.refused}. One this purse made that the mint refused for
-   * good is dropped or cancelled ({@link Refused.outcome}); the rest stay
-   * outgoing. To confirm a `policy` refusal, the purse reads the mint's info
-   * again. Rejects only if a save fails.
+   * {@link Submitted.theirs}, then calls {@link forgetOwed} with them.
+   *
+   * Each answer is checked first, against the keys of the transfer's mint,
+   * read after it: it must hold one note for each of the transfer's outputs,
+   * that output's, signed by the mint. The purse keeps none of an answer that
+   * is not the mint's, such as one from a server that is not the mint's, nor
+   * of one it cannot read the keys to check.
+   *
+   * A refused transfer does not stop the others; it is listed in
+   * {@link Submitted.refused}, as is one whose answer the purse did not keep.
+   * One this purse made that the mint refused for good is dropped or
+   * cancelled ({@link Refused.outcome}); the rest stay outgoing. To confirm a
+   * `policy` refusal, the purse reads the mint's info again. Rejects only if
+   * a save fails.
    */
   async submit(transfers: ScheduledTransfer[]): Promise<Submitted> {
     const order = [...transfers].sort((a, b) => a.afterSecs - b.afterSecs);
@@ -568,26 +583,69 @@ export class Purse {
       await sleepUntil(start + Math.min(transfer.afterSecs, MAX_DELAY_SECS) * 1000);
       let notes: string[];
       try {
-        notes = await this.#send(transfer.request);
+        notes = await this.#retrying(() => this.client.transfer(transfer.request));
       } catch (error) {
         const { atStake, outcome } = await this.#refused(transfer.request, error);
         submitted.refused.push({ request: transfer.request, error, atStake, outcome });
         continue;
       }
-      const { value, theirs } = await this.#change(
+      const taken = await this.#takeAnswer(transfer.request, notes);
+      if ('error' in taken) {
+        // Nothing changed: a transfer this purse made stays outgoing, for the
+        // next settle.
+        submitted.refused.push({
+          request: transfer.request,
+          error: taken.error,
+          atStake: undefined,
+          outcome: 'kept',
+        });
+        continue;
+      }
+      submitted.value += taken.value;
+      submitted.answered += 1;
+      submitted.notes.push(...notes);
+      submitted.theirs.push(...taken.theirs);
+    }
+    return submitted;
+  }
+
+  /**
+   * Records the answer to `transfer` once it checks out against the keys of
+   * the transfer's mint, and resolves to the value taken in and the
+   * counterparty's notes, or to why the answer was not kept: it is not the
+   * mint's, or the keys could not be read. Rejects only if a save fails.
+   */
+  async #takeAnswer(
+    transfer: string,
+    notes: string[],
+  ): Promise<{ value: bigint; theirs: string[] } | { error: unknown }> {
+    let keys: string;
+    try {
+      const mint = transferMint(transfer);
+      // Read after the answer, so that they know the generation its notes sit
+      // in, which a rotation may have opened since an earlier read.
+      keys = await this.#retrying(() => this.client.keysText(mint));
+    } catch (error) {
+      return { error };
+    }
+    const json = JSON.stringify(notes);
+    // Set once the answer checked out: a rejection after it is the save's.
+    let checked = false;
+    try {
+      return await this.#change(
         () => {
-          const json = JSON.stringify(notes);
-          const value = this.#holder.settle(transfer.request, json);
+          const value = this.#holder.settle(keys, transfer, json);
+          checked = true;
           return { value, theirs: JSON.parse(this.#holder.theirs(json)) as string[] };
         },
         () => {},
       );
-      submitted.value += value;
-      submitted.answered += 1;
-      submitted.notes.push(...notes);
-      submitted.theirs.push(...theirs);
+    } catch (error) {
+      if (checked) {
+        throw error;
+      }
+      return { error };
     }
-    return submitted;
   }
 
   /**
@@ -641,12 +699,15 @@ export class Purse {
     return { atStake: undefined, outcome: cancelled ? 'cancelled' : 'kept' };
   }
 
-  /** Sends one transfer, retrying while the failure is transient. */
-  async #send(transfer: string): Promise<string[]> {
+  /**
+   * Makes the request `call` makes, again while the failure is transient, as
+   * {@link Retry} says.
+   */
+  async #retrying<T>(call: () => Promise<T>): Promise<T> {
     let delay = this.#retry.firstDelayMs;
     for (let attempt = 1; ; attempt += 1) {
       try {
-        return await this.client.transfer(transfer);
+        return await call();
       } catch (error) {
         if (!isTransient(error) || attempt >= this.#retry.attempts) {
           throw error;

@@ -14,11 +14,11 @@ use tokio::net::TcpListener;
 use tokio::sync::oneshot;
 use tokio::task::JoinHandle;
 use worgl::{
-    HolderKey, Issuer, IssuerKey, LedgerConfig, MintKey, MintRequest, Note, NoteStatus, Output,
-    Policy, PublicKey, TransferRequest,
+    HolderKey, Issuer, IssuerKey, LedgerConfig, MintKey, MintRequest, Note, NoteError, NoteStatus,
+    Output, Policy, PublicKey, TransferRequest,
 };
 use worgl_client::{Client, Error, MemoryStore, Outcome, Purse, Retry, Store, Submitted};
-use worgl_sdk::{PayError, PaymentRequest, ScheduledTransfer, Spacing};
+use worgl_sdk::{AnswerError, PayError, PaymentRequest, ScheduledTransfer, Spacing};
 use worgl_server::{AppState, MintSpec, init_state, router};
 
 /// No waiting between transfers.
@@ -647,6 +647,133 @@ async fn counting(server: &Server) -> (String, Arc<AtomicUsize>) {
     let url = format!("http://{}", listener.local_addr().unwrap());
     tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
     (url, tries)
+}
+
+/// Changes the notes of an answer to a transfer.
+type Tamper = Arc<dyn Fn(&mut Vec<Note>) + Send + Sync>;
+
+/// A server that passes each transfer on to `server` and its answer back as
+/// `tamper` changes it, and the mint's keys as they are: one that is not the
+/// mint's, or stands between the purse and the mint. Returns its URL. It
+/// serves nothing else.
+async fn tampering(server: &Server, tamper: Tamper) -> String {
+    let client = server.client();
+    let relay = {
+        let client = client.clone();
+        move |Json(request): Json<TransferRequest>| {
+            let (client, tamper) = (client.clone(), tamper.clone());
+            async move {
+                let mut notes = client.transfer(&request).await.unwrap();
+                tamper(&mut notes);
+                Json(json!({ "notes": notes }))
+            }
+        }
+    };
+    let mint = server.mint;
+    let keys = move || {
+        let client = client.clone();
+        async move { Json(client.keys(&mint).await.unwrap()) }
+    };
+    let app = axum::Router::new()
+        .route("/v1/transfer", axum::routing::post(relay))
+        .route(&format!("/v1/mints/{mint}/keys"), axum::routing::get(keys));
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let url = format!("http://{}", listener.local_addr().unwrap());
+    tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+    url
+}
+
+/// Checks that `lost`, which held what `purse` holds, kept nothing of the
+/// one answer in `submitted` and reported it with an error `why` accepts.
+fn kept_nothing<S: Store>(
+    lost: &Purse<MemoryStore>,
+    purse: &Purse<S>,
+    submitted: &Submitted,
+    why: impl Fn(&Error) -> bool,
+) {
+    assert_eq!((submitted.answered, submitted.value), (0, 0));
+    assert!(submitted.notes.is_empty() && submitted.theirs.is_empty());
+    let [refused] = submitted.refused.as_slice() else {
+        panic!("{:?}", submitted.refused)
+    };
+    assert!(why(&refused.error), "{}", refused.error);
+    assert!(!refused.error.is_transient());
+    assert_eq!(refused.outcome, Outcome::Kept);
+    assert_eq!(lost.holder().to_json(), purse.holder().to_json());
+}
+
+#[tokio::test]
+async fn an_answer_that_is_not_the_mints_is_not_kept() {
+    let server = Server::start().await;
+    let (alice, bob) = (server.purse(), server.purse());
+    server.fund(&alice, 8, 8).await;
+    // Genuine notes of the mint, for a key nobody here holds.
+    let stranger = HolderKey::generate().public_key();
+    let mut strangers = Vec::new();
+    for amount in [1, 2, 4] {
+        strangers.push(server.mint_to(amount, stranger).await);
+    }
+    // Bob's 4 and 1, and Alice's change of 2 and 1.
+    let request = bob.request(&server.mint, 5).await.unwrap();
+    let payment = alice.pay(&request, NOW).await.unwrap();
+
+    let forged: Tamper = Arc::new(|notes| {
+        let mut bytes = notes[0].to_bytes();
+        bytes[Note::LEN - 1] ^= 1;
+        notes[0] = Note::from_bytes(&bytes).unwrap();
+    });
+    let misdirected: Tamper = Arc::new(move |notes| {
+        let amount = notes[0].amount();
+        notes[0] = *strangers.iter().find(|n| n.amount() == amount).unwrap();
+    });
+    let tamperings = [
+        (
+            forged,
+            AnswerError::Note {
+                index: 0,
+                error: NoteError::BadSignature,
+            },
+        ),
+        (misdirected, AnswerError::Unasked(0)),
+    ];
+    for (tamper, expected) in tamperings {
+        let client = Client::new(&tampering(&server, tamper).await).unwrap();
+        // Neither the payer resending nor the payee submitting keeps any of
+        // it: the payer's transfer stays outgoing, for the next settle.
+        let lost = Purse::new(client.clone(), alice.holder(), MemoryStore::new()).with_retry(QUICK);
+        let settled = lost.settle(NOW).await.unwrap();
+        kept_nothing(
+            &lost,
+            &alice,
+            &settled,
+            |error| matches!(error, Error::Answer(error) if *error == expected),
+        );
+        let lost = Purse::new(client, bob.holder(), MemoryStore::new()).with_retry(QUICK);
+        let received = lost.receive(&request, &payment).await.unwrap();
+        kept_nothing(
+            &lost,
+            &bob,
+            &received,
+            |error| matches!(error, Error::Answer(error) if *error == expected),
+        );
+    }
+
+    // Nor without the mint's keys to check an answer with.
+    let (url, _) = counting(&server).await;
+    let client = Client::new(&url).unwrap();
+    let lost = Purse::new(client, alice.holder(), MemoryStore::new()).with_retry(QUICK);
+    let settled = lost.settle(NOW).await.unwrap();
+    kept_nothing(&lost, &alice, &settled, |error| {
+        error.code() == Some("http")
+    });
+
+    // The mint's own server answers them, and both keep their notes.
+    let received = bob.receive(&request, &payment).await.unwrap();
+    all_answered(&received, 1);
+    assert_eq!(received.value, 5);
+    let settled = alice.settle(NOW).await.unwrap();
+    all_answered(&settled, 1);
+    assert_eq!(settled.value, 3);
 }
 
 #[tokio::test]

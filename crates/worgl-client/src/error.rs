@@ -6,7 +6,7 @@ use std::time::Duration;
 
 use serde::Deserialize;
 use worgl::NoteError;
-use worgl_sdk::{CheckError, LoadError, NoLayers, PayError, RequestError};
+use worgl_sdk::{AnswerError, CheckError, LoadError, NoLayers, PayError, RequestError};
 
 /// An error from a [`Client`](crate::Client) or a [`Purse`](crate::Purse).
 #[derive(Debug, thiserror::Error)]
@@ -28,6 +28,11 @@ pub enum Error {
     /// A note handed over does not carry the mint's signature.
     #[error("a note is not signed by its mint: {0}")]
     Note(#[from] NoteError),
+    /// An answer to a transfer is not the mint's: it does not hold the
+    /// notes the transfer asks for, signed by the mint. A purse keeps none
+    /// of it.
+    #[error(transparent)]
+    Answer(#[from] AnswerError),
     /// The mint's info lists no layers.
     #[error(transparent)]
     NoLayers(#[from] NoLayers),

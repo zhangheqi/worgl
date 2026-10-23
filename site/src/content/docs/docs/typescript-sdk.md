@@ -69,6 +69,13 @@ run purses against a real server.
   save fails, the change is undone and the call rejects. After a `busy`
   answer it waits as long as the mint's `Retry-After` asks, up to 30
   seconds, before the next try.
+- Before it keeps an answer, the purse checks it against the keys of the
+  transfer's mint, read after the answer: one note for each of the
+  transfer's outputs, with that output's amount and key, signed by the mint.
+  It keeps none of an answer that is not the mint's, such as a forged note
+  from a server that is not the mint's, nor of one whose keys it cannot
+  read. The transfer is listed in `submitted.refused` with outcome `kept`,
+  and one the purse made stays outgoing, for `settle` to send again.
 - `purse.refresh(mint)` pays the notes about to expire back to the purse,
   each at a random moment before the next rotation, and resends the
   outgoing transfers that must land before it. `planRefresh` and `submit`

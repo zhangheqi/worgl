@@ -26,7 +26,8 @@
 //! 2. The payer calls [`Holder::pay`] and returns the [`Payment`]: signed
 //!    transfers, each spending one of its notes, with a time to submit each.
 //! 3. The payee checks it with [`PaymentRequest::check`], submits each
-//!    transfer at its time, takes the new notes in with [`Holder::absorb`],
+//!    transfer at its time, records each answer with [`Holder::settle`],
+//!    which checks it against the mint's keys and takes the new notes in,
 //!    and hands the rest of the answers, [`Holder::theirs`], back to the
 //!    payer: its change.
 //! 4. The payer checks their signatures and takes them in with
@@ -66,7 +67,8 @@
 //! request.check(&payment)?;
 //! for transfer in &payment.transfers {
 //!     let answer = mint.transfer(&transfer.request)?;
-//!     bob.absorb(&answer);
+//!     // Bob checks the answer against the mint's keys and keeps his notes.
+//!     bob.settle(mint.keys(), &transfer.request, &answer)?;
 //!     // Bob hands Alice the rest, her change; she checks it and keeps it.
 //!     let change = bob.theirs(&answer);
 //!     for note in &change {
@@ -94,8 +96,8 @@ mod payment;
 mod random;
 
 pub use holder::{
-    Balance, Holder, LoadError, MAX_REQUESTED_NOTES, MadePayment, PAID_KEYS_KEPT, PayError,
-    REFRESH_MARGIN_SECS, RequestError,
+    AnswerError, Balance, Holder, LoadError, MAX_REQUESTED_NOTES, MadePayment, PAID_KEYS_KEPT,
+    PayError, REFRESH_MARGIN_SECS, RequestError,
 };
 pub use mint::{MintInfo, MintView, NoLayers, NoteState, Schedule};
 pub use payment::{CheckError, Payment, PaymentRequest, ScheduledTransfer, Spacing};
