@@ -273,7 +273,10 @@ describe('browser store', () => {
         ...(await tab.pay(await payee.request(server.mint, 5n))).transfers,
       ];
       const paused = pauseAfterLoad(store);
-      const submitting = tab.submit(transfers);
+      const steps: string[] = [];
+      const submitting = tab.submit(transfers, {
+        onProgress: (progress) => steps.push(`${progress.step} ${progress.index}`),
+      });
       await paused.loaded;
       await navigator.locks.request(`worgl:${name}`, { steal: true }, async () => {});
       await (await open(name)).request(server.mint, 1n);
@@ -283,6 +286,8 @@ describe('browser store', () => {
       // it, and the second transfer goes on.
       const submitted = await submitting;
       assert.deepEqual([submitted.answered, submitted.value, submitted.refused], [2, 6n, []]);
+      assert.deepEqual(submitted.unsent, []);
+      assert.deepEqual(steps, ['sending 0', 'answered 0', 'sending 1', 'answered 1']);
       assert.deepEqual(tab.outgoing(), []);
       const saved = await (await open(name)).balance(server.mint);
       assert.deepEqual([saved.outgoing, saved.held, saved.requested], [0n, 6n, 1n]);
