@@ -64,6 +64,9 @@
 //! let request = bob.request(&view(&mint)?, 5)?;
 //! let payment = alice.pay(&view(&mint)?, &request, Spacing::default())?;
 //! request.check(&payment)?;
+//! // Until the mint answers, 5 is on its way to Bob and 3 back to Alice.
+//! let balance = alice.balance(&view(&mint)?);
+//! assert_eq!((balance.sending, balance.change, balance.total()), (5, 3, 3));
 //! for transfer in &payment.transfers {
 //!     let answer = mint.transfer(&transfer.request)?;
 //!     bob.absorb(&answer);
@@ -87,6 +90,12 @@
 //! until the next rotation. The view holds the info's layers, which no clock
 //! moves, so read the info again after a rotation. [`Holder::refresh`] keeps
 //! notes alive by paying the ones about to expire to the holder itself.
+//!
+//! [`Holder::balance`] splits what a holder has at a mint into parts that do
+//! not overlap: what it holds, what its transfers not yet answered pay
+//! others and pay it back, and what it asked payers for. Its
+//! [total](Balance::total) adds what it holds and what comes back to it as
+//! change and refreshes, counting no note twice.
 
 mod holder;
 mod mint;

@@ -188,7 +188,8 @@ impl<S: Store> Purse<S> {
         self.lock().clone()
     }
 
-    /// Value held at `mint`, by what it can do now, from the mint's info.
+    /// Value this purse has at `mint`, in parts that do not overlap (see
+    /// [`Balance`]), from the mint's info.
     pub async fn balance(&self, mint: &PublicKey) -> Result<Balance, Error> {
         let view = self.client.view(mint).await?;
         Ok(self.lock().balance(&view))

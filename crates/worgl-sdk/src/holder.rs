@@ -2,7 +2,7 @@
 //! signed but not seen land.
 
 use std::cmp::Reverse;
-use std::collections::{HashSet, VecDeque};
+use std::collections::{HashMap, HashSet, VecDeque};
 
 use serde::{Deserialize, Serialize};
 use worgl::{Denominations, HolderKey, Note, Output, PolicyError, PublicKey, TransferRequest};
@@ -119,25 +119,93 @@ pub struct MadePayment {
     pub owed: Vec<Note>,
 }
 
-/// Value a holder has at one mint, by what it can do now.
+/// Value a holder has at one mint, in parts that do not overlap: each unit
+/// of value counts in exactly one of them.
+///
+/// - Held now: [`spendable`](Self::spendable), [`frozen`](Self::frozen) and
+///   [`unknown`](Self::unknown), together [`held`](Self::held).
+/// - On its way out: [`sending`](Self::sending), what transfers not yet
+///   answered pay others.
+/// - On its way in, by where it comes from: [`change`](Self::change) and
+///   [`refreshing`](Self::refreshing), what those transfers pay back to this
+///   holder, and [`requested`](Self::requested), from payers.
+///
+/// [`total`](Self::total), the value held plus change and refreshing, is
+/// what the holder has at the mint. Paying lowers it by the amount paid,
+/// which counts as sending until the transfers are answered; submitting
+/// them, settling their answers, refreshing and asking to be paid leave it
+/// as it is. Taking in a payment raises it by the value that counted as
+/// requested, and a rotation lowers it by the notes held in the layer it
+/// drops. [Cancelling](Holder::cancel) a transfer raises it by what the
+/// transfer paid others, since the note it spends is back;
+/// [forgetting](Holder::forget) one lowers it by its change. Either way the
+/// change moves to unconfirmed.
+///
+/// Four more fields overlap those parts, or may, so a screen adds none of
+/// them in:
+///
+/// - [`expiring`](Self::expiring) is part of spendable and frozen.
+/// - [`outgoing`](Self::outgoing), the notes those transfers spend, is
+///   sending, change and refreshing together, plus any of their notes for
+///   this holder taken in before the transfer was settled, such as change
+///   handed over in part.
+/// - [`expected`](Self::expected), every key handed out and not yet paid, is
+///   requested, change and refreshing together.
+/// - [`unconfirmed`](Self::unconfirmed) comes only if the mint applied the
+///   transfers dropped or cancelled after all. A cancelled transfer's note
+///   is held again, and the mint applied that transfer only if it spent the
+///   note, so its change would come instead of value counted as held, never
+///   on top of it.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Balance {
-    /// Can be spent now.
+    /// Held, and can be spent now.
     pub spendable: u128,
-    /// In the last layer: spendable after the next rotation.
+    /// Held in the last layer: spendable after the next rotation.
     pub frozen: u128,
     /// Part of the above that dies at the next rotation unless refreshed.
     pub expiring: u128,
-    /// In notes the view cannot place: read the mint's info again.
+    /// Held in notes the view cannot place: read the mint's info again.
     pub unknown: u128,
-    /// In notes spent by transfers not yet answered.
-    pub outgoing: u128,
-    /// Expected from keys handed out and not yet paid.
-    pub expected: u128,
+    /// What transfers not yet answered pay to keys that are not this
+    /// holder's: its payees' notes.
+    #[serde(default)]
+    pub sending: u128,
+    /// What transfers not yet answered that pay others too pay back to this
+    /// holder: the change of its payments.
+    #[serde(default)]
+    pub change: u128,
+    /// What transfers not yet answered that pay this holder alone pay it,
+    /// such as those [`Holder::refresh`] plans.
+    #[serde(default)]
+    pub refreshing: u128,
+    /// Asked for in payment requests and not yet received.
+    #[serde(default)]
+    pub requested: u128,
     /// Change of transfers dropped or cancelled, which comes only if the
-    /// counterparty hands it over: see [`Holder::forget`].
+    /// counterparty hands it over: see [`Holder::forget`]. It is in neither
+    /// held nor the total: after a [cancel](Holder::cancel), it comes only
+    /// if the mint spent the note taken back.
     #[serde(default)]
     pub unconfirmed: u128,
+    /// In notes spent by transfers not yet answered. It overlaps sending,
+    /// change and refreshing, which say where that value goes.
+    pub outgoing: u128,
+    /// Expected from keys handed out and not yet paid: requested, change and
+    /// refreshing together.
+    pub expected: u128,
+}
+
+impl Balance {
+    /// Value held now: spendable, frozen and unknown together.
+    pub fn held(&self) -> u128 {
+        self.spendable + self.frozen + self.unknown
+    }
+
+    /// Value the holder has at the mint: held now, or on its way back as
+    /// change or refreshing.
+    pub fn total(&self) -> u128 {
+        self.held() + self.change + self.refreshing
+    }
 }
 
 /// A payment request cannot be made.
@@ -968,7 +1036,16 @@ impl Holder {
         lost
     }
 
-    /// Value held at `mint`, by what it can do now.
+    /// Value this holder has at `mint`, in parts that do not overlap: what
+    /// it holds, what its transfers not yet answered pay others and pay it
+    /// back, and what it asked payers for. See [`Balance`].
+    ///
+    /// An output of such a transfer is this holder's when its key is that of
+    /// a note held, a note expected or unconfirmed change. A transfer whose
+    /// outputs are all this holder's, as a refresh's are, pays it back as
+    /// refreshing; any other pays it back as change. That goes by the
+    /// transfers alone, not the [payments](Self::payments) kept, so a store
+    /// the first release saved, which keeps none, splits the same way.
     pub fn balance(&self, mint: &MintView) -> Balance {
         let mut balance = Balance::default();
         for held in &self.notes {
@@ -994,14 +1071,41 @@ impl Holder {
                 NoteState::Expired | NoteState::OtherMint => {}
             }
         }
+        let own: HashSet<PublicKey> = self
+            .notes
+            .iter()
+            .map(|h| *h.note.holder())
+            .chain(self.expected.iter().map(|e| e.key.public_key()))
+            .chain(self.unconfirmed.iter().map(|u| u.change.key.public_key()))
+            .collect();
+        // The keys of this holder's that transfers not yet answered pay,
+        // each with whether its transfer pays this holder alone.
+        let mut paid_back = HashMap::new();
         for outgoing in &self.outgoing {
-            if outgoing.spends.note.issuer() == &mint.issuer {
-                balance.outgoing += u128::from(outgoing.spends.note.amount());
+            if outgoing.spends.note.issuer() != &mint.issuer {
+                continue;
+            }
+            balance.outgoing += u128::from(outgoing.spends.note.amount());
+            let outputs = &outgoing.request.outputs;
+            let alone = outputs.iter().all(|o| own.contains(&o.holder));
+            for output in outputs {
+                if own.contains(&output.holder) {
+                    paid_back.insert(output.holder, alone);
+                } else {
+                    balance.sending += u128::from(output.amount);
+                }
             }
         }
         for expected in &self.expected {
-            if expected.mint == mint.issuer {
-                balance.expected += u128::from(expected.amount);
+            if expected.mint != mint.issuer {
+                continue;
+            }
+            let value = u128::from(expected.amount);
+            balance.expected += value;
+            match paid_back.get(&expected.key.public_key()) {
+                Some(true) => balance.refreshing += value,
+                Some(false) => balance.change += value,
+                None => balance.requested += value,
             }
         }
         for unconfirmed in &self.unconfirmed {

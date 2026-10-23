@@ -174,6 +174,59 @@ describe('purse', () => {
     assert.equal(submitted.theirs.length, request.notes.length);
   });
 
+  test('a balance adds up through a payment, a refresh and a cancel', async () => {
+    // Its own server, since it rotates the mint twice.
+    const own = await TestServer.start();
+    try {
+      const open = () => Purse.open(own.client(), quick);
+      const [alice, bob, carol] = [await open(), await open(), await open()];
+      // The parts that never overlap, once the sums are checked against them.
+      const parts = async (purse: Purse): Promise<bigint[]> => {
+        const b = await purse.balance(own.mint);
+        assert.equal(b.held, b.spendable + b.frozen + b.unknown);
+        assert.equal(b.total, b.held + b.change + b.refreshing);
+        assert.equal(b.outgoing, b.sending + b.change + b.refreshing);
+        assert.equal(b.expected, b.requested + b.change + b.refreshing);
+        return [b.held, b.sending, b.change, b.refreshing, b.requested, b.unconfirmed];
+      };
+      await own.fund(alice, 12n, 8n);
+      assert.deepEqual(await parts(alice), [12n, 0n, 0n, 0n, 0n, 0n]);
+
+      // Bob asks for 3; Alice pays from her 4 and submits it herself.
+      const request = await bob.request(own.mint, 3n);
+      assert.deepEqual(await parts(bob), [0n, 0n, 0n, 0n, 3n, 0n]);
+      const payment = await alice.pay(request, NO_SPACING);
+      assert.deepEqual(await parts(alice), [8n, 3n, 1n, 0n, 0n, 0n]);
+      assert.equal((await alice.balance(own.mint)).total, 9n);
+      const submitted = await alice.submit(payment.transfers);
+      allAnswered(submitted, 1);
+      assert.deepEqual(await parts(alice), [9n, 0n, 0n, 0n, 0n, 0n]);
+      assert.equal(await bob.accept(submitted.theirs), 3n);
+      assert.deepEqual(await parts(bob), [3n, 0n, 0n, 0n, 0n, 0n]);
+
+      // The 8 is about to die; refreshed, it is on its way back.
+      await own.rotate();
+      await own.rotate();
+      const plan = await alice.planRefresh(own.mint);
+      assert.equal(plan.length, 1);
+      assert.deepEqual(await parts(alice), [1n, 0n, 0n, 8n, 0n, 0n]);
+      allAnswered(await alice.submit(now(plan)), 1);
+      assert.deepEqual(await parts(alice), [9n, 0n, 0n, 0n, 0n, 0n]);
+
+      // She pays Carol 2 from the 8, then cancels: the 8 is back, and its
+      // change may still come.
+      const asked = await carol.request(own.mint, 2n);
+      const cancelled = await alice.pay(asked, NO_SPACING);
+      assert.deepEqual(await parts(alice), [1n, 2n, 6n, 0n, 0n, 0n]);
+      assert.equal((await alice.balance(own.mint)).total, 7n);
+      assert.equal(await alice.cancel(cancelled.transfers[0]!.request), true);
+      assert.deepEqual(await parts(alice), [9n, 0n, 0n, 0n, 0n, 6n]);
+      assert.equal((await alice.balance(own.mint)).total, 9n);
+    } finally {
+      await own.stop();
+    }
+  });
+
   test('the payee hands back change the mint no longer answers for', async () => {
     // Two receipts, kept no minimum time, stand in for a mint whose receipts
     // many transfers pushed out.

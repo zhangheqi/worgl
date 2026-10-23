@@ -5,7 +5,7 @@ use std::collections::HashSet;
 use proptest::prelude::*;
 use worgl::{HolderKey, Issuer, IssuerKey, LedgerConfig, Note, Output, Policy};
 use worgl_sdk::{
-    CheckError, Holder, MintInfo, MintView, NoteState, PayError, Payment, PaymentRequest,
+    Balance, CheckError, Holder, MintInfo, MintView, NoteState, PayError, Payment, PaymentRequest,
     REFRESH_MARGIN_SECS, Schedule, Spacing,
 };
 
@@ -64,9 +64,27 @@ fn settle_all(holder: &mut Holder, payment: &Payment, answers: &[Vec<Note>]) -> 
         .sum()
 }
 
-fn total(holder: &Holder, view: &MintView) -> u128 {
-    let b = holder.balance(view);
-    b.spendable + b.frozen + b.unknown
+/// A holder's balance at `issuer`, once its sums are checked against its
+/// parts.
+fn balance(holder: &Holder, issuer: &Issuer) -> Balance {
+    let b = holder.balance(&view(issuer));
+    assert_eq!(b.expected, b.requested + b.change + b.refreshing, "{b:?}");
+    assert!(b.expiring <= b.spendable + b.frozen, "{b:?}");
+    assert!(b.outgoing >= b.sending + b.change + b.refreshing, "{b:?}");
+    b
+}
+
+/// The parts of a balance, which never overlap: held, sending, change,
+/// refreshing and requested; then unconfirmed, which is apart from them.
+fn parts(b: &Balance) -> [u128; 6] {
+    [
+        b.held(),
+        b.sending,
+        b.change,
+        b.refreshing,
+        b.requested,
+        b.unconfirmed,
+    ]
 }
 
 #[test]
@@ -241,7 +259,7 @@ fn refreshing_keeps_notes_alive() {
     mint.rotate().unwrap();
     let v = view(&mint);
     assert_eq!(alice.prune(&v), 6 - refreshed);
-    assert_eq!(total(&alice, &v), refreshed);
+    assert_eq!(alice.balance(&v).held(), refreshed);
     let note = *alice.notes().next().unwrap();
     assert!(matches!(
         mint.status(&note),
@@ -383,6 +401,10 @@ fn taking_answers_settles_a_transfer_only_once_all_its_change_is_back() {
     assert_eq!(alice.take_answers(&change[..1]), first);
     assert_eq!(alice.outgoing().count(), 1);
     assert_eq!(alice.at_stake(transfer), Some(7 - first));
+    // The change taken in counts as held, and the rest as change, once each.
+    let b = balance(&alice, &mint);
+    assert_eq!(parts(&b), [8 + first, 1, 7 - first, 0, 0, 0]);
+    assert_eq!((b.total(), b.outgoing), (15, 8));
     assert_eq!(alice.take_answers(&change[1..]), 7 - first);
     assert_eq!(alice.outgoing().count(), 0);
 
@@ -560,6 +582,109 @@ fn cancelling_returns_the_note() {
         (8, 0, 0, 5)
     );
     assert_eq!(alice.payments().count(), 0);
+}
+
+#[test]
+fn a_balance_adds_up_through_a_payment_a_refresh_and_a_cancel() {
+    let mut mint = issuer(4);
+    let (mut alice, mut bob, mut carol) = (Holder::new(), Holder::new(), Holder::new());
+    fund(&mut mint, &mut alice, &[8, 4]);
+    assert_eq!(parts(&balance(&alice, &mint)), [12, 0, 0, 0, 0, 0]);
+
+    // Bob asks for 3, which is not his yet.
+    let request = bob.request(&view(&mint), 3).unwrap();
+    let b = balance(&bob, &mint);
+    assert_eq!(parts(&b), [0, 0, 0, 0, 3, 0]);
+    assert_eq!(b.total(), 0);
+
+    // Alice pays from her 4: 3 is on its way to Bob, 1 back to her.
+    let payment = alice
+        .pay(&view(&mint), &request, Spacing::default())
+        .unwrap();
+    let b = balance(&alice, &mint);
+    assert_eq!(parts(&b), [8, 3, 1, 0, 0, 0]);
+    assert_eq!((b.total(), b.outgoing, b.expected), (9, 4, 1));
+
+    // She submits it: her change is back, and Bob's 3 is his once handed over.
+    let answers = submit(&mut mint, &payment);
+    settle_all(&mut alice, &payment, &answers);
+    let b = balance(&alice, &mint);
+    assert_eq!(parts(&b), [9, 0, 0, 0, 0, 0]);
+    assert_eq!((b.frozen, b.total(), b.outgoing), (1, 9, 0));
+    assert_eq!(parts(&balance(&bob, &mint)), [0, 0, 0, 0, 3, 0]);
+    let owed = alice.payments().next().unwrap().owed.clone();
+    assert_eq!(bob.take_answers(&owed), 3);
+    let b = balance(&bob, &mint);
+    assert_eq!(parts(&b), [3, 0, 0, 0, 0, 0]);
+    assert_eq!(b.total(), 3);
+
+    // The 8 is about to die; refreshed, it is on its way back to her.
+    mint.rotate().unwrap();
+    mint.rotate().unwrap();
+    let refreshes = alice.refresh(&view(&mint), 0);
+    assert_eq!(refreshes.len(), 1);
+    let b = balance(&alice, &mint);
+    assert_eq!(parts(&b), [1, 0, 0, 8, 0, 0]);
+    assert_eq!((b.total(), b.outgoing, b.expected), (9, 8, 8));
+    let answer = mint.transfer(&refreshes[0].request).unwrap();
+    assert_eq!(alice.settle(&refreshes[0].request, &answer), 8);
+    assert_eq!(parts(&balance(&alice, &mint)), [9, 0, 0, 0, 0, 0]);
+
+    // She pays Carol 2 from the 8, then cancels: the 8 is back, and its
+    // change is unconfirmed, outside the total.
+    let request = carol.request(&view(&mint), 2).unwrap();
+    let payment = alice
+        .pay(&view(&mint), &request, Spacing::default())
+        .unwrap();
+    let b = balance(&alice, &mint);
+    assert_eq!(parts(&b), [1, 2, 6, 0, 0, 0]);
+    assert_eq!(b.total(), 7);
+    assert!(alice.cancel(&payment.transfers[0].request));
+    let b = balance(&alice, &mint);
+    assert_eq!(parts(&b), [9, 0, 0, 0, 0, 6]);
+    assert_eq!((b.total(), b.outgoing, b.expected), (9, 0, 0));
+    assert_eq!(parts(&balance(&carol, &mint)), [0, 0, 0, 0, 2, 0]);
+}
+
+#[test]
+fn a_cancelled_transfers_change_comes_only_in_place_of_its_note() {
+    let mut mint = issuer(4);
+    let (mut alice, mut bob, mut carol) = (Holder::new(), Holder::new(), Holder::new());
+    fund(&mut mint, &mut alice, &[8]);
+    let request = bob.request(&view(&mint), 2).unwrap();
+    let payment = alice
+        .pay(&view(&mint), &request, Spacing::default())
+        .unwrap();
+    assert!(alice.cancel(&payment.transfers[0].request));
+    let b = balance(&alice, &mint);
+    assert_eq!(parts(&b), [8, 0, 0, 0, 0, 6]);
+    assert_eq!(b.total(), 8);
+
+    // Bob submits it after all. The mint applies it by spending the 8 taken
+    // back, so the 6 comes in its place.
+    let eight = *alice.notes().next().unwrap();
+    let answer = mint.transfer(&payment.transfers[0].request).unwrap();
+    assert!(matches!(mint.status(&eight), Ok(worgl::NoteStatus::Spent)));
+    assert_eq!(alice.absorb(&answer), 6);
+
+    // Alice counts the 8 until the mint refuses it, as any note spent
+    // elsewhere; then she has 6, never the 14 held and unconfirmed added up
+    // to.
+    let request = carol.request(&view(&mint), 8).unwrap();
+    let refused = alice
+        .pay(&view(&mint), &request, Spacing::default())
+        .unwrap();
+    let [transfer] = refused.transfers.as_slice() else {
+        panic!("8 is paid from the 8 alone");
+    };
+    assert!(matches!(
+        mint.transfer(&transfer.request),
+        Err(worgl::Error::Spent(_))
+    ));
+    assert!(alice.forget(&transfer.request));
+    let b = balance(&alice, &mint);
+    assert_eq!(parts(&b), [6, 0, 0, 0, 0, 0]);
+    assert_eq!(b.total(), 6);
 }
 
 #[test]
@@ -817,6 +942,7 @@ fn a_store_of_format_1_loads() {
     }
     let old = Holder::from_json(&saved.to_string()).unwrap();
     assert_eq!(old.balance(&view(&mint)), alice.balance(&view(&mint)));
+    assert_eq!(parts(&balance(&old, &mint)), [0, 3, 5, 0, 0, 0]);
     assert_eq!(old.outgoing().count(), 1);
     assert_eq!(old.payments().count(), 0);
 }
@@ -952,6 +1078,11 @@ proptest! {
         match alice.pay(&view(&mint), &request, Spacing::default()) {
             Ok(payment) => {
                 prop_assert_eq!(request.check(&payment), Ok(()));
+                // The amount is on its way to Bob, and the rest is Alice's.
+                let b = balance(&alice, &mint);
+                prop_assert_eq!(b.sending, u128::from(amount));
+                prop_assert_eq!(b.outgoing, b.sending + b.change);
+                prop_assert_eq!(b.total(), held - u128::from(amount));
                 let mut keys = HashSet::new();
                 for t in &payment.transfers {
                     prop_assert_eq!(t.request.inputs.len(), 1);
@@ -963,7 +1094,7 @@ proptest! {
                 let received: u128 = answers.iter().map(|n| bob.absorb(n)).sum();
                 prop_assert_eq!(received, u128::from(amount));
                 settle_all(&mut alice, &payment, &answers);
-                prop_assert_eq!(total(&alice, &view(&mint)), held - u128::from(amount));
+                prop_assert_eq!(balance(&alice, &mint).held(), held - u128::from(amount));
                 prop_assert_eq!(alice.outgoing().count(), 0);
             }
             Err(PayError::Unaffordable { spendable, needed }) => {

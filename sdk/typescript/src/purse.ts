@@ -72,25 +72,64 @@ export interface ScheduledTransfer {
   request: string;
 }
 
-/** Value held at one mint, by what it can do now. */
+/**
+ * Value a purse has at one mint, in parts that do not overlap: each unit of
+ * value counts in exactly one of `held` (`spendable`, `frozen` and
+ * `unknown`), `sending`, `change`, `refreshing` and `requested`.
+ *
+ * `total`, what is held plus change and refreshing, is what the purse has
+ * there. Paying lowers it by the amount paid, which counts as sending until
+ * the transfers are answered; submitting them, settling their answers,
+ * refreshing and asking to be paid leave it as it is. Taking in a payment
+ * raises it by the value that counted as requested, and a rotation lowers
+ * it by the notes held in the layer it drops. Cancelling a transfer raises
+ * it by what the transfer paid others, since the note it spends is back;
+ * forgetting one lowers it by its change. Either way the change moves to
+ * unconfirmed.
+ *
+ * `expiring` is part of what is held, `outgoing` and `expected` sum some of
+ * the parts, and `unconfirmed` may come instead of value held, so a screen
+ * adds none of them in.
+ */
 export interface Balance {
-  /** Can be spent now. */
+  /** Held now, or on its way back as change or refreshing. */
+  total: bigint;
+  /** Held now: spendable, frozen and unknown together. */
+  held: bigint;
+  /** Held, and can be spent now. */
   spendable: bigint;
-  /** Frozen in the last layer until the next rotation. */
+  /** Held frozen in the last layer until the next rotation. */
   frozen: bigint;
-  /** Dies at the next rotation unless refreshed (spendable or frozen). */
+  /** Held, and dies at the next rotation unless refreshed. */
   expiring: bigint;
-  /** In notes newer than the mint's info. */
+  /** Held in notes newer than the mint's info. */
   unknown: bigint;
-  /** In transfers sent and not yet seen answered. */
-  outgoing: bigint;
-  /** Asked for and not yet received. */
-  expected: bigint;
+  /** What transfers not yet answered pay others: the payees' notes. */
+  sending: bigint;
+  /** What transfers not yet answered that pay others too pay back: their change. */
+  change: bigint;
+  /**
+   * What transfers not yet answered that pay this purse alone pay it back,
+   * such as the refreshes {@link Purse.planRefresh} plans.
+   */
+  refreshing: bigint;
+  /** Asked for in payment requests and not yet received. */
+  requested: bigint;
   /**
    * Change of transfers dropped or cancelled, which comes only if the
-   * counterparty hands it over: see {@link Purse.forget}.
+   * counterparty hands it over: see {@link Purse.forget}. It is in neither
+   * `held` nor `total`: after a {@link Purse.cancel}, it comes only if the
+   * mint spent the note taken back.
    */
   unconfirmed: bigint;
+  /**
+   * In notes spent by transfers not yet answered: sending, change and
+   * refreshing together, plus any of their notes for this purse taken in
+   * before they were settled, such as change handed over in part.
+   */
+  outgoing: bigint;
+  /** Expected from keys handed out and not yet paid: requested, change and refreshing together. */
+  expected: bigint;
 }
 
 /**
@@ -311,19 +350,25 @@ export class Purse {
     });
   }
 
-  /** Value held at `mint`, from its info. */
+  /** Value this purse has at `mint`, in parts that do not overlap, from its info. */
   async balance(mint: string): Promise<Balance> {
     const info = await this.client.infoText(mint);
     const balance = this.#holder.balance(info);
     try {
       return {
+        total: balance.total,
+        held: balance.held,
         spendable: balance.spendable,
         frozen: balance.frozen,
         expiring: balance.expiring,
         unknown: balance.unknown,
+        sending: balance.sending,
+        change: balance.change,
+        refreshing: balance.refreshing,
+        requested: balance.requested,
+        unconfirmed: balance.unconfirmed,
         outgoing: balance.outgoing,
         expected: balance.expected,
-        unconfirmed: balance.unconfirmed,
       };
     } finally {
       balance.free();

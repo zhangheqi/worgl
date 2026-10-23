@@ -63,7 +63,7 @@ enum Command {
         /// The mint's issuer key.
         mint: PublicKey,
     },
-    /// Show what the purse holds at a mint.
+    /// Show what the purse has at a mint: held, and on its way in or out.
     Balance {
         /// The mint's issuer key.
         mint: PublicKey,
@@ -588,34 +588,50 @@ async fn info(client: &Client, mint: &PublicKey) -> Result<()> {
 async fn balance(purse: &Purse<Vault>, mint: &PublicKey) -> Result<()> {
     // For the time to the next rotation, by the mint's clock.
     let (view, now) = purse.client().view_and_time(mint).await?;
+    // The total, then parts that do not overlap; expiring is part of what is
+    // held, and unconfirmed change is in no total.
     let balance = purse.holder().balance(&view);
+    println!(
+        "total      {}  (held, plus change and refreshes on their way back)",
+        balance.total()
+    );
     println!("spendable  {}", balance.spendable);
     println!(
         "frozen     {}  (moves after the next rotation)",
         balance.frozen
     );
+    if balance.unknown > 0 {
+        println!(
+            "unknown    {}  (newer than the mint's info)",
+            balance.unknown
+        );
+    }
     println!(
         "expiring   {}  (dies at the next rotation unless refreshed)",
         balance.expiring
     );
     println!(
-        "outgoing   {}  (sent, not yet seen answered; see `worgl settle`)",
-        balance.outgoing
+        "change     {}  (from payments not yet seen answered)",
+        balance.change
+    );
+    if balance.refreshing > 0 {
+        println!(
+            "refreshing {}  (refreshes not yet seen answered; see `worgl settle`)",
+            balance.refreshing
+        );
+    }
+    println!(
+        "sending    {}  (paid, not yet seen answered; see `worgl settle`)",
+        balance.sending
     );
     println!(
-        "expected   {}  (asked for, not yet received)",
-        balance.expected
+        "requested  {}  (asked for, not yet received)",
+        balance.requested
     );
     if balance.unconfirmed > 0 {
         println!(
             "unconfirmed {}  (change of dropped or cancelled transfers, kept if handed back)",
             balance.unconfirmed
-        );
-    }
-    if balance.unknown > 0 {
-        println!(
-            "unknown    {}  (newer than the mint's info)",
-            balance.unknown
         );
     }
     if let Some(left) = view.until_rotation(now) {

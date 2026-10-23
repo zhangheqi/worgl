@@ -78,11 +78,13 @@ mint answers with a note of 8, bound to a fresh key in Alice's purse.
 
 ```text
 Minted 8 in 1 notes.
+total      8  (held, plus change and refreshes on their way back)
 spendable  8
 frozen     0  (moves after the next rotation)
 expiring   0  (dies at the next rotation unless refreshed)
-outgoing   0  (sent, not yet seen answered; see `worgl settle`)
-expected   0  (asked for, not yet received)
+change     0  (from payments not yet seen answered)
+sending    0  (paid, not yet seen answered; see `worgl settle`)
+requested  0  (asked for, not yet received)
 ```
 
 ## 6. Pay Bob 5
@@ -110,7 +112,9 @@ Kept 3.
 - `request` asks for 5 as two notes, 4 and 1, each to a fresh key of Bob's.
 - `pay` signs one transfer that spends Alice's 8: 4 and 1 to Bob's keys, and
   3 in change to fresh keys of her own. The payment's id, which differs
-  every time, names it for `worgl outgoing` and `worgl export`.
+  every time, names it for `worgl outgoing` and `worgl export`. Until the
+  mint's answer comes back, `worgl balance` shows Alice's 3 as `change` and
+  Bob's 5 as `sending`, and her total as 3.
 - `receive` checks the payment against the request, submits it to the mint
   and keeps Bob's new notes. The mint's answer holds Alice's change too,
   which it writes to `change.json` for her.

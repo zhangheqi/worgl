@@ -243,7 +243,7 @@ async fn a_payment_from_the_command_line() {
     assert!(setup.balance("bob.worgl").await.contains("spendable  5"));
     let alice = setup.balance("alice.worgl").await;
     assert!(alice.contains("spendable  3"), "{alice}");
-    assert!(alice.contains("outgoing   0"), "{alice}");
+    assert!(alice.contains("sending    0"), "{alice}");
 
     let notes = setup.ok("bob.worgl", &["notes"]).await.stdout;
     assert!(notes.contains(&mint), "{notes}");
@@ -449,7 +449,7 @@ async fn the_payee_hands_back_the_change() {
         settled.stderr
     );
     let alice = setup.balance("alice.worgl").await;
-    assert!(alice.contains("outgoing   0"), "{alice}");
+    assert!(alice.contains("sending    0"), "{alice}");
     assert!(alice.contains("unconfirmed 5"), "{alice}");
 
     // The change Bob sent back is still taken in.
@@ -457,7 +457,7 @@ async fn the_payee_hands_back_the_change() {
     assert_eq!(accepted.stderr.trim(), "Kept 5.");
     let alice = setup.balance("alice.worgl").await;
     assert!(alice.contains("frozen     5"), "{alice}");
-    assert!(alice.contains("outgoing   0"), "{alice}");
+    assert!(alice.contains("sending    0"), "{alice}");
     assert!(!alice.contains("unconfirmed"), "{alice}");
     let nothing = setup.ok("alice.worgl", &["settle"]).await;
     assert!(
@@ -542,7 +542,7 @@ async fn a_payment_settled_too_late_is_dropped() {
         again.stderr
     );
     let alice = setup.balance("alice.worgl").await;
-    assert!(alice.contains("outgoing   0"), "{alice}");
+    assert!(alice.contains("sending    0"), "{alice}");
     assert!(alice.contains("unconfirmed 3"), "{alice}");
 }
 
@@ -618,8 +618,10 @@ async fn a_transfer_into_a_full_layer_is_cancelled() {
         settled.stderr
     );
     let alice = setup.balance("alice.worgl").await;
+    assert!(alice.starts_with("total      8  "), "{alice}");
     assert!(alice.contains("spendable  8"), "{alice}");
-    assert!(alice.contains("outgoing   0"), "{alice}");
+    assert!(alice.contains("change     0"), "{alice}");
+    assert!(alice.contains("sending    0"), "{alice}");
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -664,8 +666,10 @@ async fn a_request_is_paid_once() {
     );
     assert!(!setup.path("payment.json").exists());
     let alice = setup.balance("alice.worgl").await;
+    assert!(alice.starts_with("total      13  "), "{alice}");
     assert!(alice.contains("spendable  8"), "{alice}");
-    assert!(alice.contains("outgoing   8"), "{alice}");
+    assert!(alice.contains("change     5"), "{alice}");
+    assert!(alice.contains("sending    3"), "{alice}");
 
     // `outgoing` names it, and `export` writes it again.
     let outgoing = setup.ok("alice.worgl", &["outgoing"]).await.stdout;
@@ -733,8 +737,10 @@ async fn a_transfer_is_cancelled_or_forgotten() {
         format!("Cancelled transfer {first}: its note of 8 is back in the purse.")
     );
     let alice = setup.balance("alice.worgl").await;
+    assert!(alice.starts_with("total      13  "), "{alice}");
     assert!(alice.contains("spendable  8"), "{alice}");
-    assert!(alice.contains("outgoing   8"), "{alice}");
+    assert!(alice.contains("change     5"), "{alice}");
+    assert!(alice.contains("sending    3"), "{alice}");
     assert!(alice.contains("unconfirmed 5"), "{alice}");
 
     let forgotten = setup.ok("alice.worgl", &["forget", &second[..4]]).await;
@@ -746,8 +752,9 @@ async fn a_transfer_is_cancelled_or_forgotten() {
         forgotten.stderr
     );
     let alice = setup.balance("alice.worgl").await;
-    assert!(alice.contains("spendable  8"), "{alice}");
-    assert!(alice.contains("outgoing   0"), "{alice}");
+    assert!(alice.starts_with("total      8  "), "{alice}");
+    assert!(alice.contains("change     0"), "{alice}");
+    assert!(alice.contains("sending    0"), "{alice}");
     assert!(alice.contains("unconfirmed 10"), "{alice}");
     let nothing = setup.ok("alice.worgl", &["outgoing"]).await;
     assert!(
@@ -1064,7 +1071,7 @@ async fn refreshing_resends_a_payment_before_its_note_dies() {
         "{}",
         refreshed.stderr
     );
-    assert!(setup.balance("alice.worgl").await.contains("outgoing   0"));
+    assert!(setup.balance("alice.worgl").await.contains("sending    0"));
     setup.rotate().await;
     let received = setup
         .ok("bob.worgl", &["receive", "request.json", "payment.json"])
@@ -1191,7 +1198,7 @@ async fn the_playground_faucet_fills_a_purse() {
     let run = setup.worgl("alice.worgl", &["playground"]).await;
     assert!(!run.ok);
     assert!(run.stderr.contains("asking the faucet"), "{}", run.stderr);
-    assert!(setup.balance("alice.worgl").await.contains("expected   0 "));
+    assert!(setup.balance("alice.worgl").await.contains("requested  0 "));
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
