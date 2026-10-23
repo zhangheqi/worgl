@@ -188,7 +188,8 @@ blocks, holding the database open in an older version, rejects with
 `store_blocked` rather than waiting. What the store holds lasts until the
 site's data is cleared or a private window closes, and the browser may
 clear it to free space unless the page holds persistent storage
-(`navigator.storage.persist()`).
+(`navigator.storage.persist()`). A backup from `purse.backup`, kept outside
+the browser, restores the purse once the store is gone.
 
 ## Following a submit
 
