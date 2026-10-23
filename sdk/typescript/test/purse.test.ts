@@ -1,6 +1,7 @@
 // The TypeScript SDK against a real server on a local port.
 
 import assert from 'node:assert/strict';
+import { getEventListeners } from 'node:events';
 import { mkdtempSync, readdirSync, rmSync, statSync, writeFileSync } from 'node:fs';
 import { createServer as createHttpServer } from 'node:http';
 import { type AddressInfo } from 'node:net';
@@ -191,6 +192,44 @@ describe('client', () => {
     );
     const live = new AbortController().signal;
     assert.equal((await client.info(server.mint, { signal: live })).issuer, server.mint);
+  });
+
+  test('a signal needs no AbortSignal.any, and is let go once a call is done', async () => {
+    // As in Safari before 17.4.
+    const any = Object.getOwnPropertyDescriptor(AbortSignal, 'any')!;
+    Reflect.deleteProperty(AbortSignal, 'any');
+    try {
+      // The page's signal outlives the call, which no longer listens to it.
+      const page = new AbortController();
+      const client = server.client();
+      assert.equal((await client.info(server.mint, { signal: page.signal })).issuer, server.mint);
+      assert.deepEqual(getEventListeners(page.signal, 'abort'), []);
+
+      // Aborted on its way, a call rejects with the signal's reason.
+      const reason = new Error('left the page');
+      const fetch: typeof globalThis.fetch = (input, init) => {
+        page.abort(reason);
+        return globalThis.fetch(input, init);
+      };
+      await assert.rejects(
+        new Client(server.url, { fetch }).info(server.mint, { signal: page.signal }),
+        (error) => error === reason,
+      );
+      assert.deepEqual(getEventListeners(page.signal, 'abort'), []);
+
+      // And a purse submits with one.
+      const [alice, bob] = [await purse(), await purse()];
+      await server.fund(alice, 8n, 8n);
+      const request = await bob.request(server.mint, 5n);
+      const payment = await alice.pay(request, NO_SPACING);
+      const submitted = await alice.submit(payment.transfers, {
+        signal: new AbortController().signal,
+      });
+      allAnswered(submitted, 1);
+      assert.equal(await bob.accept(submitted.theirs), 5n);
+    } finally {
+      Object.defineProperty(AbortSignal, 'any', any);
+    }
   });
 });
 

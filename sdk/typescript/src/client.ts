@@ -318,16 +318,19 @@ export class Client {
       headers.authorization = `Bearer ${token}`;
     }
     const timeout = AbortSignal.timeout(this.#timeoutMs);
-    const init: RequestInit = {
-      method,
-      headers,
-      signal: signal === undefined ? timeout : AbortSignal.any([timeout, signal]),
-    };
+    const either = signal === undefined ? undefined : anyOf([timeout, signal]);
+    const init: RequestInit = { method, headers, signal: either?.signal ?? timeout };
     if (body !== undefined) {
       init.body = body;
     }
-    const response = await this.#fetch(`${this.baseUrl}${path}`, init);
-    const text = await response.text();
+    let response: Response;
+    let text: string;
+    try {
+      response = await this.#fetch(`${this.baseUrl}${path}`, init);
+      text = await response.text();
+    } finally {
+      either?.release();
+    }
     if (response.ok) {
       return { text, date: response.headers.get('date') };
     }
@@ -348,4 +351,33 @@ export class Client {
       retryAfter !== undefined && /^\d+$/.test(retryAfter) ? Number(retryAfter) * 1000 : undefined;
     throw new MintError(response.status, code, message, retryAfterMs);
   }
+}
+
+/**
+ * A signal that aborts once one of `signals` does, with its reason, as
+ * `AbortSignal.any` makes one, which browsers have only since Chrome 116,
+ * Firefox 124 and Safari 17.4; and `release`, which stops following them,
+ * so that a signal a page keeps for long holds no listener of each request
+ * after it is done.
+ */
+function anyOf(signals: AbortSignal[]): { signal: AbortSignal; release: () => void } {
+  const controller = new AbortController();
+  const follow = (event: Event): void => {
+    release();
+    controller.abort((event.target as AbortSignal).reason);
+  };
+  const release = (): void => {
+    for (const each of signals) {
+      each.removeEventListener('abort', follow);
+    }
+  };
+  const aborted = signals.find((each) => each.aborted);
+  if (aborted !== undefined) {
+    controller.abort(aborted.reason);
+  } else {
+    for (const each of signals) {
+      each.addEventListener('abort', follow);
+    }
+  }
+  return { signal: controller.signal, release };
 }

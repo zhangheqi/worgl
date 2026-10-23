@@ -185,8 +185,7 @@ const submitted = await alice.submit(payment.transfers, {
   mint's info plans nothing.
 
 Every `Client` call takes `{ signal }` too, and rejects with the signal's
-reason once it aborts. In a browser, passing a `signal` needs
-`AbortSignal.any`: Chrome 116, Firefox 124 or Safari 17.4.
+reason once it aborts.
 
 ## Client and errors
 
