@@ -237,7 +237,7 @@ impl Holder {
     /// the mint is asked nothing about any one note, unlike with
     /// [`note_report`].
     #[wasm_bindgen(js_name = notesAt)]
-    pub fn notes_at(&self, info: &str) -> Result<Vec<HeldNote>, JsError> {
+    pub fn notes_at(&self, info: &str) -> Result<Vec<HeldNote>, Error> {
         Ok(held_notes(&self.inner, &view(info)?))
     }
 
@@ -245,7 +245,7 @@ impl Holder {
     /// note of this holder's unless it moves first, by the mint's clock: see
     /// [`worgl_sdk::Holder::first_expiry`].
     #[wasm_bindgen(js_name = firstExpiry)]
-    pub fn first_expiry(&self, info: &str) -> Result<Option<u64>, JsError> {
+    pub fn first_expiry(&self, info: &str) -> Result<Option<u64>, Error> {
         Ok(self.inner.first_expiry(&view(info)?))
     }
 }
