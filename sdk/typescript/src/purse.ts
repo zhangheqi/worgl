@@ -559,9 +559,10 @@ export interface PurseOptions {
  * there, makes the change to that, and saves before letting go, so a note
  * another purse took in meanwhile is kept, not saved over. It never holds
  * the lock across a request to the mint. {@link settle} resends the
- * transfers of the holder saved now, and {@link backup} seals that holder.
- * Reads such as {@link notes} and {@link balance} show the holder as this
- * purse last read or saved it.
+ * transfers of the holder saved now, {@link backup} seals that holder, and
+ * {@link checkNotes} asks about its unchecked notes. Reads such as
+ * {@link notes} and {@link balance} show the holder as this purse last read
+ * or saved it.
  */
 export class Purse {
   /** The client requests go through. */
@@ -1280,7 +1281,9 @@ export class Purse {
    * spent or expired are discarded; those it reports live or unissued are
    * kept, and no longer unchecked. An unissued note may come back, as after
    * the mint restored its state from a backup. A note this purse does not
-   * hold is only reported.
+   * hold is only reported. The unchecked notes are read in turn after the
+   * changes before it and, with a store that has a lock, under the lock, so
+   * they include those another purse on the store restored.
    *
    * The mint's answers are not signed, so ask only this purse's server, the
    * mint's own. Each question shows the mint one note, from this machine's
@@ -1290,12 +1293,12 @@ export class Purse {
    * let the transfers that next spend the notes find the spent ones, which
    * the mint refuses. {@link prune} drops the expired ones without asking.
    */
-  async checkNotes(
-    notes: string[] = this.unchecked(),
-    spacing: Spacing = DEFAULT_SPACING,
-  ): Promise<Checked> {
+  async checkNotes(notes?: string[], spacing: Spacing = DEFAULT_SPACING): Promise<Checked> {
+    // Read in turn, and under the store's lock if it has one, as settle
+    // reads the transfers it resends.
+    const asked = notes ?? (await this.#current(async () => this.unchecked()));
     const checked: Checked = { value: 0n, discarded: [], kept: [], unanswered: [] };
-    for (const [index, note] of notes.entries()) {
+    for (const [index, note] of asked.entries()) {
       if (index > 0) {
         await sleep(gap(spacing) * 1000);
       }

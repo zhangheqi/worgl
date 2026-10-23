@@ -553,6 +553,34 @@ describe('browser store', () => {
       assert.equal(await requestedIn(await sealing), 1n);
       assert.equal(await requestedIn(await tab.backup(PASSPHRASE)), 1n + 2n);
     });
+
+    test('checks the notes another tab restored, as saved now', backupWaits, async () => {
+      // A purse elsewhere is backed up, then spends its note.
+      const elsewhere = await Purse.open(server.client(), quick);
+      await server.fund(elsewhere, 8n, 8n);
+      const sealed = await elsewhere.backup(PASSPHRASE);
+      const payee = await Purse.open(server.client(), quick);
+      const request = await payee.request(server.mint, 5n);
+      await payee.receive(request, await elsewhere.pay(request, NO_SPACING));
+
+      // Two tabs open the purse before a third asks for 2, and one of them
+      // restores the backup into what the third saved.
+      const name = server.url;
+      const [restoring, checking] = [await open(name), await open(name)];
+      await (await open(name)).request(server.mint, 2n);
+      const restored = await restoring.restore(await Backup.open(sealed, PASSPHRASE));
+      assert.equal(restored.notes.length, 1);
+      const balance = await (await open(name)).balance(server.mint);
+      assert.deepEqual([balance.unchecked, balance.requested], [8n, 2n]);
+
+      // The other tab asks the mint about the note restored, which it had
+      // not read, and drops it as spent.
+      assert.deepEqual(checking.unchecked(), []);
+      const checked = await checking.checkNotes(undefined, NO_SPACING);
+      assert.deepEqual(checked, { value: 8n, discarded: restored.notes, kept: [], unanswered: [] });
+      const after = await (await open(name)).balance(server.mint);
+      assert.deepEqual([after.held, after.unchecked, after.requested], [0n, 0n, 2n]);
+    });
   });
 });
 

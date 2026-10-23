@@ -138,11 +138,11 @@ the mint answers with the same notes while it keeps its answers.
   browser share an `IndexedDbStore`. Before each change a purse takes the
   lock, reads what is saved, makes the change to that and saves before
   letting go, so none saves over a note another took in; it never holds
-  the lock across a request to the mint, and `settle` resends and `backup`
-  seals what is saved now. Reads such as `notes` and `balance` show what
-  the purse last read or saved. `MemoryStore` and `FileStore` have no
-  lock, so give each purse one of its own; a store that wraps another
-  passes its `lock` on.
+  the lock across a request to the mint, and `settle` resends, `backup`
+  seals and `checkNotes` asks about what is saved now. Reads such as
+  `notes` and `balance` show what the purse last read or saved.
+  `MemoryStore` and `FileStore` have no lock, so give each purse one of its
+  own; a store that wraps another passes its `lock` on.
 
 Importing the package loads the WebAssembly module: from disk under Node,
 through `fetch` relative to the module in a browser or bundler. It needs
