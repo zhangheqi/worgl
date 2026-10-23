@@ -167,8 +167,10 @@ const submitted = await alice.submit(payment.transfers, {
   `sending`, then `answered` or `refused`, or `unsent`, with the counts so
   far. A `refused` one carries its entry of `submitted.refused` as
   `refusal`, whose `outcome` tells a transfer kept for a later `settle`
-  from one dropped or cancelled for good. An exception it throws is
-  reported as uncaught and stops nothing.
+  from one dropped or cancelled for good. The purse goes on past an
+  exception it throws and reports it as uncaught, as an event listener's
+  is: a browser logs it, and Node ends the process unless the application
+  handles `uncaughtException`.
 - `sendNow` cuts the waits short once it aborts: the transfers left go one
   after another. That gives up the spacing that keeps the mint from linking
   their notes by when they arrive (see the

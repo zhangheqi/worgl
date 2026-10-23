@@ -1052,6 +1052,31 @@ describe('submit', () => {
     assert.deepEqual(alice.outgoing(), [kept!.request]);
   });
 
+  test('goes on past an exception from onProgress, reported as uncaught', async () => {
+    const [alice, bob] = [await purse(), await purse()];
+    await server.fund(alice, 8n, 4n);
+    const request = await bob.requestAtMost(server.mint, 8n, 4n);
+    const payment = await alice.pay(request, NO_SPACING);
+    // As an application's own handler sees it; without one, Node would end.
+    const uncaught: unknown[] = [];
+    process.setUncaughtExceptionCaptureCallback((error) => uncaught.push(error));
+    const bug = new Error('a bug in the screen');
+    try {
+      const submitted = await alice.submit(payment.transfers, {
+        onProgress: (progress) => {
+          if (progress.step === 'sending') {
+            throw bug;
+          }
+        },
+      });
+      allAnswered(submitted, 2);
+      assert.equal(await bob.accept(submitted.theirs), 8n);
+    } finally {
+      process.setUncaughtExceptionCaptureCallback(null);
+    }
+    assert.deepEqual(uncaught, [bug, bug]);
+  });
+
   test('sends the rest at once when asked', async () => {
     const [alice, bob] = [await purse(), await purse()];
     await server.fund(alice, 24n, 4n);

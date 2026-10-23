@@ -316,9 +316,10 @@ export interface SubmitOptions {
    * `unsent` once submitting stopped before its turn (see
    * {@link SubmitProgress}). Each call carries the counts so far, for a
    * screen to draw "2 of 3" and when the next transfer goes. It is called
-   * synchronously, so it should return quickly. An exception it throws does
-   * not stop submitting: it is reported as uncaught, as an event listener's
-   * is.
+   * synchronously, so it should return quickly. The purse goes on past an
+   * exception it throws and reports it as uncaught, as an event listener's
+   * is: a browser logs it, and Node ends the process, as for any uncaught
+   * exception, unless the application handles `uncaughtException`.
    */
   onProgress?: (progress: SubmitProgress) => void;
   /**
