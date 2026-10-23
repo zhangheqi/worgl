@@ -10,7 +10,8 @@ included. [`worgl-client`](https://crates.io/crates/worgl-client) runs it
 over HTTP, which is what most programs want. With the `vault` feature, it
 seals a holder under a passphrase into the purse file the `worgl` command
 line keeps, and opens one; `Holder::merge` takes a backup back into a purse
-that moved on since.
+that moved on since, counting what only the backup had as unchecked until
+the mint says.
 
 ```sh
 cargo add worgl worgl-sdk

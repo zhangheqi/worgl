@@ -226,6 +226,7 @@ impl Holder {
             spendable: balance.spendable,
             frozen: balance.frozen,
             expiring: balance.expiring,
+            unchecked: balance.unchecked,
             unknown: balance.unknown,
             sending: balance.sending,
             change: balance.change,
@@ -274,6 +275,21 @@ impl Holder {
         })
     }
 
+    /// The held notes that came from another copy of the purse, which may
+    /// have spent them since, as a JSON array; see
+    /// [`worgl_sdk::Holder::unchecked`]. Only their mint can tell, and asking
+    /// it shows it each note.
+    pub fn unchecked(&self) -> String {
+        json(&self.inner.unchecked().collect::<Vec<_>>())
+    }
+
+    /// Stops doubting the held notes, a JSON array, that their mint reports
+    /// live or unissued, and returns their value; see
+    /// [`worgl_sdk::Holder::keep`].
+    pub fn keep(&mut self, notes: &str) -> Result<u128, Error> {
+        Ok(self.inner.keep(&parse::<Vec<Note>>(notes)?))
+    }
+
     /// Drops the held notes, a JSON array, that their mint reports spent or
     /// expired, and returns their value. Only on the mint's answer for each
     /// note: see [`worgl_sdk::Holder::discard`].
@@ -283,19 +299,27 @@ impl Holder {
 
     /// Takes in `other`, another copy of this holder's purse such as a
     /// backup, keeping what is the purse's in either and counting nothing
-    /// twice that the two can tell apart; returns what changed. What only
-    /// the mint can tell, and what asking it shows, is in
+    /// twice that the two can tell apart; returns what changed. What the
+    /// other copy alone had comes in unchecked, until the mint says: see
     /// [`worgl_sdk::Holder::merge`].
     pub fn merge(&mut self, other: &Holder) -> Merged {
         let merged = self.inner.merge(&other.inner);
         let each = |transfers: Vec<TransferRequest>| transfers.iter().map(json).collect();
         Merged {
             notes: json(&merged.notes),
+            spent: json(&merged.spent),
             outgoing: each(merged.outgoing),
-            settled: each(merged.settled),
             ended: each(merged.ended),
             conflicts: each(merged.conflicts),
         }
+    }
+
+    /// Takes in `part`, another part of this holder's purse and as current
+    /// as this one, such as the holder for the mints of another server, as
+    /// [`merge`](Self::merge) does but doubting nothing; see
+    /// [`worgl_sdk::Holder::join`].
+    pub fn join(&mut self, part: &Holder) {
+        self.inner.join(&part.inner);
     }
 }
 
@@ -304,8 +328,8 @@ impl Holder {
 #[derive(Debug)]
 pub struct Merged {
     notes: String,
+    spent: String,
     outgoing: Vec<String>,
-    settled: Vec<String>,
     ended: Vec<String>,
     conflicts: Vec<String>,
 }
@@ -313,28 +337,30 @@ pub struct Merged {
 #[wasm_bindgen]
 impl Merged {
     /// The notes held now that were not before, a JSON array: the other
-    /// copy's, which this one may have spent since.
+    /// copy's. Those this copy knew nothing of are unchecked.
     #[wasm_bindgen(getter)]
     pub fn notes(&self) -> String {
         self.notes.clone()
     }
 
-    /// The transfers outgoing now that were not before, each as JSON, to
-    /// resend.
+    /// The notes held before that the other copy spent in a transfer it
+    /// ended, a JSON array. They are dropped.
+    #[wasm_bindgen(getter)]
+    pub fn spent(&self) -> String {
+        self.spent.clone()
+    }
+
+    /// The transfers outgoing now that were not before, each as JSON:
+    /// resending one carries it out if the mint never applied it, and the
+    /// notes its answer pays this holder are unchecked.
     #[wasm_bindgen(getter)]
     pub fn outgoing(&self) -> Vec<String> {
         self.outgoing.clone()
     }
 
-    /// The transfers outgoing before that the other copy showed answered,
-    /// each as JSON. They are settled.
-    #[wasm_bindgen(getter)]
-    pub fn settled(&self) -> Vec<String> {
-        self.settled.clone()
-    }
-
-    /// The transfers outgoing before that the other copy cancelled or
-    /// forgot, each as JSON. They are ended the same way.
+    /// The transfers outgoing before that the other copy settled, cancelled
+    /// or forgot, or showed answered, each as JSON. They are ended the same
+    /// way.
     #[wasm_bindgen(getter)]
     pub fn ended(&self) -> Vec<String> {
         self.ended.clone()
@@ -363,7 +389,7 @@ pub struct Vault {
 #[wasm_bindgen]
 impl Vault {
     /// Derives a key from `passphrase` under a fresh random salt, for a new
-    /// purse file.
+    /// purse file. An empty passphrase is refused.
     #[wasm_bindgen(constructor)]
     pub fn new(passphrase: &str) -> Result<Vault, Error> {
         let inner = vault::Vault::new(passphrase)?;
@@ -379,8 +405,8 @@ impl Vault {
     }
 
     /// Seals `holder` into a purse file, with `mints`, a JSON array of
-    /// `{"mint", "server"}` that names the server of each mint, under a
-    /// fresh nonce.
+    /// `{"mint", "server"}` that names the server of each mint and may carry
+    /// other members, such as a name for the mint, under a fresh nonce.
     pub fn seal(&self, holder: &Holder, mints: &str) -> Result<String, Error> {
         let mints = parse::<Vec<MintEntry>>(mints)?;
         Ok(self.inner.seal(&holder.inner, &mints)?)
@@ -416,7 +442,8 @@ impl Contents {
     }
 
     /// The server of each mint, as the purse that sealed it named them: a
-    /// JSON array of `{"mint", "server"}`, empty for a file `worgl` wrote.
+    /// JSON array of `{"mint", "server"}` with any other members each entry
+    /// has, empty for a file an older `worgl` wrote.
     #[wasm_bindgen(getter)]
     pub fn mints(&self) -> String {
         self.mints.clone()
@@ -577,8 +604,8 @@ fn scheduled(transfers: Vec<ScheduledTransfer>) -> Vec<Scheduled> {
 
 /// Value a holder has at one mint; see [`worgl_sdk::Balance`]. Held,
 /// sending, change, refreshing and requested never overlap; outgoing and
-/// expected sum some of them, expiring is part of what is held, and
-/// unconfirmed may come instead of value held.
+/// expected sum some of them, expiring is part of what is held, unchecked
+/// is part of the total, and unconfirmed may come instead of value held.
 #[wasm_bindgen]
 #[derive(Debug, Clone, Copy)]
 pub struct Balance {
@@ -597,6 +624,12 @@ pub struct Balance {
     /// Value held that dies at the next rotation unless refreshed.
     #[wasm_bindgen(readonly)]
     pub expiring: u128,
+    /// Part of the total that came from another copy of the purse in a
+    /// merge, which may have spent it since: the notes
+    /// [`unchecked`](Holder::unchecked) lists, and change and refreshes paid
+    /// to keys that copy handed out.
+    #[wasm_bindgen(readonly)]
+    pub unchecked: u128,
     /// Value held in notes newer than the mint's info.
     #[wasm_bindgen(readonly)]
     pub unknown: u128,

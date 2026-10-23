@@ -41,6 +41,12 @@ export interface WorglErrorDetails {
   out_of_memory: NoFields;
   /** The system's random number generator failed, so no backup can be sealed. */
   no_randomness: NoFields;
+  /**
+   * The passphrase for a new backup is empty, which would let anyone who
+   * gets the file spend its notes. A backup opens with whatever passphrase
+   * sealed it.
+   */
+  empty_passphrase: NoFields;
   /** A request for nothing: the amount is zero. */
   zero_amount: NoFields;
   /** A request for `amount`, which cannot be split into the mint's denominations. */

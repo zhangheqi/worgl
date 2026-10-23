@@ -100,24 +100,29 @@ the mint answers with the same notes while it keeps its answers.
   `refreshing` on their way back from them, and `requested`. Its `total`,
   held plus change and refreshing, counts no note twice: paying lowers it by
   the amount paid, and submitting, settling and refreshing leave it as it
-  is. `outgoing` and `expected` sum some of those parts, and `expiring` is
-  part of what is held. `unconfirmed`, change of transfers dropped or
-  cancelled, is in no part: after a cancel it comes only if the mint spent
-  the note taken back.
+  is. `outgoing` and `expected` sum some of those parts, `expiring` is part
+  of what is held, and `unchecked` is the part of the total a restore took
+  in from another copy of the purse, until the mint says it was not spent
+  since. `unconfirmed`, change of transfers dropped or cancelled, is in no
+  part: after a cancel it comes only if the mint spent the note taken back.
 - `purse.takeFromFaucet(new Client(faucetUrl))` asks a playground faucet
   (`worgl-faucet`) for a note, to a fresh key like any other, and keeps it.
   A page on another origin than the faucet's can ask it only if the faucet
   names that origin with `--allow-origin`.
 - `purse.backup(passphrase)` seals the purse into a backup, the file the
   `worgl` command line keeps its purse in, naming the purse's server for
-  each mint. `Backup.open(sealed, passphrase)` opens one, or a purse file of
-  `worgl`, and `purse.restore(backup)` merges it in: a note in both is held
-  once, and a transfer the backup shows answered or ended is settled or
-  ended here too. A note the backup holds that the purse spent since counts
-  until the mint says otherwise: `purse.checkNotes(restored.notes)` asks it
-  about each, at random gaps, and discards the spent ones, which shows the
-  mint those notes one after another. Deriving a backup's key takes 64 MiB
-  of memory and about a quarter of a second.
+  each mint; `{ purses, mints }` adds the purses of other servers, and what
+  the application keeps of each mint, such as a name, which every reader
+  gives back in `backup.mints`. `Backup.open(sealed, passphrase)` opens one,
+  or a purse file of `worgl`, and `purse.restore(backup)` merges it in: a
+  note in both is held once, and a transfer either copy settled, cancelled
+  or forgot stays ended. What only the backup had may have been spent since
+  by another copy, so it comes in unchecked (`purse.unchecked()`) and
+  counts until the mint says otherwise: `purse.checkNotes()` asks it about
+  each, at random gaps, discards the spent ones and keeps the rest, which
+  shows the mint those notes one after another. Deriving a backup's key
+  takes 64 MiB of memory and about a quarter of a second, and an empty
+  passphrase is refused.
 - `Client` makes one call per route and rejects with a `MintError` carrying
   the mint's code (`spent`, `frozen`, `paused`…); `isTransient(error)` says
   whether trying again may work. It counts `layer_full` out: a transfer
@@ -196,6 +201,7 @@ purse calls built on them.
 | `damaged` | | `Backup.open`: a part of the backup does not read, such as its salt, settings or ciphertext, or it opened to no purse. The message says which. |
 | `out_of_memory` | | `Backup.open`, `backup`: too little memory to derive the key: 64 MiB, or up to 256 MiB for a backup whose settings ask for more. |
 | `no_randomness` | | `backup`: the system's random number generator failed. |
+| `empty_passphrase` | | `backup`: the passphrase is empty, which would let anyone who gets the backup spend its notes. |
 | `unknown_format` | `format` | `Purse.open`, `Backup.open`: the saved purse, or the one a backup holds, is in `format`, a newer one this SDK does not read. |
 | `malformed` | | Any call: something it was given is not the JSON it takes, such as a payment request, a payment, notes, a mint's info or keys, or, for `Purse.open`, a saved purse; or a transfer spends no notes. |
 | `no_layers` | | Any call that reads a mint's info: the info lists no layers. |

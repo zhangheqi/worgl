@@ -118,6 +118,8 @@ fn explain(path: &Path, error: VaultError) -> anyhow::Error {
         VaultError::Holder(LoadError::Json(_)) | VaultError::Damaged(_) => {
             anyhow::Error::new(error).context(format!("{path} is damaged"))
         }
-        VaultError::Memory | VaultError::Random => anyhow::Error::new(error),
+        VaultError::Memory | VaultError::Random | VaultError::EmptyPassphrase => {
+            anyhow::Error::new(error)
+        }
     }
 }

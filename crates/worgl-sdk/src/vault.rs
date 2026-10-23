@@ -131,6 +131,11 @@ pub enum VaultError {
     /// could be drawn.
     #[error("the system random number generator failed")]
     Random,
+    /// [`Vault::new`] was given an empty passphrase, which would let anyone
+    /// who gets the file open it and spend its notes. A file is opened with
+    /// whatever passphrase sealed it.
+    #[error("the passphrase is empty")]
+    EmptyPassphrase,
 }
 
 /// What a purse file holds: the holder, and where the purse reaches its
@@ -276,8 +281,12 @@ impl std::fmt::Debug for Vault {
 impl Vault {
     /// Derives a key from `passphrase` under a fresh random salt, with
     /// Argon2id over 64 MiB, three passes and one lane, to seal a new purse
-    /// file.
+    /// file. An empty passphrase is refused, as
+    /// [`VaultError::EmptyPassphrase`].
     pub fn new(passphrase: &str) -> Result<Self, VaultError> {
+        if passphrase.is_empty() {
+            return Err(VaultError::EmptyPassphrase);
+        }
         let mut salt = [0u8; SALT_LEN];
         getrandom::fill(&mut salt).map_err(|_| VaultError::Random)?;
         let header = Header {
@@ -626,6 +635,32 @@ mod tests {
             )
         };
         assert_eq!(header(&sealed), header(WRITTEN_BY_0_1));
+    }
+
+    #[test]
+    fn no_vault_seals_under_an_empty_passphrase() {
+        assert!(matches!(Vault::new(""), Err(VaultError::EmptyPassphrase)));
+        // A file sealed so, by a writer that allows it, still opens.
+        let header = Header {
+            format: FORMAT.into(),
+            version: VERSION,
+            kdf: Kdf {
+                algorithm: ALGORITHM.into(),
+                memory_kib: 1024,
+                iterations: 1,
+                parallelism: 1,
+                salt: hex::encode([3u8; SALT_LEN]),
+            },
+        };
+        let sealed = Vault::derive(header, "")
+            .unwrap()
+            .seal(&Holder::new(), &[])
+            .unwrap();
+        assert!(Vault::open(&sealed, "").is_ok());
+        assert!(matches!(
+            Vault::open(&sealed, "x"),
+            Err(VaultError::Passphrase)
+        ));
     }
 
     #[test]

@@ -150,6 +150,7 @@ impl From<VaultError> for Error {
                 thrown("unknown_format").with("format", *format)
             }
             VaultError::Passphrase => thrown("wrong_passphrase"),
+            VaultError::EmptyPassphrase => thrown("empty_passphrase"),
             VaultError::Memory => thrown("out_of_memory"),
             VaultError::Random => thrown("no_randomness"),
         }
@@ -367,7 +368,7 @@ mod tests {
     }
 
     #[test]
-    fn purse_files_that_do_not_open_have_codes() {
+    fn purse_files_that_do_not_open_or_seal_have_codes() {
         check(VaultError::NotSealed, "not_sealed", &[]);
         let version = ("version", Detail::Count(2));
         check(VaultError::Version(2), "unknown_version", &[version]);
@@ -378,6 +379,7 @@ mod tests {
         let newer = VaultError::Holder(LoadError::Format(9));
         check(newer, "unknown_format", &[format]);
         check(VaultError::Passphrase, "wrong_passphrase", &[]);
+        check(VaultError::EmptyPassphrase, "empty_passphrase", &[]);
         check(VaultError::Memory, "out_of_memory", &[]);
         check(VaultError::Random, "no_randomness", &[]);
     }

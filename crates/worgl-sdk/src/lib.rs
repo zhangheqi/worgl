@@ -107,8 +107,14 @@
 //!
 //! [`Holder::merge`] takes another copy of a holder's purse into it, such as
 //! a backup or another device's copy, keeping what is the purse's in either
-//! and counting nothing twice that the two can tell apart. Its docs list
-//! what only the mint can tell, and what asking it shows.
+//! and counting nothing twice that the two can tell apart. Each copy
+//! remembers the transfers it ended last, so a transfer one copy settled,
+//! cancelled or forgot stays ended. What only the other copy had may be out
+//! of date, so it comes in [unchecked](Holder::unchecked), and counts in
+//! [`Balance::unchecked`] until the mint says otherwise; the docs of
+//! [`Holder::unchecked`] weigh what asking it shows. [`Holder::join`] takes
+//! in a part as current, such as the holder of another server's mints for
+//! one backup of both, and doubts nothing.
 //!
 //! With the `vault` feature, [`vault`] seals a holder under a passphrase
 //! into the purse file the `worgl` command line keeps, with the server of
@@ -122,8 +128,8 @@ mod random;
 pub mod vault;
 
 pub use holder::{
-    AnswerError, Balance, Holder, LoadError, MAX_REQUESTED_NOTES, MadePayment, Merged,
-    PAID_KEYS_KEPT, PayError, REFRESH_MARGIN_SECS, RequestError,
+    AnswerError, Balance, ENDED_TRANSFERS_KEPT, Holder, LoadError, MAX_REQUESTED_NOTES,
+    MadePayment, Merged, PAID_KEYS_KEPT, PayError, REFRESH_MARGIN_SECS, RequestError,
 };
 pub use mint::{MintInfo, MintView, NoLayers, NoteState, Schedule};
 pub use payment::{CheckError, Payment, PaymentRequest, ScheduledTransfer, Spacing};

@@ -9,7 +9,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use worgl::{LedgerConfig, MintKey, MintRequest, Note, Policy, PublicKey};
 use worgl_client::{Client, MemoryStore, Purse};
 use worgl_sdk::vault::{MintEntry, Vault};
-use worgl_sdk::{MintView, PaymentRequest, Spacing};
+use worgl_sdk::{Holder, MintView, PaymentRequest, Spacing};
 use worgl_server::{AppState, MintSpec, init_state, router};
 
 const PASSPHRASE: &str = "correct horse battery staple";
@@ -1163,6 +1163,14 @@ async fn the_purse_is_encrypted() {
     assert!(again.stderr.contains("already exists"), "{}", again.stderr);
     let missing = setup.worgl("nobody.worgl", &["notes"]).await;
     assert!(missing.stderr.contains("worgl init"), "{}", missing.stderr);
+    let empty = setup.worgl_with("empty.worgl", "", &["init"]).await;
+    assert!(!empty.ok);
+    assert!(
+        empty.stderr.contains("the passphrase is empty"),
+        "{}",
+        empty.stderr
+    );
+    assert!(!setup.path("empty.worgl").exists());
 }
 
 /// A purse `worgl` 0.1 wrote, under the test passphrase: notes of 8 and 4,
@@ -1210,15 +1218,16 @@ async fn a_mint_list_in_the_purse_is_kept() {
     let setup = Setup::start().await;
     setup.ok("alice.worgl", &["init"]).await;
     setup.mint_into("alice.worgl", 8).await;
-    // Sealed again with the server of its mint, as the TypeScript SDK seals
-    // a backup.
+    // Restored into a new purse and sealed again with the server of its
+    // mint and a name for it, as the TypeScript SDK seals a backup.
     let saved = fs::read_to_string(setup.path("alice.worgl")).unwrap();
     let (vault, opened) = Vault::open(&saved, PASSPHRASE).unwrap();
     assert!(opened.mints.is_empty());
-    let entry = MintEntry::new(setup.mint, &setup.url);
-    let backup = vault
-        .seal(&opened.holder, std::slice::from_ref(&entry))
-        .unwrap();
+    let mut restored = Holder::new();
+    restored.merge(&opened.holder);
+    let mut entry = MintEntry::new(setup.mint, &setup.url);
+    entry.extra.insert("name".into(), "Playground".into());
+    let backup = vault.seal(&restored, std::slice::from_ref(&entry)).unwrap();
     fs::write(setup.path("alice.worgl"), backup).unwrap();
 
     let mint = setup.mint.to_string();
@@ -1230,6 +1239,7 @@ async fn a_mint_list_in_the_purse_is_kept() {
         .await;
     let balance = setup.balance("alice.worgl").await;
     assert!(balance.contains("spendable  8\n"), "{balance}");
+    assert!(balance.contains("unchecked  8 "), "{balance}");
     assert!(balance.contains("requested  5 "), "{balance}");
     let saved = fs::read_to_string(setup.path("alice.worgl")).unwrap();
     let (_, reopened) = Vault::open(&saved, PASSPHRASE).unwrap();

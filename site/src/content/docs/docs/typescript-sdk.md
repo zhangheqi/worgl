@@ -134,10 +134,11 @@ run purses against a real server.
   `refreshing` on their way back from them, and `requested`. Its `total`,
   held plus change and refreshing, counts no note twice: paying lowers it by
   the amount paid, and submitting, settling and refreshing leave it as it
-  is. `outgoing` and `expected` sum some of those parts, and `expiring` is
-  part of what is held. `unconfirmed`, change of transfers dropped or
-  cancelled, is in no part: after a cancel it comes only if the mint spent
-  the note taken back.
+  is. `outgoing` and `expected` sum some of those parts, `expiring` is part
+  of what is held, and `unchecked` is the part of the total a restore took
+  in from another copy of the purse, until the mint says it was not spent
+  since. `unconfirmed`, change of transfers dropped or cancelled, is in no
+  part: after a cancel it comes only if the mint spent the note taken back.
 - `purse.takeFromFaucet(new Client(faucetUrl))` asks a playground
   [faucet](../running-a-faucet/) for a note, to a fresh key like any other,
   and keeps it. A page on another origin than the faucet's can ask it only
@@ -210,6 +211,7 @@ purse calls built on them.
 | `damaged` | | `Backup.open`: a part of the backup does not read, such as its salt, settings or ciphertext, or it opened to no purse. The message says which. |
 | `out_of_memory` | | `Backup.open`, `backup`: too little memory to derive the key: 64 MiB, or up to 256 MiB for a backup whose settings ask for more. |
 | `no_randomness` | | `backup`: the system's random number generator failed. |
+| `empty_passphrase` | | `backup`: the passphrase is empty, which would let anyone who gets the backup spend its notes. |
 | `unknown_format` | `format` | `Purse.open`, `Backup.open`: the saved purse, or the one a backup holds, is in `format`, a newer one this SDK does not read. |
 | `malformed` | | Any call: something it was given is not the JSON it takes, such as a payment request, a payment, notes, a mint's info or keys, or, for `Purse.open`, a saved purse; or a transfer spends no notes. |
 | `no_layers` | | Any call that reads a mint's info: the info lists no layers. |
@@ -236,7 +238,27 @@ const sealed = await alice.backup(passphrase); // keep it apart from the store
 // On another device, or once the store is lost:
 const restored = await alice.restore(await Backup.open(sealed, passphrase));
 await alice.settle(); // resends the transfers it took in
+await alice.checkNotes(); // asks the mint about the notes it took in
 ```
+
+One backup can hold the purses of several servers, each naming its own
+server for its mints, and what the application keeps of each mint, such as
+the name and unit a person gave it:
+
+```ts
+const sealed = await here.backup(passphrase, {
+  purses: [there],
+  mints: [{ mint, server: here.client.baseUrl, extra: { name: 'Playground' } }],
+});
+const backup = await Backup.open(sealed, passphrase);
+backup.mints; // each mint with its server and its `extra`
+await here.restore(backup); // takes the mints of here's server
+await there.restore(backup); // and there's
+```
+
+A mint one of the purses holds is named with that purse's server, and one
+no purse holds is sealed as listed. `worgl` keeps the list as it is each
+time it saves.
 
 A backup holds every note's secret key, like the store, sealed with
 XChaCha20-Poly1305 under a key derived from the passphrase with Argon2id
@@ -244,25 +266,38 @@ over 64 MiB, three passes. Deriving it takes about a quarter of a second in
 Node and in Chromium on a desktop processor, longer on a phone, and blocks
 the thread meanwhile; the WebAssembly memory grows by 64 MiB the first time
 and keeps that size. A wrong passphrase and a backup altered after it was
-sealed are refused alike, with `wrong_passphrase`.
+sealed are refused alike, with `wrong_passphrase`, and an empty passphrase
+for a new backup with `empty_passphrase`.
 
 Restoring keeps what is the purse's in either copy and counts nothing twice
 that the two can tell apart: a note in both is held once, a request of
-either is expected until it is paid, and a transfer the backup shows
-answered, or cancelled or forgotten, is settled or ended here too.
-`restored` lists what changed. Some of it only the mint can tell:
+either is expected until it is paid, and a transfer either copy settled,
+cancelled or forgot stays ended, with what that copy did with its notes.
+Each purse remembers the last 512 transfers it ended at each mint for this.
+`restored` lists what changed.
 
-- A note only the backup holds may be one the purse spent since. It counts
-  until the mint says otherwise. `purse.prune(mint)` drops the expired ones
-  from the mint's info alone, and `purse.checkNotes(restored.notes)` asks
-  the mint about each and discards those it reports spent. Each question
-  shows the mint one note, from this machine's address and at its time, so
-  it asks at random gaps, 2 to 60 seconds by default (see the
-  [Privacy model](../privacy/#timing)). Asking nothing leaves the transfers
-  that next spend the notes to find the spent ones, which the mint refuses.
-- A transfer only the backup has outgoing may be one the purse settled and
-  forgot. `purse.settle()` resends it: the mint answers with the same notes
-  while it keeps the answer, and refuses it once its note is spent.
+What only the backup had may be out of date: since it was sealed, another
+copy of the purse, such as this one before it lost its storage, may have
+spent its notes, or settled its transfers and spent their change. So what
+the purse knew nothing of comes in unchecked, `purse.unchecked()`, and
+counts in `balance.unchecked` until the mint says otherwise. A backup
+restored into a new purse is all unchecked.
+
+- `purse.checkNotes()` asks the mint about each unchecked note, discards
+  those it reports spent or expired, and keeps the rest, checked. Each
+  question shows the mint one note, from this machine's address and at its
+  time, so it asks at random gaps, 2 to 60 seconds by default (see the
+  [Privacy model](../privacy/#timing)). `purse.prune(mint)` drops the
+  expired ones from the mint's info alone, and asking nothing leaves the
+  transfers that next spend the notes to find the spent ones, which the
+  mint refuses.
+- A transfer only the backup has outgoing, in `restored.outgoing`, is resent
+  by `purse.settle()`: the mint carries it out if it never applied it, as
+  the copy that made it meant, answers with the same notes while it keeps
+  the answer if it did, and refuses it if another transfer spent its note.
+  The notes the answer pays the purse are unchecked too, since another copy
+  may have settled the transfer and spent them. `purse.cancel` one that
+  should not go.
 - Two transfers that spend one note, in `restored.conflicts`, are a note
   each copy spent. The mint applies at most one, and `settle` drops the
   other.

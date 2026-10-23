@@ -78,7 +78,7 @@ note of 3 from a mint whose notes are powers of two.
 |---|---|
 | `init` | Creates an empty purse. |
 | `info MINT` | Shows a mint's layers, rotation schedule and supply. |
-| `balance MINT` | Shows the purse's total at a mint, what it holds plus what comes back to it as change and refreshes, then parts that do not overlap: what it holds (spendable and frozen, with what of it expires at the next rotation), change on its way back, what it is sending to payees, and what it asked for. Refreshes not yet answered and notes newer than the mint's info show when there are some. So does unconfirmed change of dropped or cancelled transfers, which is in no total: after a cancel it comes only if the mint spent the note taken back. |
+| `balance MINT` | Shows the purse's total at a mint, what it holds plus what comes back to it as change and refreshes, then parts that do not overlap: what it holds (spendable and frozen, with what of it expires at the next rotation), change on its way back, what it is sending to payees, and what it asked for. Refreshes not yet answered, notes newer than the mint's info, and unchecked value, which a restore took in from another copy of the purse and which may have been spent since, show when there are some. So does unconfirmed change of dropped or cancelled transfers, which is in no total: after a cancel it comes only if the mint spent the note taken back. |
 | `notes` | Lists the notes held and what each can do now. |
 | `request MINT AMOUNT` | Asks to be paid: writes a payment request to send to the payer. `--at-most N` asks for notes no larger than N, for a payer whose notes are small. `-o` names the file (default `-`). |
 | `withdraw REQUEST` | Stops expecting the notes of a request that will not be paid. |
@@ -206,14 +206,16 @@ same key.
 
 A backup from the [TypeScript SDK](../typescript-sdk/#backups) is a purse
 file too, so `worgl` opens one as its purse. Beside the purse, it names the
-server of each mint, and `worgl` keeps that list as it is when it saves; it
-still talks to the server `--server` names. A purse file `worgl` 0.1 wrote
-has no list and opens as before, and `worgl` 0.1 opens a file with one,
-dropping the list when it saves. `worgl` reads a file whose settings ask
-for up to 256 MiB, eight passes and 16 lanes, and refuses one that asks for
-more before deriving anything. Copy the file to back the purse up, and
-restore a copy with the TypeScript SDK's `purse.restore`, which merges it
-with what the purse holds now.
+server of each mint, with what else the application keeps of it, such as a
+name, and `worgl` keeps that list as it is when it saves; it still talks to
+the server `--server` names. A purse file `worgl` 0.1 wrote has no list and
+opens as before, and `worgl` 0.1 opens a file with one, dropping the list,
+the record of the transfers the purse ended and which notes are unchecked
+when it saves. `worgl` reads a file whose settings ask for up to 256 MiB,
+eight passes and 16 lanes, and refuses one that asks for more before
+deriving anything. Copy the file to back the purse up, and restore a copy
+with the TypeScript SDK's `purse.restore`, which merges it with what the
+purse holds now.
 
 ## Keeping notes alive
 

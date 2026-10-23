@@ -34,6 +34,7 @@ export {
   isTransient,
 } from './client.ts';
 export {
+  type BackupOptions,
   type Balance,
   type Checked,
   DEFAULT_RETRY,

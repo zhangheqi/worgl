@@ -102,15 +102,19 @@ describe('backup', () => {
     assert.ok(!sealed.includes('"notes"'));
 
     const backup = await Backup.open(sealed, PASSPHRASE);
-    assert.deepEqual(backup.mints, [{ mint: server.mint, server: server.url }]);
+    assert.deepEqual(backup.mints, [{ mint: server.mint, server: server.url, extra: {} }]);
     const copy = await purse();
     const restored = await copy.restore(backup);
     assert.deepEqual(restored.notes.sort(), alice.notes().sort());
     assert.deepEqual(
-      [restored.outgoing, restored.settled, restored.ended, restored.conflicts, restored.others],
+      [restored.spent, restored.outgoing, restored.ended, restored.conflicts, restored.others],
       [[], [], [], [], []],
     );
-    assert.deepEqual(await copy.balance(server.mint), await alice.balance(server.mint));
+    // All of it is unchecked: another copy may have spent it since.
+    assert.deepEqual(copy.unchecked().sort(), alice.notes().sort());
+    const balance = await copy.balance(server.mint);
+    assert.equal(balance.unchecked, 12n);
+    assert.deepEqual({ ...balance, unchecked: 0n }, await alice.balance(server.mint));
 
     // Once in, the same backup adds nothing, nor does a purse's own.
     for (const [into, again] of [
@@ -161,7 +165,7 @@ describe('backup', () => {
     // A change by `worgl` keeps the server the backup names.
     await worgl('alice.worgl', 'request', server.mint, '3', '-o', 'request.json');
     const changed = await Backup.open(readFileSync(join(dir, 'alice.worgl'), 'utf8'), PASSPHRASE);
-    assert.deepEqual(changed.mints, [{ mint: server.mint, server: server.url }]);
+    assert.deepEqual(changed.mints, [{ mint: server.mint, server: server.url, extra: {} }]);
     const copy = await purse();
     await copy.restore(changed);
     const balance = await copy.balance(server.mint);
@@ -172,7 +176,7 @@ describe('backup', () => {
     await worgl('bob.worgl', 'init');
     await worgl('bob.worgl', 'request', server.mint, '2', '-o', 'bob.json');
     const bob = await Backup.open(readFileSync(join(dir, 'bob.worgl'), 'utf8'), PASSPHRASE);
-    assert.deepEqual(bob.mints, [{ mint: server.mint, server: undefined }]);
+    assert.deepEqual(bob.mints, [{ mint: server.mint, server: undefined, extra: {} }]);
     const bobs = await purse();
     await bobs.restore(bob);
     assert.equal((await bobs.balance(server.mint)).requested, 2n);
@@ -180,7 +184,7 @@ describe('backup', () => {
 
   test('restores a purse file worgl 0.1 wrote', async () => {
     const backup = await Backup.open(writtenBy01, PASSPHRASE);
-    assert.deepEqual(backup.mints, [{ mint: itsMint, server: undefined }]);
+    assert.deepEqual(backup.mints, [{ mint: itsMint, server: undefined, extra: {} }]);
     const restored = await (await purse()).restore(backup);
     assert.equal(restored.notes.length, 2);
     assert.deepEqual(restored.others, []);
@@ -198,13 +202,72 @@ describe('backup', () => {
     const elsewhere = await purse(new Client('http://127.0.0.1:9'));
     const restored = await elsewhere.restore(backup);
     assert.deepEqual(restored.notes, []);
-    assert.deepEqual(restored.others, [{ mint: server.mint, server: server.url }]);
+    assert.deepEqual(restored.others, [{ mint: server.mint, server: server.url, extra: {} }]);
     assert.deepEqual((await elsewhere.restore(backup, [server.mint])).notes, alice.notes());
+  });
+
+  test('holds the purses of several servers, and the names of their mints', async () => {
+    const other = await TestServer.start();
+    try {
+      const [here, there] = [await purse(), await purse(other.client())];
+      await server.fund(here, 8n, 8n);
+      await other.fund(there, 4n, 4n);
+      const named = { name: 'Playground', unit: 'tokens' };
+      const elsewhere = 'https://mint.example.com';
+      const sealed = await here.backup(PASSPHRASE, {
+        purses: [there],
+        mints: [
+          { mint: server.mint, server: 'http://ignored.example', extra: named },
+          { mint: itsMint, server: elsewhere, extra: { name: 'Old' } },
+        ],
+      });
+      const listed = [
+        { mint: server.mint, server: server.url, extra: named },
+        { mint: other.mint, server: other.url, extra: {} },
+        { mint: itsMint, server: elsewhere, extra: { name: 'Old' } },
+      ].sort((a, b) => (a.mint < b.mint ? -1 : 1));
+      const backup = await Backup.open(sealed, PASSPHRASE);
+      assert.deepEqual(backup.mints, listed);
+
+      // Each server's purse takes its part back.
+      for (const [from, into] of [
+        [here, await purse()],
+        [there, await purse(other.client())],
+      ] as const) {
+        const restored = await into.restore(backup);
+        assert.deepEqual(restored.notes, from.notes());
+        const kept = from.client.baseUrl;
+        assert.deepEqual(
+          restored.others,
+          listed.filter((m) => m.server !== kept),
+        );
+      }
+
+      // `worgl` keeps the list as it is when it changes the file.
+      writeFileSync(join(dir, 'both.worgl'), sealed);
+      await worgl('both.worgl', 'request', server.mint, '3', '-o', 'both.json');
+      const changed = readFileSync(join(dir, 'both.worgl'), 'utf8');
+      assert.deepEqual((await Backup.open(changed, PASSPHRASE)).mints, listed);
+
+      // A mint in two of the purses is refused.
+      const twice = await purse();
+      await server.fund(twice, 1n, 1n);
+      await assert.rejects(here.backup(PASSPHRASE, { purses: [twice] }), TypeError);
+    } finally {
+      await other.stop();
+    }
+  });
+
+  test('is refused under an empty passphrase', async () => {
+    await assert.rejects((await purse()).backup(''), {
+      name: 'WorglError',
+      code: 'empty_passphrase',
+    });
   });
 });
 
 describe('restoring a backup', () => {
-  test('takes back a note spent since, until the mint says so', async () => {
+  test('takes in notes spent since unchecked, until the mint says', async () => {
     const [alice, bob] = [await purse(), await purse()];
     await server.fund(alice, 8n, 8n);
     const old = await backupOf(alice);
@@ -212,19 +275,34 @@ describe('restoring a backup', () => {
     await bob.receive(request, await alice.pay(request, NO_SPACING));
     await alice.settle(NO_SPACING);
     assert.equal(await held(alice), 3n);
-
-    const restored = await alice.restore(old);
-    assert.equal(restored.notes.length, 1);
-    assert.equal(await held(alice), 11n);
-    const checked = await alice.checkNotes(restored.notes, NO_SPACING);
-    assert.deepEqual(checked, { value: 8n, discarded: restored.notes, unanswered: [] });
+    // Alice remembers spending the note, so her old backup gives nothing back.
+    assert.deepEqual((await alice.restore(old)).notes, []);
     assert.equal(await held(alice), 3n);
-    // A live note is kept.
-    const live = await alice.checkNotes(alice.notes(), NO_SPACING);
-    assert.deepEqual(live, { value: 0n, discarded: [], unanswered: [] });
+
+    // A new purse knows nothing, and takes it in unchecked.
+    const copy = await purse();
+    const restored = await copy.restore(old);
+    assert.equal(restored.notes.length, 1);
+    assert.deepEqual(copy.unchecked(), restored.notes);
+    assert.equal((await copy.balance(server.mint)).unchecked, 8n);
+    const checked = await copy.checkNotes(undefined, NO_SPACING);
+    assert.deepEqual(checked, {
+      value: 8n,
+      discarded: restored.notes,
+      kept: [],
+      unanswered: [],
+    });
+    assert.equal(await held(copy), 0n);
+    // A live note is kept, and checked.
+    const fresh = await purse();
+    await fresh.restore(await backupOf(alice));
+    const live = await fresh.checkNotes(undefined, NO_SPACING);
+    assert.deepEqual(live, { value: 0n, discarded: [], kept: alice.notes(), unanswered: [] });
+    assert.deepEqual(fresh.unchecked(), []);
+    assert.deepEqual(await fresh.balance(server.mint), await alice.balance(server.mint));
   });
 
-  test('settles a transfer the backup shows answered', async () => {
+  test('ends a transfer the backup shows answered', async () => {
     const [alice, bob] = [await purse(), await purse()];
     await server.fund(alice, 8n, 8n);
     const request = await bob.request(server.mint, 5n);
@@ -238,8 +316,64 @@ describe('restoring a backup', () => {
     assert.equal(outgoing.length, 1);
     assert.equal((await copy.balance(server.mint)).outgoing, 8n);
     const restored = await copy.restore(await backupOf(alice));
-    assert.deepEqual(restored.settled, outgoing);
-    assert.deepEqual(await copy.balance(server.mint), await alice.balance(server.mint));
+    assert.deepEqual(restored.ended, outgoing);
+    // The change is Alice's too, who may spend it.
+    const balance = await copy.balance(server.mint);
+    assert.equal(balance.unchecked, 3n);
+    assert.deepEqual({ ...balance, unchecked: 0n }, await alice.balance(server.mint));
+  });
+
+  test('does not bring back a transfer settled since, nor its change', async () => {
+    // Its own server, since the change moves only after a rotation.
+    const own = await TestServer.start();
+    try {
+      const open = () => purse(own.client());
+      const total = async (purse: Purse) => (await purse.balance(own.mint)).total;
+      const [alice, bob, carol] = [await open(), await open(), await open()];
+      await own.fund(alice, 8n, 8n);
+      const toBob = await bob.request(own.mint, 5n);
+      const payment = await alice.pay(toBob, NO_SPACING);
+      const paying = await backupOf(alice);
+      await bob.receive(toBob, payment);
+      await alice.settle(NO_SPACING);
+      await own.rotate();
+      const toCarol = await carol.request(own.mint, 3n);
+      await carol.receive(toCarol, await alice.pay(toCarol, NO_SPACING));
+      await alice.settle(NO_SPACING);
+      assert.equal(await total(alice), 0n);
+
+      const restored = await alice.restore(paying);
+      assert.deepEqual([restored.notes, restored.outgoing], [[], []]);
+      await alice.settle(NO_SPACING);
+      assert.equal(await total(alice), 0n);
+
+      // A new purse brings the transfer back, and its change counts
+      // unchecked until the mint says Alice spent it.
+      const copy = await open();
+      assert.equal((await copy.restore(paying)).outgoing.length, 1);
+      assert.equal((await copy.settle(NO_SPACING)).answered, 1);
+      const balance = await copy.balance(own.mint);
+      assert.deepEqual([balance.held, balance.unchecked], [3n, 3n]);
+      assert.equal((await copy.checkNotes(undefined, NO_SPACING)).value, 3n);
+      assert.equal(await total(copy), 0n);
+    } finally {
+      await own.stop();
+    }
+  });
+
+  test('keeps a transfer cancelled since cancelled', async () => {
+    const [alice, bob] = [await purse(), await purse()];
+    await server.fund(alice, 4n, 4n);
+    const request = await bob.request(server.mint, 4n);
+    const payment = await alice.pay(request, NO_SPACING);
+    const paying = await backupOf(alice);
+    const [transfer] = payment.transfers;
+    assert.ok(transfer !== undefined && (await alice.cancel(transfer.request)));
+
+    const restored = await alice.restore(paying);
+    assert.deepEqual(restored.outgoing, []);
+    const balance = await alice.balance(server.mint);
+    assert.deepEqual([balance.held, balance.sending, balance.outgoing], [4n, 0n, 0n]);
   });
 
   test('expects the keys of requests from either copy', async () => {
