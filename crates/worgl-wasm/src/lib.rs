@@ -15,7 +15,7 @@ use wasm_bindgen::prelude::*;
 use worgl::issuer::LayerSummary;
 use worgl::{KeySet, Note, NoteStatus, PublicKey, Serial, Supply, TransferRequest};
 use worgl_sdk::{
-    MintInfo, MintView, Payment, PaymentRequest, Schedule, ScheduledTransfer, Spacing,
+    MintInfo, MintView, NoteState, Payment, PaymentRequest, Schedule, ScheduledTransfer, Spacing,
 };
 
 /// The notes one holder owns, with their keys; see [`worgl_sdk::Holder`].
@@ -220,6 +220,108 @@ impl Holder {
     pub fn notes(&self) -> String {
         json(&self.inner.notes().collect::<Vec<_>>())
     }
+
+    /// The notes held at the mint, in the order [`notes`](Self::notes)
+    /// lists them, each with where it stands, from the mint's `info` alone:
+    /// the mint is asked nothing about any one note, unlike with
+    /// [`note_report`].
+    #[wasm_bindgen(js_name = notesAt)]
+    pub fn notes_at(&self, info: &str) -> Result<Vec<HeldNote>, JsError> {
+        Ok(held_notes(&self.inner, &view(info)?))
+    }
+
+    /// Unix time of the first scheduled rotation at the mint that takes a
+    /// note of this holder's unless it moves first, by the mint's clock: see
+    /// [`worgl_sdk::Holder::first_expiry`].
+    #[wasm_bindgen(js_name = firstExpiry)]
+    pub fn first_expiry(&self, info: &str) -> Result<Option<u64>, JsError> {
+        Ok(self.inner.first_expiry(&view(info)?))
+    }
+}
+
+/// A note a holder holds and where it stands at its mint, from the mint's
+/// info alone; see [`Holder::notes_at`]. It holds no more of the note than
+/// its serial and amount.
+#[wasm_bindgen]
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct HeldNote {
+    /// The note's generation.
+    #[wasm_bindgen(readonly)]
+    pub generation: u64,
+    /// Its index in the generation.
+    #[wasm_bindgen(readonly)]
+    pub index: u32,
+    /// Its amount.
+    #[wasm_bindgen(readonly)]
+    pub amount: u64,
+    state: &'static str,
+    position: Option<u32>,
+    spendable_at: Option<u64>,
+    expires_at: Option<u64>,
+}
+
+#[wasm_bindgen]
+impl HeldNote {
+    /// `spendable`, `expiring` (spendable, and dies at the next rotation
+    /// unless it moves), `frozen` (in the last layer until the next
+    /// rotation), `expired` (its layer was dropped) or `unknown` (newer than
+    /// the info).
+    #[wasm_bindgen(
+        getter,
+        unchecked_return_type = "'spendable' | 'expiring' | 'frozen' | 'expired' | 'unknown'"
+    )]
+    pub fn state(&self) -> String {
+        self.state.into()
+    }
+
+    /// The position of its layer, 0 for the first, unless it is expired or
+    /// unknown.
+    #[wasm_bindgen(getter)]
+    pub fn position(&self) -> Option<u32> {
+        self.position
+    }
+
+    /// For a frozen note, Unix time of the scheduled rotation after which it
+    /// can move; see [`MintView::spendable_at`].
+    #[wasm_bindgen(getter, js_name = spendableAt)]
+    pub fn spendable_at(&self) -> Option<u64> {
+        self.spendable_at
+    }
+
+    /// Unix time of the scheduled rotation that drops its layer, unless it
+    /// moves first; see [`MintView::expires_at`].
+    #[wasm_bindgen(getter, js_name = expiresAt)]
+    pub fn expires_at(&self) -> Option<u64> {
+        self.expires_at
+    }
+}
+
+/// Where each of `holder`'s notes at the view's mint stands.
+fn held_notes(holder: &worgl_sdk::Holder, view: &MintView) -> Vec<HeldNote> {
+    holder
+        .notes()
+        .filter_map(|note| {
+            let state = match view.state(note) {
+                NoteState::Spendable {
+                    expires_after_rotations: 1,
+                } => "expiring",
+                NoteState::Spendable { .. } => "spendable",
+                NoteState::Frozen { .. } => "frozen",
+                NoteState::Expired => "expired",
+                NoteState::Unknown => "unknown",
+                NoteState::OtherMint => return None,
+            };
+            Some(HeldNote {
+                generation: note.serial().generation,
+                index: note.serial().index,
+                amount: note.amount(),
+                state,
+                position: view.position(note),
+                spendable_at: view.spendable_at(note),
+                expires_at: view.expires_at(note),
+            })
+        })
+        .collect()
 }
 
 /// A signed transfer and when to submit it.
@@ -573,6 +675,12 @@ struct VerifiedText {
 }
 
 /// Reads the answer of `POST /v1/verify`.
+///
+/// Each such request shows the mint one note, from the asker's address and
+/// at its time, so asking about several notes in a row invites the guess
+/// that they have one owner. [`Holder::notes_at`] tells where the notes a
+/// holder holds stand from the mint's info, which says nothing about any
+/// one note.
 #[wasm_bindgen(js_name = noteReport)]
 pub fn note_report(verified: &str) -> Result<NoteReport, JsError> {
     let verified = parse::<VerifiedText>(verified)?;

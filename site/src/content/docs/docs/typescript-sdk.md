@@ -81,6 +81,17 @@ run purses against a real server.
   headers must send it too; without it, the browser's clock counts the
   moments. `purse.prune(mint)` drops the notes whose layer the mint's info
   says it has dropped, never by this machine's clock.
+- `purse.notesAt(mint)` lists the notes held at a mint, each with its value,
+  its layer, what it can do now (`spendable`, `expiring` at the next
+  rotation, `frozen` in the last layer until then, `expired` or `unknown`),
+  when a frozen one can move (`spendableAt`) and when it dies unless moved
+  (`expiresAt`), in Unix seconds by the mint's clock. `purse.firstExpiry(mint)`
+  is the first time the mint would take a note of the purse's, counting
+  those its outgoing transfers spend: an application that keeps notes alive
+  only while it runs should run again before then, less a margin of its own.
+  Both read the mint's info and nothing else. `client.verify(note)` asks the
+  mint about one note instead, so asking about several in a row invites the
+  guess that they have one owner (see the [Privacy model](../privacy/)).
 - When the payer submits instead (`purse.submit(payment.transfers)`), it
   hands `submitted.theirs`, the payee's notes, to the payee, who checks their
   signatures against the mint's keys and keeps them with

@@ -876,6 +876,112 @@ fn a_view_tells_when_a_note_expires() {
     assert_eq!(later.expires_at(&note), None);
 }
 
+/// The view of a mint that rotates every 100 seconds, next at 1,000 plus
+/// 100 for each rotation it has made.
+fn on_schedule(issuer: &Issuer) -> MintView {
+    let mut v = view(issuer);
+    v.schedule = Some(Schedule {
+        period_secs: 100,
+        next_at: 1_000 + 100 * v.oldest,
+    });
+    v
+}
+
+#[test]
+fn a_view_tells_when_a_frozen_note_can_move() {
+    let mut mint = issuer(4);
+    let (mut alice, mut bob) = (Holder::new(), Holder::new());
+    fund(&mut mint, &mut alice, &[8]);
+    let minted = *alice.notes().next().unwrap();
+    let request = bob.request(&view(&mint), 8).unwrap();
+    let payment = alice
+        .pay(&view(&mint), &request, Spacing::default())
+        .unwrap();
+    for notes in submit(&mut mint, &payment) {
+        bob.absorb(&notes);
+    }
+    let note = *bob.notes().next().unwrap();
+    assert_eq!(view(&mint).spendable_at(&note), None);
+
+    // In the last layer, it moves after the next rotation and dies at the
+    // fourth. A spendable note has no such time.
+    let mut v = on_schedule(&mint);
+    assert_eq!(v.spendable_at(&note), Some(1_000));
+    assert_eq!(v.expires_at(&note), Some(1_300));
+    assert_eq!(v.spendable_at(&minted), None);
+    v.paused = true;
+    assert_eq!(v.spendable_at(&note), None);
+
+    // A view of one layer, which no mint has, would have it die then.
+    let one = MintView {
+        layers: 1,
+        oldest: note.serial().generation,
+        ..on_schedule(&mint)
+    };
+    assert_eq!(
+        one.state(&note),
+        NoteState::Frozen {
+            expires_after_rotations: 1
+        }
+    );
+    assert_eq!(one.spendable_at(&note), None);
+
+    // Once the mint has made that rotation, the note is spendable.
+    mint.rotate().unwrap();
+    let later = on_schedule(&mint);
+    assert!(matches!(later.state(&note), NoteState::Spendable { .. }));
+    assert_eq!(later.spendable_at(&note), None);
+    assert_eq!(later.expires_at(&note), Some(1_300));
+}
+
+#[test]
+fn the_first_expiry_is_the_first_rotation_to_take_a_note() {
+    let mut mint = issuer(4);
+    let (mut alice, mut bob) = (Holder::new(), Holder::new());
+    // Minted second to last, a rotation apart: the 8 dies at 1,200, the 2
+    // at 1,300.
+    fund(&mut mint, &mut alice, &[8]);
+    mint.rotate().unwrap();
+    fund(&mut mint, &mut alice, &[2]);
+    let v = on_schedule(&mint);
+    assert_eq!(alice.first_expiry(&v), Some(1_200));
+    assert_eq!(alice.first_expiry(&view(&mint)), None);
+    let paused = MintView {
+        paused: true,
+        ..on_schedule(&mint)
+    };
+    assert_eq!(alice.first_expiry(&paused), None);
+    assert_eq!(Holder::new().first_expiry(&v), None);
+
+    // The 8, spent by a transfer not yet answered, still counts: if the
+    // mint never applies it, the 8 dies at 1,200.
+    let request = bob.request(&v, 5).unwrap();
+    let payment = alice.pay(&v, &request, Spacing::default()).unwrap();
+    assert_eq!(alice.notes().count(), 1);
+    assert_eq!(alice.first_expiry(&v), Some(1_200));
+    // Once settled, the change lands one layer on and dies with the 2.
+    let answer = mint.transfer(&payment.transfers[0].request).unwrap();
+    assert_eq!(bob.absorb(&answer), 5);
+    assert_eq!(alice.take_answers(&bob.theirs(&answer)), 3);
+    assert_eq!(alice.first_expiry(&on_schedule(&mint)), Some(1_300));
+
+    // A transfer left outgoing past the rotation that drops its note counts
+    // at the next, while the mint may still answer it, and then no more.
+    let mut carol = Holder::new();
+    fund(&mut mint, &mut carol, &[4]);
+    mint.rotate().unwrap();
+    mint.rotate().unwrap();
+    let v = on_schedule(&mint);
+    let request = bob.request(&v, 4).unwrap();
+    carol.pay(&v, &request, Spacing::default()).unwrap();
+    assert_eq!(carol.notes().count(), 0);
+    assert_eq!(carol.first_expiry(&v), Some(1_300));
+    mint.rotate().unwrap();
+    assert_eq!(carol.first_expiry(&on_schedule(&mint)), Some(1_400));
+    mint.rotate().unwrap();
+    assert_eq!(carol.first_expiry(&on_schedule(&mint)), None);
+}
+
 #[test]
 fn a_refresh_planned_past_the_rotations_time_is_due_at_once() {
     let mut mint = issuer(3);

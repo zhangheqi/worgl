@@ -94,6 +94,45 @@ export interface Balance {
 }
 
 /**
+ * A note a purse holds and where it stands at its mint, from the mint's info
+ * alone: see {@link Purse.notesAt}. It holds no more of the note than its
+ * serial and value. Times are Unix seconds by the mint's clock, from the next
+ * rotation its info names, and are `undefined` when the mint has no schedule
+ * or is paused.
+ */
+export interface HeldNote {
+  /** Its serial, by which the mint knows it. */
+  serial: { generation: bigint; index: number };
+  /** Its value. */
+  amount: bigint;
+  /**
+   * What it can do now:
+   *
+   * - `spendable`: it can be spent, and outlives the next rotation.
+   * - `expiring`: it can be spent, and dies at the next rotation unless it
+   *   moves first: {@link Purse.refresh} pays it back to the purse.
+   * - `frozen`: it sits in the last layer, where the notes of a transfer
+   *   usually land, and can move only after the next rotation.
+   * - `expired`: the mint has dropped its layer, so it is worth nothing;
+   *   {@link Purse.prune} drops it.
+   * - `unknown`: it is newer than the mint's info, which cannot place it, as
+   *   when the info is a copy saved before the rotation that opened its
+   *   layer.
+   */
+  state: 'spendable' | 'expiring' | 'frozen' | 'expired' | 'unknown';
+  /**
+   * The position of its layer, 0 for the first, unless it is expired or
+   * unknown. Untouched, a note at position `p` dies `p + 1` rotations from
+   * now.
+   */
+  position: number | undefined;
+  /** For a frozen note, when it can move: the time of the next rotation. */
+  spendableAt: bigint | undefined;
+  /** When the rotation that drops its layer comes, unless it moves first. */
+  expiresAt: bigint | undefined;
+}
+
+/**
  * What a purse did with a transfer the mint refused.
  *
  * - `kept`: nothing. A transfer this purse made stays outgoing, for the next
@@ -328,6 +367,50 @@ export class Purse {
     } finally {
       balance.free();
     }
+  }
+
+  /**
+   * The notes held at `mint`, in the order {@link notes} lists them, each
+   * with its value, its layer, what it can do now, when it can move and when
+   * it dies unless moved. Like {@link balance}, it reads the mint's info and
+   * nothing else: the mint learns nothing about any one note, and what it
+   * reports is what this purse holds already. {@link Client.verify}, by
+   * contrast, shows the mint each note it is asked about, so asking about a
+   * purse's notes one after another invites the guess that they have one
+   * owner.
+   */
+  async notesAt(mint: string): Promise<HeldNote[]> {
+    const info = await this.client.infoText(mint);
+    return this.#holder.notesAt(info).map((note) => {
+      const read = {
+        serial: { generation: note.generation, index: note.index },
+        amount: note.amount,
+        state: note.state,
+        position: note.position,
+        spendableAt: note.spendableAt,
+        expiresAt: note.expiresAt,
+      };
+      note.free();
+      return read;
+    });
+  }
+
+  /**
+   * When `mint` first takes a note of this purse's unless it moves first:
+   * the Unix time, in seconds by the mint's clock, of the scheduled rotation
+   * that drops a note it holds, or the note one of its outgoing transfers
+   * spends, whichever comes first. A transfer whose note the last rotation
+   * dropped counts at the next, which drops the notes it made if the mint
+   * applied it. `undefined` when the mint has no schedule or is paused, or
+   * when none of these is left. It reads the mint's info and nothing else.
+   *
+   * An application that keeps notes alive only while it runs, with
+   * {@link refresh}, should run again before it, less a margin of its own:
+   * the date to come back by. Once it has passed, read it again, since the
+   * mint may not have made that rotation yet.
+   */
+  async firstExpiry(mint: string): Promise<bigint | undefined> {
+    return this.#holder.firstExpiry(await this.client.infoText(mint));
   }
 
   /**

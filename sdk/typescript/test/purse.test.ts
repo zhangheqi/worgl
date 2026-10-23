@@ -10,6 +10,7 @@ import { after, before, describe, test } from 'node:test';
 
 import {
   Client,
+  type HeldNote,
   Holder,
   MemoryStore,
   MintError,
@@ -625,6 +626,153 @@ describe('refresh', () => {
     } finally {
       await own.stop();
     }
+  });
+});
+
+describe('note states', () => {
+  test("come from the mint's info alone", async () => {
+    // Its own server, since it rotates the mint, on a schedule so that
+    // notes have times.
+    const own = await TestServer.start({}, DAY);
+    try {
+      const asked: string[] = [];
+      const fetch: typeof globalThis.fetch = (input, init) => {
+        asked.push(`${init?.method ?? 'GET'} ${new URL(String(input)).pathname}`);
+        return globalThis.fetch(input, init);
+      };
+      const alice = await Purse.open(new Client(own.url, { fetch }), quick);
+      const bob = await Purse.open(own.client(), quick);
+      await own.fund(alice, 4n, 4n);
+      const stale = await own.client().infoText(own.mint);
+      await own.rotate();
+      await own.rotate();
+      await own.fund(alice, 2n, 2n);
+      await own.fund(bob, 1n, 1n);
+      const request = await alice.request(own.mint, 1n);
+      allAnswered(await alice.receive(request, await bob.pay(request, NO_SPACING)), 1);
+
+      asked.length = 0;
+      const notes = await alice.notesAt(own.mint);
+      const first = await alice.firstExpiry(own.mint);
+      // The mint was asked nothing about any one note.
+      const info = `GET /v1/mints/${own.mint}/info`;
+      assert.deepEqual(asked, [info, info]);
+
+      const { oldest, rotation } = await own.client().info(own.mint);
+      const next = rotation?.nextAt ?? 0n;
+      const day = BigInt(DAY);
+      const where = (note: HeldNote | undefined) => {
+        assert.ok(note !== undefined);
+        const { serial, state, position, spendableAt, expiresAt } = note;
+        return { generation: serial.generation, state, position, spendableAt, expiresAt };
+      };
+      assert.deepEqual(
+        notes.map((note) => note.amount),
+        [4n, 2n, 1n],
+      );
+      // The 4, minted second to last two rotations ago, dies at the next.
+      assert.deepEqual(where(notes[0]), {
+        generation: oldest,
+        state: 'expiring',
+        position: 0,
+        spendableAt: undefined,
+        expiresAt: next,
+      });
+      assert.deepEqual(where(notes[1]), {
+        generation: oldest + 2n,
+        state: 'spendable',
+        position: 2,
+        spendableAt: undefined,
+        expiresAt: next + 2n * day,
+      });
+      // The 1 just arrived in the last layer: it rests until the next rotation.
+      assert.deepEqual(where(notes[2]), {
+        generation: oldest + 3n,
+        state: 'frozen',
+        position: 3,
+        spendableAt: next,
+        expiresAt: next + 3n * day,
+      });
+      assert.equal(first, next);
+
+      // An info older than a note cannot place it.
+      const stub: typeof globalThis.fetch = (input, init) => {
+        if (!String(input).endsWith('/info')) {
+          return globalThis.fetch(input, init);
+        }
+        const headers = { 'content-type': 'application/json' };
+        return Promise.resolve(new Response(stale, { headers }));
+      };
+      const behind = await Purse.open(new Client(own.url, { fetch: stub }), {
+        store: new MemoryStore(alice.toJson()),
+      });
+      assert.deepEqual(
+        (await behind.notesAt(own.mint)).map((note) => [note.state, note.position]),
+        [['spendable', 2], ['unknown', undefined], ['unknown', undefined]],
+      );
+      // Another mint's info places none of them.
+      const elsewhere = await Purse.open(server.client(), {
+        store: new MemoryStore(alice.toJson()),
+      });
+      assert.deepEqual(await elsewhere.notesAt(server.mint), []);
+
+      // A paused mint skips its rotations, so no time can be told.
+      await own.client().pause(own.mint, own.token);
+      assert.deepEqual(
+        (await alice.notesAt(own.mint)).map((note) => [
+          note.position,
+          note.spendableAt,
+          note.expiresAt,
+        ]),
+        [
+          [0, undefined, undefined],
+          [2, undefined, undefined],
+          [3, undefined, undefined],
+        ],
+      );
+      assert.equal(await alice.firstExpiry(own.mint), undefined);
+      await own.client().resume(own.mint, own.token);
+
+      // Left alone past the rotation, the 4 is gone and the 1 can move.
+      await own.rotate();
+      const later = (await own.client().info(own.mint)).rotation?.nextAt ?? 0n;
+      assert.deepEqual(
+        (await alice.notesAt(own.mint)).map((note) => [note.state, note.position, note.expiresAt]),
+        [
+          ['expired', undefined, undefined],
+          ['spendable', 1, later + day],
+          ['spendable', 2, later + 2n * day],
+        ],
+      );
+      assert.equal(await alice.firstExpiry(own.mint), later + day);
+      assert.equal(await alice.prune(own.mint), 4n);
+
+      // The 2, spent by a transfer not yet answered, still counts.
+      await alice.pay(await bob.request(own.mint, 2n), NO_SPACING);
+      assert.deepEqual(
+        (await alice.notesAt(own.mint)).map((note) => note.amount),
+        [1n],
+      );
+      assert.equal(await alice.firstExpiry(own.mint), later + day);
+    } finally {
+      await own.stop();
+    }
+  });
+
+  test('have no times at a mint without a schedule', async () => {
+    const alice = await purse();
+    await server.fund(alice, 8n, 8n);
+    assert.deepEqual(
+      (await alice.notesAt(server.mint)).map((note) => [
+        note.amount,
+        note.state,
+        note.position,
+        note.spendableAt,
+        note.expiresAt,
+      ]),
+      [[8n, 'spendable', 2, undefined, undefined]],
+    );
+    assert.equal(await alice.firstExpiry(server.mint), undefined);
   });
 });
 
