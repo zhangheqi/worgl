@@ -32,6 +32,37 @@ and the faucet hands out 10,000 a day; `--amount`, `--per-address` and
 Behind a reverse proxy, pass `--behind-proxy` so clients are counted by the
 address the proxy appends to `X-Forwarded-For`.
 
+## Pages in a browser
+
+A browser lets a page read the faucet's answers only if the page is on the
+faucet's own origin, or on one the faucet names. Name each origin whose
+pages may ask it with `--allow-origin`, or in `WORGL_FAUCET_ALLOW_ORIGIN`
+separated by commas, as a scheme, a host and a port, with no path and no
+trailing `/`:
+
+```sh
+./target/release/worgl-faucet ... --allow-origin https://purse.example \
+    --allow-origin http://localhost:5173
+```
+
+For a named origin the faucet answers preflights and sends
+`Access-Control-Allow-Origin` with `Vary: Origin`, so the page can read
+its note, or the `Retry-After` of a refusal. Without the flag it sends no
+CORS headers. It refuses `*` at start: a page gets its note for whatever key
+it names, from the visitor's address, so with `*` any website could collect
+notes through its visitors. Origins are matched exactly, so a pattern such
+as `https://*.purse.example` is refused too.
+
+A request for a note from a page on any other origin is refused with `403
+unknown_origin` before it counts against the visitor's address, even one a
+browser sends without a preflight, as for a form. Requests from outside a
+browser send no `Origin` header and are not checked.
+
+A page served beside the faucet, on its own origin, needs no flag when the
+faucet is on HTTPS or a loopback address: the faucet knows such a page by
+the `Sec-Fetch-Site: same-origin` header, which browsers send only there.
+Over plain HTTP on any other address, name that page's origin too.
+
 ## Taking a note
 
 `worgl playground` asks the faucet at `--faucet`, or at the server's URL when

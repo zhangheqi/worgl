@@ -35,6 +35,16 @@ the mint answers with the same notes while it keeps its answers.
   save fails, the change is undone and the call rejects. After a `busy`
   answer it waits as long as the mint's `Retry-After` asks, up to 30
   seconds, before the next try.
+- Before it keeps an answer, the purse checks it against the keys of the
+  transfer's mint, read after the answer: one note for each of the
+  transfer's outputs, with that output's amount and key, signed by the mint.
+  It keeps none of an answer that is not the mint's, such as a forged note
+  from a server that is not the mint's, nor of one whose keys it cannot
+  read. The transfer is listed in `submitted.refused` with outcome `kept`,
+  and one the purse made stays outgoing, for `settle` to send again. Its
+  error is a `WorglError` that says what is wrong with the answer
+  (`miscounted`, `unasked`, `unsigned` or `wrong_issuer`), or why the keys
+  could not be read.
 - `purse.refresh(mint)` pays the notes about to expire back to the purse,
   each at a random moment before the next rotation, and resends the
   outgoing transfers that must land before it. `planRefresh` and `submit`
@@ -43,8 +53,8 @@ the mint answers with the same notes while it keeps its answers.
   (`client.infoTextAndTime`), so this machine's clock, slow or fast, moves
   none past the rotation. A browser reads that `Date` from a mint on
   another origin only if the answer carries
-  `Access-Control-Expose-Headers: Date`, so the proxy that adds the CORS
-  headers must send it too; without it, the browser's clock counts the
+  `Access-Control-Expose-Headers: Date`, as `worgl-server`'s do unless it
+  runs with `--no-cors`; without it, the browser's clock counts the
   moments. `purse.prune(mint)` drops the notes whose layer the mint's info
   says it has dropped, never by this machine's clock.
 - `purse.notesAt(mint)` lists the notes held at a mint, each with its value,
@@ -86,11 +96,14 @@ the mint answers with the same notes while it keeps its answers.
   keeping them once they are handed over.
 - `purse.takeFromFaucet(new Client(faucetUrl))` asks a playground faucet
   (`worgl-faucet`) for a note, to a fresh key like any other, and keeps it.
+  A page on another origin than the faucet's can ask it only if the faucet
+  names that origin with `--allow-origin`.
 - `Client` makes one call per route and rejects with a `MintError` carrying
   the mint's code (`spent`, `frozen`, `paused`…); `isTransient(error)` says
   whether trying again may work. It counts `layer_full` out: a transfer
   refused so is refused every time, though a mint request may pass after
-  the next rotation.
+  the next rotation. What the SDK refuses itself is a `WorglError`, with a
+  code of its own (see [Errors](#errors)).
 - Stores: `MemoryStore`, and `FileStore` from `worgl/node`, which replaces
   its file atomically, readable by its owner only. The JSON holds every
   note's secret key, so keep it private and encrypted at rest. Implement
@@ -99,6 +112,67 @@ the mint answers with the same notes while it keeps its answers.
 Importing the package loads the WebAssembly module: from disk under Node,
 through `fetch` relative to the module in a browser or bundler. It needs
 Node 22.18 or later, or a browser with top-level `await`.
+
+## Errors
+
+A refusal from the mint rejects with a `MintError`, which carries the mint's
+code (see
+[Error codes](../../site/src/content/docs/docs/error-codes.md)). What the SDK
+refuses itself, in its Rust core or around it, such as a payment the purse
+cannot make, throws or rejects with a `WorglError`: an `Error` named
+`WorglError`, with a stable `code` and that code's fields in `details`.
+`message` is for people and may change. `isWorglError(error)` tells one
+apart, and checking `code` then gives `details` their type:
+
+```ts
+try {
+  await alice.pay(request);
+} catch (error) {
+  if (
+    !(isWorglError(error) && error.code === 'fragmented') ||
+    error.details.atMost === undefined
+  ) {
+    throw error;
+  }
+  // Alice's notes are too small for the ones Bob asked for: he drops
+  // that request and asks again, in notes she can pay.
+  await bob.withdraw(request);
+  await alice.pay(await bob.requestAtMost(mint, request.amount, error.details.atMost));
+}
+```
+
+In `details`, amounts and generations are `bigint`, counts and limits
+`number`, keys hex strings, and a field with no value `undefined`.
+`Holder` and the other exports of the core throw the same codes as the
+purse calls built on them.
+
+| Code | `details` | Meaning |
+|---|---|---|
+| `unaffordable` | `spendable`, `needed` | `pay`: only `spendable` can be spent now, and the request asks for `needed`. Frozen notes become spendable at the next rotation. |
+| `fragmented` | `largest`, `atMost` | `pay`: enough can be spent, but in notes too small for those the request asks for; the largest is `largest`. A request for the same amount in notes of at most `atMost`, which the payee makes with `requestAtMost` after withdrawing the first, can be paid now, and none in larger notes can. `atMost` is `undefined` when no such request can be paid, as when it would take too many notes: ask for less, or wait for frozen notes to become spendable. |
+| `denomination` | `amount` | `pay`: the request asks for a note of `amount`, which is not one of the mint's denominations. |
+| `paid` | `holder` | `pay`: the request asks for a note to `holder`, a key the purse has paid already, such as one request twice. Paying again takes a new request. |
+| `too_many_outputs` | `maxOutputs` | `pay`: the change does not fit in the `maxOutputs` notes one transfer may make. |
+| `empty_request` | | `pay`: the request asks for nothing. |
+| `wrong_mint` | | `pay`: the request is for another mint than the info read for it. `receive`: the payment spends notes of another mint than the request's. |
+| `policy` | | `pay`: a transfer it planned breaks the mint's policy, which is a bug. The message says how. |
+| `sign` | | `pay`: signing failed, which means the saved purse is corrupt. |
+| `zero_amount` | | `request`, `requestAtMost`: the amount is zero. |
+| `unsplittable` | `amount` | `request`, `requestAtMost`: `amount` cannot be split into the mint's denominations, or into those no larger than asked. |
+| `too_many_notes` | `max` | `request`, `requestAtMost`: the request would take more than `max` notes. |
+| `unpaid` | `amount`, `holder` | `receive`: the payment does not pay the note of `amount` to `holder` that the request asks for. |
+| `overpaid` | `amount`, `holder` | `receive`: the payment pays `amount` to `holder`, a key the request asks a note for, more than once or with another amount. |
+| `not_one_input` | | `receive`: a transfer of the payment spends more or fewer than one note. |
+| `bad_signature` | | `accept`: a note's signature does not verify: it is forged or altered. |
+| `unknown_generation` | `generation` | `accept`: the mint's keys hold none for a note's `generation`, because its layer was dropped or the keys predate it. |
+| `wrong_issuer` | | `accept`: the keys the server gave for a note's mint are another mint's. `Submitted.refused`: the keys it gave for a transfer's mint are another mint's, so the purse kept none of the answer. |
+| `miscounted` | `outputs`, `answered` | `Submitted.refused`, from `submit`, `receive`, `settle` or `refresh`: an answer to a transfer holds `answered` notes for its `outputs` outputs. It is not the mint's, and the purse kept none of it. |
+| `unasked` | `index` | `Submitted.refused`: note `index` of an answer is not the transfer's output in its place, but another mint's, or of another amount or key. The purse kept none of the answer. |
+| `unsigned` | `index` | `Submitted.refused`: note `index` of an answer does not carry the mint's signature: it is forged or altered, or the keys do not know its generation. The purse kept none of the answer. |
+| `faucet_amount` | `amount` | `takeFromFaucet`: the faucet hands out notes of `amount`, which its mint cannot make as one note. |
+| `unknown_format` | `format` | `Purse.open`: the saved purse is in `format`, a newer one this SDK does not read. |
+| `malformed` | | Any call: something it was given is not the JSON it takes, such as a payment request, a payment, notes, a mint's info or keys, or, for `Purse.open`, a saved purse; or a transfer spends no notes. |
+| `no_layers` | | Any call that reads a mint's info: the info lists no layers. |
 
 ## Building and testing
 

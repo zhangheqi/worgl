@@ -10,7 +10,7 @@ use std::time::{Duration, Instant};
 
 use openraft::Vote;
 use openraft::raft::{AppendEntriesRequest, VoteRequest};
-use reqwest::{Method, StatusCode};
+use reqwest::{Method, StatusCode, header};
 use serde_json::{Value, json};
 use tokio::net::TcpListener;
 use tokio::sync::oneshot;
@@ -33,6 +33,9 @@ const LEDGER: LedgerConfig = LedgerConfig {
 /// How long a test waits for the members to agree, or for a mint to have a
 /// leader again.
 const PATIENCE: Duration = Duration::from_secs(30);
+
+/// The origin of the page that calls the members in the CORS tests.
+const PAGE: &str = "https://purse.example";
 
 /// A mint the tests created, with the keys to run it.
 struct TestMint {
@@ -669,7 +672,7 @@ async fn any_member_answers_for_the_leader() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn a_follower_relays_a_busy_answer_with_its_retry_after() {
+async fn a_follower_relays_a_busy_answer_a_page_on_any_origin_can_read() {
     // One receipt, kept an hour: longer than the test takes.
     let policy = Policy {
         receipt_capacity: 1,
@@ -691,21 +694,58 @@ async fn a_follower_relays_a_busy_answer_with_its_retry_after() {
     };
     let request = TransferRequest::single(second, &alice, output).unwrap();
     for server in [leader, follower] {
-        let url = format!("http://{}/v1/transfer", cluster.servers[server].api);
+        let api = cluster.servers[server].api;
+        // Any member answers a preflight itself, without passing it on,
+        // even on a route it would pass on to the mint's leader.
+        for path in ["/v1/transfer".to_owned(), mint.path("mint")] {
+            let answer = cluster
+                .client
+                .request(Method::OPTIONS, format!("http://{api}{path}"))
+                .header(header::ORIGIN, PAGE)
+                .header(header::ACCESS_CONTROL_REQUEST_METHOD, "POST")
+                .header(header::ACCESS_CONTROL_REQUEST_HEADERS, "content-type")
+                .send()
+                .await
+                .unwrap();
+            assert_eq!(answer.status(), StatusCode::OK, "{path}");
+            let headers = answer.headers();
+            assert_eq!(headers[header::ACCESS_CONTROL_ALLOW_ORIGIN], "*");
+            assert_eq!(headers[header::ACCESS_CONTROL_ALLOW_METHODS], "POST");
+        }
+        // A path no route serves, which a follower passes on too.
+        let answer = cluster
+            .client
+            .get(format!("http://{api}{}", mint.path("nope")))
+            .header(header::ORIGIN, PAGE)
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(answer.status(), StatusCode::NOT_FOUND);
+        assert_eq!(answer.headers()[header::ACCESS_CONTROL_ALLOW_ORIGIN], "*");
+
+        let url = format!("http://{api}/v1/transfer");
         let answer = cluster
             .client
             .post(url)
+            .header(header::ORIGIN, PAGE)
             .json(&request)
             .send()
             .await
             .unwrap();
         assert_eq!(answer.status(), StatusCode::SERVICE_UNAVAILABLE);
-        let retry_after: u64 = answer.headers()[reqwest::header::RETRY_AFTER]
+        let headers = answer.headers();
+        let retry_after: u64 = headers[header::RETRY_AFTER]
             .to_str()
             .unwrap()
             .parse()
             .unwrap();
         assert!((3500..=3600).contains(&retry_after), "{retry_after}");
+        assert_eq!(headers[header::ACCESS_CONTROL_ALLOW_ORIGIN], "*");
+        assert_eq!(
+            headers[header::ACCESS_CONTROL_EXPOSE_HEADERS],
+            "date,retry-after"
+        );
+        assert!(headers.contains_key(header::DATE));
         assert_eq!(answer.json::<Value>().await.unwrap()["error"], "busy");
     }
     cluster.stop().await;

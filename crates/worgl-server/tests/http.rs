@@ -8,7 +8,7 @@ use std::time::Duration;
 
 use axum::Router;
 use axum::body::Body;
-use axum::http::{Method, Request, StatusCode, header};
+use axum::http::{HeaderMap, Method, Request, StatusCode, header};
 use http_body_util::BodyExt;
 use serde_json::{Value, json};
 use tower::ServiceExt;
@@ -16,12 +16,17 @@ use worgl::{
     BurnRequest, HolderKey, Issuer, IssuerKey, KeySet, LedgerConfig, MintKey, MintRequest, Note,
     Output, Policy, PublicKey, TransferRequest,
 };
-use worgl_server::{AppState, CreatedMint, Info, MintSpec, create_mint, init_state, router};
+use worgl_server::{
+    AppState, CreatedMint, Info, MintSpec, create_mint, init_state, router, router_without_cors,
+};
 
 const LEDGER: LedgerConfig = LedgerConfig {
     layers: 4,
     layer_size: 1024,
 };
+
+/// The origin of the page that calls the server in the CORS tests.
+const PAGE: &str = "https://purse.example";
 
 /// Sends one request to the router and parses the JSON answer.
 async fn call(
@@ -31,10 +36,27 @@ async fn call(
     token: Option<String>,
     body: Value,
 ) -> (StatusCode, Value) {
+    let (status, _, answer) = call_from(app, None, method, &path, token.as_deref(), body).await;
+    (status, answer)
+}
+
+/// Sends one request to the router, from a page on `origin` if one is
+/// given, and returns the answer's status, headers and parsed JSON.
+async fn call_from(
+    app: Router,
+    origin: Option<&str>,
+    method: Method,
+    path: &str,
+    token: Option<&str>,
+    body: Value,
+) -> (StatusCode, HeaderMap, Value) {
     let mut request = Request::builder()
         .method(method)
         .uri(path)
         .header(header::CONTENT_TYPE, "application/json");
+    if let Some(origin) = origin {
+        request = request.header(header::ORIGIN, origin);
+    }
     if let Some(token) = token {
         request = request.header(header::AUTHORIZATION, format!("Bearer {token}"));
     }
@@ -43,11 +65,56 @@ async fn call(
         .await
         .unwrap();
     let status = response.status();
+    let headers = response.headers().clone();
     let bytes = response.into_body().collect().await.unwrap().to_bytes();
     (
         status,
+        headers,
         serde_json::from_slice(&bytes).unwrap_or(Value::Null),
     )
+}
+
+/// Sends the preflight a browser sends before a page on [`PAGE`] makes a
+/// `method` request to `path` with the request headers `headers`, and
+/// returns the answer's status and headers.
+async fn preflight(
+    app: &Router,
+    method: &Method,
+    path: &str,
+    headers: &str,
+) -> (StatusCode, HeaderMap) {
+    let request = Request::builder()
+        .method(Method::OPTIONS)
+        .uri(path)
+        .header(header::ORIGIN, PAGE)
+        .header(header::ACCESS_CONTROL_REQUEST_METHOD, method.as_str())
+        .header(header::ACCESS_CONTROL_REQUEST_HEADERS, headers)
+        .body(Body::empty())
+        .unwrap();
+    let response = app.clone().oneshot(request).await.unwrap();
+    (response.status(), response.headers().clone())
+}
+
+/// Checks that a page on any origin can read an answer whole, its `Date`
+/// and `Retry-After` included, and that the server allows no credentials.
+fn assert_readable_from_any_page(headers: &HeaderMap) {
+    assert_eq!(headers[header::ACCESS_CONTROL_ALLOW_ORIGIN], "*");
+    assert_eq!(
+        headers[header::ACCESS_CONTROL_EXPOSE_HEADERS],
+        "date,retry-after"
+    );
+    assert!(!headers.contains_key(header::ACCESS_CONTROL_ALLOW_CREDENTIALS));
+}
+
+/// Checks that an answer carries no CORS header, so a page on another
+/// origin can read none of it.
+fn assert_no_cors(headers: &HeaderMap) {
+    assert!(
+        headers
+            .keys()
+            .all(|name| !name.as_str().starts_with("access-control-")),
+        "{headers:?}"
+    );
 }
 
 /// A mint the tests created, with the keys to run it.
@@ -147,12 +214,18 @@ impl Server {
     }
 
     /// Stops serving and opens the state directory again, as a restart would.
-    async fn restart(mut self) -> Self {
+    async fn restart(self) -> Self {
+        self.restart_with(router).await
+    }
+
+    /// Stops serving and opens the state directory again, serving it with
+    /// `routes`.
+    async fn restart_with(mut self, routes: fn(AppState) -> Router) -> Self {
         drop(std::mem::replace(&mut self.app, Router::new()));
         // Each committer lets go of its store once it sees its mint dropped.
         for _ in 0..200 {
             if let Ok(state) = AppState::open(self.dir.path(), 1000) {
-                self.app = router(state);
+                self.app = routes(state);
                 return self;
             }
             tokio::time::sleep(Duration::from_millis(10)).await;
@@ -175,6 +248,18 @@ impl Server {
             body,
         )
         .await
+    }
+
+    /// Sends one request from a page on [`PAGE`] and returns the answer's
+    /// status, headers and parsed JSON.
+    async fn call_from_page(
+        &self,
+        method: Method,
+        path: &str,
+        token: Option<&str>,
+        body: Value,
+    ) -> (StatusCode, HeaderMap, Value) {
+        call_from(self.app.clone(), Some(PAGE), method, path, token, body).await
     }
 
     async fn post_mint(&self, mint: &TestMint, request: &MintRequest) -> (StatusCode, Value) {
@@ -348,6 +433,172 @@ async fn each_token_opens_only_its_own_routes() {
             .await;
         assert_eq!(status, StatusCode::NOT_FOUND);
     }
+}
+
+#[tokio::test]
+async fn the_routes_without_a_token_answer_pages_on_any_origin() {
+    // One receipt, kept an hour: longer than the test takes.
+    let server = Server::with_policy(
+        Policy {
+            receipt_capacity: 1,
+            receipt_min_age_secs: 3600,
+            ..Policy::cash_like()
+        },
+        None,
+    )
+    .await;
+    let routes = [
+        (Method::GET, "/healthz".to_owned()),
+        (Method::GET, "/readyz".to_owned()),
+        (Method::GET, server.path("info")),
+        (Method::GET, server.path("keys")),
+        (Method::POST, "/v1/verify".to_owned()),
+        (Method::POST, "/v1/transfer".to_owned()),
+        (Method::POST, "/v1/burn".to_owned()),
+        (Method::POST, server.path("mint")),
+    ];
+    for (method, path) in &routes {
+        let (status, headers) = preflight(&server.app, method, path, "content-type").await;
+        assert_eq!(status, StatusCode::OK, "{path}");
+        assert_eq!(headers[header::ACCESS_CONTROL_ALLOW_ORIGIN], "*");
+        assert_eq!(
+            headers[header::ACCESS_CONTROL_ALLOW_METHODS],
+            method.as_str()
+        );
+        assert_eq!(
+            headers[header::ACCESS_CONTROL_ALLOW_HEADERS],
+            "content-type"
+        );
+        assert_eq!(headers[header::ACCESS_CONTROL_MAX_AGE], "86400");
+        assert!(!headers.contains_key(header::ACCESS_CONTROL_ALLOW_CREDENTIALS));
+    }
+
+    let (status, headers, info) = server
+        .call_from_page(Method::GET, &server.path("info"), None, Value::Null)
+        .await;
+    assert_eq!(status, StatusCode::OK, "{info}");
+    assert_readable_from_any_page(&headers);
+    let alice = HolderKey::generate();
+    let first = server.mint(8, &alice).await;
+    let second = server.mint(8, &alice).await;
+    let body = serde_json::to_value(pay(first, &alice).0).unwrap();
+    let (status, headers, answer) = server
+        .call_from_page(Method::POST, "/v1/transfer", None, body)
+        .await;
+    assert_eq!(status, StatusCode::OK, "{answer}");
+    assert_readable_from_any_page(&headers);
+
+    // Refusals too, so a page can read their codes and when to come back.
+    let body = serde_json::to_value(pay(second, &alice).0).unwrap();
+    let (status, headers, answer) = server
+        .call_from_page(Method::POST, "/v1/transfer", None, body)
+        .await;
+    assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
+    assert_eq!(answer["error"], "busy");
+    assert!(headers.contains_key(header::RETRY_AFTER));
+    assert_readable_from_any_page(&headers);
+    let (status, headers, answer) = server
+        .call_from_page(Method::POST, "/v1/transfer", None, json!({"inputs": 1}))
+        .await;
+    assert_eq!(status.as_u16() / 100, 4);
+    assert_eq!(answer["error"], "malformed");
+    assert_readable_from_any_page(&headers);
+    let (status, headers, answer) = server
+        .call_from_page(Method::GET, "/v1/mints/zz/info", None, Value::Null)
+        .await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
+    assert_eq!(answer["error"], "unknown_mint");
+    assert_readable_from_any_page(&headers);
+}
+
+#[tokio::test]
+async fn paths_no_route_serves_answer_pages_on_any_origin() {
+    let server = Server::new().await;
+    // A page that calls the wrong server, or a route this one lacks, reads
+    // the 404 rather than a network error.
+    for path in [
+        "/v1/nope".to_owned(),
+        server.path("nope"),
+        "/v2/info".to_owned(),
+    ] {
+        for method in [Method::GET, Method::POST] {
+            let (status, headers) = preflight(&server.app, &method, &path, "content-type").await;
+            assert_eq!(status, StatusCode::OK, "{method} {path}");
+            assert_eq!(headers[header::ACCESS_CONTROL_ALLOW_ORIGIN], "*");
+            assert_eq!(headers[header::ACCESS_CONTROL_ALLOW_METHODS], "GET,POST");
+            let (status, headers, _) = server
+                .call_from_page(method.clone(), &path, None, Value::Null)
+                .await;
+            assert_eq!(status, StatusCode::NOT_FOUND, "{method} {path}");
+            assert_readable_from_any_page(&headers);
+        }
+    }
+}
+
+#[tokio::test]
+async fn the_routes_with_a_token_answer_no_page_on_another_origin() {
+    let server = Server::new().await;
+    let routes = [
+        (Method::POST, server.path("rotate")),
+        (Method::POST, server.path("pause")),
+        (Method::POST, server.path("resume")),
+        (Method::GET, "/v1/admin/mints".to_owned()),
+        (Method::POST, "/v1/admin/mints".to_owned()),
+    ];
+    // A browser never sends the request, so a page cannot use a token.
+    for (method, path) in &routes {
+        let headers = "authorization,content-type";
+        let (status, headers) = preflight(&server.app, method, path, headers).await;
+        assert_eq!(status, StatusCode::METHOD_NOT_ALLOWED, "{method} {path}");
+        assert_no_cors(&headers);
+    }
+    // Nor could it read an answer, right token or wrong.
+    for (token, expected) in [
+        (&*server.token, StatusCode::OK),
+        ("wrong", StatusCode::UNAUTHORIZED),
+    ] {
+        let (status, headers, _) = server
+            .call_from_page(
+                Method::POST,
+                &server.path("resume"),
+                Some(token),
+                Value::Null,
+            )
+            .await;
+        assert_eq!(status, expected);
+        assert_no_cors(&headers);
+    }
+    let (status, headers, _) = server
+        .call_from_page(
+            Method::GET,
+            "/v1/admin/mints",
+            Some(&server.operator),
+            Value::Null,
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_no_cors(&headers);
+}
+
+#[tokio::test]
+async fn without_cors_no_route_answers_pages_on_other_origins() {
+    let server = Server::new().await.restart_with(router_without_cors).await;
+    for (method, path) in [
+        (Method::GET, server.path("info")),
+        (Method::POST, "/v1/transfer".to_owned()),
+    ] {
+        let (status, headers) = preflight(&server.app, &method, &path, "content-type").await;
+        assert_eq!(status, StatusCode::METHOD_NOT_ALLOWED, "{path}");
+        assert_no_cors(&headers);
+    }
+    let (status, headers) = preflight(&server.app, &Method::GET, "/v1/nope", "content-type").await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
+    assert_no_cors(&headers);
+    let (status, headers, info) = server
+        .call_from_page(Method::GET, &server.path("info"), None, Value::Null)
+        .await;
+    assert_eq!(status, StatusCode::OK, "{info}");
+    assert_no_cors(&headers);
 }
 
 #[tokio::test]

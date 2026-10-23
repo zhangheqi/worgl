@@ -2885,9 +2885,12 @@ dependencies = [
  "serde",
  "serde_json",
  "tempfile",
+ "thiserror 2.0.21",
  "tokio",
+ "tower-http",
  "tracing",
  "tracing-subscriber",
+ "url",
  "worgl",
  "worgl-client",
  "worgl-server",
@@ -2939,6 +2942,7 @@ dependencies = [
  "tempfile",
  "tokio",
  "tower",
+ "tower-http",
  "tracing",
  "tracing-subscriber",
  "worgl",
@@ -2951,6 +2955,7 @@ name = "worgl-wasm"
 version = "0.1.0"
 dependencies = [
  "getrandom 0.4.3",
+ "js-sys",
  "serde",
  "serde_json",
  "wasm-bindgen",

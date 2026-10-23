@@ -51,5 +51,11 @@ export {
   type Spacing,
   type Submitted,
 } from './purse.ts';
+export {
+  type WorglError,
+  type WorglErrorCode,
+  type WorglErrorDetails,
+  isWorglError,
+} from './error.ts';
 export { MemoryStore, type Store } from './store.ts';
 export { Holder } from './core.ts';

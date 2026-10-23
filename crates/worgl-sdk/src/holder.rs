@@ -5,7 +5,10 @@ use std::cmp::Reverse;
 use std::collections::{HashSet, VecDeque};
 
 use serde::{Deserialize, Serialize};
-use worgl::{Denominations, HolderKey, Note, Output, PolicyError, PublicKey, TransferRequest};
+use worgl::{
+    Denominations, HolderKey, KeySet, Note, NoteError, Output, PolicyError, PublicKey,
+    TransferRequest,
+};
 
 use crate::mint::{MintView, NoteState};
 use crate::payment::{Payment, PaymentRequest, ScheduledTransfer, Spacing};
@@ -47,7 +50,7 @@ const UNSCHEDULED_REFRESH_SECS: u64 = 60;
 /// note it expects, never two notes in one transfer, transfers of one
 /// payment and refreshes spread out in time, and outputs in random order.
 /// It does no networking: submit the transfers it makes to the mint, and
-/// give it the mint's answers.
+/// give it the answers with the mint's keys, which it checks them against.
 ///
 /// Notes are bearer: whoever holds this store holds the money. Save it with
 /// [`to_json`](Self::to_json), encrypted at rest, after every change.
@@ -184,14 +187,23 @@ pub enum PayError {
         needed: u128,
     },
     /// Enough value is spendable, but in notes too small for the notes the
-    /// request asks for. Ask the payee for a request with smaller notes; see
-    /// [`Holder::request_at_most`].
+    /// request asks for. When `at_most` names a size, ask the payee for the
+    /// same amount in notes of at most that, with
+    /// [`Holder::request_at_most`]: the spendable notes pay that request.
     #[error(
         "the requested notes do not fit the spendable notes; the largest spendable note is {largest}"
     )]
     Fragmented {
         /// The largest spendable note.
         largest: u64,
+        /// The largest note a request for the same amount, split as
+        /// [`Holder::request_at_most`] splits it, may ask for and still be
+        /// paid from the spendable notes: one of the mint's denominations up
+        /// to `largest`, or of the spendable notes' amounts when the mint
+        /// takes any amount. `None` when no such request fits, as when it
+        /// would take more notes than a request may ask for: ask for less,
+        /// or wait for frozen notes to become spendable.
+        at_most: Option<u64>,
     },
     /// The change would take more notes than one transfer may create.
     #[error("the change does not fit in {max_outputs} notes per transfer")]
@@ -207,6 +219,40 @@ pub enum PayError {
     /// means the store is corrupt.
     #[error(transparent)]
     Sign(#[from] worgl::Error),
+}
+
+/// An answer to a transfer is not the mint's, so [`Holder::settle`] keeps
+/// none of it.
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+pub enum AnswerError {
+    /// The transfer spends no notes, so it goes to no mint.
+    #[error("the transfer spends no notes, so no mint answers it")]
+    NoInputs,
+    /// The keys are not those of the mint whose notes the transfer spends.
+    #[error("the keys are not those of the mint the transfer goes to")]
+    WrongKeys,
+    /// The answer does not hold one note for each of the transfer's outputs.
+    #[error("the answer holds {answered} notes for the transfer's {outputs} outputs")]
+    Count {
+        /// The transfer's outputs.
+        outputs: usize,
+        /// The notes in the answer.
+        answered: usize,
+    },
+    /// A note is not the one the transfer asks for in its place: it is
+    /// another mint's, or of another amount or key than that output.
+    #[error("note {0} of the answer is not the transfer's output {0}")]
+    Unasked(usize),
+    /// A note does not carry the mint's signature: it is forged or altered,
+    /// or the keys do not know its generation, as keys read before the
+    /// rotation that opened it do not.
+    #[error("note {index} of the answer is not signed by the mint: {error}")]
+    Note {
+        /// Its place in the answer.
+        index: usize,
+        /// Why it does not verify.
+        error: NoteError,
+    },
 }
 
 /// A saved store cannot be read.
@@ -252,8 +298,9 @@ impl Holder {
     }
 
     /// Asks for `amount` from `mint` in notes of at most `largest` each. A
-    /// payer whose notes are small answers [`PayError::Fragmented`] to a
-    /// plain [`request`](Self::request); this request it can pay.
+    /// payer whose notes are small answers a plain [`request`](Self::request)
+    /// with [`PayError::Fragmented`], whose `at_most` is a `largest` it can
+    /// pay.
     pub fn request_at_most(
         &mut self,
         mint: &MintView,
@@ -441,9 +488,6 @@ impl Holder {
 
     /// Chooses which note pays which requested outputs.
     fn plan(&self, mint: &MintView, request: &PaymentRequest) -> Result<Vec<Part>, PayError> {
-        let max_outputs = usize::from(mint.policy.max_outputs.max(1));
-        let denominations = &mint.policy.denominations;
-        let change_of = |room: u64| split(denominations, room, None, max_outputs).ok();
         let needed = request.amount();
         let mut spendable: Vec<usize> = (0..self.notes.len())
             .filter(|&i| matches!(mint.state(&self.notes[i].note), NoteState::Spendable { .. }))
@@ -457,19 +501,47 @@ impl Holder {
                 needed,
             });
         }
+        self.parts(mint, &spendable, &request.outputs)
+            .map_err(|unfit| match unfit {
+                Unfit::Change => PayError::TooManyOutputs {
+                    max_outputs: mint.policy.max_outputs,
+                },
+                Unfit::Notes => {
+                    let largest = spendable.last().map_or(0, |&i| amount(i));
+                    PayError::Fragmented {
+                        largest,
+                        at_most: self.at_most(mint, &spendable, needed, largest),
+                    }
+                }
+            })
+    }
+
+    /// Chooses which of the `spendable` notes, given smallest first, pays
+    /// which of `outputs`.
+    fn parts(
+        &self,
+        mint: &MintView,
+        spendable: &[usize],
+        outputs: &[Output],
+    ) -> Result<Vec<Part>, Unfit> {
+        let max_outputs = usize::from(mint.policy.max_outputs.max(1));
+        let denominations = &mint.policy.denominations;
+        let change_of = |room: u64| split(denominations, room, None, max_outputs).ok();
+        let amount = |i: usize| self.notes[i].note.amount();
+        let needed: u128 = outputs.iter().map(|o| u128::from(o.amount)).sum();
 
         // The smallest single note that covers everything, change included.
-        for &i in &spendable {
+        for &i in spendable {
             if u128::from(amount(i)) < needed {
                 continue;
             }
             let room = (u128::from(amount(i)) - needed) as u64;
             if let Some(change) = change_of(room)
-                && request.outputs.len() + change.len() <= max_outputs
+                && outputs.len() + change.len() <= max_outputs
             {
                 return Ok(vec![Part {
                     note: i,
-                    paid: request.outputs.clone(),
+                    paid: outputs.to_vec(),
                     change,
                 }]);
             }
@@ -477,9 +549,9 @@ impl Holder {
 
         // Otherwise the largest notes first, each paying the largest
         // requested outputs it can hold.
-        let mut wanted = request.outputs.clone();
+        let mut wanted = outputs.to_vec();
         wanted.sort_by_key(|o| Reverse(o.amount));
-        let mut notes = spendable.clone();
+        let mut notes = spendable.to_vec();
         let mut plan = Vec::new();
         let mut change_limited = false;
         while !wanted.is_empty() {
@@ -520,15 +592,53 @@ impl Holder {
             }
         }
         if !wanted.is_empty() {
-            let max_outputs = mint.policy.max_outputs;
-            let largest = spendable.last().map_or(0, |&i| amount(i));
             return Err(if change_limited {
-                PayError::TooManyOutputs { max_outputs }
+                Unfit::Change
             } else {
-                PayError::Fragmented { largest }
+                Unfit::Notes
             });
         }
         Ok(plan)
+    }
+
+    /// The largest note that a request for `needed`, split as
+    /// [`request_at_most`](Self::request_at_most) splits it, may ask for
+    /// and still be paid from the `spendable` notes, the largest of which
+    /// is `largest`. See [`PayError::Fragmented`].
+    fn at_most(
+        &self,
+        mint: &MintView,
+        spendable: &[usize],
+        needed: u128,
+        largest: u64,
+    ) -> Option<u64> {
+        let needed = u64::try_from(needed).ok()?;
+        let denominations = &mint.policy.denominations;
+        let mut sizes: Vec<u64> = match denominations {
+            Denominations::Any => spendable
+                .iter()
+                .map(|&i| self.notes[i].note.amount())
+                .collect(),
+            Denominations::PowersOfTwo => (0..64).map(|bit| 1u64 << bit).collect(),
+            Denominations::List(values) => values.clone(),
+        };
+        sizes.retain(|&size| size <= largest);
+        sizes.sort_unstable_by_key(|&size| Reverse(size));
+        sizes.dedup();
+        sizes.into_iter().find(|&size| {
+            split(denominations, needed, Some(size), MAX_REQUESTED_NOTES).is_ok_and(|amounts| {
+                // Only the amounts matter to the plan, so the mint's key
+                // stands in for the payee's.
+                let outputs: Vec<Output> = amounts
+                    .into_iter()
+                    .map(|amount| Output {
+                        amount,
+                        holder: mint.issuer,
+                    })
+                    .collect();
+                self.parts(mint, spendable, &outputs).is_ok()
+            })
+        })
     }
 
     /// Takes in the notes of a mint's answer that were made for this
@@ -536,8 +646,9 @@ impl Holder {
     /// change included, or a refresh. Notes for other keys are ignored, and a
     /// note already held is not taken twice. Returns the value taken in.
     ///
-    /// Give it notes from the mint's own answer, or check them first with
-    /// [`Note::verify`]: the store does not check signatures.
+    /// It checks no signatures: check them first with [`Note::verify`],
+    /// unless the notes come from an issuer in this process. An answer from a
+    /// server goes to [`settle`](Self::settle), which checks it.
     pub fn absorb(&mut self, notes: &[Note]) -> u128 {
         let mut taken = 0;
         for note in notes {
@@ -584,15 +695,33 @@ impl Holder {
             .collect()
     }
 
-    /// Records the mint's answer to one of this holder's transfers: the
-    /// transfer stops being outgoing and its notes for this holder are taken
-    /// in. Returns the value taken in.
+    /// Records the mint's answer to a transfer, once it checks out against
+    /// `keys`, the key set of the mint the transfer goes to: the transfer
+    /// stops being outgoing and its notes for this holder are taken in.
+    /// Returns the value taken in.
+    ///
+    /// The answer checks out when it holds one note for each of the
+    /// transfer's outputs, in their order, each of the mint, with that
+    /// output's amount and key, and signed by the mint ([`Note::verify`]).
+    /// When it does not, nothing changes: a transfer that was outgoing stays
+    /// outgoing, to resend to the mint. So a server that is not the mint's,
+    /// or one that answers wrongly, can neither pass off forged notes, or
+    /// notes for other keys, as this holder's change or refreshed notes, nor
+    /// end a transfer with an answer that leaves them out. Read the keys
+    /// after the answer: keys read before a rotation do not know the
+    /// generation it opened, where the answer's notes may sit.
     ///
     /// When the transfer was outgoing and is part of a payment this holder
     /// made, the answer's notes for the payee are kept for it, among the
     /// payment's [owed](MadePayment::owed) notes: a resend may be what
     /// carried out the payment.
-    pub fn settle(&mut self, request: &TransferRequest, answer: &[Note]) -> u128 {
+    pub fn settle(
+        &mut self,
+        keys: &KeySet,
+        request: &TransferRequest,
+        answer: &[Note],
+    ) -> Result<u128, AnswerError> {
+        check_answer(keys, request, answer)?;
         let before = self.outgoing.len();
         self.outgoing.retain(|o| o.request != *request);
         if self.outgoing.len() < before
@@ -615,7 +744,7 @@ impl Holder {
         }
         let taken = self.absorb(answer);
         self.tidy();
-        taken
+        Ok(taken)
     }
 
     /// Takes in notes the counterparty handed over from the mint's answers,
@@ -627,9 +756,9 @@ impl Holder {
     /// needs no change, stays outgoing: only [resending](Self::resend) it
     /// shows it was applied.
     ///
-    /// Give it notes from the mint's own answer, or check them first with
-    /// [`Note::verify`]: the store does not check signatures, and a forged
-    /// note would settle a transfer as surely as a real one.
+    /// Check their signatures first with [`Note::verify`]: the store checks
+    /// none, and a forged note would settle a transfer as surely as a real
+    /// one.
     ///
     /// A signature shows that the mint issued a note, not which transfer it
     /// answers. A counterparty holding the transfer can pay the same keys
@@ -1093,12 +1222,58 @@ fn dropped_last(mint: &MintView, note: &Note) -> bool {
     note.issuer() == &mint.issuer && note.serial().generation.checked_add(1) == Some(mint.oldest)
 }
 
+/// Checks that `answer` is what the mint whose key set is `keys` answers to
+/// `request`: one note per output, in order, each the output's and signed by
+/// the mint.
+fn check_answer(
+    keys: &KeySet,
+    request: &TransferRequest,
+    answer: &[Note],
+) -> Result<(), AnswerError> {
+    if request.inputs.is_empty() {
+        return Err(AnswerError::NoInputs);
+    }
+    let mint = keys.issuer();
+    if request
+        .inputs
+        .iter()
+        .any(|spend| spend.note.issuer() != mint)
+    {
+        return Err(AnswerError::WrongKeys);
+    }
+    if answer.len() != request.outputs.len() {
+        return Err(AnswerError::Count {
+            outputs: request.outputs.len(),
+            answered: answer.len(),
+        });
+    }
+    for (index, (note, output)) in answer.iter().zip(&request.outputs).enumerate() {
+        if note.issuer() != mint
+            || note.amount() != output.amount
+            || note.holder() != &output.holder
+        {
+            return Err(AnswerError::Unasked(index));
+        }
+        note.verify(keys)
+            .map_err(|error| AnswerError::Note { index, error })?;
+    }
+    Ok(())
+}
+
 /// One transfer of a payment: the note it spends, the requested outputs it
 /// pays and the change it returns.
 struct Part {
     note: usize,
     paid: Vec<Output>,
     change: Vec<u64>,
+}
+
+/// Why the spendable notes cannot pay some outputs, though they add up.
+enum Unfit {
+    /// The notes are too small for the outputs.
+    Notes,
+    /// A note's change would take more notes than a transfer may make.
+    Change,
 }
 
 enum Split {
