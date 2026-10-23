@@ -1259,9 +1259,11 @@ describe('faucet', () => {
 
 /**
  * A store in memory that several purses share, as tabs share a browser's,
- * with a lock that lets one at a time change it. `held` says whether one
- * holds it now and `locks` how often it was taken; `load` fails while
- * `failing` is set.
+ * with a lock that lets one at a time change it. Like a store on disk, it
+ * answers a little after it is asked: a load with what was saved when it
+ * was asked, and a save once it has saved, which it allows only under the
+ * lock. `held` says whether one holds it now and `locks` how often it was
+ * taken; `load` fails while `failing` is set.
  */
 class SharedStore extends MemoryStore {
   held = false;
@@ -1273,7 +1275,15 @@ class SharedStore extends MemoryStore {
     if (this.failing) {
       throw new Error('cannot read the store');
     }
-    return super.load();
+    const saved = await super.load();
+    await later();
+    return saved;
+  }
+
+  override async save(json: string): Promise<void> {
+    assert.ok(this.held, 'saved outside the lock');
+    await later();
+    return super.save(json);
   }
 
   lock<T>(locked: () => Promise<T>): Promise<T> {
@@ -1290,6 +1300,11 @@ class SharedStore extends MemoryStore {
     this.#queue = result.catch(() => {});
     return result;
   }
+}
+
+/** Resolves a few milliseconds from now, as a store's answer would. */
+function later(): Promise<void> {
+  return new Promise((resolve) => setTimeout(resolve, 5));
 }
 
 describe('a shared store', () => {
