@@ -175,12 +175,14 @@ const submitted = await alice.submit(payment.transfers, {
   sent, and it resolves with what was done. A transfer on its way is
   treated as one whose answer was lost, since the mint may have applied it:
   it is in `submitted.refused` with outcome `kept` and the signal's reason
-  as its error. The transfers not sent are in `submitted.unsent`. Those the
-  purse made stay outgoing, so `settle` sends them again later, and the
-  mint answers one it applied with the same notes while it keeps its answer.
-  A change being saved is saved first, so the purse is never left
-  half-saved. A `refresh` stopped before it has read the mint's info plans
-  nothing.
+  as its error. An answer the mint has given already is still checked and
+  kept, since a resend gets it again only while the mint keeps it, so the
+  stop takes effect from the next transfer. The transfers not sent are in
+  `submitted.unsent`. Those the purse made stay outgoing, so `settle` sends
+  them again later, and the mint answers one it applied with the same notes
+  while it keeps its answer. A change being saved is saved first, so the
+  purse is never left half-saved. A `refresh` stopped before it has read the
+  mint's info plans nothing.
 
 Every `Client` call takes `{ signal }` too, and rejects with the signal's
 reason once it aborts. In a browser, passing a `signal` needs

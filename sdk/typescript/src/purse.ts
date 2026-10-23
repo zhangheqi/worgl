@@ -329,8 +329,11 @@ export interface SubmitOptions {
    * applied it: it is listed in {@link Submitted.refused} with outcome
    * `kept` and the signal's reason as its error, by default an `AbortError`
    * that {@link isTransient} accepts, and one this purse made stays
-   * outgoing, for {@link Purse.settle} to send again. The transfers not yet
-   * sent are listed in {@link Submitted.unsent}.
+   * outgoing, for {@link Purse.settle} to send again. An answer the mint
+   * has given already is not abandoned, since a resend gets it again only
+   * while the mint keeps it: the purse still reads the mint's keys to check
+   * it, within the client's timeout and as {@link Retry} says, and keeps
+   * it. The transfers not yet sent are listed in {@link Submitted.unsent}.
    */
   signal?: AbortSignal;
 }
@@ -899,7 +902,10 @@ export class Purse {
         report('refused', index);
         continue;
       }
-      const taken = await this.#takeAnswer(transfer.request, notes, signal);
+      // The answer is in hand, so it is checked and kept even once the
+      // signal has aborted: a resend gets it again only while the mint
+      // keeps it.
+      const taken = await this.#takeAnswer(transfer.request, notes);
       if ('error' in taken) {
         // Nothing changed: a transfer this purse made stays outgoing, for the
         // next settle.
@@ -925,23 +931,18 @@ export class Purse {
    * Records the answer to `transfer` once it checks out against the keys of
    * the transfer's mint, and resolves to the value taken in and the
    * counterparty's notes, or to why the answer was not kept: it is not the
-   * mint's, or the keys could not be read, as when `signal` aborted first.
-   * Rejects only if a save fails.
+   * mint's, or the keys could not be read. Rejects only if a save fails.
    */
   async #takeAnswer(
     transfer: string,
     notes: string[],
-    signal: AbortSignal | undefined,
   ): Promise<{ value: bigint; theirs: string[] } | { error: unknown }> {
     let keys: string;
     try {
       const mint = transferMint(transfer);
       // Read after the answer, so that they know the generation its notes sit
       // in, which a rotation may have opened since an earlier read.
-      keys = await this.#retrying(
-        () => this.client.keysText(mint, requestOptions(signal)),
-        signal,
-      );
+      keys = await this.#retrying(() => this.client.keysText(mint));
     } catch (error) {
       return { error };
     }
@@ -1027,7 +1028,7 @@ export class Purse {
    * reason, as does `call` when the signal stopped it, while a refusal
    * rejects as itself.
    */
-  async #retrying<T>(call: () => Promise<T>, signal: AbortSignal | undefined): Promise<T> {
+  async #retrying<T>(call: () => Promise<T>, signal?: AbortSignal): Promise<T> {
     let delay = this.#retry.firstDelayMs;
     for (let attempt = 1; ; attempt += 1) {
       try {

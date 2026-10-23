@@ -39,9 +39,12 @@ const MAX_RETRY_AFTER: Duration = Duration::from_secs(30);
 /// A call stops where it waits once its future is dropped, as under a
 /// timeout or in a task that is aborted. The holder changes and is saved
 /// only between waits, never across one, so it is never left half-saved.
-/// A transfer on its way then is as one whose answer was lost: the mint
-/// may have applied it, and one this purse made stays outgoing, for
-/// [`settle`](Self::settle) to send again.
+/// A transfer whose answer is not kept yet, because it is on its way or
+/// the purse is reading the mint's keys to check the answer, is then as
+/// one whose answer was lost: the mint may have applied it, and one this
+/// purse made stays outgoing, for [`settle`](Self::settle) to send again.
+/// The mint answers that resend with the same notes only while it keeps
+/// its answer (see [`settle`](Self::settle)).
 ///
 /// Several processes can share one store too. Before each change the purse
 /// takes the store's [lock](Store::lock) and reads the holder saved there,

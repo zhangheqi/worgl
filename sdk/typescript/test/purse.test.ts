@@ -1080,18 +1080,13 @@ describe('submit', () => {
 
   test('a transfer stopped on its way is as one whose answer was lost', async () => {
     // Stopped once the mint has applied the transfer and while its answer is
-    // on the way back, or while the purse reads the keys to check it; and
-    // for a reason that reads as the mint's own refusal, which drops nothing.
-    const stops = [
-      { where: '/v1/transfer', reason: undefined },
-      { where: '/keys', reason: undefined },
-      { where: '/v1/transfer', reason: new MintError(409, 'spent', 'the person left') },
-    ];
-    for (const { where, reason } of stops) {
+    // on the way back; and for a reason that reads as the mint's own
+    // refusal, which drops nothing.
+    for (const reason of [undefined, new MintError(409, 'spent', 'the person left')]) {
       const stop = new AbortController();
       let armed = false;
       const fetch: typeof globalThis.fetch = async (input, init) => {
-        if (!armed || stop.signal.aborted || !String(input).endsWith(where)) {
+        if (!armed || stop.signal.aborted || !String(input).endsWith('/v1/transfer')) {
           return globalThis.fetch(input, init);
         }
         // The request reaches the server, then the person leaves, and the
@@ -1115,7 +1110,7 @@ describe('submit', () => {
         signal: stop.signal,
         onProgress: (progress) => steps.push(told(progress)),
       });
-      assert.deepEqual(steps, ['sending 0', 'refused 0'], where);
+      assert.deepEqual(steps, ['sending 0', 'refused 0'], String(reason));
       assert.deepEqual([stopped.answered, stopped.value, stopped.unsent], [0, 0n, []]);
       assert.equal(stopped.refused.length, 1);
       const refused = stopped.refused[0]!;
@@ -1134,6 +1129,62 @@ describe('submit', () => {
       assert.equal(await bob.accept(settled.theirs), 5n);
       const balance = await alice.balance(server.mint);
       assert.deepEqual([balance.total, balance.held, balance.outgoing], [3n, 3n, 0n]);
+    }
+  });
+
+  test('a stop once the mint has answered keeps the answer', async () => {
+    // One receipt, kept no minimum time, stands in for a mint whose receipts
+    // many transfers push out: a resend would not get the answer again.
+    const own = await TestServer.start({ receipt_capacity: 1, receipt_min_age_secs: 0 });
+    try {
+      const stop = new AbortController();
+      let armed = false;
+      const fetch: typeof globalThis.fetch = (input, init) => {
+        if (armed && String(input).endsWith('/keys')) {
+          // The person leaves while the purse reads the keys to check the
+          // first answer.
+          armed = false;
+          stop.abort();
+        }
+        return globalThis.fetch(input, init);
+      };
+      const alice = await Purse.open(new Client(own.url, { fetch }), quick);
+      const open = () => Purse.open(own.client(), quick);
+      const [bob, carol, dave] = [await open(), await open(), await open()];
+      await own.fund(alice, 16n, 8n);
+      await own.fund(carol, 1n, 1n);
+      const first = await bob.request(own.mint, 5n);
+      const second = await bob.request(own.mint, 5n);
+      const transfers = [
+        ...(await alice.pay(first, NO_SPACING)).transfers,
+        ...(await alice.pay(second, NO_SPACING)).transfers,
+      ];
+
+      const steps: string[] = [];
+      armed = true;
+      const stopped = await alice.submit(transfers, {
+        signal: stop.signal,
+        onProgress: (progress) => steps.push(told(progress)),
+      });
+      assert.equal(stop.signal.aborted, true);
+      // The first answer is checked and kept; the stop takes effect from the
+      // second transfer.
+      assert.deepEqual(steps, ['sending 0', 'answered 0', 'unsent 1']);
+      assert.deepEqual([stopped.answered, stopped.value, stopped.refused], [1, 3n, []]);
+      assert.deepEqual(stopped.unsent, transfers.slice(1));
+      assert.deepEqual(alice.outgoing(), [transfers[1]!.request]);
+
+      // Another holder's transfer pushes Alice's receipt out, which costs her
+      // nothing now, and settle sends the rest.
+      const asked = await dave.request(own.mint, 1n);
+      allAnswered(await dave.receive(asked, await carol.pay(asked, NO_SPACING)), 1);
+      const settled = await alice.settle(NO_SPACING);
+      allAnswered(settled, 1);
+      assert.equal(await bob.accept([...stopped.theirs, ...settled.theirs]), 10n);
+      const balance = await alice.balance(own.mint);
+      assert.deepEqual([balance.total, balance.held, balance.outgoing], [6n, 6n, 0n]);
+    } finally {
+      await own.stop();
     }
   });
 
