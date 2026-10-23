@@ -12,7 +12,7 @@ import {
   forceCloseDatabase,
 } from 'fake-indexeddb';
 
-import { Purse, isWorglError } from '../src/index.ts';
+import { Client, NO_SPACING, Purse, isWorglError } from '../src/index.ts';
 import { IndexedDbStore } from '../src/browser.ts';
 import { TestServer } from './server.ts';
 
@@ -404,6 +404,96 @@ describe('browser store', () => {
       forceCloseDatabase(opened.at(-1)!.result as unknown as typeof IDBDatabase);
       assert.notEqual(await store.load(), undefined);
       assert.equal(await requested(name), 2n);
+    });
+
+    test('settles what another tab paid, as saved now, and says so', async () => {
+      // A tab opens the purse before another funds it and pays from it.
+      const name = server.url;
+      const tab = await open(name);
+      const other = await open(name);
+      await server.fund(other, 8n, 4n);
+      const payee = await Purse.open(server.client(), quick);
+      const request = await payee.requestAtMost(server.mint, 8n, 4n);
+      const payment = await other.pay(request, NO_SPACING);
+      const paid = payment.transfers.map((transfer) => transfer.request).sort();
+      assert.deepEqual(tab.outgoing(), []);
+
+      // Stopped before it starts, a settle sends none of them, and lists
+      // them all as unsent.
+      const stopped = await tab.settle(NO_SPACING, { signal: AbortSignal.abort() });
+      assert.deepEqual([stopped.answered, stopped.refused], [0, []]);
+      assert.deepEqual(stopped.unsent.map((transfer) => transfer.request).sort(), paid);
+
+      const steps: string[] = [];
+      const settled = await tab.settle(NO_SPACING, {
+        onProgress: (progress) => steps.push(`${progress.step} ${progress.index}`),
+      });
+      assert.deepEqual([settled.answered, settled.refused, settled.unsent], [2, [], []]);
+      assert.deepEqual(steps, ['sending 0', 'answered 0', 'sending 1', 'answered 1']);
+      assert.equal(await payee.accept(settled.theirs), 8n);
+      assert.deepEqual((await open(name)).outgoing(), []);
+    });
+
+    test('keeps an answer in hand when stopped while another tab holds the lock', async () => {
+      const name = server.url;
+      const store = new IndexedDbStore(name);
+      const stop = new AbortController();
+      let armed = false;
+      let holding: Promise<void> | undefined;
+      let release = (): void => {};
+      let released = false;
+      const fetch: typeof globalThis.fetch = (input, init) => {
+        if (armed && holding === undefined && String(input).endsWith('/keys')) {
+          // Another tab takes the lock while the purse reads the keys to
+          // check the first answer.
+          holding = navigator.locks.request(
+            `worgl:${name}`,
+            () => new Promise<void>((resolve) => (release = resolve)),
+          );
+        }
+        return globalThis.fetch(input, init);
+      };
+      const lock = store.lock.bind(store);
+      store.lock = <T>(locked: () => Promise<T>): Promise<T> => {
+        if (holding !== undefined && !stop.signal.aborted) {
+          // The person leaves while the purse waits for the lock to keep the
+          // answer, and the other tab lets go a little later.
+          stop.abort();
+          setTimeout(() => {
+            released = true;
+            release();
+          }, 50);
+        }
+        return lock(locked);
+      };
+      const tab = await Purse.open(new Client(server.url, { fetch }), { store, ...quick });
+      const payee = await Purse.open(server.client(), quick);
+      await server.fund(tab, 16n, 8n);
+      const transfers = [
+        ...(await tab.pay(await payee.request(server.mint, 5n), NO_SPACING)).transfers,
+        ...(await tab.pay(await payee.request(server.mint, 5n), NO_SPACING)).transfers,
+      ];
+
+      const steps: string[] = [];
+      armed = true;
+      const stopped = await tab.submit(transfers, {
+        signal: stop.signal,
+        onProgress: (progress) => steps.push(`${progress.step} ${progress.index}`),
+      });
+      await holding;
+      assert.ok(released);
+      // The first answer is kept once the other tab lets go; the stop takes
+      // effect from the second transfer.
+      assert.deepEqual(steps, ['sending 0', 'answered 0', 'unsent 1']);
+      assert.deepEqual([stopped.answered, stopped.value, stopped.refused], [1, 3n, []]);
+      assert.deepEqual(stopped.unsent, transfers.slice(1));
+
+      // A purse opened on the store has the rest outgoing, and settles it.
+      const reopened = await open(name);
+      assert.deepEqual(reopened.outgoing(), [transfers[1]!.request]);
+      const settled = await reopened.settle(NO_SPACING);
+      assert.deepEqual([settled.answered, settled.refused, settled.unsent], [1, [], []]);
+      assert.equal(await payee.accept([...stopped.theirs, ...settled.theirs]), 10n);
     });
   });
 });
