@@ -401,7 +401,7 @@ export class Purse {
    * refused before anything is signed. Refusals are {@link WorglError}s,
    * such as `unaffordable` when too little can be spent now, or `fragmented`
    * when enough can but in notes too small for those asked for, with the
-   * largest in its details.
+   * largest notes a request for the amount may ask for in its details.
    */
   async pay(request: PaymentRequest, spacing: Spacing = DEFAULT_SPACING): Promise<Payment> {
     const info = await this.client.infoText(request.mint);

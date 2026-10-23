@@ -3,8 +3,8 @@ type NoFields = Record<string, never>;
 
 /**
  * The fields each {@link WorglError} code carries in its `details`.
- * Amounts and generations are `bigint`, counts and limits `number`, and
- * keys hex strings.
+ * Amounts and generations are `bigint`, counts and limits `number`, keys
+ * hex strings, and a field with no value `undefined`.
  */
 export interface WorglErrorDetails {
   /**
@@ -44,10 +44,13 @@ export interface WorglErrorDetails {
   unaffordable: { spendable: bigint; needed: bigint };
   /**
    * Enough can be spent, but in notes too small for the notes the request
-   * asks for: the largest is `largest`. Ask the payee for a request in
-   * notes of at most that, as `requestAtMost` makes.
+   * asks for: the largest is `largest`. A request for the same amount in
+   * notes of at most `atMost`, as `requestAtMost` makes, can be paid now,
+   * and none in larger notes can. `atMost` is `undefined` when no such
+   * request can be paid, as when it would take too many notes: ask for
+   * less, or wait for frozen notes to become spendable.
    */
-  fragmented: { largest: bigint };
+  fragmented: { largest: bigint; atMost: bigint | undefined };
   /** The change would take more than the `maxOutputs` notes one transfer may make. */
   too_many_outputs: { maxOutputs: number };
   /** A transfer planned for the payment breaks the mint's policy: a bug. The message says how. */
@@ -90,11 +93,16 @@ export type WorglErrorCode = keyof WorglErrorDetails;
  * try {
  *   await alice.pay(request);
  * } catch (error) {
- *   if (!(isWorglError(error) && error.code === 'fragmented')) {
+ *   if (
+ *     !(isWorglError(error) && error.code === 'fragmented') ||
+ *     error.details.atMost === undefined
+ *   ) {
  *     throw error;
  *   }
- *   // Alice's notes are too small for the ones Bob asked for: he asks again.
- *   await alice.pay(await bob.requestAtMost(mint, request.amount, error.details.largest));
+ *   // Alice's notes are too small for the ones Bob asked for: he drops
+ *   // that request and asks again, in notes she can pay.
+ *   await bob.withdraw(request);
+ *   await alice.pay(await bob.requestAtMost(mint, request.amount, error.details.atMost));
  * }
  * ```
  *

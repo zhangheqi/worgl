@@ -130,22 +130,28 @@ tells one apart, and checking `code` then gives `details` their type:
 try {
   await alice.pay(request);
 } catch (error) {
-  if (!(isWorglError(error) && error.code === 'fragmented')) {
+  if (
+    !(isWorglError(error) && error.code === 'fragmented') ||
+    error.details.atMost === undefined
+  ) {
     throw error;
   }
-  // Alice's notes are too small for the ones Bob asked for: he asks again.
-  await alice.pay(await bob.requestAtMost(mint, request.amount, error.details.largest));
+  // Alice's notes are too small for the ones Bob asked for: he drops
+  // that request and asks again, in notes she can pay.
+  await bob.withdraw(request);
+  await alice.pay(await bob.requestAtMost(mint, request.amount, error.details.atMost));
 }
 ```
 
 In `details`, amounts and generations are `bigint`, counts and limits
-`number`, and keys hex strings. `Holder` and the other exports of the core
-throw the same codes as the purse calls built on them.
+`number`, keys hex strings, and a field with no value `undefined`.
+`Holder` and the other exports of the core throw the same codes as the
+purse calls built on them.
 
 | Code | `details` | Meaning |
 |---|---|---|
 | `unaffordable` | `spendable`, `needed` | `pay`: only `spendable` can be spent now, and the request asks for `needed`. Frozen notes become spendable at the next rotation. |
-| `fragmented` | `largest` | `pay`: enough can be spent, but in notes too small for those the request asks for; the largest is `largest`. Ask the payee again for notes of at most that, with `requestAtMost`. |
+| `fragmented` | `largest`, `atMost` | `pay`: enough can be spent, but in notes too small for those the request asks for; the largest is `largest`. A request for the same amount in notes of at most `atMost`, which the payee makes with `requestAtMost` after withdrawing the first, can be paid now, and none in larger notes can. `atMost` is `undefined` when no such request can be paid, as when it would take too many notes: ask for less, or wait for frozen notes to become spendable. |
 | `denomination` | `amount` | `pay`: the request asks for a note of `amount`, which is not one of the mint's denominations. |
 | `paid` | `holder` | `pay`: the request asks for a note to `holder`, a key the purse has paid already, such as one request twice. Paying again takes a new request. |
 | `too_many_outputs` | `maxOutputs` | `pay`: the change does not fit in the `maxOutputs` notes one transfer may make. |

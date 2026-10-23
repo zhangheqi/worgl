@@ -479,28 +479,80 @@ describe('purse', () => {
       assert.equal(isTransient(error), false);
       return true;
     });
+    await bob.withdraw(tooMuch);
 
     // Enough, but in notes of 2 for the one note of 8 asked: the payee asks
-    // again for notes no larger than the largest Alice holds.
+    // again in notes no larger than the largest that fit.
     const whole = await bob.request(server.mint, 8n);
-    let largest = 0n;
-    await assert.rejects(alice.pay(whole, NO_SPACING), (error: unknown) => {
-      assert.ok(isWorglError(error) && error.code === 'fragmented');
-      largest = error.details.largest;
-      assert.equal(
-        error.message,
-        'the requested notes do not fit the spendable notes; the largest spendable note is 2',
-      );
-      return true;
+    await assert.rejects(alice.pay(whole, NO_SPACING), {
+      name: 'WorglError',
+      code: 'fragmented',
+      details: { largest: 2n, atMost: 2n },
+      message: 'the requested notes do not fit the spendable notes; the largest spendable note is 2',
     });
-    assert.equal(largest, 2n);
     const balance = await alice.balance(server.mint);
     assert.deepEqual([balance.spendable, balance.outgoing], [8n, 0n]);
 
-    const smaller = await bob.requestAtMost(server.mint, 8n, largest);
+    await bob.withdraw(whole);
+    const smaller = await bob.requestAtMost(server.mint, 8n, 2n);
     const received = await bob.receive(smaller, await alice.pay(smaller, NO_SPACING));
     allAnswered(received, 4);
     assert.equal(received.value, 8n);
+    assert.equal((await bob.balance(server.mint)).expected, 0n);
+
+    // A request paid already, and requests that cannot be made.
+    const [paid] = smaller.notes;
+    await assert.rejects(alice.pay(smaller, NO_SPACING), {
+      code: 'paid',
+      details: { holder: paid!.holder },
+    });
+    await assert.rejects(bob.request(server.mint, 0n), { code: 'zero_amount', details: {} });
+    await assert.rejects(bob.requestAtMost(server.mint, 257n, 1n), {
+      code: 'too_many_notes',
+      details: { max: 256 },
+      message: 'the request would need more than 256 notes',
+    });
+  });
+
+  test('a fragmented payment names the largest notes that fit', async () => {
+    const [alice, bob] = [await purse(), await purse()];
+    // Notes of 4, 1, 1, 1 and 1. A request for 8 in notes of 4 would need
+    // the second 4 from the notes of 1, and in notes of 2 two of them: only
+    // notes of 1 fit.
+    await server.fund(alice, 4n, 4n);
+    await server.fund(alice, 4n, 1n);
+
+    const request = await bob.request(server.mint, 8n);
+    try {
+      await alice.pay(request, NO_SPACING);
+      assert.fail('the notes of 4 and 1 paid a note of 8');
+    } catch (error) {
+      // As the README has it.
+      if (
+        !(isWorglError(error) && error.code === 'fragmented') ||
+        error.details.atMost === undefined
+      ) {
+        throw error;
+      }
+      assert.deepEqual(error.details, { largest: 4n, atMost: 1n });
+      await bob.withdraw(request);
+      const smaller = await bob.requestAtMost(server.mint, request.amount, error.details.atMost);
+      const received = await bob.receive(smaller, await alice.pay(smaller, NO_SPACING));
+      allAnswered(received, 5);
+      assert.equal(received.value, 8n);
+    }
+    assert.equal((await bob.balance(server.mint)).expected, 0n);
+
+    // From notes of 64, 1 and 1, no request for 66 fits: in any size it
+    // asks for a note of 2 or more beside those the 64 pays, or, in notes
+    // of 1, for more than one transfer from the 64 may make.
+    const carol = await purse();
+    await server.fund(carol, 64n, 64n);
+    await server.fund(carol, 2n, 1n);
+    await assert.rejects(carol.pay(await bob.request(server.mint, 66n), NO_SPACING), {
+      code: 'fragmented',
+      details: { largest: 64n, atMost: undefined },
+    });
   });
 
   test('a paused mint is retried, reported, then paid', async () => {

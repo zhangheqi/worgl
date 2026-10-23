@@ -11,8 +11,8 @@ use worgl_sdk::{CheckError, LoadError, MAX_REQUESTED_NOTES, NoLayers, PayError, 
 /// of the Rust error it comes from.
 ///
 /// The fields are named in camelCase. Amounts and generations are `bigint`,
-/// counts and limits `number`, and keys hex strings. The TypeScript SDK
-/// lists every code with its fields.
+/// counts and limits `number`, keys hex strings, and a field with no value
+/// `undefined`. The TypeScript SDK lists every code with its fields.
 #[derive(Debug)]
 pub struct Error {
     code: &'static str,
@@ -21,7 +21,7 @@ pub struct Error {
 }
 
 /// A field of an error's details.
-#[derive(Debug)]
+#[derive(Debug, PartialEq, Eq)]
 enum Detail {
     /// An amount or a generation.
     Big(u128),
@@ -29,6 +29,8 @@ enum Detail {
     Count(u32),
     /// A key, in hex.
     Key(PublicKey),
+    /// No value: `undefined`.
+    Undefined,
 }
 
 impl From<u64> for Detail {
@@ -61,6 +63,12 @@ impl From<PublicKey> for Detail {
     }
 }
 
+impl<T: Into<Detail>> From<Option<T>> for Detail {
+    fn from(value: Option<T>) -> Self {
+        value.map_or(Self::Undefined, Into::into)
+    }
+}
+
 impl Error {
     /// An error of `code` with no fields.
     pub(crate) fn new(code: &'static str, message: impl Display) -> Self {
@@ -86,6 +94,7 @@ impl From<Error> for JsValue {
                 Detail::Big(value) => JsValue::from(value),
                 Detail::Count(value) => JsValue::from(value),
                 Detail::Key(key) => JsValue::from(key.to_string()),
+                Detail::Undefined => JsValue::UNDEFINED,
             };
             set(&details, name, &value);
         }
@@ -150,7 +159,9 @@ impl From<PayError> for Error {
             PayError::Unaffordable { spendable, needed } => thrown("unaffordable")
                 .with("spendable", *spendable)
                 .with("needed", *needed),
-            PayError::Fragmented { largest } => thrown("fragmented").with("largest", *largest),
+            PayError::Fragmented { largest, at_most } => thrown("fragmented")
+                .with("largest", *largest)
+                .with("atMost", *at_most),
             PayError::TooManyOutputs { max_outputs } => {
                 thrown("too_many_outputs").with("maxOutputs", *max_outputs)
             }
@@ -191,5 +202,105 @@ impl From<NoteError> for Error {
             }
             NoteError::BadSignature => thrown("bad_signature"),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use worgl::{HolderKey, Note, Output, PolicyError};
+
+    use super::*;
+
+    /// Checks the code and fields `error` is thrown with, and that its
+    /// message is the Rust error's.
+    fn check<E: Display + Into<Error>>(error: E, code: &str, details: &[(&'static str, Detail)]) {
+        let message = error.to_string();
+        let thrown: Error = error.into();
+        assert_eq!(thrown.code, code, "{message}");
+        assert_eq!(thrown.details, details, "{message}");
+        assert_eq!(thrown.message, message);
+    }
+
+    #[test]
+    fn requests_are_refused_with_their_codes() {
+        check(RequestError::Zero, "zero_amount", &[]);
+        let amount = ("amount", Detail::Big(5));
+        check(RequestError::Denominations(5), "unsplittable", &[amount]);
+        let max = ("max", Detail::Count(256));
+        check(RequestError::TooManyNotes, "too_many_notes", &[max]);
+    }
+
+    #[test]
+    fn payments_are_refused_with_their_codes() {
+        let key = HolderKey::generate().public_key();
+        check(PayError::WrongMint, "wrong_mint", &[]);
+        check(PayError::Empty, "empty_request", &[]);
+        let amount = ("amount", Detail::Big(3));
+        check(PayError::Denomination(3), "denomination", &[amount]);
+        check(PayError::Paid(key), "paid", &[("holder", Detail::Key(key))]);
+        let unaffordable = PayError::Unaffordable {
+            spendable: 8,
+            needed: 16,
+        };
+        let fields = [("spendable", Detail::Big(8)), ("needed", Detail::Big(16))];
+        check(unaffordable, "unaffordable", &fields);
+        let fragmented = PayError::Fragmented {
+            largest: 4,
+            at_most: Some(1),
+        };
+        let fields = [("largest", Detail::Big(4)), ("atMost", Detail::Big(1))];
+        check(fragmented, "fragmented", &fields);
+        let fragmented = PayError::Fragmented {
+            largest: 64,
+            at_most: None,
+        };
+        let fields = [("largest", Detail::Big(64)), ("atMost", Detail::Undefined)];
+        check(fragmented, "fragmented", &fields);
+        let outputs = PayError::TooManyOutputs { max_outputs: 16 };
+        check(
+            outputs,
+            "too_many_outputs",
+            &[("maxOutputs", Detail::Count(16))],
+        );
+        check(PayError::Policy(PolicyError::Limits), "policy", &[]);
+        let sign = PayError::Sign(PolicyError::Limits.into());
+        check(sign, "sign", &[]);
+    }
+
+    #[test]
+    fn payments_that_do_not_match_their_request_have_codes() {
+        let holder = HolderKey::generate().public_key();
+        let output = Output { amount: 4, holder };
+        let fields = [("amount", Detail::Big(4)), ("holder", Detail::Key(holder))];
+        check(CheckError::WrongMint, "wrong_mint", &[]);
+        check(CheckError::NotOneInput, "not_one_input", &[]);
+        check(CheckError::Missing(output), "unpaid", &fields);
+        check(CheckError::Duplicate(output), "overpaid", &fields);
+    }
+
+    #[test]
+    fn notes_that_do_not_verify_have_codes() {
+        let truncated = Note::from_bytes(&[]).unwrap_err();
+        assert!(matches!(truncated, NoteError::Malformed(_)));
+        check(truncated, "malformed", &[]);
+        check(NoteError::Version(9), "malformed", &[]);
+        check(NoteError::WrongIssuer, "wrong_issuer", &[]);
+        let generation = ("generation", Detail::Big(7));
+        check(
+            NoteError::UnknownGeneration(7),
+            "unknown_generation",
+            &[generation],
+        );
+        check(NoteError::BadSignature, "bad_signature", &[]);
+    }
+
+    #[test]
+    fn unreadable_arguments_have_codes() {
+        let json = || serde_json::from_str::<u8>("{").unwrap_err();
+        check(json(), "malformed", &[]);
+        check(LoadError::Json(json()), "malformed", &[]);
+        let format = ("format", Detail::Count(9));
+        check(LoadError::Format(9), "unknown_format", &[format]);
+        check(NoLayers, "no_layers", &[]);
     }
 }
