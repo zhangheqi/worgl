@@ -89,6 +89,10 @@
 //! until the next rotation. The view holds the info's layers, which no clock
 //! moves, so read the info again after a rotation. [`Holder::refresh`] keeps
 //! notes alive by paying the ones about to expire to the holder itself.
+//! With a schedule in the info, [`MintView::spendable_at`] and
+//! [`MintView::expires_at`] say when a note can move and when it dies
+//! untouched, and [`Holder::first_expiry`] when the first of the holder's
+//! would: the time to refresh by.
 
 mod holder;
 mod mint;

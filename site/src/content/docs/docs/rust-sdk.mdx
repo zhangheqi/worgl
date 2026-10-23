@@ -139,7 +139,11 @@ in place of the server. CI runs it.
 A `MintView`, read from a mint's info, tells the holder which notes can move
 now, which are frozen until the next rotation and which die at it. It holds
 the info's layers, which no clock moves, so read the info again after a
-rotation. `Holder::refresh` keeps notes alive by paying the ones about to
+rotation. With a schedule in the info, `MintView::spendable_at` and
+`MintView::expires_at` say when a frozen note can move and when a note dies
+untouched, and `Holder::first_expiry` when the first of the holder's would,
+counting the notes its outgoing transfers spend: the time to refresh by.
+`Holder::refresh` keeps notes alive by paying the ones about to
 expire to the holder itself, and `Holder::due_resends` gives the outgoing
 transfers to resend before the next rotation. Both spread them over the time
 left from a `now` by the mint's clock, which `Client::view_and_time` reads

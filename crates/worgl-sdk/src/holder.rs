@@ -990,9 +990,7 @@ impl Holder {
             .iter()
             .filter(|o| {
                 let note = &o.spends.note;
-                let dropped_last = note.issuer() == &mint.issuer
-                    && note.serial().generation.checked_add(1) == Some(mint.oldest);
-                dropped_last
+                dropped_last(mint, note)
                     || matches!(
                         mint.state(note),
                         NoteState::Spendable {
@@ -1141,6 +1139,32 @@ impl Holder {
         balance
     }
 
+    /// Unix time, in seconds, of the first scheduled rotation at `mint` that
+    /// takes something from this holder unless it moves first: the one that
+    /// drops a note it holds, or the note an outgoing transfer spends, after
+    /// which a transfer the mint never applied never can be. A transfer
+    /// whose note the last rotation dropped counts at the next, which drops
+    /// the notes it made if the mint applied it (see
+    /// [`due_resends`](Self::due_resends)). `None` when the mint has no
+    /// schedule or is paused, or when none of these is left: notes newer
+    /// than the view do not count.
+    ///
+    /// An application that keeps notes alive only while it runs, with
+    /// [`refresh`](Self::refresh) and [`due_resends`](Self::due_resends),
+    /// should run again before it, less a margin of its own. The time is by
+    /// the mint's clock, as the view gives it; once it has passed, read the
+    /// info again, since the mint may not have made that rotation yet.
+    pub fn first_expiry(&self, mint: &MintView) -> Option<u64> {
+        let next_at = mint.schedule.filter(|_| !mint.paused)?.next_at;
+        let held = self.notes.iter().filter_map(|h| mint.expires_at(&h.note));
+        let outgoing = self.outgoing.iter().filter_map(|o| {
+            let note = &o.spends.note;
+            mint.expires_at(note)
+                .or_else(|| dropped_last(mint, note).then_some(next_at))
+        });
+        held.chain(outgoing).min()
+    }
+
     /// The notes held, of every mint.
     pub fn notes(&self) -> impl Iterator<Item = &Note> {
         self.notes.iter().map(|h| &h.note)
@@ -1190,6 +1214,12 @@ fn refresh_window(mint: &MintView, now: u64) -> u64 {
         Some(left) => left.saturating_sub(REFRESH_MARGIN_SECS.min(left / 2)),
         None => UNSCHEDULED_REFRESH_SECS,
     }
+}
+
+/// Whether `note` is of `mint` and sat in the layer its last rotation
+/// dropped.
+fn dropped_last(mint: &MintView, note: &Note) -> bool {
+    note.issuer() == &mint.issuer && note.serial().generation.checked_add(1) == Some(mint.oldest)
 }
 
 /// Checks that `answer` is what the mint whose key set is `keys` answers to

@@ -36,6 +36,7 @@ export {
   type Balance,
   DEFAULT_RETRY,
   DEFAULT_SPACING,
+  type HeldNote,
   MAX_DELAY_SECS,
   type MadePayment,
   NO_SPACING,
