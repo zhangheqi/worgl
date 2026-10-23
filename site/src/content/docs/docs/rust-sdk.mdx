@@ -67,7 +67,7 @@ for a note, to a fresh key like any other.
 | Call | What it does |
 |---|---|
 | `request(&mint, amount)` | Asks to be paid: a `PaymentRequest` of fresh keys to send the payer. |
-| `request_at_most(&mint, amount, largest)` | The same, in notes no larger than `largest`. |
+| `request_at_most(&mint, amount, largest)` | The same, in notes no larger than `largest`. When `pay` refuses a request as `PayError::Fragmented`, a request in notes no larger than its `at_most` is one the payer can pay. |
 | `pay(&request, spacing)` | Answers a request with a `Payment` of signed transfers. Refuses, before signing, a request for a note the mint does not make or to a key the purse has paid already. |
 | `receive(&request, &payment)` | Checks a payment, submits each transfer at its time and keeps the notes. |
 | `settle(spacing)` | Sends the transfers not yet seen answered again, and takes in the change. |

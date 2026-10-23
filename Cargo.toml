@@ -41,6 +41,9 @@ getrandom = "0.4"
 hex = "0.4"
 http-body-util = "0.1"
 httpdate = "1"
+# Without its default features, js-sys leaves out the bindings that need a
+# page's Content Security Policy to allow `unsafe-eval`.
+js-sys = { version = "0.3.106", default-features = false }
 # With `loosen-follower-log-revert`, a leader that finds a follower lacks
 # entries the leader had counted it as holding, as after the member was
 # restored from an older copy of its directory, logs a warning ("follower

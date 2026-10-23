@@ -1,5 +1,6 @@
 // The Rust core, compiled to WebAssembly. Importing this module loads it:
-// from disk under Node, through fetch in a browser or bundler.
+// from disk under Node, through fetch in a browser or bundler. A call that
+// fails throws a WorglError (see error.ts).
 
 import init, { initSync } from '../wasm/worgl_wasm.js';
 

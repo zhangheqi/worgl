@@ -184,14 +184,23 @@ pub enum PayError {
         needed: u128,
     },
     /// Enough value is spendable, but in notes too small for the notes the
-    /// request asks for. Ask the payee for a request with smaller notes; see
-    /// [`Holder::request_at_most`].
+    /// request asks for. When `at_most` names a size, ask the payee for the
+    /// same amount in notes of at most that, with
+    /// [`Holder::request_at_most`]: the spendable notes pay that request.
     #[error(
         "the requested notes do not fit the spendable notes; the largest spendable note is {largest}"
     )]
     Fragmented {
         /// The largest spendable note.
         largest: u64,
+        /// The largest note a request for the same amount, split as
+        /// [`Holder::request_at_most`] splits it, may ask for and still be
+        /// paid from the spendable notes: one of the mint's denominations up
+        /// to `largest`, or of the spendable notes' amounts when the mint
+        /// takes any amount. `None` when no such request fits, as when it
+        /// would take more notes than a request may ask for: ask for less,
+        /// or wait for frozen notes to become spendable.
+        at_most: Option<u64>,
     },
     /// The change would take more notes than one transfer may create.
     #[error("the change does not fit in {max_outputs} notes per transfer")]
@@ -252,8 +261,9 @@ impl Holder {
     }
 
     /// Asks for `amount` from `mint` in notes of at most `largest` each. A
-    /// payer whose notes are small answers [`PayError::Fragmented`] to a
-    /// plain [`request`](Self::request); this request it can pay.
+    /// payer whose notes are small answers a plain [`request`](Self::request)
+    /// with [`PayError::Fragmented`], whose `at_most` is a `largest` it can
+    /// pay.
     pub fn request_at_most(
         &mut self,
         mint: &MintView,
@@ -441,9 +451,6 @@ impl Holder {
 
     /// Chooses which note pays which requested outputs.
     fn plan(&self, mint: &MintView, request: &PaymentRequest) -> Result<Vec<Part>, PayError> {
-        let max_outputs = usize::from(mint.policy.max_outputs.max(1));
-        let denominations = &mint.policy.denominations;
-        let change_of = |room: u64| split(denominations, room, None, max_outputs).ok();
         let needed = request.amount();
         let mut spendable: Vec<usize> = (0..self.notes.len())
             .filter(|&i| matches!(mint.state(&self.notes[i].note), NoteState::Spendable { .. }))
@@ -457,19 +464,47 @@ impl Holder {
                 needed,
             });
         }
+        self.parts(mint, &spendable, &request.outputs)
+            .map_err(|unfit| match unfit {
+                Unfit::Change => PayError::TooManyOutputs {
+                    max_outputs: mint.policy.max_outputs,
+                },
+                Unfit::Notes => {
+                    let largest = spendable.last().map_or(0, |&i| amount(i));
+                    PayError::Fragmented {
+                        largest,
+                        at_most: self.at_most(mint, &spendable, needed, largest),
+                    }
+                }
+            })
+    }
+
+    /// Chooses which of the `spendable` notes, given smallest first, pays
+    /// which of `outputs`.
+    fn parts(
+        &self,
+        mint: &MintView,
+        spendable: &[usize],
+        outputs: &[Output],
+    ) -> Result<Vec<Part>, Unfit> {
+        let max_outputs = usize::from(mint.policy.max_outputs.max(1));
+        let denominations = &mint.policy.denominations;
+        let change_of = |room: u64| split(denominations, room, None, max_outputs).ok();
+        let amount = |i: usize| self.notes[i].note.amount();
+        let needed: u128 = outputs.iter().map(|o| u128::from(o.amount)).sum();
 
         // The smallest single note that covers everything, change included.
-        for &i in &spendable {
+        for &i in spendable {
             if u128::from(amount(i)) < needed {
                 continue;
             }
             let room = (u128::from(amount(i)) - needed) as u64;
             if let Some(change) = change_of(room)
-                && request.outputs.len() + change.len() <= max_outputs
+                && outputs.len() + change.len() <= max_outputs
             {
                 return Ok(vec![Part {
                     note: i,
-                    paid: request.outputs.clone(),
+                    paid: outputs.to_vec(),
                     change,
                 }]);
             }
@@ -477,9 +512,9 @@ impl Holder {
 
         // Otherwise the largest notes first, each paying the largest
         // requested outputs it can hold.
-        let mut wanted = request.outputs.clone();
+        let mut wanted = outputs.to_vec();
         wanted.sort_by_key(|o| Reverse(o.amount));
-        let mut notes = spendable.clone();
+        let mut notes = spendable.to_vec();
         let mut plan = Vec::new();
         let mut change_limited = false;
         while !wanted.is_empty() {
@@ -520,15 +555,53 @@ impl Holder {
             }
         }
         if !wanted.is_empty() {
-            let max_outputs = mint.policy.max_outputs;
-            let largest = spendable.last().map_or(0, |&i| amount(i));
             return Err(if change_limited {
-                PayError::TooManyOutputs { max_outputs }
+                Unfit::Change
             } else {
-                PayError::Fragmented { largest }
+                Unfit::Notes
             });
         }
         Ok(plan)
+    }
+
+    /// The largest note that a request for `needed`, split as
+    /// [`request_at_most`](Self::request_at_most) splits it, may ask for
+    /// and still be paid from the `spendable` notes, the largest of which
+    /// is `largest`. See [`PayError::Fragmented`].
+    fn at_most(
+        &self,
+        mint: &MintView,
+        spendable: &[usize],
+        needed: u128,
+        largest: u64,
+    ) -> Option<u64> {
+        let needed = u64::try_from(needed).ok()?;
+        let denominations = &mint.policy.denominations;
+        let mut sizes: Vec<u64> = match denominations {
+            Denominations::Any => spendable
+                .iter()
+                .map(|&i| self.notes[i].note.amount())
+                .collect(),
+            Denominations::PowersOfTwo => (0..64).map(|bit| 1u64 << bit).collect(),
+            Denominations::List(values) => values.clone(),
+        };
+        sizes.retain(|&size| size <= largest);
+        sizes.sort_unstable_by_key(|&size| Reverse(size));
+        sizes.dedup();
+        sizes.into_iter().find(|&size| {
+            split(denominations, needed, Some(size), MAX_REQUESTED_NOTES).is_ok_and(|amounts| {
+                // Only the amounts matter to the plan, so the mint's key
+                // stands in for the payee's.
+                let outputs: Vec<Output> = amounts
+                    .into_iter()
+                    .map(|amount| Output {
+                        amount,
+                        holder: mint.issuer,
+                    })
+                    .collect();
+                self.parts(mint, spendable, &outputs).is_ok()
+            })
+        })
     }
 
     /// Takes in the notes of a mint's answer that were made for this
@@ -1069,6 +1142,14 @@ struct Part {
     note: usize,
     paid: Vec<Output>,
     change: Vec<u64>,
+}
+
+/// Why the spendable notes cannot pay some outputs, though they add up.
+enum Unfit {
+    /// The notes are too small for the outputs.
+    Notes,
+    /// A note's change would take more notes than a transfer may make.
+    Change,
 }
 
 enum Split {
