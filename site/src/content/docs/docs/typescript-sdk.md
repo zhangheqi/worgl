@@ -204,7 +204,13 @@ purse calls built on them.
 | `unasked` | `index` | `Submitted.refused`: note `index` of an answer is not the transfer's output in its place, but another mint's, or of another amount or key. The purse kept none of the answer. |
 | `unsigned` | `index` | `Submitted.refused`: note `index` of an answer does not carry the mint's signature: it is forged or altered, or the keys do not know its generation. The purse kept none of the answer. |
 | `faucet_amount` | `amount` | `takeFromFaucet`: the faucet hands out notes of `amount`, which its mint cannot make as one note. |
-| `unknown_format` | `format` | `Purse.open`: the saved purse is in `format`, a newer one this SDK does not read. |
+| `wrong_passphrase` | | `Backup.open`: the passphrase is wrong, or the backup was altered after it was sealed: the two look the same. |
+| `not_sealed` | | `Backup.open`: the text is not a backup or purse file. |
+| `unknown_version` | `version` | `Backup.open`: the backup is of `version`, a newer one this SDK does not read. |
+| `damaged` | | `Backup.open`: a part of the backup does not read, such as its salt, settings or ciphertext, or it opened to no purse. The message says which. |
+| `out_of_memory` | | `Backup.open`, `backup`: too little memory to derive the key: 64 MiB, or up to 256 MiB for a backup whose settings ask for more. |
+| `no_randomness` | | `backup`: the system's random number generator failed. |
+| `unknown_format` | `format` | `Purse.open`, `Backup.open`: the saved purse, or the one a backup holds, is in `format`, a newer one this SDK does not read. |
 | `malformed` | | Any call: something it was given is not the JSON it takes, such as a payment request, a payment, notes, a mint's info or keys, or, for `Purse.open`, a saved purse; or a transfer spends no notes. |
 | `no_layers` | | Any call that reads a mint's info: the info lists no layers. |
 
@@ -215,13 +221,64 @@ atomically, readable by its owner only. The JSON holds every note's secret
 key, so keep it private and encrypted at rest. Implement `Store` to keep it
 elsewhere.
 
+## Backups
+
+`purse.backup(passphrase)` seals the purse into a backup: the file the
+[`worgl` command](../command-line/#the-purse-file) keeps its purse in, which
+it opens as a purse, with the purse's server named for each mint.
+`Backup.open(sealed, passphrase)` opens a backup, or a purse file of `worgl`,
+and `purse.restore(backup)` merges it into a purse:
+
+```ts
+import { Backup } from 'worgl';
+
+const sealed = await alice.backup(passphrase); // keep it apart from the store
+// On another device, or once the store is lost:
+const restored = await alice.restore(await Backup.open(sealed, passphrase));
+await alice.settle(); // resends the transfers it took in
+```
+
+A backup holds every note's secret key, like the store, sealed with
+XChaCha20-Poly1305 under a key derived from the passphrase with Argon2id
+over 64 MiB, three passes. Deriving it takes about a quarter of a second in
+Node and in Chromium on a desktop processor, longer on a phone, and blocks
+the thread meanwhile; the WebAssembly memory grows by 64 MiB the first time
+and keeps that size. A wrong passphrase and a backup altered after it was
+sealed are refused alike, with `wrong_passphrase`.
+
+Restoring keeps what is the purse's in either copy and counts nothing twice
+that the two can tell apart: a note in both is held once, a request of
+either is expected until it is paid, and a transfer the backup shows
+answered, or cancelled or forgotten, is settled or ended here too.
+`restored` lists what changed. Some of it only the mint can tell:
+
+- A note only the backup holds may be one the purse spent since. It counts
+  until the mint says otherwise. `purse.prune(mint)` drops the expired ones
+  from the mint's info alone, and `purse.checkNotes(restored.notes)` asks
+  the mint about each and discards those it reports spent. Each question
+  shows the mint one note, from this machine's address and at its time, so
+  it asks at random gaps, 2 to 60 seconds by default (see the
+  [Privacy model](../privacy/#timing)). Asking nothing leaves the transfers
+  that next spend the notes to find the spent ones, which the mint refuses.
+- A transfer only the backup has outgoing may be one the purse settled and
+  forgot. `purse.settle()` resends it: the mint answers with the same notes
+  while it keeps the answer, and refuses it once its note is spent.
+- Two transfers that spend one note, in `restored.conflicts`, are a note
+  each copy spent. The mint applies at most one, and `settle` drops the
+  other.
+
+`restore` takes the mints the backup names this purse's server for, or no
+server, as in a purse file of `worgl`. `restored.others` lists the rest, to
+restore into a purse of their server; `purse.restore(backup, [mint])` names
+the mints to take instead.
+
 ## Testing it yourself
 
-The tests run against a real server on a local port, so build the server
-first:
+The tests run against a real server on a local port, and open backups with
+the `worgl` command line, so build both first:
 
 ```sh
-cargo build -p worgl-server -p worgl-faucet   # from the repository root
+cargo build -p worgl-server -p worgl-faucet -p worgl-cli   # from the repository root
 cd sdk/typescript
 npm run check   # type-checks the package and its tests
 npm test

@@ -108,6 +108,16 @@ the mint answers with the same notes while it keeps its answers.
   (`worgl-faucet`) for a note, to a fresh key like any other, and keeps it.
   A page on another origin than the faucet's can ask it only if the faucet
   names that origin with `--allow-origin`.
+- `purse.backup(passphrase)` seals the purse into a backup, the file the
+  `worgl` command line keeps its purse in, naming the purse's server for
+  each mint. `Backup.open(sealed, passphrase)` opens one, or a purse file of
+  `worgl`, and `purse.restore(backup)` merges it in: a note in both is held
+  once, and a transfer the backup shows answered or ended is settled or
+  ended here too. A note the backup holds that the purse spent since counts
+  until the mint says otherwise: `purse.checkNotes(restored.notes)` asks it
+  about each, at random gaps, and discards the spent ones, which shows the
+  mint those notes one after another. Deriving a backup's key takes 64 MiB
+  of memory and about a quarter of a second.
 - `Client` makes one call per route and rejects with a `MintError` carrying
   the mint's code (`spent`, `frozen`, `paused`…); `isTransient(error)` says
   whether trying again may work. It counts `layer_full` out: a transfer
@@ -180,7 +190,13 @@ purse calls built on them.
 | `unasked` | `index` | `Submitted.refused`: note `index` of an answer is not the transfer's output in its place, but another mint's, or of another amount or key. The purse kept none of the answer. |
 | `unsigned` | `index` | `Submitted.refused`: note `index` of an answer does not carry the mint's signature: it is forged or altered, or the keys do not know its generation. The purse kept none of the answer. |
 | `faucet_amount` | `amount` | `takeFromFaucet`: the faucet hands out notes of `amount`, which its mint cannot make as one note. |
-| `unknown_format` | `format` | `Purse.open`: the saved purse is in `format`, a newer one this SDK does not read. |
+| `wrong_passphrase` | | `Backup.open`: the passphrase is wrong, or the backup was altered after it was sealed: the two look the same. |
+| `not_sealed` | | `Backup.open`: the text is not a backup or purse file. |
+| `unknown_version` | `version` | `Backup.open`: the backup is of `version`, a newer one this SDK does not read. |
+| `damaged` | | `Backup.open`: a part of the backup does not read, such as its salt, settings or ciphertext, or it opened to no purse. The message says which. |
+| `out_of_memory` | | `Backup.open`, `backup`: too little memory to derive the key: 64 MiB, or up to 256 MiB for a backup whose settings ask for more. |
+| `no_randomness` | | `backup`: the system's random number generator failed. |
+| `unknown_format` | `format` | `Purse.open`, `Backup.open`: the saved purse, or the one a backup holds, is in `format`, a newer one this SDK does not read. |
 | `malformed` | | Any call: something it was given is not the JSON it takes, such as a payment request, a payment, notes, a mint's info or keys, or, for `Purse.open`, a saved purse; or a transfer spends no notes. |
 | `no_layers` | | Any call that reads a mint's info: the info lists no layers. |
 
@@ -189,7 +205,7 @@ purse calls built on them.
 ```sh
 rustup target add wasm32-unknown-unknown
 cargo install wasm-bindgen-cli --version 0.2.129 --locked  # the version Cargo.lock pins
-cargo build -p worgl-server -p worgl-faucet   # the tests run against them
+cargo build -p worgl-server -p worgl-faucet -p worgl-cli   # the tests run against them
 npm ci
 npm run build   # compiles the Rust core to wasm/ and the package to dist/
 npm run check   # type-checks the package and its tests

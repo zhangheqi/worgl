@@ -15,8 +15,32 @@ export interface WorglErrorDetails {
   malformed: NoFields;
   /** The mint's info lists no layers. */
   no_layers: NoFields;
-  /** The saved purse is in `format`, a newer one this SDK does not read. */
+  /**
+   * The saved purse, or the purse a backup holds, is in `format`, a newer
+   * one this SDK does not read.
+   */
   unknown_format: { format: number };
+  /** The text is not a backup or purse file. */
+  not_sealed: NoFields;
+  /** The backup is of `version`, a newer one this SDK does not read. */
+  unknown_version: { version: number };
+  /**
+   * The passphrase is wrong, or the backup was altered after it was sealed:
+   * the two look the same.
+   */
+  wrong_passphrase: NoFields;
+  /**
+   * A part of the backup does not read, such as its salt, settings or
+   * ciphertext, or it opened to no purse. The message says which.
+   */
+  damaged: NoFields;
+  /**
+   * Too little memory to derive the backup's key: 64 MiB, or up to 256 MiB
+   * for a backup whose settings ask for more.
+   */
+  out_of_memory: NoFields;
+  /** The system's random number generator failed, so no backup can be sealed. */
+  no_randomness: NoFields;
   /** A request for nothing: the amount is zero. */
   zero_amount: NoFields;
   /** A request for `amount`, which cannot be split into the mint's denominations. */

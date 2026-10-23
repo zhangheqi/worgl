@@ -7,7 +7,10 @@ transfers of one payment spread out in time.
 
 It does no networking and keeps no files, so it runs anywhere, WebAssembly
 included. [`worgl-client`](https://crates.io/crates/worgl-client) runs it
-over HTTP, which is what most programs want.
+over HTTP, which is what most programs want. With the `vault` feature, it
+seals a holder under a passphrase into the purse file the `worgl` command
+line keeps, and opens one; `Holder::merge` takes a backup back into a purse
+that moved on since.
 
 ```sh
 cargo add worgl worgl-sdk

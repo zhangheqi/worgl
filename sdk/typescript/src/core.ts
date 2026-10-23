@@ -17,6 +17,7 @@ if (wasm.protocol === 'file:' && fs !== undefined) {
 
 export {
   Holder,
+  Vault,
   breaksPolicy,
   checkPayment,
   mintSummary,

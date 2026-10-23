@@ -104,7 +104,7 @@ dependencies = [
  "base64ct",
  "blake2",
  "cpufeatures",
- "password-hash",
+ "zeroize",
 ]
 
 [[package]]
@@ -337,6 +337,7 @@ dependencies = [
  "cipher",
  "cpufeatures",
  "rand_core 0.10.1",
+ "zeroize",
 ]
 
 [[package]]
@@ -349,6 +350,7 @@ dependencies = [
  "chacha20",
  "cipher",
  "poly1305",
+ "zeroize",
 ]
 
 [[package]]
@@ -1330,31 +1332,10 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "7c87def4c32ab89d880effc9e097653c8da5d6ef28e6b539d313baaacfbafcbe"
 
 [[package]]
-name = "password-hash"
-version = "0.6.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "aab41826031698d6ffcd9cff78ef56ef998e39dc7e5067cdfebe373842d4723b"
-dependencies = [
- "getrandom 0.4.3",
- "phc",
-]
-
-[[package]]
 name = "percent-encoding"
 version = "2.3.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "9b4f627cb1b25917193a259e49bdad08f671f8d9708acfd5fe0a8c1455d87220"
-
-[[package]]
-name = "phc"
-version = "0.6.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "44dc769b75f93afdddd8c7fa12d685292ddeff1e66f7f0f3a234cf1818afe892"
-dependencies = [
- "base64ct",
- "ctutils",
- "getrandom 0.4.3",
-]
 
 [[package]]
 name = "pin-project"
@@ -2835,12 +2816,8 @@ name = "worgl-cli"
 version = "0.1.0"
 dependencies = [
  "anyhow",
- "argon2",
  "axum",
- "base64",
- "chacha20poly1305",
  "clap",
- "getrandom 0.4.3",
  "hex",
  "rpassword",
  "serde",
@@ -2914,6 +2891,9 @@ dependencies = [
 name = "worgl-sdk"
 version = "0.1.0"
 dependencies = [
+ "argon2",
+ "base64",
+ "chacha20poly1305",
  "getrandom 0.4.3",
  "hex",
  "proptest",
@@ -2921,6 +2901,7 @@ dependencies = [
  "serde_json",
  "thiserror 2.0.21",
  "worgl",
+ "zeroize",
 ]
 
 [[package]]

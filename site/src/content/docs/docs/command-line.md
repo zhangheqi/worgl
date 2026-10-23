@@ -180,6 +180,41 @@ reads it again and saves before unlocking, so no command saves over a note
 another one took in. The lock is a file beside the purse,
 `.purse.worgl.lock`.
 
+## The purse file
+
+The purse file is JSON: the settings and salt of the key derivation in the
+clear, a nonce, and the purse sealed with XChaCha20-Poly1305 under the
+derived key. The settings are authenticated with it, so they cannot be
+weakened without the passphrase. Each save takes a fresh nonce under the
+same key.
+
+```json
+{
+  "format": "worgl-purse",
+  "version": 1,
+  "kdf": {
+    "algorithm": "argon2id",
+    "memory_kib": 65536,
+    "iterations": 3,
+    "parallelism": 1,
+    "salt": "…"
+  },
+  "nonce": "…",
+  "ciphertext": "…"
+}
+```
+
+A backup from the [TypeScript SDK](../typescript-sdk/#backups) is a purse
+file too, so `worgl` opens one as its purse. Beside the purse, it names the
+server of each mint, and `worgl` keeps that list as it is when it saves; it
+still talks to the server `--server` names. A purse file `worgl` 0.1 wrote
+has no list and opens as before, and `worgl` 0.1 opens a file with one,
+dropping the list when it saves. `worgl` reads a file whose settings ask
+for up to 256 MiB, eight passes and 16 lanes, and refuses one that asks for
+more before deriving anything. Copy the file to back the purse up, and
+restore a copy with the TypeScript SDK's `purse.restore`, which merges it
+with what the purse holds now.
+
 ## Keeping notes alive
 
 A note left alone dies when its layer is dropped. Run `worgl refresh MINT`

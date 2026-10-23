@@ -2,8 +2,9 @@
 
 `worgl`: hold, pay and receive [Worgl](https://zhangheqi.github.io/worgl/)
 notes from the command line. The purse lives in one file, encrypted under a
-passphrase. Payment requests, payments and handed-over notes are JSON files
-for the two sides to exchange.
+passphrase, which is also the format of the TypeScript SDK's backups: each
+opens the other's. Payment requests, payments and handed-over notes are JSON
+files for the two sides to exchange.
 
 ```sh
 cargo install worgl-cli --locked

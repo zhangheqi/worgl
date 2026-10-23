@@ -1,4 +1,5 @@
-import { type Client, MintError, isTransient } from './client.ts';
+import { type Backup, type BackupMint, seal } from './backup.ts';
+import { type Client, MintError, type NoteState, isTransient } from './client.ts';
 import {
   Holder,
   type Scheduled,
@@ -248,6 +249,63 @@ export interface Submitted {
    * read the mint's keys to check.
    */
   refused: Refused[];
+}
+
+/**
+ * What {@link Purse.restore} took in from a backup, what the backup showed
+ * was done with, and what only the mint can settle. Notes and transfers are
+ * JSON.
+ */
+export interface Restored {
+  /**
+   * Notes held now that were not before, from the backup. This purse may
+   * have spent some since: it forgets a transfer once it is answered, and
+   * the note it spent with it. A backup a day old mostly holds such notes on
+   * a mint that rotates every few hours. They count until the mint says
+   * otherwise; {@link Purse.prune} drops the expired ones from the mint's
+   * info alone, and {@link Purse.checkNotes} asks the mint about the rest.
+   */
+  notes: string[];
+  /**
+   * Transfers outgoing now that were not before, from the backup.
+   * {@link Purse.settle} resends them: the mint answers each with its notes
+   * if it applied it and keeps the answer, and refuses one whose note is
+   * gone, which is then dropped.
+   */
+  outgoing: string[];
+  /**
+   * Transfers outgoing before that the backup showed answered, by holding or
+   * spending every note they pay this purse. They are settled.
+   */
+  settled: string[];
+  /**
+   * Transfers outgoing before that the backup ended, keeping their change
+   * as unconfirmed: cancelled if it holds their note again, forgotten if
+   * not. They are ended here too, the same way.
+   */
+  ended: string[];
+  /**
+   * Transfers outgoing now that spend a note another one spends: this purse
+   * and the backup each spent it, in a transfer of its own. The mint applies
+   * at most one, and {@link Purse.settle} tells which; until then that
+   * note's value counts in both.
+   */
+  conflicts: string[];
+  /**
+   * The mints of the backup left out, each with the server the backup names
+   * for it: restore those into a purse of that server.
+   */
+  others: BackupMint[];
+}
+
+/** What {@link Purse.checkNotes} found. */
+export interface Checked {
+  /** Value this purse held in the notes the mint reported spent or expired, now discarded. */
+  value: bigint;
+  /** The notes the mint reported spent or expired. This purse holds none of them now. */
+  discarded: string[];
+  /** The notes the mint could not be asked about, each with the last error. They are kept. */
+  unanswered: { note: string; error: unknown }[];
 }
 
 /**
@@ -843,6 +901,110 @@ export class Purse {
   }
 
   /**
+   * Seals this purse into a backup under `passphrase`, in turn after the
+   * changes before it, naming this purse's server for each of its mints.
+   * The backup is the purse file of the `worgl` command line, which opens
+   * it as a purse; {@link Backup.open} opens it here, and {@link restore}
+   * merges it into a purse.
+   *
+   * It holds the secret key of every note: anyone with the backup and the
+   * passphrase can spend them. Its key is derived from the passphrase with
+   * Argon2id over 64 MiB, which takes a moment and blocks the thread
+   * meanwhile, and a fresh salt each time.
+   */
+  async backup(passphrase: string): Promise<string> {
+    const sealed = this.#changes.then(() => seal(this.#holder, passphrase, this.client.baseUrl));
+    this.#changes = sealed.catch(() => {});
+    return sealed;
+  }
+
+  /**
+   * Merges `backup`, a copy of this purse such as an older backup or
+   * another device's, into it and saves. What is the purse's in either is
+   * kept, and nothing is counted twice that the two can tell apart: see
+   * {@link Restored} for what only the mint can tell. A backup of another
+   * purse merges as the union of the two.
+   *
+   * It takes the part of the backup that is of `mints`: by default every
+   * mint it names this purse's server for, or no server, as in a purse file
+   * of the `worgl` command line. The others are listed in
+   * {@link Restored.others}. The mint is asked nothing.
+   */
+  async restore(backup: Backup, mints?: string[]): Promise<Restored> {
+    const here = this.client.baseUrl;
+    const taken =
+      mints ??
+      backup.mints
+        .filter((m) => m.server === undefined || m.server === here)
+        .map((m) => m.mint);
+    const whole = Holder.fromJson(backup.toJson());
+    let part: Holder;
+    try {
+      part = whole.only(JSON.stringify(taken));
+    } finally {
+      whole.free();
+    }
+    try {
+      const restored = await this.#changeOrRestore(() => {
+        const merged = this.#holder.merge(part);
+        try {
+          return {
+            notes: JSON.parse(merged.notes) as string[],
+            outgoing: merged.outgoing,
+            settled: merged.settled,
+            ended: merged.ended,
+            conflicts: merged.conflicts,
+          };
+        } finally {
+          merged.free();
+        }
+      });
+      return { ...restored, others: backup.mints.filter((m) => !taken.includes(m.mint)) };
+    } finally {
+      part.free();
+    }
+  }
+
+  /**
+   * Asks the mint about each of `notes`, such as {@link Restored.notes},
+   * spaced by random gaps of `spacing`, and discards those it reports spent
+   * or expired, then saves. A note it reports unissued is kept: it may come
+   * back, as after the mint restored its state from a backup. A note this
+   * purse does not hold is only reported.
+   *
+   * The mint's answers are not signed, so ask only this purse's server, the
+   * mint's own. Each question shows the mint one note, from this machine's
+   * address and at its time, so asking about notes one after another
+   * invites the guess that they have one owner. Ask only when that is
+   * acceptable, with gaps as wide as you can wait for; or ask nothing, and
+   * let the transfers that next spend the notes find the spent ones, which
+   * the mint refuses. {@link prune} drops the expired ones without asking.
+   */
+  async checkNotes(notes: string[], spacing: Spacing = DEFAULT_SPACING): Promise<Checked> {
+    const checked: Checked = { value: 0n, discarded: [], unanswered: [] };
+    for (const [index, note] of notes.entries()) {
+      if (index > 0) {
+        await sleep(gap(spacing) * 1000);
+      }
+      let state: NoteState;
+      try {
+        state = await this.#retrying(() => this.client.verify(note));
+      } catch (error) {
+        checked.unanswered.push({ note, error });
+        continue;
+      }
+      if (state.state === 'spent' || state.state === 'expired') {
+        checked.discarded.push(note);
+      }
+    }
+    if (checked.discarded.length > 0) {
+      const gone = JSON.stringify(checked.discarded);
+      checked.value = await this.#changeOrRestore(() => this.#holder.discard(gone));
+    }
+    return checked;
+  }
+
+  /**
    * Makes the request `call` makes, again while the failure is transient, as
    * {@link Retry} says.
    */
@@ -909,6 +1071,12 @@ function read(transfers: Scheduled[]): ScheduledTransfer[] {
 
 function sleep(ms: number): Promise<void> {
   return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+/** A gap drawn at random from `spacing`, in seconds. */
+function gap(spacing: Spacing): number {
+  const [drawn = 0] = crypto.getRandomValues(new Uint32Array(1));
+  return spacing.minSecs + (drawn / 2 ** 32) * Math.max(0, spacing.maxSecs - spacing.minSecs);
 }
 
 /**

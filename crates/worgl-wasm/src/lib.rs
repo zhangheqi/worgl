@@ -9,6 +9,9 @@
 //! Every privacy rule lives in the Rust core; the TypeScript side only moves
 //! text between the holder, the server and its store.
 //!
+//! [`Vault`] seals a holder into a purse file under a passphrase, in the
+//! format of [`worgl_sdk::vault`], which the `worgl` command line opens too.
+//!
 //! A call that fails throws an `Error` named `WorglError`, with a stable
 //! `code` and that code's fields in `details` beside the message: see
 //! [`Error`].
@@ -22,6 +25,7 @@ use serde::de::DeserializeOwned;
 use wasm_bindgen::prelude::*;
 use worgl::issuer::LayerSummary;
 use worgl::{KeySet, Note, NoteStatus, PublicKey, Serial, Supply, TransferRequest};
+use worgl_sdk::vault::{self, MintEntry};
 use worgl_sdk::{
     MintInfo, MintView, NoteState, Payment, PaymentRequest, Schedule, ScheduledTransfer, Spacing,
 };
@@ -33,7 +37,7 @@ use worgl_sdk::{
 /// transfers before the mint's next rotation take the Unix time in seconds
 /// to plan from too, by the mint's clock: see [`worgl_sdk::Holder::refresh`].
 #[wasm_bindgen]
-#[derive(Debug, Default)]
+#[derive(Debug, Clone, Default)]
 pub struct Holder {
     inner: worgl_sdk::Holder,
 }
@@ -253,6 +257,169 @@ impl Holder {
     #[wasm_bindgen(js_name = firstExpiry)]
     pub fn first_expiry(&self, info: &str) -> Result<Option<u64>, Error> {
         Ok(self.inner.first_expiry(&view(info)?))
+    }
+
+    /// The issuer keys of the mints this holder has anything of, in key
+    /// order.
+    pub fn mints(&self) -> Vec<String> {
+        self.inner.mints().iter().map(ToString::to_string).collect()
+    }
+
+    /// A copy of the part of this holder that is of `mints`, a JSON array
+    /// of issuer keys; see [`worgl_sdk::Holder::only`].
+    pub fn only(&self, mints: &str) -> Result<Holder, Error> {
+        let mints = parse::<Vec<PublicKey>>(mints)?;
+        Ok(Self {
+            inner: self.inner.only(&mints),
+        })
+    }
+
+    /// Drops the held notes, a JSON array, that their mint reports spent or
+    /// expired, and returns their value. Only on the mint's answer for each
+    /// note: see [`worgl_sdk::Holder::discard`].
+    pub fn discard(&mut self, notes: &str) -> Result<u128, Error> {
+        Ok(self.inner.discard(&parse::<Vec<Note>>(notes)?))
+    }
+
+    /// Takes in `other`, another copy of this holder's purse such as a
+    /// backup, keeping what is the purse's in either and counting nothing
+    /// twice that the two can tell apart; returns what changed. What only
+    /// the mint can tell, and what asking it shows, is in
+    /// [`worgl_sdk::Holder::merge`].
+    pub fn merge(&mut self, other: &Holder) -> Merged {
+        let merged = self.inner.merge(&other.inner);
+        let each = |transfers: Vec<TransferRequest>| transfers.iter().map(json).collect();
+        Merged {
+            notes: json(&merged.notes),
+            outgoing: each(merged.outgoing),
+            settled: each(merged.settled),
+            ended: each(merged.ended),
+            conflicts: each(merged.conflicts),
+        }
+    }
+}
+
+/// What [`Holder::merge`] changed; see [`worgl_sdk::Merged`].
+#[wasm_bindgen]
+#[derive(Debug)]
+pub struct Merged {
+    notes: String,
+    outgoing: Vec<String>,
+    settled: Vec<String>,
+    ended: Vec<String>,
+    conflicts: Vec<String>,
+}
+
+#[wasm_bindgen]
+impl Merged {
+    /// The notes held now that were not before, a JSON array: the other
+    /// copy's, which this one may have spent since.
+    #[wasm_bindgen(getter)]
+    pub fn notes(&self) -> String {
+        self.notes.clone()
+    }
+
+    /// The transfers outgoing now that were not before, each as JSON, to
+    /// resend.
+    #[wasm_bindgen(getter)]
+    pub fn outgoing(&self) -> Vec<String> {
+        self.outgoing.clone()
+    }
+
+    /// The transfers outgoing before that the other copy showed answered,
+    /// each as JSON. They are settled.
+    #[wasm_bindgen(getter)]
+    pub fn settled(&self) -> Vec<String> {
+        self.settled.clone()
+    }
+
+    /// The transfers outgoing before that the other copy cancelled or
+    /// forgot, each as JSON. They are ended the same way.
+    #[wasm_bindgen(getter)]
+    pub fn ended(&self) -> Vec<String> {
+        self.ended.clone()
+    }
+
+    /// The transfers outgoing now that spend a note another one spends,
+    /// each as JSON: the mint applies at most one.
+    #[wasm_bindgen(getter)]
+    pub fn conflicts(&self) -> Vec<String> {
+        self.conflicts.clone()
+    }
+}
+
+/// A key derived from a passphrase, which seals a holder into a purse file
+/// and opens it again; see [`worgl_sdk::vault::Vault`]. The file is the
+/// one `worgl` keeps its purse in.
+///
+/// Deriving the key takes 64 MiB of memory and a moment, on purpose: keep
+/// the vault to seal again under the same key.
+#[wasm_bindgen]
+#[derive(Debug)]
+pub struct Vault {
+    inner: vault::Vault,
+}
+
+#[wasm_bindgen]
+impl Vault {
+    /// Derives a key from `passphrase` under a fresh random salt, for a new
+    /// purse file.
+    #[wasm_bindgen(constructor)]
+    pub fn new(passphrase: &str) -> Result<Vault, Error> {
+        let inner = vault::Vault::new(passphrase)?;
+        Ok(Self { inner })
+    }
+
+    /// Derives the key that opens `sealed`, a purse file, from `passphrase`
+    /// and the file's own settings, and checks it opens it. Read the file
+    /// with [`unseal`](Self::unseal), which needs no new key.
+    pub fn open(sealed: &str, passphrase: &str) -> Result<Vault, Error> {
+        let (inner, _) = vault::Vault::open(sealed, passphrase)?;
+        Ok(Self { inner })
+    }
+
+    /// Seals `holder` into a purse file, with `mints`, a JSON array of
+    /// `{"mint", "server"}` that names the server of each mint, under a
+    /// fresh nonce.
+    pub fn seal(&self, holder: &Holder, mints: &str) -> Result<String, Error> {
+        let mints = parse::<Vec<MintEntry>>(mints)?;
+        Ok(self.inner.seal(&holder.inner, &mints)?)
+    }
+
+    /// Opens `sealed`, a purse file this vault sealed or opened, or another
+    /// save of it.
+    pub fn unseal(&self, sealed: &str) -> Result<Contents, Error> {
+        let contents = self.inner.unseal(sealed)?;
+        Ok(Contents {
+            holder: Holder {
+                inner: contents.holder,
+            },
+            mints: json(&contents.mints),
+        })
+    }
+}
+
+/// What a purse file holds; see [`worgl_sdk::vault::Contents`].
+#[wasm_bindgen]
+#[derive(Debug)]
+pub struct Contents {
+    holder: Holder,
+    mints: String,
+}
+
+#[wasm_bindgen]
+impl Contents {
+    /// The holder.
+    #[wasm_bindgen(getter)]
+    pub fn holder(&self) -> Holder {
+        self.holder.clone()
+    }
+
+    /// The server of each mint, as the purse that sealed it named them: a
+    /// JSON array of `{"mint", "server"}`, empty for a file `worgl` wrote.
+    #[wasm_bindgen(getter)]
+    pub fn mints(&self) -> String {
+        self.mints.clone()
     }
 }
 

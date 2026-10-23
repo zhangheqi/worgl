@@ -211,6 +211,35 @@ impl Balance {
     }
 }
 
+/// What [`Holder::merge`] changed: what it took in from the other copy,
+/// what that copy showed was done with, and what only the mint can settle.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct Merged {
+    /// Notes held now that were not before, from the other copy. This copy
+    /// may have spent them since, in a transfer it has forgotten once
+    /// answered: only the mint can tell. See [`Holder::merge`].
+    pub notes: Vec<Note>,
+    /// Transfers outgoing now that were not before, from the other copy,
+    /// with the notes they spend. Resend them ([`Holder::resend`]): the mint
+    /// answers each with its notes if it applied it and keeps the answer,
+    /// and refuses one whose note is gone.
+    pub outgoing: Vec<TransferRequest>,
+    /// Transfers outgoing before that the other copy showed answered: it
+    /// holds, or spends, every note they pay this holder. They are settled
+    /// here too.
+    pub settled: Vec<TransferRequest>,
+    /// Transfers outgoing before that the other copy ended, keeping their
+    /// change as unconfirmed: [cancelled](Holder::cancel) if it holds their
+    /// note again, [forgotten](Holder::forget) if not. They are ended here
+    /// too, the same way.
+    pub ended: Vec<TransferRequest>,
+    /// Transfers outgoing now that spend a note another one spends: each
+    /// copy spent it, in a transfer of its own. The mint applies at most
+    /// one, and resending them tells which; it refuses the other, which is
+    /// then dropped. Until then that note's value counts in both.
+    pub conflicts: Vec<TransferRequest>,
+}
+
 /// A payment request cannot be made.
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 pub enum RequestError {
@@ -334,8 +363,11 @@ pub enum LoadError {
     Format(u32),
 }
 
+/// A store as [`Holder::to_json`] saves it. A purse file seals it with a
+/// mint list beside its members, as `mints`, so none of them may take that
+/// name.
 #[derive(Serialize, Deserialize)]
-struct Saved {
+pub(crate) struct Saved {
     format: u32,
     notes: Vec<Held>,
     expected: Vec<Expected>,
@@ -1274,14 +1306,356 @@ impl Holder {
         self.notes.iter().map(|h| &h.note)
     }
 
+    /// The mints this holder has anything of, in key order: a note held or
+    /// spent by an outgoing transfer, a key expected, unconfirmed change or
+    /// a payment kept.
+    pub fn mints(&self) -> Vec<PublicKey> {
+        let mut mints: Vec<PublicKey> = self
+            .notes
+            .iter()
+            .map(|h| *h.note.issuer())
+            .chain(self.expected.iter().map(|e| e.mint))
+            .chain(self.outgoing.iter().map(|o| *o.spends.note.issuer()))
+            .chain(self.unconfirmed.iter().map(|u| u.change.mint))
+            .chain(self.payments.iter().map(|p| p.payment.mint))
+            .collect();
+        mints.sort_unstable();
+        mints.dedup();
+        mints
+    }
+
+    /// A copy of the part of this holder that is of `mints`: their notes,
+    /// keys expected, outgoing transfers, unconfirmed change and payments,
+    /// as for the purse of a server that serves those mints. The keys paid
+    /// last name no mint, so the copy has all of them.
+    pub fn only(&self, mints: &[PublicKey]) -> Holder {
+        let of = |mint: &PublicKey| mints.contains(mint);
+        Holder {
+            notes: self
+                .notes
+                .iter()
+                .filter(|h| of(h.note.issuer()))
+                .cloned()
+                .collect(),
+            expected: self
+                .expected
+                .iter()
+                .filter(|e| of(&e.mint))
+                .cloned()
+                .collect(),
+            outgoing: self
+                .outgoing
+                .iter()
+                .filter(|o| of(o.spends.note.issuer()))
+                .cloned()
+                .collect(),
+            unconfirmed: self
+                .unconfirmed
+                .iter()
+                .filter(|u| of(&u.change.mint))
+                .cloned()
+                .collect(),
+            payments: self
+                .payments
+                .iter()
+                .filter(|p| of(&p.payment.mint))
+                .cloned()
+                .collect(),
+            paid: self.paid.clone(),
+        }
+    }
+
+    /// Drops held `notes` that their mint reports spent or expired, such as
+    /// notes a [merge](Self::merge) took in that this purse had spent since,
+    /// and returns their value. Their keys go with them, for good.
+    ///
+    /// Only the mint can tell (`POST /v1/verify`), and its answer is not
+    /// signed: drop a note only on an answer for that note from its mint's
+    /// server, as a transfer is [forgotten](Self::forget) only on the mint's
+    /// refusal. A note it reports unissued may come back, as after the mint
+    /// restored its state from a backup: keep it.
+    pub fn discard(&mut self, notes: &[Note]) -> u128 {
+        let mut value = 0;
+        self.notes.retain(|h| {
+            let gone = notes.contains(&h.note);
+            if gone {
+                value += u128::from(h.note.amount());
+            }
+            !gone
+        });
+        value
+    }
+
+    /// Takes in `other`, another copy of this holder's purse, such as an
+    /// older backup or another device's copy: what is the purse's in either
+    /// is kept, and nothing is counted twice that the two copies can tell
+    /// apart. Returns what changed; see [`Merged`]. A holder of other mints,
+    /// or of another purse, merges as the union of the two.
+    ///
+    /// - A note in both is held once. A note one copy holds and the other's
+    ///   outgoing transfer spends waits with that transfer, as it does after
+    ///   [`pay`](Self::pay).
+    /// - A transfer outgoing in either copy is outgoing here, unless the
+    ///   other copy shows it answered, by holding or spending every note it
+    ///   pays this holder, as [`take_answers`](Self::take_answers) judges;
+    ///   then it is settled. One the other copy ended, its change kept as
+    ///   unconfirmed, is [cancelled](Self::cancel) here if that copy holds
+    ///   its note again and [forgotten](Self::forget) if not.
+    /// - The keys either copy handed out, for requests, change and
+    ///   refreshes, are expected here until a note pays them, and the same
+    ///   goes for unconfirmed change. A request one copy
+    ///   [withdrew](Self::withdraw) is expected again, since a payer may
+    ///   still pay it.
+    /// - A payment either copy keeps is kept, and the two records of one
+    ///   payment are one: with the transfers neither copy cancelled or
+    ///   forgot, and the notes either keeps for the payee. So is every key
+    ///   either copy paid, which [`pay`](Self::pay) refuses to pay again.
+    ///
+    /// Some of it only the mint can tell:
+    ///
+    /// - A note only the other copy holds, among [`Merged::notes`], may be
+    ///   one this copy spent since, in a transfer it forgot once answered:
+    ///   a backup a day old mostly holds such notes on a mint that rotates
+    ///   every few hours. It is held, and counted, until the mint says
+    ///   otherwise. [`prune`](Self::prune), with the mint's info, drops the
+    ///   expired ones without asking about any note; ask the mint about the
+    ///   rest (`POST /v1/verify`) and [`discard`](Self::discard) those it
+    ///   reports spent. A note only this copy holds may likewise be one the
+    ///   other copy spent; the next transfer that spends it tells.
+    /// - A transfer only one copy has outgoing may be one the other settled
+    ///   and forgot, so its change may count beside the notes that change
+    ///   became. Resending it tells: the mint answers with the same notes
+    ///   while it keeps the answer, and refuses it as spent after.
+    /// - Two transfers that spend one note, [`Merged::conflicts`], spend a
+    ///   note both copies spent: the mint applies at most one.
+    ///
+    /// Each `POST /v1/verify` shows the mint one note, from the asker's
+    /// address and at its time, so asking about the notes of a merge one
+    /// after another tells it they have one owner. Ask only if that is
+    /// acceptable, spread out in time, or ask nothing and let the transfers
+    /// that next spend the notes find the spent ones, which the mint
+    /// refuses.
+    pub fn merge(&mut self, other: &Holder) -> Merged {
+        let held_before: HashSet<Note> = self.notes.iter().map(|h| h.note).collect();
+        let outgoing_before: Vec<TransferRequest> =
+            self.outgoing.iter().map(|o| o.request.clone()).collect();
+        // Before the union, which would hide which copy ended what.
+        let ended_there = self.ended_in(other);
+        let ended_here = other.ended_in(self);
+
+        let mut held = held_before.clone();
+        for theirs in &other.notes {
+            if held.insert(theirs.note) {
+                self.notes.push(theirs.clone());
+            }
+        }
+        for outgoing in &other.outgoing {
+            if !self.outgoing.iter().any(|o| o.request == outgoing.request) {
+                self.outgoing.push(outgoing.clone());
+            }
+        }
+        for expected in &other.expected {
+            let key = expected.key.public_key();
+            if !self.expected.iter().any(|e| e.key.public_key() == key) {
+                self.expected.push(expected.clone());
+            }
+        }
+        for unconfirmed in &other.unconfirmed {
+            let key = unconfirmed.change.key.public_key();
+            if !self
+                .unconfirmed
+                .iter()
+                .any(|u| u.change.key.public_key() == key)
+            {
+                self.unconfirmed.push(unconfirmed.clone());
+            }
+        }
+        for made in &other.payments {
+            let same = self.payments.iter_mut().find(|p| {
+                p.request == made.request
+                    && p.payment.transfers.iter().any(|t| {
+                        made.payment
+                            .transfers
+                            .iter()
+                            .any(|u| u.request == t.request)
+                    })
+            });
+            match same {
+                // One pay call: each copy only ever drops its transfers.
+                Some(kept) => {
+                    kept.payment.transfers.retain(|t| {
+                        made.payment
+                            .transfers
+                            .iter()
+                            .any(|u| u.request == t.request)
+                    });
+                    for note in &made.owed {
+                        if !kept.owed.contains(note) {
+                            kept.owed.push(*note);
+                        }
+                    }
+                }
+                None => self.payments.push(made.clone()),
+            }
+        }
+        let paid: HashSet<PublicKey> = self.paid.iter().copied().collect();
+        let more: Vec<PublicKey> = other
+            .paid
+            .iter()
+            .filter(|key| !paid.contains(key))
+            .copied()
+            .collect();
+        self.remember_paid(more);
+
+        let mut ended = Vec::new();
+        for (request, cancelled) in ended_there.into_iter().chain(ended_here) {
+            let Some(spends) = self.end(&request) else {
+                continue;
+            };
+            if cancelled && !self.notes.iter().any(|h| h.note == spends.note) {
+                self.notes.push(spends);
+            }
+            if outgoing_before.contains(&request) {
+                ended.push(request);
+            }
+        }
+        let settled = self.settle_received();
+
+        let mut spends: HashMap<Note, usize> = HashMap::new();
+        for outgoing in &self.outgoing {
+            *spends.entry(outgoing.spends.note).or_default() += 1;
+        }
+        Merged {
+            notes: self
+                .notes
+                .iter()
+                .map(|h| h.note)
+                .filter(|note| !held_before.contains(note))
+                .collect(),
+            outgoing: self
+                .outgoing
+                .iter()
+                .map(|o| &o.request)
+                .filter(|request| !outgoing_before.contains(request))
+                .cloned()
+                .collect(),
+            settled: settled
+                .into_iter()
+                .filter(|request| outgoing_before.contains(request))
+                .collect(),
+            ended,
+            conflicts: self
+                .outgoing
+                .iter()
+                .filter(|o| spends[&o.spends.note] > 1)
+                .map(|o| o.request.clone())
+                .collect(),
+        }
+    }
+
+    /// The transfers this holder has outgoing that `other` ended, cancelled
+    /// or forgotten: `other` has none of them outgoing, and keeps the key of
+    /// an output of each as unconfirmed change, which only ending it puts
+    /// there. Each comes with whether `other` holds its note again, as after
+    /// a cancel.
+    fn ended_in(&self, other: &Holder) -> Vec<(TransferRequest, bool)> {
+        self.outgoing
+            .iter()
+            .filter(|o| {
+                !other.outgoing.iter().any(|t| t.request == o.request)
+                    && o.request.outputs.iter().any(|out| {
+                        other
+                            .unconfirmed
+                            .iter()
+                            .any(|u| u.change.key.public_key() == out.holder)
+                    })
+            })
+            .map(|o| {
+                let back = other.notes.iter().any(|h| h.note == o.spends.note);
+                (o.request.clone(), back)
+            })
+            .collect()
+    }
+
+    /// Restores what a holder knows once its notes are counted: a note an
+    /// outgoing transfer spends is not held, a key whose note came is
+    /// neither expected nor unconfirmed, and a transfer the mint answered is
+    /// settled. It answered one whose notes for this holder all came, held
+    /// or spent since, and one whose payment keeps a note for the payee from
+    /// its answer. Returns the transfers it settled.
+    fn settle_received(&mut self) -> Vec<TransferRequest> {
+        let spent: HashSet<Note> = self.outgoing.iter().map(|o| o.spends.note).collect();
+        self.notes.retain(|h| !spent.contains(&h.note));
+        // Every note this holder has had, held or spent by a transfer not
+        // yet answered: what it was paid.
+        let received: HashSet<(PublicKey, u64, PublicKey)> = self
+            .notes
+            .iter()
+            .chain(self.outgoing.iter().map(|o| &o.spends))
+            .map(|h| (*h.note.issuer(), h.note.amount(), *h.note.holder()))
+            .collect();
+        let came = |e: &Expected| received.contains(&(e.mint, e.amount, e.key.public_key()));
+        self.expected.retain(|e| !came(e));
+        let expected: HashSet<PublicKey> =
+            self.expected.iter().map(|e| e.key.public_key()).collect();
+        let mut unconfirmed = HashSet::new();
+        self.unconfirmed.retain(|u| {
+            let key = u.change.key.public_key();
+            !came(&u.change) && !expected.contains(&key) && unconfirmed.insert(key)
+        });
+        let own: HashSet<PublicKey> = received
+            .iter()
+            .map(|&(_, _, key)| key)
+            .chain(expected.iter().copied())
+            .chain(unconfirmed.iter().copied())
+            .collect();
+        let payments = &self.payments;
+        let mut settled = Vec::new();
+        self.outgoing.retain(|o| {
+            let mint = *o.spends.note.issuer();
+            let outputs = &o.request.outputs;
+            let mut paid = outputs
+                .iter()
+                .filter(|out| own.contains(&out.holder))
+                .peekable();
+            let came = paid.peek().is_some()
+                && paid.all(|out| received.contains(&(mint, out.amount, out.holder)));
+            // Within one payment, no two transfers pay one output.
+            let owed = payments.iter().any(|made| {
+                made.payment
+                    .transfers
+                    .iter()
+                    .any(|t| t.request == o.request)
+                    && made.owed.iter().any(|note| {
+                        note.issuer() == &mint
+                            && outputs.iter().any(|out| {
+                                out.amount == note.amount() && out.holder == *note.holder()
+                            })
+                    })
+            });
+            let answered = came || owed;
+            if answered {
+                settled.push(o.request.clone());
+            }
+            !answered
+        });
+        self.tidy();
+        settled
+    }
+
     /// The whole store as JSON, secret keys included.
     ///
     /// A store with unconfirmed change or notes owed to payees is written in
     /// format 2, which an SDK that reads only format 1 refuses rather than
     /// open without them; any other store is written in format 1.
     pub fn to_json(&self) -> String {
+        serde_json::to_string(&self.saved()).expect("a store always serializes")
+    }
+
+    /// The store as [`to_json`](Self::to_json) saves it.
+    pub(crate) fn saved(&self) -> Saved {
         let plain = self.unconfirmed.is_empty() && self.payments.iter().all(|p| p.owed.is_empty());
-        serde_json::to_string(&Saved {
+        Saved {
             format: if plain { 1 } else { FORMAT },
             notes: self.notes.clone(),
             expected: self.expected.clone(),
@@ -1289,8 +1663,7 @@ impl Holder {
             unconfirmed: self.unconfirmed.clone(),
             payments: self.payments.clone(),
             paid: self.paid.clone(),
-        })
-        .expect("a store always serializes")
+        }
     }
 
     /// Reads a store written by [`to_json`](Self::to_json), by this SDK or

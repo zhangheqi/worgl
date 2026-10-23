@@ -102,15 +102,28 @@
 //! others and pay it back, and what it asked payers for. Its
 //! [total](Balance::total) adds what it holds and what comes back to it as
 //! change and refreshes, counting no note twice.
+//!
+//! # Copies of a purse
+//!
+//! [`Holder::merge`] takes another copy of a holder's purse into it, such as
+//! a backup or another device's copy, keeping what is the purse's in either
+//! and counting nothing twice that the two can tell apart. Its docs list
+//! what only the mint can tell, and what asking it shows.
+//!
+//! With the `vault` feature, [`vault`] seals a holder under a passphrase
+//! into the purse file the `worgl` command line keeps, with the server of
+//! each mint beside it, and opens one.
 
 mod holder;
 mod mint;
 mod payment;
 mod random;
+#[cfg(feature = "vault")]
+pub mod vault;
 
 pub use holder::{
-    AnswerError, Balance, Holder, LoadError, MAX_REQUESTED_NOTES, MadePayment, PAID_KEYS_KEPT,
-    PayError, REFRESH_MARGIN_SECS, RequestError,
+    AnswerError, Balance, Holder, LoadError, MAX_REQUESTED_NOTES, MadePayment, Merged,
+    PAID_KEYS_KEPT, PayError, REFRESH_MARGIN_SECS, RequestError,
 };
 pub use mint::{MintInfo, MintView, NoLayers, NoteState, Schedule};
 pub use payment::{CheckError, Payment, PaymentRequest, ScheduledTransfer, Spacing};

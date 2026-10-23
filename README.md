@@ -202,7 +202,7 @@ tests against a real server:
 ```sh
 rustup target add wasm32-unknown-unknown
 cargo install wasm-bindgen-cli --version 0.2.129 --locked  # the version Cargo.lock pins
-cargo build -p worgl-server -p worgl-faucet
+cargo build -p worgl-server -p worgl-faucet -p worgl-cli
 cd sdk/typescript && npm ci && npm run build && npm run check && npm test
 ```
 
