@@ -272,7 +272,9 @@ export interface SubmitProgress {
    * - `sending`: it is on its way to the mint, retries included; the purse
    *   then checks the answer against the mint's keys and keeps it.
    * - `answered`: the mint answered it and the purse kept the answer.
-   * - `refused`: it is listed in {@link Submitted.refused}.
+   * - `refused`: it did not go through, or its answer was not kept, and it
+   *   is listed in {@link Submitted.refused}; `refusal` says why, and
+   *   whether the purse keeps it for later.
    * - `unsent`: it is listed in {@link Submitted.unsent}.
    */
   step: 'waiting' | 'sending' | 'answered' | 'refused' | 'unsent';
@@ -292,6 +294,14 @@ export interface SubmitProgress {
    * counts them. `undefined` for the other steps.
    */
   sendAt: number | undefined;
+  /**
+   * For `refused`, the transfer's entry in {@link Submitted.refused}: the
+   * error, and with {@link Refused.outcome} whether the purse kept it for a
+   * later {@link Purse.settle}, as after a lost answer or a mint that is
+   * busy, or dropped or cancelled it for good. `undefined` for the other
+   * steps.
+   */
+  refusal: Refused | undefined;
 }
 
 /**
@@ -854,7 +864,11 @@ export class Purse {
       refused: [],
       unsent: [],
     };
-    const report = (step: SubmitProgress['step'], index: number, sendAt?: number): void => {
+    const report = (
+      step: SubmitProgress['step'],
+      index: number,
+      { sendAt, refusal }: { sendAt?: number; refusal?: Refused } = {},
+    ): void => {
       if (onProgress === undefined) {
         return;
       }
@@ -866,6 +880,7 @@ export class Purse {
         answered: submitted.answered,
         refused: submitted.refused.length,
         sendAt,
+        refusal,
       };
       try {
         onProgress(progress);
@@ -880,7 +895,7 @@ export class Purse {
     for (const [index, transfer] of order.entries()) {
       const sendAt = start + Math.min(transfer.afterSecs, MAX_DELAY_SECS) * 1000;
       if (!signal?.aborted && !sendNow?.aborted && sendAt > Date.now()) {
-        report('waiting', index, sendAt);
+        report('waiting', index, { sendAt });
         await sleepUntil(sendAt, signal, sendNow);
       }
       if (signal?.aborted) {
@@ -898,8 +913,9 @@ export class Purse {
         const { atStake, outcome } = stoppedBy(signal, error)
           ? { atStake: undefined, outcome: 'kept' as const }
           : await this.#refused(transfer.request, error, signal);
-        submitted.refused.push({ request: transfer.request, error, atStake, outcome });
-        report('refused', index);
+        const refusal: Refused = { request: transfer.request, error, atStake, outcome };
+        submitted.refused.push(refusal);
+        report('refused', index, { refusal });
         continue;
       }
       // The answer is in hand, so it is checked and kept even once the
@@ -909,13 +925,14 @@ export class Purse {
       if ('error' in taken) {
         // Nothing changed: a transfer this purse made stays outgoing, for the
         // next settle.
-        submitted.refused.push({
+        const refusal: Refused = {
           request: transfer.request,
           error: taken.error,
           atStake: undefined,
           outcome: 'kept',
-        });
-        report('refused', index);
+        };
+        submitted.refused.push(refusal);
+        report('refused', index, { refusal });
         continue;
       }
       submitted.value += taken.value;

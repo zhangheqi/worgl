@@ -996,6 +996,62 @@ describe('submit', () => {
     }
   });
 
+  test('says what became of a refused transfer as it happens', async () => {
+    const stop = new AbortController();
+    let sent = 0;
+    const fetch: typeof globalThis.fetch = (input, init) => {
+      if (!String(input).endsWith('/v1/transfer')) {
+        return globalThis.fetch(input, init);
+      }
+      sent += 1;
+      if (sent === 1) {
+        // The mint finds the first transfer's note spent.
+        const body = JSON.stringify({ error: 'spent', message: 'scripted' });
+        const headers = { 'content-type': 'application/json' };
+        return Promise.resolve(new Response(body, { status: 409, headers }));
+      }
+      if (sent === 3) {
+        // The person leaves while the third is on its way.
+        stop.abort();
+      }
+      return globalThis.fetch(input, init);
+    };
+    const alice = await Purse.open(new Client(server.url, { fetch }), quick);
+    const bob = await purse();
+    await server.fund(alice, 12n, 4n);
+    const request = await bob.requestAtMost(server.mint, 12n, 4n);
+    const payment = await alice.pay(request, NO_SPACING);
+    const heard: SubmitProgress[] = [];
+    const submitted = await alice.submit(payment.transfers, {
+      signal: stop.signal,
+      onProgress: (progress) => heard.push(progress),
+    });
+    assert.deepEqual(
+      heard.map((p) => [told(p), p.answered, p.refused]),
+      [
+        ['sending 0', 0, 0],
+        ['refused 0', 0, 1],
+        ['sending 1', 0, 1],
+        ['answered 1', 1, 1],
+        ['sending 2', 1, 1],
+        ['refused 2', 1, 2],
+      ],
+    );
+    // A screen tells a transfer refused for good from one kept for later,
+    // from the entry the result lists.
+    assert.deepEqual(
+      heard.map(({ refusal }) => (refusal === undefined ? -1 : submitted.refused.indexOf(refusal))),
+      [-1, 0, -1, -1, -1, 1],
+    );
+    const [dropped, kept] = submitted.refused;
+    assert.equal(dropped!.outcome, 'dropped');
+    assert.ok(dropped!.error instanceof MintError);
+    assert.equal(dropped!.error.code, 'spent');
+    assert.equal(kept!.outcome, 'kept');
+    assert.equal(kept!.error, stop.signal.reason);
+    assert.deepEqual(alice.outgoing(), [kept!.request]);
+  });
+
   test('sends the rest at once when asked', async () => {
     const [alice, bob] = [await purse(), await purse()];
     await server.fund(alice, 24n, 4n);

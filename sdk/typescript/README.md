@@ -145,7 +145,10 @@ const submitted = await alice.submit(payment.transfers, {
 - `onProgress` hears of each transfer, in the order they go, as it is
   `waiting` for its time (until `sendAt`, in `Date.now()` milliseconds),
   `sending`, then `answered` or `refused`, or `unsent`, with the counts so
-  far. An exception it throws is reported as uncaught and stops nothing.
+  far. A `refused` one carries its entry of `submitted.refused` as
+  `refusal`, whose `outcome` tells a transfer kept for a later `settle`
+  from one dropped or cancelled for good. An exception it throws is
+  reported as uncaught and stops nothing.
 - `sendNow` cuts the waits short once it aborts: the transfers left go one
   after another. That gives up the spacing that keeps the mint from linking
   their notes by when they arrive (see the
