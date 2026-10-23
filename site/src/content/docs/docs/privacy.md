@@ -41,8 +41,9 @@ The SDKs and `worgl` spread the transfers of one payment at random gaps, 2
 to 60 seconds apart by default, and spread refreshes across the rotation
 period. A refresh made once the rotation's time has come, before the mint
 makes it, has no time left to spread over and sends everything at once.
-Closer spacing, `worgl refresh --now`, or a spacing of zero in your own code
-lets the mint link the notes by when they arrive. Outputs are
+Closer spacing, `worgl refresh --now`, a spacing of zero in your own code,
+or `sendNow` in the TypeScript SDK, which sends the rest of a submit at
+once, lets the mint link the notes by when they arrive. Outputs are
 shuffled too, so the payee's notes are not always first.
 
 Asking about a note, with `POST /v1/verify`, shows the mint that note just

@@ -143,6 +143,49 @@ run purses against a real server.
   and keeps it. A page on another origin than the faucet's can ask it only
   if the faucet [names that origin](../running-a-faucet/#pages-in-a-browser).
 
+## Following a submit
+
+`submit`, and `receive`, `settle` and `refresh`, which submit too, take
+options for a screen that shows a payment or a refresh as it goes:
+
+```ts
+const rest = new AbortController();  // the "Send the rest now" button calls rest.abort()
+const leave = new AbortController();
+addEventListener('pagehide', () => leave.abort());
+
+const submitted = await alice.submit(payment.transfers, {
+  onProgress: ({ step, answered, refused, total, sendAt }) => {
+    // Draws "2 of 3", and while a transfer is waiting, when it goes.
+  },
+  sendNow: rest.signal,
+  signal: leave.signal,
+});
+```
+
+- `onProgress` hears of each transfer, in the order they go, as it is
+  `waiting` for its time (until `sendAt`, in `Date.now()` milliseconds),
+  `sending`, then `answered` or `refused`, or `unsent`, with the counts so
+  far. An exception it throws is reported as uncaught and stops nothing.
+- `sendNow` cuts the waits short once it aborts: the transfers left go one
+  after another. That gives up the spacing that keeps the mint from linking
+  their notes by when they arrive (see the
+  [Privacy model](../privacy/#timing)), so offer it rather than make it the
+  default. Retries after a failure still wait.
+- `signal` stops the call once it aborts: no wait goes on, nothing more is
+  sent, and it resolves with what was done. A transfer on its way is
+  treated as one whose answer was lost, since the mint may have applied it:
+  it is in `submitted.refused` with outcome `kept` and the signal's reason
+  as its error. The transfers not sent are in `submitted.unsent`. Those the
+  purse made stay outgoing, so `settle` sends them again later, and the
+  mint answers one it applied with the same notes while it keeps its answer.
+  A change being saved is saved first, so the purse is never left
+  half-saved. A `refresh` stopped before it has read the mint's info plans
+  nothing.
+
+Every `Client` call takes `{ signal }` too, and rejects with the signal's
+reason once it aborts. In a browser, passing a `signal` needs
+`AbortSignal.any`: Chrome 116, Firefox 124 or Safari 17.4.
+
 ## Client and errors
 
 `Client` makes one call per route and rejects with a `MintError` carrying the

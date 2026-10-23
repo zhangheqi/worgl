@@ -8,6 +8,16 @@ export interface ClientOptions {
   timeoutMs?: number;
 }
 
+/** How one {@link Client} call is sent, beyond what it sends. */
+export interface RequestOptions {
+  /**
+   * Abandons the request once it aborts, as `fetch` does: the call rejects
+   * with the signal's reason. A request already on its way may still have
+   * reached the server, and a transfer may have been applied.
+   */
+  signal?: AbortSignal;
+}
+
 /** A mint's info, in numbers that keep their precision. */
 export interface MintInfo {
   /** The mint's issuer key, in hex. */
@@ -105,8 +115,10 @@ export function isTransient(error: unknown): boolean {
 /**
  * A connection to one Worgl server, which may host many mints.
  *
- * Every call is a single request with no retry. Protocol objects travel as
- * JSON text, as the Rust core makes them, so no amount loses precision.
+ * Every call is a single request with no retry, and takes
+ * {@link RequestOptions} last, whose `signal` abandons it. Protocol objects
+ * travel as JSON text, as the Rust core makes them, so no amount loses
+ * precision.
  */
 export class Client {
   /** The server URL requests go to. */
@@ -127,8 +139,8 @@ export class Client {
   }
 
   /** `GET /v1/mints/{mint}/info`, as the server wrote it. */
-  infoText(mint: string): Promise<string> {
-    return this.#send('GET', `/v1/mints/${mint}/info`);
+  infoText(mint: string, options: RequestOptions = {}): Promise<string> {
+    return this.#send('GET', `/v1/mints/${mint}/info`, options);
   }
 
   /**
@@ -141,16 +153,19 @@ export class Client {
    * rotates by its server's clock, and planning by this machine's, if it
    * runs slow, can put them past the rotation.
    */
-  async infoTextAndTime(mint: string): Promise<{ info: string; time: bigint }> {
-    const { text, date } = await this.#answer('GET', `/v1/mints/${mint}/info`);
+  async infoTextAndTime(
+    mint: string,
+    options: RequestOptions = {},
+  ): Promise<{ info: string; time: bigint }> {
+    const { text, date } = await this.#answer('GET', `/v1/mints/${mint}/info`, options);
     const answered = date === null ? Number.NaN : Date.parse(date);
     const ms = Number.isNaN(answered) ? Date.now() : answered;
     return { info: text, time: BigInt(Math.floor(ms / 1000)) };
   }
 
   /** `GET /v1/mints/{mint}/info`, read. */
-  async info(mint: string): Promise<MintInfo> {
-    const summary = mintSummary(await this.infoText(mint));
+  async info(mint: string, options: RequestOptions = {}): Promise<MintInfo> {
+    const summary = mintSummary(await this.infoText(mint, options));
     try {
       const periodSecs = summary.periodSecs;
       const nextAt = summary.nextAt;
@@ -175,8 +190,8 @@ export class Client {
   }
 
   /** `GET /v1/mints/{mint}/keys`: the keys that sign its notes, as JSON. */
-  keysText(mint: string): Promise<string> {
-    return this.#send('GET', `/v1/mints/${mint}/keys`);
+  keysText(mint: string, options: RequestOptions = {}): Promise<string> {
+    return this.#send('GET', `/v1/mints/${mint}/keys`, options);
   }
 
   /**
@@ -188,8 +203,9 @@ export class Client {
    * `Purse.notesAt` reads only the mint's info, which says nothing about any
    * one note.
    */
-  async verify(note: string): Promise<NoteState> {
-    const report = noteReport(await this.#send('POST', '/v1/verify', JSON.stringify({ note })));
+  async verify(note: string, options: RequestOptions = {}): Promise<NoteState> {
+    const body = JSON.stringify({ note });
+    const report = noteReport(await this.#send('POST', '/v1/verify', options, body));
     try {
       const { position, hopsLeft, expiresAfterRotations } = report;
       return {
@@ -207,18 +223,18 @@ export class Client {
   }
 
   /** `POST /v1/transfer`: the new notes, in the order of the outputs. */
-  async transfer(transfer: string): Promise<string[]> {
-    const answer = JSON.parse(await this.#send('POST', '/v1/transfer', transfer)) as {
+  async transfer(transfer: string, options: RequestOptions = {}): Promise<string[]> {
+    const answer = JSON.parse(await this.#send('POST', '/v1/transfer', options, transfer)) as {
       notes: string[];
     };
     return answer.notes;
   }
 
   /** `POST /v1/mints/{mint}/mint`, for a request signed by a mint authority. */
-  async mint(mint: string, request: string): Promise<string> {
-    const answer = JSON.parse(await this.#send('POST', `/v1/mints/${mint}/mint`, request)) as {
-      note: string;
-    };
+  async mint(mint: string, request: string, options: RequestOptions = {}): Promise<string> {
+    const answer = JSON.parse(
+      await this.#send('POST', `/v1/mints/${mint}/mint`, options, request),
+    ) as { note: string };
     return answer.note;
   }
 
@@ -227,8 +243,8 @@ export class Client {
    * faucet is `worgl-faucet`, at this client's URL, which may be its mint's
    * server with the faucet behind the same proxy.
    */
-  async faucet(): Promise<FaucetInfo> {
-    const text = await this.#send('GET', '/v1/faucet');
+  async faucet(options: RequestOptions = {}): Promise<FaucetInfo> {
+    const text = await this.#send('GET', '/v1/faucet', options);
     const about = JSON.parse(text) as {
       mint: string;
       per_address_per_hour: number;
@@ -254,36 +270,43 @@ export class Client {
    * the faucet's limits it rejects with a {@link MintError} of status 429 and
    * code `rate_limited` or `exhausted`.
    */
-  async askFaucet(holder: string): Promise<string> {
+  async askFaucet(holder: string, options: RequestOptions = {}): Promise<string> {
     const answer = JSON.parse(
-      await this.#send('POST', '/v1/faucet', JSON.stringify({ holder })),
+      await this.#send('POST', '/v1/faucet', options, JSON.stringify({ holder })),
     ) as { note: string };
     return answer.note;
   }
 
   /** `POST /v1/mints/{mint}/rotate`, with the mint's admin token. */
-  async rotate(mint: string, token: string): Promise<void> {
-    await this.#send('POST', `/v1/mints/${mint}/rotate`, undefined, token);
+  async rotate(mint: string, token: string, options: RequestOptions = {}): Promise<void> {
+    await this.#send('POST', `/v1/mints/${mint}/rotate`, options, undefined, token);
   }
 
   /** `POST /v1/mints/{mint}/pause`, with the mint's admin token. */
-  async pause(mint: string, token: string): Promise<void> {
-    await this.#send('POST', `/v1/mints/${mint}/pause`, undefined, token);
+  async pause(mint: string, token: string, options: RequestOptions = {}): Promise<void> {
+    await this.#send('POST', `/v1/mints/${mint}/pause`, options, undefined, token);
   }
 
   /** `POST /v1/mints/{mint}/resume`, with the mint's admin token. */
-  async resume(mint: string, token: string): Promise<void> {
-    await this.#send('POST', `/v1/mints/${mint}/resume`, undefined, token);
+  async resume(mint: string, token: string, options: RequestOptions = {}): Promise<void> {
+    await this.#send('POST', `/v1/mints/${mint}/resume`, options, undefined, token);
   }
 
-  async #send(method: string, path: string, body?: string, token?: string): Promise<string> {
-    return (await this.#answer(method, path, body, token)).text;
+  async #send(
+    method: string,
+    path: string,
+    options: RequestOptions,
+    body?: string,
+    token?: string,
+  ): Promise<string> {
+    return (await this.#answer(method, path, options, body, token)).text;
   }
 
   /** Sends a request and returns the answer and its `Date` header, or rejects with the refusal. */
   async #answer(
     method: string,
     path: string,
+    { signal }: RequestOptions,
     body?: string,
     token?: string,
   ): Promise<{ text: string; date: string | null }> {
@@ -294,10 +317,11 @@ export class Client {
     if (token !== undefined) {
       headers.authorization = `Bearer ${token}`;
     }
+    const timeout = AbortSignal.timeout(this.#timeoutMs);
     const init: RequestInit = {
       method,
       headers,
-      signal: AbortSignal.timeout(this.#timeoutMs),
+      signal: signal === undefined ? timeout : AbortSignal.any([timeout, signal]),
     };
     if (body !== undefined) {
       init.body = body;

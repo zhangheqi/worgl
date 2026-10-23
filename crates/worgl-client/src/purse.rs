@@ -36,6 +36,13 @@ const MAX_RETRY_AFTER: Duration = Duration::from_secs(30);
 /// refresh waiting for its schedule does not block payments. The holder is
 /// locked only while it changes, never across a request.
 ///
+/// A call stops where it waits once its future is dropped, as under a
+/// timeout or in a task that is aborted. The holder changes and is saved
+/// only between waits, never across one, so it is never left half-saved.
+/// A transfer on its way then is as one whose answer was lost: the mint
+/// may have applied it, and one this purse made stays outgoing, for
+/// [`settle`](Self::settle) to send again.
+///
 /// Several processes can share one store too. Before each change the purse
 /// takes the store's [lock](Store::lock) and reads the holder saved there,
 /// makes the change to that, and saves before letting go, so a note
