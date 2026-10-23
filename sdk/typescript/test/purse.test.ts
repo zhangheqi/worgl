@@ -25,7 +25,6 @@ import {
   isTransient,
   isWorglError,
 } from '../src/index.ts';
-import { IndexedDbStore } from '../src/browser.ts';
 import { FileStore } from '../src/node.ts';
 import { keptPort, TestServer } from './server.ts';
 
@@ -1370,16 +1369,6 @@ describe('a shared store', () => {
     assert.equal(settled.value, 3n);
     const balance = await (await purse(new MemoryStore(shared.saved))).balance(server.mint);
     assert.deepEqual([balance.frozen, balance.outgoing, balance.requested], [3n, 0n, 0n]);
-  });
-});
-
-describe('browser store', () => {
-  test('needs IndexedDB and Web Locks', () => {
-    // Node has neither, and a page outside a secure context no Web Locks.
-    assert.throws(() => new IndexedDbStore('https://mint.example.com'), {
-      name: 'NotSupportedError',
-      message: /secure context/,
-    });
   });
 });
 

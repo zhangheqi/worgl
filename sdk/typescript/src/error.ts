@@ -99,10 +99,10 @@ export interface WorglErrorDetails {
    */
   store_blocked: NoFields;
   /**
-   * A browser store saved nothing: another writer saved since it last read,
-   * though it held the store's lock, as when another tab took the lock with
-   * `steal`. The purse undid the change, and reads the store again before
-   * the next.
+   * A browser store saved nothing: the change lost the store's lock while it
+   * was made, as when another tab took the lock with `steal`, or another
+   * writer saved since the change read the store. The purse undid the
+   * change, and reads the store again before the next.
    */
   store_changed: NoFields;
 }

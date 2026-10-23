@@ -22,7 +22,8 @@ export interface Store {
    * the lock it reads what is saved ({@link load}), makes the change to that
    * and saves it, so it never saves over a change another purse made since
    * it last looked. It never holds the lock across a request to the mint,
-   * and never asks for it while it holds it.
+   * and never asks for it while it holds it. A store with a lock may refuse
+   * a save made outside it, as `IndexedDbStore` does.
    *
    * Leave it out for a store only one purse writes: the purse's own holder
    * is then always current, and it reads the store only when it opens.

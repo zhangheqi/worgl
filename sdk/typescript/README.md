@@ -149,13 +149,17 @@ strict durability: it resolves only once the browser has flushed it to
 disk, not once it has handed it to the operating system, which a power cut
 can undo and which Chrome does by default.
 
-Every tab and worker of the page's origin can open a purse on the store.
-Each change takes the Web Lock of the same name, `worgl:<name>`, so an
-application that holds a lock of its own, such as for the one tab that
-keeps notes alive, names it otherwise, or every change waits for it. Each
-save also checks that nothing was saved since the store last read, and
-rejects with `store_changed` if another tab took the lock with `steal`;
-the change is undone, and the next one reads the store again.
+Every tab and worker of the page's origin can open a purse on the store,
+and purses can share one `IndexedDbStore`. Each change takes the Web Lock
+of the same name, `worgl:<name>`, so an application that holds a lock of
+its own, such as for the one tab that keeps notes alive, names it
+otherwise, or every change waits for it. A change that loses the lock
+meanwhile, as when another tab takes it with `steal`, saves nothing and
+rejects with `store_changed`, as does one whose save finds something saved
+since the change read the store; the change is undone, and the next one
+reads the store again. The store saves only under its lock, as a purse
+does: a `save` outside it throws a `DOMException` named
+`InvalidStateError`.
 
 Web Locks exist only in a secure context, so the page must be served over
 https or from localhost; elsewhere `new IndexedDbStore` throws a
@@ -226,7 +230,7 @@ purse calls built on them.
 | `unsigned` | `index` | `Submitted.refused`: note `index` of an answer does not carry the mint's signature: it is forged or altered, or the keys do not know its generation. The purse kept none of the answer. |
 | `faucet_amount` | `amount` | `takeFromFaucet`: the faucet hands out notes of `amount`, which its mint cannot make as one note. |
 | `store_blocked` | | `Purse.open`, or a change, on an `IndexedDbStore`: another tab holds its database open in an older version and did not close it when asked to. The next call tries again. |
-| `store_changed` | | A change of a purse on an `IndexedDbStore`: another writer saved since the store last read, though the purse held the lock, as when another tab took it with `steal`. The change is undone, and the next one reads the store again. |
+| `store_changed` | | A change of a purse on an `IndexedDbStore`: the change lost the store's lock while it was made, as when another tab took it with `steal`, or another writer saved since the change read the store. The change is undone, and the next one reads the store again. |
 | `unknown_format` | `format` | `Purse.open`: the saved purse is in `format`, a newer one this SDK does not read. |
 | `malformed` | | Any call: something it was given is not the JSON it takes, such as a payment request, a payment, notes, a mint's info or keys, or, for `Purse.open`, a saved purse; or a transfer spends no notes. |
 | `no_layers` | | Any call that reads a mint's info: the info lists no layers. |
@@ -242,5 +246,10 @@ npm run build   # compiles the Rust core to wasm/ and the package to dist/
 npm run check   # type-checks the package and its tests
 npm test        # runs the tests against a real server on a local port
 ```
+
+The tests of `IndexedDbStore` run under Node, on an IndexedDB in memory
+(`fake-indexeddb`) and Web Locks as a browser grants them. What only a
+browser shows, such as durability on disk, quota and private windows, they
+do not cover.
 
 The package is not published.
