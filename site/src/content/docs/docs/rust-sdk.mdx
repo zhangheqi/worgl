@@ -43,6 +43,15 @@ before handing out anything that depends on it. After a `busy` answer it
 waits as long as the mint's `Retry-After` asks, up to 30 seconds, before the
 next try.
 
+Before it keeps an answer, the purse checks it against the keys of the
+transfer's mint, read after the answer: one note for each of the transfer's
+outputs, with that output's amount and key, signed by the mint. It keeps
+none of an answer that is not the mint's, such as a forged note from a
+server that is not the mint's, nor of one whose keys it cannot read. The
+transfer is listed in `Submitted::refused`, with `Error::Answer` when the
+answer is not the mint's and the outcome `Kept`, and one the purse made
+stays outgoing, for `settle` to send again.
+
 `Purse::open` keeps the purse in a JSON file. The file holds every note's
 secret key, and the notes are bearer, so keep it private and encrypted at
 rest. Implement `Store` to keep it elsewhere; the `worgl` command keeps its
@@ -117,8 +126,9 @@ in place of the server. CI runs it.
 1. The payee calls `Holder::request` and sends the `PaymentRequest`.
 2. The payer calls `Holder::pay` and returns the `Payment`.
 3. The payee checks it with `PaymentRequest::check`, submits each transfer at
-   its time, takes the new notes in with `Holder::absorb`, and hands the
-   rest of the answers, `Holder::theirs`, back to the payer: its change.
+   its time, records each answer with `Holder::settle`, which checks it
+   against the mint's keys and takes the new notes in, and hands the rest of
+   the answers, `Holder::theirs`, back to the payer: its change.
 4. The payer checks their signatures and takes them in with
    `Holder::take_answers`, which settles the transfers they answer. Without
    them, it resends its outgoing transfers at the times `Holder::resend`

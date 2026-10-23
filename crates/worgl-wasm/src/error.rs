@@ -4,7 +4,9 @@ use std::fmt::Display;
 
 use wasm_bindgen::JsValue;
 use worgl::{NoteError, PublicKey};
-use worgl_sdk::{CheckError, LoadError, MAX_REQUESTED_NOTES, NoLayers, PayError, RequestError};
+use worgl_sdk::{
+    AnswerError, CheckError, LoadError, MAX_REQUESTED_NOTES, NoLayers, PayError, RequestError,
+};
 
 /// Why a call failed. JavaScript gets it as an `Error` named `WorglError`,
 /// with a stable `code`, that code's fields in `details`, and the message
@@ -189,6 +191,24 @@ impl From<CheckError> for Error {
     }
 }
 
+impl From<AnswerError> for Error {
+    fn from(error: AnswerError) -> Self {
+        let thrown = |code| Self::new(code, &error);
+        let count = |value: usize| u32::try_from(value).unwrap_or(u32::MAX);
+        match &error {
+            // As for any transfer that spends no notes.
+            AnswerError::NoInputs => thrown("malformed"),
+            // The transfer's notes are of another mint than the keys.
+            AnswerError::WrongKeys => thrown("wrong_issuer"),
+            AnswerError::Count { outputs, answered } => thrown("miscounted")
+                .with("outputs", count(*outputs))
+                .with("answered", count(*answered)),
+            AnswerError::Unasked(index) => thrown("unasked").with("index", count(*index)),
+            AnswerError::Note { index, .. } => thrown("unsigned").with("index", count(*index)),
+        }
+    }
+}
+
 impl From<NoteError> for Error {
     fn from(error: NoteError) -> Self {
         let thrown = |code| Self::new(code, &error);
@@ -276,6 +296,28 @@ mod tests {
         check(CheckError::NotOneInput, "not_one_input", &[]);
         check(CheckError::Missing(output), "unpaid", &fields);
         check(CheckError::Duplicate(output), "overpaid", &fields);
+    }
+
+    #[test]
+    fn answers_that_are_not_the_mints_have_codes() {
+        check(AnswerError::NoInputs, "malformed", &[]);
+        check(AnswerError::WrongKeys, "wrong_issuer", &[]);
+        let count = AnswerError::Count {
+            outputs: 4,
+            answered: 3,
+        };
+        let fields = [
+            ("outputs", Detail::Count(4)),
+            ("answered", Detail::Count(3)),
+        ];
+        check(count, "miscounted", &fields);
+        let index = [("index", Detail::Count(1))];
+        check(AnswerError::Unasked(1), "unasked", &index);
+        let unsigned = AnswerError::Note {
+            index: 1,
+            error: NoteError::BadSignature,
+        };
+        check(unsigned, "unsigned", &index);
     }
 
     #[test]

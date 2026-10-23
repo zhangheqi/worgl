@@ -5,7 +5,10 @@ use std::cmp::Reverse;
 use std::collections::{HashSet, VecDeque};
 
 use serde::{Deserialize, Serialize};
-use worgl::{Denominations, HolderKey, Note, Output, PolicyError, PublicKey, TransferRequest};
+use worgl::{
+    Denominations, HolderKey, KeySet, Note, NoteError, Output, PolicyError, PublicKey,
+    TransferRequest,
+};
 
 use crate::mint::{MintView, NoteState};
 use crate::payment::{Payment, PaymentRequest, ScheduledTransfer, Spacing};
@@ -47,7 +50,7 @@ const UNSCHEDULED_REFRESH_SECS: u64 = 60;
 /// note it expects, never two notes in one transfer, transfers of one
 /// payment and refreshes spread out in time, and outputs in random order.
 /// It does no networking: submit the transfers it makes to the mint, and
-/// give it the mint's answers.
+/// give it the answers with the mint's keys, which it checks them against.
 ///
 /// Notes are bearer: whoever holds this store holds the money. Save it with
 /// [`to_json`](Self::to_json), encrypted at rest, after every change.
@@ -216,6 +219,40 @@ pub enum PayError {
     /// means the store is corrupt.
     #[error(transparent)]
     Sign(#[from] worgl::Error),
+}
+
+/// An answer to a transfer is not the mint's, so [`Holder::settle`] keeps
+/// none of it.
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+pub enum AnswerError {
+    /// The transfer spends no notes, so it goes to no mint.
+    #[error("the transfer spends no notes, so no mint answers it")]
+    NoInputs,
+    /// The keys are not those of the mint whose notes the transfer spends.
+    #[error("the keys are not those of the mint the transfer goes to")]
+    WrongKeys,
+    /// The answer does not hold one note for each of the transfer's outputs.
+    #[error("the answer holds {answered} notes for the transfer's {outputs} outputs")]
+    Count {
+        /// The transfer's outputs.
+        outputs: usize,
+        /// The notes in the answer.
+        answered: usize,
+    },
+    /// A note is not the one the transfer asks for in its place: it is
+    /// another mint's, or of another amount or key than that output.
+    #[error("note {0} of the answer is not the transfer's output {0}")]
+    Unasked(usize),
+    /// A note does not carry the mint's signature: it is forged or altered,
+    /// or the keys do not know its generation, as keys read before the
+    /// rotation that opened it do not.
+    #[error("note {index} of the answer is not signed by the mint: {error}")]
+    Note {
+        /// Its place in the answer.
+        index: usize,
+        /// Why it does not verify.
+        error: NoteError,
+    },
 }
 
 /// A saved store cannot be read.
@@ -609,8 +646,9 @@ impl Holder {
     /// change included, or a refresh. Notes for other keys are ignored, and a
     /// note already held is not taken twice. Returns the value taken in.
     ///
-    /// Give it notes from the mint's own answer, or check them first with
-    /// [`Note::verify`]: the store does not check signatures.
+    /// It checks no signatures: check them first with [`Note::verify`],
+    /// unless the notes come from an issuer in this process. An answer from a
+    /// server goes to [`settle`](Self::settle), which checks it.
     pub fn absorb(&mut self, notes: &[Note]) -> u128 {
         let mut taken = 0;
         for note in notes {
@@ -657,15 +695,33 @@ impl Holder {
             .collect()
     }
 
-    /// Records the mint's answer to one of this holder's transfers: the
-    /// transfer stops being outgoing and its notes for this holder are taken
-    /// in. Returns the value taken in.
+    /// Records the mint's answer to a transfer, once it checks out against
+    /// `keys`, the key set of the mint the transfer goes to: the transfer
+    /// stops being outgoing and its notes for this holder are taken in.
+    /// Returns the value taken in.
+    ///
+    /// The answer checks out when it holds one note for each of the
+    /// transfer's outputs, in their order, each of the mint, with that
+    /// output's amount and key, and signed by the mint ([`Note::verify`]).
+    /// When it does not, nothing changes: a transfer that was outgoing stays
+    /// outgoing, to resend to the mint. So a server that is not the mint's,
+    /// or one that answers wrongly, can neither pass off forged notes, or
+    /// notes for other keys, as this holder's change or refreshed notes, nor
+    /// end a transfer with an answer that leaves them out. Read the keys
+    /// after the answer: keys read before a rotation do not know the
+    /// generation it opened, where the answer's notes may sit.
     ///
     /// When the transfer was outgoing and is part of a payment this holder
     /// made, the answer's notes for the payee are kept for it, among the
     /// payment's [owed](MadePayment::owed) notes: a resend may be what
     /// carried out the payment.
-    pub fn settle(&mut self, request: &TransferRequest, answer: &[Note]) -> u128 {
+    pub fn settle(
+        &mut self,
+        keys: &KeySet,
+        request: &TransferRequest,
+        answer: &[Note],
+    ) -> Result<u128, AnswerError> {
+        check_answer(keys, request, answer)?;
         let before = self.outgoing.len();
         self.outgoing.retain(|o| o.request != *request);
         if self.outgoing.len() < before
@@ -688,7 +744,7 @@ impl Holder {
         }
         let taken = self.absorb(answer);
         self.tidy();
-        taken
+        Ok(taken)
     }
 
     /// Takes in notes the counterparty handed over from the mint's answers,
@@ -700,9 +756,9 @@ impl Holder {
     /// needs no change, stays outgoing: only [resending](Self::resend) it
     /// shows it was applied.
     ///
-    /// Give it notes from the mint's own answer, or check them first with
-    /// [`Note::verify`]: the store does not check signatures, and a forged
-    /// note would settle a transfer as surely as a real one.
+    /// Check their signatures first with [`Note::verify`]: the store checks
+    /// none, and a forged note would settle a transfer as surely as a real
+    /// one.
     ///
     /// A signature shows that the mint issued a note, not which transfer it
     /// answers. A counterparty holding the transfer can pay the same keys
@@ -1134,6 +1190,44 @@ fn refresh_window(mint: &MintView, now: u64) -> u64 {
         Some(left) => left.saturating_sub(REFRESH_MARGIN_SECS.min(left / 2)),
         None => UNSCHEDULED_REFRESH_SECS,
     }
+}
+
+/// Checks that `answer` is what the mint whose key set is `keys` answers to
+/// `request`: one note per output, in order, each the output's and signed by
+/// the mint.
+fn check_answer(
+    keys: &KeySet,
+    request: &TransferRequest,
+    answer: &[Note],
+) -> Result<(), AnswerError> {
+    if request.inputs.is_empty() {
+        return Err(AnswerError::NoInputs);
+    }
+    let mint = keys.issuer();
+    if request
+        .inputs
+        .iter()
+        .any(|spend| spend.note.issuer() != mint)
+    {
+        return Err(AnswerError::WrongKeys);
+    }
+    if answer.len() != request.outputs.len() {
+        return Err(AnswerError::Count {
+            outputs: request.outputs.len(),
+            answered: answer.len(),
+        });
+    }
+    for (index, (note, output)) in answer.iter().zip(&request.outputs).enumerate() {
+        if note.issuer() != mint
+            || note.amount() != output.amount
+            || note.holder() != &output.holder
+        {
+            return Err(AnswerError::Unasked(index));
+        }
+        note.verify(keys)
+            .map_err(|error| AnswerError::Note { index, error })?;
+    }
+    Ok(())
 }
 
 /// One transfer of a payment: the note it spends, the requested outputs it
