@@ -1200,7 +1200,9 @@ export class Purse {
    * Argon2id over 64 MiB, which takes a moment and blocks the thread
    * meanwhile, and a fresh salt each time. An empty passphrase is refused
    * with the {@link WorglError} `empty_passphrase`, and a mint two of the
-   * purses hold with a `TypeError`.
+   * purses hold with a `TypeError`. With a store that has a lock, the read
+   * of a purse can reject as a change's does, such as with `unknown_format`
+   * once another purse on the store saved it with a newer SDK.
    */
   async backup(passphrase: string, options: BackupOptions = {}): Promise<string> {
     const purses = [...new Set([this, ...(options.purses ?? [])])];

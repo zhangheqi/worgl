@@ -9,15 +9,18 @@ type NoFields = Record<string, never>;
 export interface WorglErrorDetails {
   /**
    * An argument is not the JSON the call takes: not a payment request, a
-   * payment, notes, a mint's info or keys, or a saved purse; or a transfer
-   * spends no notes.
+   * payment, notes, a mint's info or keys, or a saved purse, which a purse
+   * reads when it opens and, on a store with a lock, in each call that takes
+   * the lock; or a transfer spends no notes.
    */
   malformed: NoFields;
   /** The mint's info lists no layers. */
   no_layers: NoFields;
   /**
    * The saved purse, or the purse a backup holds, is in `format`, a newer
-   * one this SDK does not read.
+   * one this SDK does not read. A purse reads the saved one when it opens
+   * and, on a store with a lock, in each call that takes the lock, so a page
+   * left open meets it once another tab saves with a newer SDK.
    */
   unknown_format: { format: number };
   /** The text is not a backup or purse file. */
