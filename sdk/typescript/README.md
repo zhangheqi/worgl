@@ -75,6 +75,8 @@ the mint answers with the same notes while it keeps its answers.
   keeping them once they are handed over.
 - `purse.takeFromFaucet(new Client(faucetUrl))` asks a playground faucet
   (`worgl-faucet`) for a note, to a fresh key like any other, and keeps it.
+  A page on another origin than the faucet's can ask it only if the faucet
+  names that origin with `--allow-origin`.
 - `Client` makes one call per route and rejects with a `MintError` carrying
   the mint's code (`spent`, `frozen`, `paused`…); `isTransient(error)` says
   whether trying again may work. It counts `layer_full` out: a transfer
