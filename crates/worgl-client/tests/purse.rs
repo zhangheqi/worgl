@@ -776,6 +776,70 @@ async fn an_answer_that_is_not_the_mints_is_not_kept() {
     assert_eq!(settled.value, 3);
 }
 
+/// A server that rotates `server`'s mint as each transfer reaches it, then
+/// passes the transfer on and its answer back, and passes on the mint's
+/// keys: a rotation that comes while a transfer is on its way. Returns its
+/// URL. It serves nothing else.
+async fn rotating(server: &Server) -> String {
+    let (client, mint, token) = (server.client(), server.mint, server.token.clone());
+    let relay = {
+        let client = client.clone();
+        move |Json(request): Json<TransferRequest>| {
+            let (client, token) = (client.clone(), token.clone());
+            async move {
+                client.rotate(&mint, &token).await.unwrap();
+                Json(json!({ "notes": client.transfer(&request).await.unwrap() }))
+            }
+        }
+    };
+    let keys = move || {
+        let client = client.clone();
+        async move { Json(client.keys(&mint).await.unwrap()) }
+    };
+    let app = axum::Router::new()
+        .route("/v1/transfer", axum::routing::post(relay))
+        .route(&format!("/v1/mints/{mint}/keys"), axum::routing::get(keys));
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let url = format!("http://{}", listener.local_addr().unwrap());
+    tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+    url
+}
+
+#[tokio::test]
+async fn an_answer_is_checked_with_the_keys_read_after_it() {
+    let server = Server::start().await;
+    let (alice, bob, carol) = (server.purse(), server.purse(), server.purse());
+    server.fund(&alice, 8, 8).await;
+    // Bob's 4 lands in the last layer, frozen until the next rotation.
+    let request = bob.request(&server.mint, 4).await.unwrap();
+    let payment = alice.pay(&request, NOW).await.unwrap();
+    all_answered(&bob.receive(&request, &payment).await.unwrap(), 1);
+    assert_eq!(bob.balance(&server.mint).await.unwrap().frozen, 4);
+
+    // He pays Carol with it now, to be submitted once that rotation frees
+    // it. His holder pays only with notes it can spend, so it plans by the
+    // mint's info as it will read then.
+    let mut after = server.client().view(&server.mint).await.unwrap();
+    after.oldest += 1;
+    let request = carol.request(&server.mint, 4).await.unwrap();
+    let payment = bob.holder().pay(&after, &request, NOW).unwrap();
+
+    // The rotation comes while the transfer is on its way, so the answer's
+    // notes sit in the generation it opens, which keys read before the
+    // transfer do not know. Carol's purse checks them with keys read after.
+    let client = Client::new(&rotating(&server).await).unwrap();
+    let carol = Purse::new(client, carol.holder(), MemoryStore::new()).with_retry(QUICK);
+    let received = carol.receive(&request, &payment).await.unwrap();
+    all_answered(&received, 1);
+    assert_eq!(received.value, 4);
+    assert!(
+        received
+            .notes
+            .iter()
+            .all(|note| note.serial().generation == after.newest())
+    );
+}
+
 #[tokio::test]
 async fn a_transfer_into_a_full_layer_is_sent_once_and_cancelled() {
     // Layers of 64 notes. Carol's 64 notes of 1, paid from Dave's four of

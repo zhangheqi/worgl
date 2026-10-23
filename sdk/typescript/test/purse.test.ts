@@ -373,6 +373,67 @@ describe('purse', () => {
     assert.equal(settled.value, 3n);
   });
 
+  test('an answer is checked with the keys read after it', async () => {
+    // Its own server, since it rotates the mint.
+    const own = await TestServer.start();
+    try {
+      const open = (client: Client, store = new MemoryStore()) =>
+        Purse.open(client, { store, ...quick });
+      const [alice, bob, carol] = [
+        await open(own.client()),
+        await open(own.client()),
+        await open(own.client()),
+      ];
+      await own.fund(alice, 8n, 8n);
+      // Bob's 4 lands in the last layer, frozen until the next rotation.
+      const request = await bob.request(own.mint, 4n);
+      allAnswered(await bob.receive(request, await alice.pay(request, NO_SPACING)), 1);
+      assert.equal((await bob.balance(own.mint)).frozen, 4n);
+
+      // He pays Carol with it now, to be submitted once that rotation frees
+      // it. His purse pays only with notes it can spend, so it plans by the
+      // mint's info as it will read then.
+      const ahead: typeof globalThis.fetch = async (input, init) => {
+        const answer = await globalThis.fetch(input, init);
+        if (!String(input).endsWith('/info')) {
+          return answer;
+        }
+        const info = (await answer.text()).replace(
+          /"generation":(\d+)/g,
+          (_, generation: string) => `"generation":${BigInt(generation) + 1n}`,
+        );
+        return new Response(info, { headers: { 'content-type': 'application/json' } });
+      };
+      const payer = await open(new Client(own.url, { fetch: ahead }), new MemoryStore(bob.toJson()));
+      const toCarol = await carol.request(own.mint, 4n);
+      const payment = await payer.pay(toCarol, NO_SPACING);
+
+      // The rotation comes while the transfer is on its way, so the answer's
+      // notes sit in the generation it opens, which keys read before the
+      // transfer do not know. Carol's purse checks them with keys read after.
+      const rotating: typeof globalThis.fetch = async (input, init) => {
+        if (String(input).endsWith('/v1/transfer')) {
+          await own.rotate();
+        }
+        return globalThis.fetch(input, init);
+      };
+      const payee = await open(
+        new Client(own.url, { fetch: rotating }),
+        new MemoryStore(carol.toJson()),
+      );
+      const received = await payee.receive(toCarol, payment);
+      allAnswered(received, 1);
+      assert.equal(received.value, 4n);
+      const info = await own.client().info(own.mint);
+      for (const note of received.notes) {
+        const { serial } = await own.client().verify(note);
+        assert.equal(serial.generation, info.oldest + BigInt(info.layers) - 1n);
+      }
+    } finally {
+      await own.stop();
+    }
+  });
+
   test('a refusal the mint would not give drops or cancels nothing', async () => {
     const [alice, bob] = [await purse(), await purse()];
     await server.fund(alice, 8n, 8n);
