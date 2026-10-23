@@ -301,8 +301,10 @@ otherwise, or every change waits for it. A change that loses the lock
 meanwhile, as when another tab takes it with `steal`, saves nothing and
 rejects with `store_changed`, as does one whose save finds something saved
 since the change read the store; the change is undone, and the next one
-reads the store again. The store saves only under its lock, as a purse
-does: a `save` outside it throws a `DOMException` named
+reads the store again. A submit keeps what the mint answered all the same:
+it makes that change again on what is saved now, since a resend gets an
+answer back only while the mint keeps it. The store saves only under its
+lock, as a purse does: a `save` outside it throws a `DOMException` named
 `InvalidStateError`.
 
 Web Locks exist only in a secure context, so the page must be served over
