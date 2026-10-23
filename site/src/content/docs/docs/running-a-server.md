@@ -23,13 +23,14 @@ Or build it in a clone with `cargo build --release -p worgl-server`.
 |---|---|
 | `init --state DIR` | Creates a server's state directory: an operator token and no mints. |
 | `create-mint --state DIR` | Creates a mint. `--layers` (default 4), `--layer-size` (default 1,048,576, a multiple of 64), `--policy FILE` and `--rotate-every SECS`. A running server sees it once restarted. |
-| `serve --state DIR` | Serves every mint in the directory. `--listen` (default `127.0.0.1:8080`) and `--compact-every N`, which writes a fresh snapshot of a mint after N logged events (default 100,000). |
+| `serve --state DIR` | Serves every mint in the directory. `--listen` (default `127.0.0.1:8080`), `--compact-every N`, which writes a fresh snapshot of a mint after N logged events (default 100,000), and `--no-cors`, which stops pages on other origins from reading any answer (see [Browsers](#browsers)). |
 | `sign-mint` | Signs a mint request and prints it as JSON. See [Mint authorities and keys](../keys/). |
 | `export-log --mint DIR` | Prints a mint's log for an audit. See [Exporting a log for audit](../audit/). |
 | `join-cluster` | Makes a state directory a cluster member's. See [Running a cluster](../running-a-cluster/). |
 
-`--state` can also come from `WORGL_STATE`, and `--listen` from
-`WORGL_LISTEN`. Logging follows `RUST_LOG`, at `info` by default.
+`--state` can also come from `WORGL_STATE`, `--listen` from
+`WORGL_LISTEN`, and `--no-cors` from `WORGL_NO_CORS=true`. Logging follows
+`RUST_LOG`, at `info` by default.
 
 ## The state directory
 
@@ -171,6 +172,28 @@ worgl-server sign-mint --key ./server/mints/<mint>/mint.key --issuer <mint> \
   [Backups](../backups/).
 - Three servers can run as a cluster, so each mint carries on when one
   fails. See [Running a cluster](../running-a-cluster/).
+
+## Browsers
+
+The routes that take no token answer pages on any origin, so a purse or
+other app in a browser can use your mints from wherever it is served. The
+routes that take a token answer none, so no web page on another origin can
+use a mint's admin token or the operator token. See
+[Browsers](../http-api/#browsers) for the headers.
+
+`serve --no-cors` turns this off: no answer carries CORS headers, so only
+pages on the server's own origin can read them.
+
+A page served over HTTPS cannot call a server on plain HTTP, so a mint
+meant for browsers needs the reverse proxy that adds TLS. The proxy should
+pass preflights and the server's CORS headers on as they are and add none
+of its own: a browser refuses an answer that carries two
+`Access-Control-Allow-Origin` headers.
+
+Version 0.1.0 sent no CORS headers, and these pages asked for a proxy that
+added them. If yours does, when you upgrade either stop it adding them or
+serve with `--no-cors` to keep its own; with both, browsers refuse every
+answer.
 
 ## Monitoring
 

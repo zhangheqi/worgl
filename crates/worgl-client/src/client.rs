@@ -212,6 +212,13 @@ impl Client {
     }
 
     /// `POST /v1/verify`: what the note's mint says about it.
+    ///
+    /// Each call shows the mint the note, from this machine's address and at
+    /// this time, so asking about several notes in a row invites the guess
+    /// that they have one owner. To tell where the notes a holder holds
+    /// stand, [`MintView::state`], with [`MintView::expires_at`] and
+    /// [`MintView::spendable_at`], reads only the mint's info, from
+    /// [`view`](Self::view), which says nothing about any one note.
     pub async fn verify(&self, note: &Note) -> Result<Verified, Error> {
         let request = self
             .route(Method::POST, "/v1/verify")

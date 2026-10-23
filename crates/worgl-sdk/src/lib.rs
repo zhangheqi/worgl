@@ -26,7 +26,8 @@
 //! 2. The payer calls [`Holder::pay`] and returns the [`Payment`]: signed
 //!    transfers, each spending one of its notes, with a time to submit each.
 //! 3. The payee checks it with [`PaymentRequest::check`], submits each
-//!    transfer at its time, takes the new notes in with [`Holder::absorb`],
+//!    transfer at its time, records each answer with [`Holder::settle`],
+//!    which checks it against the mint's keys and takes the new notes in,
 //!    and hands the rest of the answers, [`Holder::theirs`], back to the
 //!    payer: its change.
 //! 4. The payer checks their signatures and takes them in with
@@ -69,7 +70,8 @@
 //! assert_eq!((balance.sending, balance.change, balance.total()), (5, 3, 3));
 //! for transfer in &payment.transfers {
 //!     let answer = mint.transfer(&transfer.request)?;
-//!     bob.absorb(&answer);
+//!     // Bob checks the answer against the mint's keys and keeps his notes.
+//!     bob.settle(mint.keys(), &transfer.request, &answer)?;
 //!     // Bob hands Alice the rest, her change; she checks it and keeps it.
 //!     let change = bob.theirs(&answer);
 //!     for note in &change {
@@ -90,6 +92,10 @@
 //! until the next rotation. The view holds the info's layers, which no clock
 //! moves, so read the info again after a rotation. [`Holder::refresh`] keeps
 //! notes alive by paying the ones about to expire to the holder itself.
+//! With a schedule in the info, [`MintView::spendable_at`] and
+//! [`MintView::expires_at`] say when a note can move and when it dies
+//! untouched, and [`Holder::first_expiry`] when the first of the holder's
+//! would: the time to refresh by.
 //!
 //! [`Holder::balance`] splits what a holder has at a mint into parts that do
 //! not overlap: what it holds, what its transfers not yet answered pay
@@ -103,8 +109,8 @@ mod payment;
 mod random;
 
 pub use holder::{
-    Balance, Holder, LoadError, MAX_REQUESTED_NOTES, MadePayment, PAID_KEYS_KEPT, PayError,
-    REFRESH_MARGIN_SECS, RequestError,
+    AnswerError, Balance, Holder, LoadError, MAX_REQUESTED_NOTES, MadePayment, PAID_KEYS_KEPT,
+    PayError, REFRESH_MARGIN_SECS, RequestError,
 };
 pub use mint::{MintInfo, MintView, NoLayers, NoteState, Schedule};
 pub use payment::{CheckError, Payment, PaymentRequest, ScheduledTransfer, Spacing};

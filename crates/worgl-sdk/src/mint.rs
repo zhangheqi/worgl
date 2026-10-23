@@ -165,4 +165,18 @@ impl MintView {
         let later = u64::from(rotations - 1).saturating_mul(schedule.period_secs);
         Some(schedule.next_at.saturating_add(later))
     }
+
+    /// Unix time, in seconds, of the scheduled rotation after which a
+    /// [frozen](NoteState::Frozen) note can move: the next one the view
+    /// names. `None` when the mint has no schedule or is paused, or the note
+    /// is not frozen or does not outlive that rotation.
+    pub fn spendable_at(&self, note: &Note) -> Option<u64> {
+        let schedule = self.schedule.filter(|_| !self.paused)?;
+        match self.state(note) {
+            NoteState::Frozen {
+                expires_after_rotations,
+            } if expires_after_rotations > 1 => Some(schedule.next_at),
+            _ => None,
+        }
+    }
 }

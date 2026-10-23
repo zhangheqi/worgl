@@ -7,7 +7,9 @@ use std::time::Duration;
 
 use tokio::time::{Instant, sleep, sleep_until};
 use worgl::{KeySet, Note, PublicKey, TransferRequest};
-use worgl_sdk::{Balance, Holder, Payment, PaymentRequest, ScheduledTransfer, Spacing};
+use worgl_sdk::{
+    AnswerError, Balance, Holder, Payment, PaymentRequest, ScheduledTransfer, Spacing,
+};
 
 use crate::client::Client;
 use crate::error::Error;
@@ -22,7 +24,8 @@ const MAX_RETRY_AFTER: Duration = Duration::from_secs(30);
 
 /// A [`Holder`] connected to a server and a [`Store`]: it reads mint info
 /// itself, submits transfers at their scheduled times, retries what failed
-/// on the way, and saves after every change.
+/// on the way, checks each answer against the mint's keys, and saves after
+/// every change.
 ///
 /// Nothing that depends on a change leaves the purse before the change is
 /// saved: a payment request's keys are saved before the request is
@@ -51,7 +54,9 @@ pub struct Purse<S: Store = FileStore> {
 /// connection, a timeout, or a mint that was paused, busy or could not
 /// store it. Resending is safe, since the mint answers an identical
 /// transfer with the identical notes, before or after a rotation, for as
-/// long as it remembers the transfer (see [`Purse::settle`]).
+/// long as it remembers the transfer (see [`Purse::settle`]). The mint's
+/// keys, which the purse reads to check an answer with, are read again the
+/// same way.
 ///
 /// When the mint answers `busy`, the next wait is as long as its
 /// `Retry-After` asks, up to 30 seconds, if that is longer; the waits after
@@ -95,11 +100,15 @@ pub struct Submitted {
     /// notes. The payer's purse keeps those for the payee too, until
     /// [`forget_owed`](Purse::forget_owed) says they are handed over.
     pub theirs: Vec<Note>,
-    /// Transfers the mint refused, or that kept failing on the way.
+    /// Transfers the mint refused, that kept failing on the way, or whose
+    /// answer the purse kept none of: one that is not the mint's
+    /// ([`Error::Answer`]), or that it could not read the mint's keys to
+    /// check.
     pub refused: Vec<Refused>,
 }
 
-/// A transfer that did not go through, and why.
+/// A transfer that did not go through, or whose answer was not kept, and
+/// why.
 #[derive(Debug)]
 pub struct Refused {
     /// The transfer.
@@ -129,7 +138,8 @@ pub enum Outcome {
     /// from a server that is not the mint's or lost its state, `spent` or
     /// `expired` with another status than the mint's 409, `layer_full` with
     /// another than its 503, or `unauthorized` or `duplicate_input`, which
-    /// the mint never answers to a transfer a holder signed.
+    /// the mint never answers to a transfer a holder signed. So it is, too,
+    /// after an answer the purse kept none of (see [`Submitted::refused`]).
     Kept,
     /// Refused as `spent` or `expired`, with the mint's status 409: the note
     /// it spends is gone, so the purse [forgot](Holder::forget) the
@@ -408,11 +418,19 @@ impl<S: Store> Purse<S> {
     /// calls [`forget_owed`](Self::forget_owed) with them, as `worgl submit`
     /// does.
     ///
+    /// Each answer is checked first, against the keys of the transfer's
+    /// mint, read after it: it must hold one note for each of the transfer's
+    /// outputs, that output's, signed by the mint (see [`Holder::settle`]).
+    /// The purse keeps none of an answer that is not the mint's, such as
+    /// one from a server that is not the mint's, nor of one it cannot read
+    /// the keys to check.
+    ///
     /// A refused transfer does not stop the others; it is listed in
-    /// [`Submitted::refused`]. One this purse made that the mint refused for
-    /// good is dropped or cancelled ([`Refused::outcome`]); the rest stay
-    /// outgoing. To confirm a `policy` refusal, the purse reads the mint's
-    /// info again. The call fails only if a save does.
+    /// [`Submitted::refused`], as is one whose answer the purse did not
+    /// keep. One this purse made that the mint refused for good is dropped
+    /// or cancelled ([`Refused::outcome`]); the rest stay outgoing. To
+    /// confirm a `policy` refusal, the purse reads the mint's info again.
+    /// The call fails only if a save does.
     pub async fn submit(&self, transfers: &[ScheduledTransfer]) -> Result<Submitted, Error> {
         let mut order: Vec<&ScheduledTransfer> = transfers.iter().collect();
         order.sort_by_key(|transfer| transfer.after_secs);
@@ -421,32 +439,72 @@ impl<S: Store> Purse<S> {
         for transfer in order {
             let delay = Duration::from_secs(transfer.after_secs.min(MAX_DELAY_SECS));
             sleep_until(start + delay).await;
-            match self.send(&transfer.request).await {
-                Ok(notes) => {
-                    let (value, theirs) = self.change(
-                        |holder| {
-                            let value = holder.settle(&transfer.request, &notes);
-                            Ok((value, holder.theirs(&notes)))
-                        },
-                        |_, _| {},
-                    )?;
+            let request = &transfer.request;
+            let notes = match self.retrying(|| self.client.transfer(request)).await {
+                Ok(notes) => notes,
+                Err(error) => {
+                    let (at_stake, outcome) = self.refused(request, &error).await?;
+                    submitted.refused.push(Refused {
+                        request: request.clone(),
+                        error,
+                        at_stake,
+                        outcome,
+                    });
+                    continue;
+                }
+            };
+            match self.take_answer(request, &notes).await? {
+                Ok((value, theirs)) => {
                     submitted.value += value;
                     submitted.answered += 1;
                     submitted.notes.extend(notes);
                     submitted.theirs.extend(theirs);
                 }
-                Err(error) => {
-                    let (at_stake, outcome) = self.refused(&transfer.request, &error).await?;
-                    submitted.refused.push(Refused {
-                        request: transfer.request.clone(),
-                        error,
-                        at_stake,
-                        outcome,
-                    });
-                }
+                // Nothing changed: a transfer this purse made stays
+                // outgoing, for the next settle.
+                Err(error) => submitted.refused.push(Refused {
+                    request: request.clone(),
+                    error,
+                    at_stake: None,
+                    outcome: Outcome::Kept,
+                }),
             }
         }
         Ok(submitted)
+    }
+
+    /// Records the answer to `request` once it checks out against the keys
+    /// of the transfer's mint ([`Holder::settle`]), and returns the value
+    /// taken in and the counterparty's notes. The inner error says why the
+    /// answer was not kept: it is not the mint's ([`Error::Answer`]), or the
+    /// keys could not be read. The outer one is a store that could not be
+    /// read or saved.
+    async fn take_answer(
+        &self,
+        request: &TransferRequest,
+        answer: &[Note],
+    ) -> Result<Result<(u128, Vec<Note>), Error>, Error> {
+        let Some(spend) = request.inputs.first() else {
+            return Ok(Err(AnswerError::NoInputs.into()));
+        };
+        let mint = spend.note.issuer();
+        // Read after the answer, so that they know the generation its notes
+        // sit in, which a rotation may have opened since an earlier read.
+        let keys = match self.retrying(|| self.client.keys(mint)).await {
+            Ok(keys) => keys,
+            Err(error) => return Ok(Err(error)),
+        };
+        let settled = self.change(
+            |holder| {
+                let value = holder.settle(&keys, request, answer)?;
+                Ok((value, holder.theirs(answer)))
+            },
+            |_, _| {},
+        );
+        match settled {
+            Err(error @ Error::Answer(_)) => Ok(Err(error)),
+            settled => settled.map(Ok),
+        }
     }
 
     /// Drops or cancels a transfer the mint refused, when the refusal shows
@@ -514,12 +572,16 @@ impl<S: Store> Purse<S> {
         Ok((None, outcome))
     }
 
-    /// Sends one transfer, retrying while the failure is transient.
-    async fn send(&self, request: &TransferRequest) -> Result<Vec<Note>, Error> {
+    /// Makes the request `call` makes, again while the failure is transient,
+    /// as [`Retry`] says.
+    async fn retrying<T, F>(&self, call: impl Fn() -> F) -> Result<T, Error>
+    where
+        F: Future<Output = Result<T, Error>>,
+    {
         let mut delay = self.retry.first_delay;
         let mut attempt = 1;
         loop {
-            match self.client.transfer(request).await {
+            match call().await {
                 Err(error) if error.is_transient() && attempt < self.retry.attempts => {
                     sleep(next_wait(delay, &error)).await;
                     delay = delay.saturating_mul(2);

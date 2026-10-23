@@ -45,6 +45,11 @@ Closer spacing, `worgl refresh --now`, or a spacing of zero in your own code
 lets the mint link the notes by when they arrive. Outputs are
 shuffled too, so the payee's notes are not always first.
 
+Asking about a note, with `POST /v1/verify`, shows the mint that note just
+as a transfer does, so asking about several in a row invites the same guess.
+The SDKs and `worgl notes` tell where the notes they hold stand from the
+mint's info instead, which says nothing about any one note.
+
 ## What each party sees
 
 | Party | Sees | Cannot tell |

@@ -8,6 +8,14 @@
 //!
 //! Every privacy rule lives in the Rust core; the TypeScript side only moves
 //! text between the holder, the server and its store.
+//!
+//! A call that fails throws an `Error` named `WorglError`, with a stable
+//! `code` and that code's fields in `details` beside the message: see
+//! [`Error`].
+
+mod error;
+
+pub use error::Error;
 
 use serde::Serialize;
 use serde::de::DeserializeOwned;
@@ -15,7 +23,7 @@ use wasm_bindgen::prelude::*;
 use worgl::issuer::LayerSummary;
 use worgl::{KeySet, Note, NoteStatus, PublicKey, Serial, Supply, TransferRequest};
 use worgl_sdk::{
-    MintInfo, MintView, Payment, PaymentRequest, Schedule, ScheduledTransfer, Spacing,
+    MintInfo, MintView, NoteState, Payment, PaymentRequest, Schedule, ScheduledTransfer, Spacing,
 };
 
 /// The notes one holder owns, with their keys; see [`worgl_sdk::Holder`].
@@ -40,8 +48,8 @@ impl Holder {
 
     /// Reads a holder saved with [`to_json`](Self::to_json).
     #[wasm_bindgen(js_name = fromJson)]
-    pub fn from_json(json: &str) -> Result<Holder, JsError> {
-        let inner = worgl_sdk::Holder::from_json(json).map_err(error)?;
+    pub fn from_json(json: &str) -> Result<Holder, Error> {
+        let inner = worgl_sdk::Holder::from_json(json)?;
         Ok(Self { inner })
     }
 
@@ -52,9 +60,9 @@ impl Holder {
     }
 
     /// A payment request for `amount`, one fresh key per note.
-    pub fn request(&mut self, info: &str, amount: u64) -> Result<String, JsError> {
+    pub fn request(&mut self, info: &str, amount: u64) -> Result<String, Error> {
         let view = view(info)?;
-        Ok(json(&self.inner.request(&view, amount).map_err(error)?))
+        Ok(json(&self.inner.request(&view, amount)?))
     }
 
     /// A payment request for `amount` in notes of at most `largest`.
@@ -64,17 +72,14 @@ impl Holder {
         info: &str,
         amount: u64,
         largest: u64,
-    ) -> Result<String, JsError> {
+    ) -> Result<String, Error> {
         let view = view(info)?;
-        let request = self
-            .inner
-            .request_at_most(&view, amount, largest)
-            .map_err(error)?;
+        let request = self.inner.request_at_most(&view, amount, largest)?;
         Ok(json(&request))
     }
 
     /// Stops expecting the notes of a request.
-    pub fn withdraw(&mut self, request: &str) -> Result<(), JsError> {
+    pub fn withdraw(&mut self, request: &str) -> Result<(), Error> {
         self.inner.withdraw(&parse::<PaymentRequest>(request)?);
         Ok(())
     }
@@ -87,40 +92,46 @@ impl Holder {
         request: &str,
         min_secs: u64,
         max_secs: u64,
-    ) -> Result<String, JsError> {
+    ) -> Result<String, Error> {
         let view = view(info)?;
         let request = parse::<PaymentRequest>(request)?;
         let spacing = Spacing { min_secs, max_secs };
-        let payment = self.inner.pay(&view, &request, spacing).map_err(error)?;
+        let payment = self.inner.pay(&view, &request, spacing)?;
         Ok(json(&payment))
     }
 
     /// Takes in the notes, a JSON array, that pay keys this holder handed
-    /// out. Returns the value taken in. Check signatures first with
-    /// [`verify_notes`] unless the notes come straight from the mint.
-    pub fn absorb(&mut self, notes: &str) -> Result<u128, JsError> {
+    /// out. Returns the value taken in. It checks no signatures: check them
+    /// first with [`verify_notes`]. An answer from a server goes to
+    /// [`settle`](Self::settle), which checks it.
+    pub fn absorb(&mut self, notes: &str) -> Result<u128, Error> {
         Ok(self.inner.absorb(&parse::<Vec<Note>>(notes)?))
     }
 
     /// The notes, a JSON array, made for neither a note this holder holds
     /// nor a key it expects: the counterparty's, to hand over. Returned as a
     /// JSON array.
-    pub fn theirs(&self, notes: &str) -> Result<String, JsError> {
+    pub fn theirs(&self, notes: &str) -> Result<String, Error> {
         Ok(json(&self.inner.theirs(&parse::<Vec<Note>>(notes)?)))
     }
 
-    /// Records the mint's answer, a JSON array of notes, to a transfer.
-    /// Returns the value taken in.
-    pub fn settle(&mut self, transfer: &str, notes: &str) -> Result<u128, JsError> {
+    /// Records the mint's answer, a JSON array of notes, to a transfer, once
+    /// it checks out against `keys`, the key set of the transfer's mint as
+    /// `GET /v1/mints/{mint}/keys` returns it, read after the answer: one
+    /// note for each output, that output's, signed by the mint. Throws,
+    /// changing nothing, when it does not. Returns the value taken in.
+    pub fn settle(&mut self, keys: &str, transfer: &str, notes: &str) -> Result<u128, Error> {
+        let keys = parse::<KeySet>(keys)?;
         let transfer = parse::<TransferRequest>(transfer)?;
-        Ok(self.inner.settle(&transfer, &parse::<Vec<Note>>(notes)?))
+        let notes = parse::<Vec<Note>>(notes)?;
+        Ok(self.inner.settle(&keys, &transfer, &notes)?)
     }
 
     /// Takes in notes, a JSON array, handed over from the mint's answers,
     /// and settles the outgoing transfers they answer. Returns the value
     /// taken in. Check signatures first with [`verify_notes`].
     #[wasm_bindgen(js_name = takeAnswers)]
-    pub fn take_answers(&mut self, notes: &str) -> Result<u128, JsError> {
+    pub fn take_answers(&mut self, notes: &str) -> Result<u128, Error> {
         Ok(self.inner.take_answers(&parse::<Vec<Note>>(notes)?))
     }
 
@@ -129,7 +140,7 @@ impl Holder {
     /// `undefined` when the transfer is neither outgoing nor pays such a
     /// key.
     #[wasm_bindgen(js_name = atStake, unchecked_return_type = "bigint | undefined")]
-    pub fn at_stake(&self, transfer: &str) -> Result<JsValue, JsError> {
+    pub fn at_stake(&self, transfer: &str) -> Result<JsValue, Error> {
         // An optional u128 does not fit a fallible return, so it goes as a value.
         let stake = self.inner.at_stake(&parse::<TransferRequest>(transfer)?);
         Ok(stake.map_or(JsValue::UNDEFINED, JsValue::from))
@@ -137,13 +148,13 @@ impl Holder {
 
     /// Drops an outgoing transfer whose note is gone, keeping the keys of
     /// its change. Returns whether it was outgoing.
-    pub fn forget(&mut self, transfer: &str) -> Result<bool, JsError> {
+    pub fn forget(&mut self, transfer: &str) -> Result<bool, Error> {
         Ok(self.inner.forget(&parse::<TransferRequest>(transfer)?))
     }
 
     /// Takes back the note of an outgoing transfer the mint never applied,
     /// keeping the keys of its change. Returns whether it was outgoing.
-    pub fn cancel(&mut self, transfer: &str) -> Result<bool, JsError> {
+    pub fn cancel(&mut self, transfer: &str) -> Result<bool, Error> {
         Ok(self.inner.cancel(&parse::<TransferRequest>(transfer)?))
     }
 
@@ -168,7 +179,7 @@ impl Holder {
     /// Stops keeping the notes, a JSON array, owed to payees, once they are
     /// handed over. Returns the value it stopped keeping.
     #[wasm_bindgen(js_name = forgetOwed)]
-    pub fn forget_owed(&mut self, notes: &str) -> Result<u128, JsError> {
+    pub fn forget_owed(&mut self, notes: &str) -> Result<u128, Error> {
         Ok(self.inner.forget_owed(&parse::<Vec<Note>>(notes)?))
     }
 
@@ -183,7 +194,7 @@ impl Holder {
     /// each at a random moment before it, as `refresh` spreads its own from
     /// the same `now`.
     #[wasm_bindgen(js_name = dueResends)]
-    pub fn due_resends(&self, info: &str, now: u64) -> Result<Vec<Scheduled>, JsError> {
+    pub fn due_resends(&self, info: &str, now: u64) -> Result<Vec<Scheduled>, Error> {
         let view = view(info)?;
         Ok(scheduled(self.inner.due_resends(&view, now)))
     }
@@ -191,19 +202,19 @@ impl Holder {
     /// Pays the mint's notes that die at the next rotation back to fresh
     /// keys, each at a random moment before it, counted from `now` by the
     /// mint's clock; all at once when `now` is at or past it.
-    pub fn refresh(&mut self, info: &str, now: u64) -> Result<Vec<Scheduled>, JsError> {
+    pub fn refresh(&mut self, info: &str, now: u64) -> Result<Vec<Scheduled>, Error> {
         let view = view(info)?;
         Ok(scheduled(self.inner.refresh(&view, now)))
     }
 
     /// Drops the notes of the mint whose layer its info says was dropped,
     /// and returns the value lost.
-    pub fn prune(&mut self, info: &str) -> Result<u128, JsError> {
+    pub fn prune(&mut self, info: &str) -> Result<u128, Error> {
         Ok(self.inner.prune(&view(info)?))
     }
 
     /// Value the holder has at the mint, in parts that do not overlap.
-    pub fn balance(&self, info: &str) -> Result<Balance, JsError> {
+    pub fn balance(&self, info: &str) -> Result<Balance, Error> {
         let balance = self.inner.balance(&view(info)?);
         Ok(Balance {
             total: balance.total(),
@@ -226,6 +237,111 @@ impl Holder {
     pub fn notes(&self) -> String {
         json(&self.inner.notes().collect::<Vec<_>>())
     }
+
+    /// The notes held at the mint, in the order [`notes`](Self::notes)
+    /// lists them, each with where it stands, from the mint's `info` alone:
+    /// the mint is asked nothing about any one note, unlike with
+    /// [`note_report`].
+    #[wasm_bindgen(js_name = notesAt)]
+    pub fn notes_at(&self, info: &str) -> Result<Vec<HeldNote>, Error> {
+        Ok(held_notes(&self.inner, &view(info)?))
+    }
+
+    /// Unix time of the first scheduled rotation at the mint that takes a
+    /// note of this holder's unless it moves first, by the mint's clock: see
+    /// [`worgl_sdk::Holder::first_expiry`].
+    #[wasm_bindgen(js_name = firstExpiry)]
+    pub fn first_expiry(&self, info: &str) -> Result<Option<u64>, Error> {
+        Ok(self.inner.first_expiry(&view(info)?))
+    }
+}
+
+/// A note a holder holds and where it stands at its mint, from the mint's
+/// info alone; see [`Holder::notes_at`]. It holds no more of the note than
+/// its serial and amount.
+#[wasm_bindgen]
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct HeldNote {
+    /// The note's generation.
+    #[wasm_bindgen(readonly)]
+    pub generation: u64,
+    /// Its index in the generation.
+    #[wasm_bindgen(readonly)]
+    pub index: u32,
+    /// Its amount.
+    #[wasm_bindgen(readonly)]
+    pub amount: u64,
+    state: &'static str,
+    position: Option<u32>,
+    spendable_at: Option<u64>,
+    expires_at: Option<u64>,
+}
+
+#[wasm_bindgen]
+impl HeldNote {
+    /// `spendable`, `expiring` (spendable, and dies at the next rotation
+    /// unless it moves), `frozen` (in the last layer until the next
+    /// rotation), `expired` (its layer was dropped) or `unknown` (newer than
+    /// the info).
+    #[wasm_bindgen(
+        getter,
+        unchecked_return_type = "'spendable' | 'expiring' | 'frozen' | 'expired' | 'unknown'"
+    )]
+    pub fn state(&self) -> String {
+        self.state.into()
+    }
+
+    /// The position of its layer, 0 for the first, unless it is expired or
+    /// unknown.
+    #[wasm_bindgen(getter)]
+    pub fn position(&self) -> Option<u32> {
+        self.position
+    }
+
+    /// For a frozen note, Unix time of the scheduled rotation after which it
+    /// can move, if the mint has a schedule and is not paused; see
+    /// [`MintView::spendable_at`].
+    #[wasm_bindgen(getter, js_name = spendableAt)]
+    pub fn spendable_at(&self) -> Option<u64> {
+        self.spendable_at
+    }
+
+    /// For a note the info places, neither expired nor unknown, Unix time of
+    /// the scheduled rotation that drops its layer unless it moves first, if
+    /// the mint has a schedule and is not paused; see
+    /// [`MintView::expires_at`].
+    #[wasm_bindgen(getter, js_name = expiresAt)]
+    pub fn expires_at(&self) -> Option<u64> {
+        self.expires_at
+    }
+}
+
+/// Where each of `holder`'s notes at the view's mint stands.
+fn held_notes(holder: &worgl_sdk::Holder, view: &MintView) -> Vec<HeldNote> {
+    holder
+        .notes()
+        .filter_map(|note| {
+            let state = match view.state(note) {
+                NoteState::Spendable {
+                    expires_after_rotations: 1,
+                } => "expiring",
+                NoteState::Spendable { .. } => "spendable",
+                NoteState::Frozen { .. } => "frozen",
+                NoteState::Expired => "expired",
+                NoteState::Unknown => "unknown",
+                NoteState::OtherMint => return None,
+            };
+            Some(HeldNote {
+                generation: note.serial().generation,
+                index: note.serial().index,
+                amount: note.amount(),
+                state,
+                position: view.position(note),
+                spendable_at: view.spendable_at(note),
+                expires_at: view.expires_at(note),
+            })
+        })
+        .collect()
 }
 
 /// A signed transfer and when to submit it.
@@ -371,19 +487,19 @@ impl RequestedNote {
 
 /// The issuer key of the mint a payment request is for.
 #[wasm_bindgen(js_name = requestMint)]
-pub fn request_mint(request: &str) -> Result<String, JsError> {
+pub fn request_mint(request: &str) -> Result<String, Error> {
     Ok(parse::<PaymentRequest>(request)?.mint.to_string())
 }
 
 /// The total a payment request asks for.
 #[wasm_bindgen(js_name = requestAmount)]
-pub fn request_amount(request: &str) -> Result<u128, JsError> {
+pub fn request_amount(request: &str) -> Result<u128, Error> {
     Ok(parse::<PaymentRequest>(request)?.amount())
 }
 
 /// The notes a payment request asks for.
 #[wasm_bindgen(js_name = requestNotes)]
-pub fn request_notes(request: &str) -> Result<Vec<RequestedNote>, JsError> {
+pub fn request_notes(request: &str) -> Result<Vec<RequestedNote>, Error> {
     Ok(parse::<PaymentRequest>(request)?
         .outputs
         .into_iter()
@@ -396,37 +512,37 @@ pub fn request_notes(request: &str) -> Result<Vec<RequestedNote>, JsError> {
 
 /// Checks that a payment pays exactly what the request asks.
 #[wasm_bindgen(js_name = checkPayment)]
-pub fn check_payment(request: &str, payment: &str) -> Result<(), JsError> {
+pub fn check_payment(request: &str, payment: &str) -> Result<(), Error> {
     let request = parse::<PaymentRequest>(request)?;
-    request.check(&parse::<Payment>(payment)?).map_err(error)
+    Ok(request.check(&parse::<Payment>(payment)?)?)
 }
 
 /// The issuer key of the mint a payment is for.
 #[wasm_bindgen(js_name = paymentMint)]
-pub fn payment_mint(payment: &str) -> Result<String, JsError> {
+pub fn payment_mint(payment: &str) -> Result<String, Error> {
     Ok(parse::<Payment>(payment)?.mint.to_string())
 }
 
 /// A payment's transfers, each with when to submit it.
 #[wasm_bindgen(js_name = paymentTransfers)]
-pub fn payment_transfers(payment: &str) -> Result<Vec<Scheduled>, JsError> {
+pub fn payment_transfers(payment: &str) -> Result<Vec<Scheduled>, Error> {
     Ok(scheduled(parse::<Payment>(payment)?.transfers))
 }
 
 /// The issuer key of the mint a transfer goes to: its first input's.
 #[wasm_bindgen(js_name = transferMint)]
-pub fn transfer_mint(transfer: &str) -> Result<String, JsError> {
+pub fn transfer_mint(transfer: &str) -> Result<String, Error> {
     let transfer = parse::<TransferRequest>(transfer)?;
     let spend = transfer
         .inputs
         .first()
-        .ok_or_else(|| JsError::new("the transfer spends no notes"))?;
+        .ok_or_else(|| Error::new("malformed", "the transfer spends no notes"))?;
     Ok(spend.note.issuer().to_string())
 }
 
 /// Whether a transfer breaks the policy in a mint's info.
 #[wasm_bindgen(js_name = breaksPolicy)]
-pub fn breaks_policy(info: &str, transfer: &str) -> Result<bool, JsError> {
+pub fn breaks_policy(info: &str, transfer: &str) -> Result<bool, Error> {
     let policy = parse::<MintInfo>(info)?.policy;
     let transfer = parse::<TransferRequest>(transfer)?;
     let inputs: Vec<u64> = transfer.inputs.iter().map(|s| s.note.amount()).collect();
@@ -436,13 +552,13 @@ pub fn breaks_policy(info: &str, transfer: &str) -> Result<bool, JsError> {
 
 /// The issuer key of a note, given as a JSON string.
 #[wasm_bindgen(js_name = noteIssuer)]
-pub fn note_issuer(note: &str) -> Result<String, JsError> {
+pub fn note_issuer(note: &str) -> Result<String, Error> {
     Ok(parse::<Note>(note)?.issuer().to_string())
 }
 
 /// The issuer keys of the notes, a JSON array, each named once.
 #[wasm_bindgen(js_name = noteIssuers)]
-pub fn note_issuers(notes: &str) -> Result<Vec<String>, JsError> {
+pub fn note_issuers(notes: &str) -> Result<Vec<String>, Error> {
     let mut issuers: Vec<PublicKey> = parse::<Vec<Note>>(notes)?
         .iter()
         .map(|note| *note.issuer())
@@ -456,10 +572,10 @@ pub fn note_issuers(notes: &str) -> Result<Vec<String>, JsError> {
 /// key set `keys` is, as `GET /v1/mints/{mint}/keys` returns it. Throws on
 /// the first that is not.
 #[wasm_bindgen(js_name = verifyNotes)]
-pub fn verify_notes(keys: &str, notes: &str) -> Result<(), JsError> {
+pub fn verify_notes(keys: &str, notes: &str) -> Result<(), Error> {
     let keys = parse::<KeySet>(keys)?;
     for note in parse::<Vec<Note>>(notes)? {
-        note.verify(&keys).map_err(error)?;
+        note.verify(&keys)?;
     }
     Ok(())
 }
@@ -532,7 +648,7 @@ struct InfoText {
 
 /// Reads a mint's info.
 #[wasm_bindgen(js_name = mintSummary)]
-pub fn mint_summary(info: &str) -> Result<MintSummary, JsError> {
+pub fn mint_summary(info: &str) -> Result<MintSummary, Error> {
     let info = parse::<InfoText>(info)?;
     Ok(MintSummary {
         issuer: info.issuer.to_string(),
@@ -605,8 +721,14 @@ struct VerifiedText {
 }
 
 /// Reads the answer of `POST /v1/verify`.
+///
+/// Each such request shows the mint one note, from the asker's address and
+/// at its time, so asking about several notes in a row invites the guess
+/// that they have one owner. [`Holder::notes_at`] tells where the notes a
+/// holder holds stand from the mint's info, which says nothing about any
+/// one note.
 #[wasm_bindgen(js_name = noteReport)]
-pub fn note_report(verified: &str) -> Result<NoteReport, JsError> {
+pub fn note_report(verified: &str) -> Result<NoteReport, Error> {
     let verified = parse::<VerifiedText>(verified)?;
     let (state, live) = match verified.status {
         NoteStatus::Live {
@@ -630,19 +752,15 @@ pub fn note_report(verified: &str) -> Result<NoteReport, JsError> {
 }
 
 /// The view a mint's info gives, as the server answered it.
-fn view(info: &str) -> Result<MintView, JsError> {
+fn view(info: &str) -> Result<MintView, Error> {
     let info = parse::<MintInfo>(info)?;
-    MintView::new(&info).map_err(error)
+    Ok(MintView::new(&info)?)
 }
 
-fn parse<T: DeserializeOwned>(text: &str) -> Result<T, JsError> {
-    serde_json::from_str(text).map_err(error)
+fn parse<T: DeserializeOwned>(text: &str) -> Result<T, Error> {
+    Ok(serde_json::from_str(text)?)
 }
 
 fn json<T: Serialize>(value: &T) -> String {
     serde_json::to_string(value).expect("protocol objects always serialize")
-}
-
-fn error(error: impl std::fmt::Display) -> JsError {
-    JsError::new(&error.to_string())
 }

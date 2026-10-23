@@ -47,6 +47,33 @@ code is stable; the message is for people. A `503 busy` answer also says in
 its `Retry-After` header how many seconds to wait before sending the request
 again. See [Error codes](../error-codes/).
 
+## Browsers
+
+The routes that take no token answer pages on any origin, so a purse or
+other app in a browser can use a mint wherever the app is served. Every
+answer from them, refusals included, carries
+
+```text
+Access-Control-Allow-Origin: *
+Access-Control-Expose-Headers: date,retry-after
+```
+
+so a page can read the body, the `error` code, the `Date` a purse plans by
+and the `Retry-After` of a `busy` answer. A `POST` with a JSON body needs a
+preflight first, which each route answers by allowing its own method and
+`Content-Type`, with `Access-Control-Max-Age: 86400`. No route allows
+credentials, and none needs them: a request carries its own signatures. A
+cluster member answers preflights itself and adds the headers to the
+answers it relays from the leader. A path no route serves answers `404`
+with the same headers, so a page that calls the wrong server, or a route an
+older one lacks, reads the `404` rather than a network error.
+
+The routes that take a token, a mint's `rotate`, `pause` and `resume` and
+the `/v1/admin` routes, send no CORS headers and answer a preflight `405`,
+so a page on another origin can neither send them a token nor read their
+answers. `worgl-server serve --no-cors` serves every route that way; see
+[Running a server](../running-a-server/#browsers).
+
 ## Health and readiness
 
 `GET /healthz` answers `ok` for as long as the server runs, whatever its
@@ -141,10 +168,8 @@ value and destroys nothing more.
 The answer's `Date` header is the server's time when it answered. The SDKs'
 purses and `worgl` count the time left before `next_at` from it, not by the
 client's clock, and a cluster member that passes the request on to the
-leader relays the leader's. A browser page reads it on an answer from
-another origin only if the answer carries
-`Access-Control-Expose-Headers: Date`, which the server does not send: the
-proxy that adds CORS headers in front of it must add that one too.
+leader relays the leader's. A page on another origin reads it too, as the
+answer exposes it; see [Browsers](#browsers).
 
 ## Keys
 

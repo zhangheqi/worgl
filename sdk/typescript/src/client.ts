@@ -179,7 +179,15 @@ export class Client {
     return this.#send('GET', `/v1/mints/${mint}/keys`);
   }
 
-  /** `POST /v1/verify`: what the note's mint says about it. */
+  /**
+   * `POST /v1/verify`: what the note's mint says about it.
+   *
+   * Each call shows the mint the note, from this machine's address and at
+   * this time, so asking about several notes in a row invites the guess that
+   * they have one owner. To tell where the notes a purse holds stand,
+   * `Purse.notesAt` reads only the mint's info, which says nothing about any
+   * one note.
+   */
   async verify(note: string): Promise<NoteState> {
     const report = noteReport(await this.#send('POST', '/v1/verify', JSON.stringify({ note })));
     try {

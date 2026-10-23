@@ -10,6 +10,7 @@ import { after, before, describe, test } from 'node:test';
 
 import {
   Client,
+  type HeldNote,
   Holder,
   MemoryStore,
   MintError,
@@ -20,7 +21,9 @@ import {
   type ScheduledTransfer,
   type Store,
   type Submitted,
+  type WorglErrorCode,
   isTransient,
+  isWorglError,
 } from '../src/index.ts';
 import { FileStore } from '../src/node.ts';
 import { keptPort, TestServer } from './server.ts';
@@ -70,6 +73,50 @@ async function skewed(
   };
 }
 
+/**
+ * A client of `server` that hands on the notes of an answer to a transfer as
+ * `tamper` changes them: a server that is not the mint's, or one between the
+ * purse and the mint.
+ */
+function tampering(server: TestServer, tamper: (notes: string[]) => string[]): Client {
+  const fetch: typeof globalThis.fetch = async (input, init) => {
+    const answer = await globalThis.fetch(input, init);
+    if (!String(input).endsWith('/v1/transfer') || !answer.ok) {
+      return answer;
+    }
+    const { notes } = (await answer.json()) as { notes: string[] };
+    return new Response(JSON.stringify({ notes: tamper(notes) }), {
+      headers: { 'content-type': 'application/json' },
+    });
+  };
+  return new Client(server.url, { fetch });
+}
+
+/**
+ * Checks that `lost`, which held what `purse` holds, kept nothing of the one
+ * answer in `submitted`, and reported it with an error that `why` matches: a
+ * WorglError of `code` when one is given.
+ */
+function keptNothing(
+  lost: Purse,
+  purse: Purse,
+  submitted: Submitted,
+  why: RegExp,
+  code?: WorglErrorCode,
+): void {
+  assert.deepEqual(
+    [submitted.answered, submitted.value, submitted.notes, submitted.theirs],
+    [0, 0n, [], []],
+  );
+  assert.equal(submitted.refused.length, 1);
+  const refused = submitted.refused[0]!;
+  assert.match(String(refused.error), why);
+  assert.equal(isWorglError(refused.error) ? refused.error.code : undefined, code);
+  assert.equal(isTransient(refused.error), false);
+  assert.equal(refused.outcome, 'kept');
+  assert.equal(lost.toJson(), purse.toJson());
+}
+
 let server: TestServer;
 before(async () => {
   server = await TestServer.start();
@@ -107,6 +154,7 @@ describe('client', () => {
       assert.ok(error instanceof MintError);
       assert.equal(error.code, 'admin_unauthorized');
       assert.equal(isTransient(error), false);
+      assert.equal(isWorglError(error), false);
       return true;
     });
     await assert.rejects(client.info('00'.repeat(32)), { code: 'unknown_mint' });
@@ -165,7 +213,12 @@ describe('purse', () => {
     // A note whose signature was tampered with is refused.
     const genuine = submitted.notes[0]!;
     const forged = genuine.slice(0, 190) + (genuine[190] === 'A' ? 'B' : 'A') + genuine.slice(191);
-    await assert.rejects(bob.accept([forged]), /signature/);
+    await assert.rejects(bob.accept([forged]), {
+      name: 'WorglError',
+      code: 'bad_signature',
+      details: {},
+      message: 'issuer signature does not verify',
+    });
     assert.equal((await bob.balance(server.mint)).frozen, 0n);
 
     assert.equal(await bob.accept(submitted.notes), 6n);
@@ -291,7 +344,11 @@ describe('purse', () => {
     };
     asked.outputs[0]!.amount = 3;
     const request = PaymentRequest.from(JSON.stringify(asked));
-    await assert.rejects(alice.pay(request, NO_SPACING), /a note of 3, which is not one of/);
+    await assert.rejects(alice.pay(request, NO_SPACING), {
+      code: 'denomination',
+      details: { amount: 3n },
+      message: "the request asks for a note of 3, which is not one of the mint's denominations",
+    });
     // Nothing is parked: no transfer to resend, nothing saved.
     const balance = await alice.balance(server.mint);
     assert.deepEqual([balance.spendable, balance.outgoing, balance.expected], [8n, 0n, 0n]);
@@ -327,6 +384,129 @@ describe('purse', () => {
       assert.equal((await back.balance(server.mint)).frozen, 3n);
     } finally {
       await other.stop();
+    }
+  });
+
+  test("an answer that is not the mint's is not kept", async () => {
+    const [alice, bob] = [await purse(), await purse()];
+    await server.fund(alice, 8n, 8n);
+    // Genuine notes of the mint, for a key nobody here holds.
+    const stranger = (await (await purse()).request(server.mint, 1n)).notes[0]!.holder;
+    const strangers = new Map<bigint, string>();
+    for (const value of [1n, 2n, 4n]) {
+      strangers.set(value, await server.mintTo(value, stranger));
+    }
+    // Bob's 4 and 1, and Alice's change of 2 and 1.
+    const request = await bob.request(server.mint, 5n);
+    const payment = await alice.pay(request, NO_SPACING);
+
+    // A character of the signature changed.
+    const forged = (note: string) =>
+      note.slice(0, 190) + (note[190] === 'A' ? 'B' : 'A') + note.slice(191);
+    // A note's amount: its bytes 45 to 53, big-endian.
+    const amount = (note: string) => Buffer.from(note, 'base64url').readBigUInt64BE(45);
+    const tamperings = [
+      {
+        tamper: ([first, ...rest]: string[]) => [forged(first!), ...rest],
+        why: /note 0 of the answer is not signed by the mint: issuer signature does not verify/,
+        code: 'unsigned' as const,
+      },
+      // A genuine note of the mint, of the amount asked for, to another key.
+      {
+        tamper: ([first, ...rest]: string[]) => [strangers.get(amount(first!))!, ...rest],
+        why: /note 0 of the answer is not the transfer's output 0/,
+        code: 'unasked' as const,
+      },
+    ];
+    for (const { tamper, why, code } of tamperings) {
+      // Neither the payer resending nor the payee submitting keeps any of it:
+      // the payer's transfer stays outgoing, for the next settle.
+      const open = (from: Purse) =>
+        Purse.open(tampering(server, tamper), { store: new MemoryStore(from.toJson()), ...quick });
+      const payer = await open(alice);
+      keptNothing(payer, alice, await payer.settle(NO_SPACING), why, code);
+      const payee = await open(bob);
+      keptNothing(payee, bob, await payee.receive(request, payment), why, code);
+    }
+
+    // Nor without the mint's keys to check an answer with.
+    const keyless: typeof globalThis.fetch = (input, init) =>
+      String(input).endsWith('/keys')
+        ? Promise.resolve(new Response('not here', { status: 404 }))
+        : globalThis.fetch(input, init);
+    const payer = await Purse.open(new Client(server.url, { fetch: keyless }), {
+      store: new MemoryStore(alice.toJson()),
+      ...quick,
+    });
+    keptNothing(payer, alice, await payer.settle(NO_SPACING), /not here \(http, HTTP 404\)/);
+
+    // The mint's own server answers them, and both keep their notes.
+    const received = await bob.receive(request, payment);
+    allAnswered(received, 1);
+    assert.equal(received.value, 5n);
+    const settled = await alice.settle(NO_SPACING);
+    allAnswered(settled, 1);
+    assert.equal(settled.value, 3n);
+  });
+
+  test('an answer is checked with the keys read after it', async () => {
+    // Its own server, since it rotates the mint.
+    const own = await TestServer.start();
+    try {
+      const open = (client: Client, store = new MemoryStore()) =>
+        Purse.open(client, { store, ...quick });
+      const [alice, bob, carol] = [
+        await open(own.client()),
+        await open(own.client()),
+        await open(own.client()),
+      ];
+      await own.fund(alice, 8n, 8n);
+      // Bob's 4 lands in the last layer, frozen until the next rotation.
+      const request = await bob.request(own.mint, 4n);
+      allAnswered(await bob.receive(request, await alice.pay(request, NO_SPACING)), 1);
+      assert.equal((await bob.balance(own.mint)).frozen, 4n);
+
+      // He pays Carol with it now, to be submitted once that rotation frees
+      // it. His purse pays only with notes it can spend, so it plans by the
+      // mint's info as it will read then.
+      const ahead: typeof globalThis.fetch = async (input, init) => {
+        const answer = await globalThis.fetch(input, init);
+        if (!String(input).endsWith('/info')) {
+          return answer;
+        }
+        const info = (await answer.text()).replace(
+          /"generation":(\d+)/g,
+          (_, generation: string) => `"generation":${BigInt(generation) + 1n}`,
+        );
+        return new Response(info, { headers: { 'content-type': 'application/json' } });
+      };
+      const payer = await open(new Client(own.url, { fetch: ahead }), new MemoryStore(bob.toJson()));
+      const toCarol = await carol.request(own.mint, 4n);
+      const payment = await payer.pay(toCarol, NO_SPACING);
+
+      // The rotation comes while the transfer is on its way, so the answer's
+      // notes sit in the generation it opens, which keys read before the
+      // transfer do not know. Carol's purse checks them with keys read after.
+      const rotating: typeof globalThis.fetch = async (input, init) => {
+        if (String(input).endsWith('/v1/transfer')) {
+          await own.rotate();
+        }
+        return globalThis.fetch(input, init);
+      };
+      const payee = await open(
+        new Client(own.url, { fetch: rotating }),
+        new MemoryStore(carol.toJson()),
+      );
+      const received = await payee.receive(toCarol, payment);
+      allAnswered(received, 1);
+      assert.equal(received.value, 4n);
+      const info = await own.client().info(own.mint);
+      for (const note of received.notes) {
+        const { serial } = await own.client().verify(note);
+        assert.equal(serial.generation, info.oldest + BigInt(info.layers) - 1n);
+      }
+    } finally {
+      await own.stop();
     }
   });
 
@@ -501,8 +681,100 @@ describe('purse', () => {
     const asked = await bob.request(server.mint, 4n);
     const other = await bob.request(server.mint, 4n);
     const payment = await alice.pay(other, NO_SPACING);
-    await assert.rejects(bob.receive(asked, payment));
+    const [unpaid] = asked.notes;
+    await assert.rejects(bob.receive(asked, payment), {
+      code: 'unpaid',
+      details: { amount: unpaid!.amount, holder: unpaid!.holder },
+    });
     assert.equal((await alice.balance(server.mint)).outgoing, 8n);
+  });
+
+  test('a payment the purse cannot make says why in its code and details', async () => {
+    const [alice, bob] = [await purse(), await purse()];
+    await server.fund(alice, 8n, 2n);
+
+    const tooMuch = await bob.request(server.mint, 16n);
+    await assert.rejects(alice.pay(tooMuch, NO_SPACING), (error: unknown) => {
+      assert.ok(isWorglError(error) && error.code === 'unaffordable');
+      assert.deepEqual(error.details, { spendable: 8n, needed: 16n });
+      assert.equal(error.message, '8 is spendable now and 16 is needed');
+      assert.equal(isTransient(error), false);
+      return true;
+    });
+    await bob.withdraw(tooMuch);
+
+    // Enough, but in notes of 2 for the one note of 8 asked: the payee asks
+    // again in notes no larger than the largest that fit.
+    const whole = await bob.request(server.mint, 8n);
+    await assert.rejects(alice.pay(whole, NO_SPACING), {
+      name: 'WorglError',
+      code: 'fragmented',
+      details: { largest: 2n, atMost: 2n },
+      message: 'the requested notes do not fit the spendable notes; the largest spendable note is 2',
+    });
+    const balance = await alice.balance(server.mint);
+    assert.deepEqual([balance.spendable, balance.outgoing], [8n, 0n]);
+
+    await bob.withdraw(whole);
+    const smaller = await bob.requestAtMost(server.mint, 8n, 2n);
+    const received = await bob.receive(smaller, await alice.pay(smaller, NO_SPACING));
+    allAnswered(received, 4);
+    assert.equal(received.value, 8n);
+    assert.equal((await bob.balance(server.mint)).expected, 0n);
+
+    // A request paid already, and requests that cannot be made.
+    const [paid] = smaller.notes;
+    await assert.rejects(alice.pay(smaller, NO_SPACING), {
+      code: 'paid',
+      details: { holder: paid!.holder },
+    });
+    await assert.rejects(bob.request(server.mint, 0n), { code: 'zero_amount', details: {} });
+    await assert.rejects(bob.requestAtMost(server.mint, 257n, 1n), {
+      code: 'too_many_notes',
+      details: { max: 256 },
+      message: 'the request would need more than 256 notes',
+    });
+  });
+
+  test('a fragmented payment names the largest notes that fit', async () => {
+    const [alice, bob] = [await purse(), await purse()];
+    // Notes of 4, 1, 1, 1 and 1. A request for 8 in notes of 4 would need
+    // the second 4 from the notes of 1, and in notes of 2 two of them: only
+    // notes of 1 fit.
+    await server.fund(alice, 4n, 4n);
+    await server.fund(alice, 4n, 1n);
+
+    const request = await bob.request(server.mint, 8n);
+    try {
+      await alice.pay(request, NO_SPACING);
+      assert.fail('the notes of 4 and 1 paid a note of 8');
+    } catch (error) {
+      // As the README has it.
+      if (
+        !(isWorglError(error) && error.code === 'fragmented') ||
+        error.details.atMost === undefined
+      ) {
+        throw error;
+      }
+      assert.deepEqual(error.details, { largest: 4n, atMost: 1n });
+      await bob.withdraw(request);
+      const smaller = await bob.requestAtMost(server.mint, request.amount, error.details.atMost);
+      const received = await bob.receive(smaller, await alice.pay(smaller, NO_SPACING));
+      allAnswered(received, 5);
+      assert.equal(received.value, 8n);
+    }
+    assert.equal((await bob.balance(server.mint)).expected, 0n);
+
+    // From notes of 64, 1 and 1, no request for 66 fits: in any size it
+    // asks for a note of 2 or more beside those the 64 pays, or, in notes
+    // of 1, for more than one transfer from the 64 may make.
+    const carol = await purse();
+    await server.fund(carol, 64n, 64n);
+    await server.fund(carol, 2n, 1n);
+    await assert.rejects(carol.pay(await bob.request(server.mint, 66n), NO_SPACING), {
+      code: 'fragmented',
+      details: { largest: 64n, atMost: undefined },
+    });
   });
 
   test('a paused mint is retried, reported, then paid', async () => {
@@ -681,6 +953,164 @@ describe('refresh', () => {
   });
 });
 
+describe('note states', () => {
+  test("come from the mint's info alone", async () => {
+    // Its own server, since it rotates the mint, on a schedule so that
+    // notes have times.
+    const own = await TestServer.start({}, DAY);
+    try {
+      const asked: string[] = [];
+      const fetch: typeof globalThis.fetch = (input, init) => {
+        asked.push(`${init?.method ?? 'GET'} ${new URL(String(input)).pathname}`);
+        return globalThis.fetch(input, init);
+      };
+      const alice = await Purse.open(new Client(own.url, { fetch }), quick);
+      const bob = await Purse.open(own.client(), quick);
+      await own.fund(alice, 4n, 4n);
+      const stale = await own.client().infoText(own.mint);
+      await own.rotate();
+      await own.rotate();
+      await own.fund(alice, 2n, 2n);
+      await own.fund(bob, 1n, 1n);
+      const request = await alice.request(own.mint, 1n);
+      allAnswered(await alice.receive(request, await bob.pay(request, NO_SPACING)), 1);
+
+      asked.length = 0;
+      const notes = await alice.notesAt(own.mint);
+      const first = await alice.firstExpiry(own.mint);
+      // The mint was asked nothing about any one note.
+      const info = `GET /v1/mints/${own.mint}/info`;
+      assert.deepEqual(asked, [info, info]);
+
+      const { oldest, rotation } = await own.client().info(own.mint);
+      const next = rotation?.nextAt ?? 0n;
+      const day = BigInt(DAY);
+      const where = (note: HeldNote | undefined) => {
+        assert.ok(note !== undefined);
+        const { serial, state, position, spendableAt, expiresAt } = note;
+        return { generation: serial.generation, state, position, spendableAt, expiresAt };
+      };
+      assert.deepEqual(
+        notes.map((note) => note.amount),
+        [4n, 2n, 1n],
+      );
+      // The 4, minted second to last two rotations ago, dies at the next.
+      assert.deepEqual(where(notes[0]), {
+        generation: oldest,
+        state: 'expiring',
+        position: 0,
+        spendableAt: undefined,
+        expiresAt: next,
+      });
+      assert.deepEqual(where(notes[1]), {
+        generation: oldest + 2n,
+        state: 'spendable',
+        position: 2,
+        spendableAt: undefined,
+        expiresAt: next + 2n * day,
+      });
+      // The 1 just arrived in the last layer: it rests until the next rotation.
+      assert.deepEqual(where(notes[2]), {
+        generation: oldest + 3n,
+        state: 'frozen',
+        position: 3,
+        spendableAt: next,
+        expiresAt: next + 3n * day,
+      });
+      assert.equal(first, next);
+
+      // An info older than a note cannot place it.
+      const stub: typeof globalThis.fetch = (input, init) => {
+        if (!String(input).endsWith('/info')) {
+          return globalThis.fetch(input, init);
+        }
+        const headers = { 'content-type': 'application/json' };
+        return Promise.resolve(new Response(stale, { headers }));
+      };
+      const behindClient = new Client(own.url, { fetch: stub });
+      const behind = await Purse.open(behindClient, { store: new MemoryStore(alice.toJson()) });
+      const staleNext = (await behindClient.info(own.mint)).rotation?.nextAt ?? 0n;
+      // It still has a schedule, yet tells no time for the notes it cannot
+      // place.
+      assert.deepEqual(
+        (await behind.notesAt(own.mint)).map((note) => [
+          note.state,
+          note.position,
+          note.spendableAt,
+          note.expiresAt,
+        ]),
+        [
+          ['spendable', 2, undefined, staleNext + 2n * day],
+          ['unknown', undefined, undefined, undefined],
+          ['unknown', undefined, undefined, undefined],
+        ],
+      );
+      // Another mint's info places none of them.
+      const elsewhere = await Purse.open(server.client(), {
+        store: new MemoryStore(alice.toJson()),
+      });
+      assert.deepEqual(await elsewhere.notesAt(server.mint), []);
+
+      // A paused mint skips its rotations, so no time can be told.
+      await own.client().pause(own.mint, own.token);
+      assert.deepEqual(
+        (await alice.notesAt(own.mint)).map((note) => [
+          note.position,
+          note.spendableAt,
+          note.expiresAt,
+        ]),
+        [
+          [0, undefined, undefined],
+          [2, undefined, undefined],
+          [3, undefined, undefined],
+        ],
+      );
+      assert.equal(await alice.firstExpiry(own.mint), undefined);
+      await own.client().resume(own.mint, own.token);
+
+      // Left alone past the rotation, the 4 is gone and the 1 can move.
+      await own.rotate();
+      const later = (await own.client().info(own.mint)).rotation?.nextAt ?? 0n;
+      assert.deepEqual(
+        (await alice.notesAt(own.mint)).map((note) => [note.state, note.position, note.expiresAt]),
+        [
+          ['expired', undefined, undefined],
+          ['spendable', 1, later + day],
+          ['spendable', 2, later + 2n * day],
+        ],
+      );
+      assert.equal(await alice.firstExpiry(own.mint), later + day);
+      assert.equal(await alice.prune(own.mint), 4n);
+
+      // The 2, spent by a transfer not yet answered, still counts.
+      await alice.pay(await bob.request(own.mint, 2n), NO_SPACING);
+      assert.deepEqual(
+        (await alice.notesAt(own.mint)).map((note) => note.amount),
+        [1n],
+      );
+      assert.equal(await alice.firstExpiry(own.mint), later + day);
+    } finally {
+      await own.stop();
+    }
+  });
+
+  test('have no times at a mint without a schedule', async () => {
+    const alice = await purse();
+    await server.fund(alice, 8n, 8n);
+    assert.deepEqual(
+      (await alice.notesAt(server.mint)).map((note) => [
+        note.amount,
+        note.state,
+        note.position,
+        note.spendableAt,
+        note.expiresAt,
+      ]),
+      [[8n, 'spendable', 2, undefined, undefined]],
+    );
+    assert.equal(await alice.firstExpiry(server.mint), undefined);
+  });
+});
+
 describe("a clock off the mint's", () => {
   // Its own server, whose mint rotates once a day besides on request.
   let own: TestServer;
@@ -788,6 +1218,27 @@ describe('faucet', () => {
     assert.equal(purse.notes().length, 2);
   });
 
+  test('a faucet whose notes its mint cannot make whole is refused', async () => {
+    // What a faucet of notes of 3 would say, which the mint makes as 2 and 1.
+    const about = {
+      mint: playground.mint,
+      amount: 3,
+      per_address_per_hour: 3,
+      per_day: 10_000,
+      left_today: 10_000,
+    };
+    const fetch: typeof globalThis.fetch = async () =>
+      new Response(JSON.stringify(about), { headers: { 'content-type': 'application/json' } });
+    const purse = await Purse.open(playground.client(), quick);
+    await assert.rejects(purse.takeFromFaucet(new Client(playground.url, { fetch })), {
+      name: 'WorglError',
+      code: 'faucet_amount',
+      details: { amount: 3n },
+      message: 'the faucet hands out notes of 3, which its mint cannot make as one note',
+    });
+    assert.equal((await purse.balance(playground.mint)).expected, 0n);
+  });
+
   test('a refusal leaves nothing expected', async () => {
     const purse = await Purse.open(playground.client(), quick);
     // The address had two of its three notes above.
@@ -832,6 +1283,12 @@ describe('file store', () => {
     const holder = new Holder();
     const copy = Holder.fromJson(holder.toJson());
     assert.equal(copy.toJson(), holder.toJson());
-    assert.throws(() => Holder.fromJson('{"format":9,"notes":[],"expected":[],"outgoing":[]}'));
+    assert.throws(() => Holder.fromJson('{"format":9,"notes":[],"expected":[],"outgoing":[]}'), {
+      name: 'WorglError',
+      code: 'unknown_format',
+      details: { format: 9 },
+      message: 'saved in format 9, which this SDK does not read',
+    });
+    assert.throws(() => PaymentRequest.from('{"mint":'), { name: 'WorglError', code: 'malformed' });
   });
 });
