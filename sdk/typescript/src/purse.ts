@@ -365,21 +365,12 @@ export class Purse {
   /** The store saves go to. */
   readonly store: Store;
   #holder: Holder;
-  /** The JSON this purse last read from its store or saved there. */
-  #saved: string | undefined;
   readonly #retry: Retry;
   #changes: Promise<unknown> = Promise.resolve();
 
-  private constructor(
-    client: Client,
-    holder: Holder,
-    saved: string | undefined,
-    store: Store,
-    retry: Retry,
-  ) {
+  private constructor(client: Client, holder: Holder, store: Store, retry: Retry) {
     this.client = client;
     this.#holder = holder;
-    this.#saved = saved;
     this.store = store;
     this.#retry = retry;
   }
@@ -389,7 +380,7 @@ export class Purse {
     const store = options.store ?? new MemoryStore();
     const saved = await store.load();
     const holder = saved === undefined ? new Holder() : Holder.fromJson(saved);
-    return new Purse(client, holder, saved, store, options.retry ?? DEFAULT_RETRY);
+    return new Purse(client, holder, store, options.retry ?? DEFAULT_RETRY);
   }
 
   /** The whole purse as JSON, secret keys included. */
@@ -894,22 +885,20 @@ export class Purse {
   #change<T>(apply: () => T, undo: (value: T) => void): Promise<T> {
     return this.#current(async () => {
       const value = apply();
-      const json = this.#holder.toJson();
       try {
-        await this.store.save(json);
+        await this.store.save(this.#holder.toJson());
       } catch (error) {
         undo(value);
         throw error;
       }
-      this.#saved = json;
       return value;
     });
   }
 
   /**
    * Runs `use` after any change before it. With a store that has a lock, it
-   * runs holding it, on the holder saved now: read again if another purse
-   * saved since this one last read or saved.
+   * runs holding it, on the holder saved now: read again if it is not this
+   * purse's, as when another purse saved since this one last read or saved.
    */
   #current<T>(use: () => Promise<T>): Promise<T> {
     const run = (): Promise<T> => {
@@ -918,11 +907,13 @@ export class Purse {
       }
       return this.store.lock(async () => {
         const saved = await this.store.load();
-        if (saved !== undefined && saved !== this.#saved) {
+        // Read in only if it differs: writing a holder out to compare takes
+        // a small part of the time reading one in does, and leaves no copy
+        // of its keys behind.
+        if (saved !== undefined && saved !== this.#holder.toJson()) {
           const holder = Holder.fromJson(saved);
           this.#holder.free();
           this.#holder = holder;
-          this.#saved = saved;
         }
         return use();
       });
