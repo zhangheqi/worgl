@@ -349,6 +349,15 @@ export interface PurseOptions {
  * Nothing that depends on a change leaves the purse before the change is
  * saved. If a save fails, the change is undone and the call rejects.
  * Changes are applied and saved one at a time, so calls may overlap.
+ *
+ * Several purses can share a store that has a {@link Store.lock | lock},
+ * as the tabs of a browser share an `IndexedDbStore` from `worgl/browser`.
+ * Before each change the purse takes the lock and reads the holder saved
+ * there, makes the change to that, and saves before letting go, so a note
+ * another purse took in meanwhile is kept, not saved over. It never holds
+ * the lock across a request to the mint, and {@link settle} resends the
+ * transfers of the holder saved now. Reads such as {@link notes} and
+ * {@link balance} show the holder as this purse last read or saved it.
  */
 export class Purse {
   /** The client requests go through. */
@@ -356,12 +365,21 @@ export class Purse {
   /** The store saves go to. */
   readonly store: Store;
   #holder: Holder;
+  /** The JSON this purse last read from its store or saved there. */
+  #saved: string | undefined;
   readonly #retry: Retry;
   #changes: Promise<unknown> = Promise.resolve();
 
-  private constructor(client: Client, holder: Holder, store: Store, retry: Retry) {
+  private constructor(
+    client: Client,
+    holder: Holder,
+    saved: string | undefined,
+    store: Store,
+    retry: Retry,
+  ) {
     this.client = client;
     this.#holder = holder;
+    this.#saved = saved;
     this.store = store;
     this.#retry = retry;
   }
@@ -371,7 +389,7 @@ export class Purse {
     const store = options.store ?? new MemoryStore();
     const saved = await store.load();
     const holder = saved === undefined ? new Holder() : Holder.fromJson(saved);
-    return new Purse(client, holder, store, options.retry ?? DEFAULT_RETRY);
+    return new Purse(client, holder, saved, store, options.retry ?? DEFAULT_RETRY);
   }
 
   /** The whole purse as JSON, secret keys included. */
@@ -629,7 +647,9 @@ export class Purse {
   /**
    * Resends the transfers this purse made and has not seen answered, at
    * random gaps, and takes in their change. Call it once a payee has had
-   * time to submit a payment, or after a restart. The answer to a payment's
+   * time to submit a payment, or after a restart. With a store that has a
+   * lock, the transfers are those of the holder saved now, so they include
+   * any another purse on the store made. The answer to a payment's
    * transfer keeps the payee's notes for it, in case the payee has not
    * submitted the payment and the resend carried it out (see
    * {@link MadePayment.owed}), and a transfer refused for good is dropped or
@@ -645,7 +665,9 @@ export class Purse {
    * the transfers whose chance the next rotation ends.
    */
   async settle(spacing: Spacing = DEFAULT_SPACING): Promise<Submitted> {
-    const transfers = read(this.#holder.resend(BigInt(spacing.minSecs), BigInt(spacing.maxSecs)));
+    const transfers = await this.#current(async () =>
+      read(this.#holder.resend(BigInt(spacing.minSecs), BigInt(spacing.maxSecs))),
+    );
     return this.submit(transfers);
   }
 
@@ -716,7 +738,8 @@ export class Purse {
    * One this purse made that the mint refused for good is dropped or
    * cancelled ({@link Refused.outcome}); the rest stay outgoing. To confirm a
    * `policy` refusal, the purse reads the mint's info again. Rejects only if
-   * a save fails.
+   * the store fails: a save, or the read of a store with a lock before a
+   * change.
    */
   async submit(transfers: ScheduledTransfer[]): Promise<Submitted> {
     const order = [...transfers].sort((a, b) => a.afterSecs - b.afterSecs);
@@ -756,7 +779,7 @@ export class Purse {
    * Records the answer to `transfer` once it checks out against the keys of
    * the transfer's mint, and resolves to the value taken in and the
    * counterparty's notes, or to why the answer was not kept: it is not the
-   * mint's, or the keys could not be read. Rejects only if a save fails.
+   * mint's, or the keys could not be read. Rejects only if the store fails.
    */
   async #takeAnswer(
     transfer: string,
@@ -772,19 +795,21 @@ export class Purse {
       return { error };
     }
     const json = JSON.stringify(notes);
-    // Set once the answer checked out: a rejection after it is the save's.
-    let checked = false;
+    // Set while the answer is checked: a rejection then is the answer's, and
+    // any other, before or after, is the store's.
+    let checking = false;
     try {
       return await this.#change(
         () => {
+          checking = true;
           const value = this.#holder.settle(keys, transfer, json);
-          checked = true;
+          checking = false;
           return { value, theirs: JSON.parse(this.#holder.theirs(json)) as string[] };
         },
         () => {},
       );
     } catch (error) {
-      if (checked) {
+      if (!checking) {
         throw error;
       }
       return { error };
@@ -862,19 +887,45 @@ export class Purse {
   }
 
   /**
-   * Changes the holder and saves it, after any change before it is saved.
-   * If the save fails, `undo` takes the change back and the call rejects.
+   * Changes the holder as saved now and saves it, after any change before
+   * it, holding the store's lock throughout if it has one. If the save
+   * fails, `undo` takes the change back and the call rejects.
    */
   #change<T>(apply: () => T, undo: (value: T) => void): Promise<T> {
-    const run = async (): Promise<T> => {
+    return this.#current(async () => {
       const value = apply();
+      const json = this.#holder.toJson();
       try {
-        await this.store.save(this.#holder.toJson());
+        await this.store.save(json);
       } catch (error) {
         undo(value);
         throw error;
       }
+      this.#saved = json;
       return value;
+    });
+  }
+
+  /**
+   * Runs `use` after any change before it. With a store that has a lock, it
+   * runs holding it, on the holder saved now: read again if another purse
+   * saved since this one last read or saved.
+   */
+  #current<T>(use: () => Promise<T>): Promise<T> {
+    const run = (): Promise<T> => {
+      if (this.store.lock === undefined) {
+        return use();
+      }
+      return this.store.lock(async () => {
+        const saved = await this.store.load();
+        if (saved !== undefined && saved !== this.#saved) {
+          const holder = Holder.fromJson(saved);
+          this.#holder.free();
+          this.#holder = holder;
+          this.#saved = saved;
+        }
+        return use();
+      });
     };
     const result = this.#changes.then(run, run);
     this.#changes = result.catch(() => {});

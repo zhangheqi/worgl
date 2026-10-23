@@ -11,6 +11,9 @@ import type { Store } from './store.ts';
  * A save writes a temporary file beside it, flushes it to disk and renames
  * it over the old one, so a crash leaves either the old store or the new,
  * never a mix. The file is readable by its owner only.
+ *
+ * It has no {@link Store.lock | lock}, so give each purse a file of its
+ * own: two purses on one file save over each other's changes.
  */
 export class FileStore implements Store {
   readonly path: string;

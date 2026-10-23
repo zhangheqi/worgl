@@ -13,6 +13,21 @@ export interface Store {
    * does.
    */
   save(json: string): Promise<void>;
+  /**
+   * Runs `locked` while holding the store's lock, and resolves or rejects
+   * as it does, for a store more than one purse writes, such as one that two
+   * tabs of a browser share. The lock keeps out every other purse that takes
+   * it, in this program or another, until `locked` is done. A purse takes
+   * it for every change, and to read the transfers a settle resends: under
+   * the lock it reads what is saved ({@link load}), makes the change to that
+   * and saves it, so it never saves over a change another purse made since
+   * it last looked. It never holds the lock across a request to the mint,
+   * and never asks for it while it holds it.
+   *
+   * Leave it out for a store only one purse writes: the purse's own holder
+   * is then always current, and it reads the store only when it opens.
+   */
+  lock?<T>(locked: () => Promise<T>): Promise<T>;
 }
 
 /**

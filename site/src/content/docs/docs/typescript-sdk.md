@@ -28,7 +28,8 @@ npm run build   # compiles the Rust core to wasm/ and the package to dist/
 
 Then point your project at the built folder, for instance with
 `npm install ../worgl/sdk/typescript`. The package is named `worgl`, with
-`worgl/node` for what needs Node.
+`worgl/node` for what needs Node and `worgl/browser` for what needs a
+browser.
 
 It needs Node 22.18 or later, or a browser with top-level `await`.
 Importing the package loads the WebAssembly module: from disk under Node,
@@ -204,16 +205,63 @@ purse calls built on them.
 | `unasked` | `index` | `Submitted.refused`: note `index` of an answer is not the transfer's output in its place, but another mint's, or of another amount or key. The purse kept none of the answer. |
 | `unsigned` | `index` | `Submitted.refused`: note `index` of an answer does not carry the mint's signature: it is forged or altered, or the keys do not know its generation. The purse kept none of the answer. |
 | `faucet_amount` | `amount` | `takeFromFaucet`: the faucet hands out notes of `amount`, which its mint cannot make as one note. |
+| `store_blocked` | | `Purse.open`, or a change, on an `IndexedDbStore`: another tab holds its database open in an older version and did not close it when asked to. The next call tries again. |
+| `store_changed` | | A change of a purse on an `IndexedDbStore`: another writer saved since the store last read, though the purse held the lock, as when another tab took it with `steal`. The change is undone, and the next one reads the store again. |
 | `unknown_format` | `format` | `Purse.open`: the saved purse is in `format`, a newer one this SDK does not read. |
 | `malformed` | | Any call: something it was given is not the JSON it takes, such as a payment request, a payment, notes, a mint's info or keys, or, for `Purse.open`, a saved purse; or a transfer spends no notes. |
 | `no_layers` | | Any call that reads a mint's info: the info lists no layers. |
 
 ## Stores
 
-`MemoryStore`, and `FileStore` from `worgl/node`, which replaces its file
-atomically, readable by its owner only. The JSON holds every note's secret
-key, so keep it private and encrypted at rest. Implement `Store` to keep it
-elsewhere.
+`MemoryStore`; `FileStore` from `worgl/node`, which replaces its file
+atomically, readable by its owner only; and `IndexedDbStore` from
+`worgl/browser`, below. The JSON holds every note's secret key, so keep it
+private and encrypted at rest. Implement `Store` to keep it elsewhere.
+
+Several purses can share a store that has a `lock`, as tabs of one browser
+share an `IndexedDbStore`. Before each change a purse takes the lock, reads
+what is saved, makes the change to that and saves before letting go, so
+none saves over a note another took in. It never holds the lock across a
+request to the mint, and `settle` resends what is saved now. Reads such as
+`notes` and `balance` show what the purse last read or saved. `MemoryStore`
+and `FileStore` have no lock, so give each purse one of its own; a store
+that wraps another passes its `lock` on.
+
+### In a browser
+
+```ts
+import { Client, Purse } from 'worgl';
+import { IndexedDbStore } from 'worgl/browser';
+
+const server = 'https://mint.example.com';
+const purse = await Purse.open(new Client(server), { store: new IndexedDbStore(server) });
+```
+
+`IndexedDbStore` keeps a purse in the browser's IndexedDB, in the database
+`worgl:<name>`. Name each store after its server, as above, and the purses
+of several servers live side by side. Each save is one transaction with
+strict durability: it resolves only once the browser has flushed it to
+disk, not once it has handed it to the operating system, which a power cut
+can undo and which Chrome does by default.
+
+Every tab and worker of the page's origin can open a purse on the store.
+Each change takes the Web Lock of the same name, `worgl:<name>`, so an
+application that holds a lock of its own, such as for the one tab that
+keeps notes alive, names it otherwise, or every change waits for it. Each
+save also checks that nothing was saved since the store last read, and
+rejects with `store_changed` if another tab took the lock with `steal`;
+the change is undone, and the next one reads the store again.
+
+Web Locks exist only in a secure context, so the page must be served over
+https or from localhost; elsewhere `new IndexedDbStore` throws a
+`DOMException` named `NotSupportedError`. A save the browser refuses
+rejects with its `DOMException`, such as a `QuotaExceededError` when the
+origin is out of space, and the change is undone. An open that another tab
+blocks, holding the database open in an older version, rejects with
+`store_blocked` rather than waiting. What the store holds lasts until the
+site's data is cleared or a private window closes, and the browser may
+clear it to free space unless the page holds persistent storage
+(`navigator.storage.persist()`).
 
 ## Testing it yourself
 

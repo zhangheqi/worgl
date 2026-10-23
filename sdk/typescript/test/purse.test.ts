@@ -25,6 +25,7 @@ import {
   isTransient,
   isWorglError,
 } from '../src/index.ts';
+import { IndexedDbStore } from '../src/browser.ts';
 import { FileStore } from '../src/node.ts';
 import { keptPort, TestServer } from './server.ts';
 
@@ -1253,6 +1254,117 @@ describe('faucet', () => {
     const balance = await purse.balance(playground.mint);
     assert.equal(balance.spendable, 64n);
     assert.equal(balance.expected, 0n);
+  });
+});
+
+/**
+ * A store in memory that several purses share, as tabs share a browser's,
+ * with a lock that lets one at a time change it. `held` says whether one
+ * holds it now and `locks` how often it was taken; `load` fails while
+ * `failing` is set.
+ */
+class SharedStore extends MemoryStore {
+  held = false;
+  locks = 0;
+  failing = false;
+  #queue: Promise<unknown> = Promise.resolve();
+
+  override async load(): Promise<string | undefined> {
+    if (this.failing) {
+      throw new Error('cannot read the store');
+    }
+    return super.load();
+  }
+
+  lock<T>(locked: () => Promise<T>): Promise<T> {
+    const run = async (): Promise<T> => {
+      this.held = true;
+      this.locks += 1;
+      try {
+        return await locked();
+      } finally {
+        this.held = false;
+      }
+    };
+    const result = this.#queue.then(run, run);
+    this.#queue = result.catch(() => {});
+    return result;
+  }
+}
+
+describe('a shared store', () => {
+  test('keeps the changes of purses racing on it', async () => {
+    const alice = await purse();
+    await server.fund(alice, 16n, 4n);
+    const shared = new SharedStore();
+    // Two tabs open Bob's purse, and each asks twice at once.
+    const [bob, alsoBob] = [await purse(shared), await purse(shared)];
+    const asking = [bob, bob, alsoBob, alsoBob];
+    const requests = await Promise.all(asking.map((who) => who.request(server.mint, 4n)));
+    const payments = await Promise.all(requests.map((request) => alice.pay(request, NO_SPACING)));
+    const received = await Promise.all(
+      asking.map((who, i) => who.receive(requests[i]!, payments[i]!)),
+    );
+    for (const submitted of received) {
+      allAnswered(submitted, 1);
+    }
+
+    const reopened = await purse(new MemoryStore(shared.saved));
+    const balance = await reopened.balance(server.mint);
+    assert.deepEqual([balance.frozen, balance.requested], [16n, 0n]);
+  });
+
+  test('is locked only while a change is made, never across a request', async () => {
+    const shared = new SharedStore();
+    const lockedFor: string[] = [];
+    const fetch: typeof globalThis.fetch = (input, init) => {
+      if (shared.held) {
+        lockedFor.push(String(input));
+      }
+      return globalThis.fetch(input, init);
+    };
+    const bob = await Purse.open(new Client(server.url, { fetch }), { store: shared, ...quick });
+    await server.fund(bob, 8n, 8n);
+    const request = await (await purse()).request(server.mint, 5n);
+    const payment = await bob.pay(request, NO_SPACING);
+    allAnswered(await bob.submit(payment.transfers), 1);
+    allAnswered(await bob.settle(NO_SPACING), 0);
+    await bob.planRefresh(server.mint);
+    await bob.prune(server.mint);
+
+    assert.deepEqual(lockedFor, []);
+    assert.equal(shared.locks, 7);
+  });
+
+  test('a change it cannot read for rejects and keeps nothing', async () => {
+    const shared = new SharedStore();
+    const bob = await purse(shared);
+    await server.fund(bob, 8n, 8n);
+    const request = await (await purse()).request(server.mint, 5n);
+    const payment = await bob.pay(request, NO_SPACING);
+
+    shared.failing = true;
+    await assert.rejects(bob.submit(payment.transfers), /cannot read the store/);
+    await assert.rejects(bob.request(server.mint, 2n), /cannot read the store/);
+    shared.failing = false;
+    assert.equal(bob.outgoing().length, 1);
+
+    // The mint answers the transfer again, and the purse keeps its change.
+    const settled = await bob.settle(NO_SPACING);
+    allAnswered(settled, 1);
+    assert.equal(settled.value, 3n);
+    const balance = await (await purse(new MemoryStore(shared.saved))).balance(server.mint);
+    assert.deepEqual([balance.frozen, balance.outgoing, balance.requested], [3n, 0n, 0n]);
+  });
+});
+
+describe('browser store', () => {
+  test('needs IndexedDB and Web Locks', () => {
+    // Node has neither, and a page outside a secure context no Web Locks.
+    assert.throws(() => new IndexedDbStore('https://mint.example.com'), {
+      name: 'NotSupportedError',
+      message: /secure context/,
+    });
   });
 });
 
