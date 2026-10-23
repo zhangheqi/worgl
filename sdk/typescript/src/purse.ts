@@ -558,9 +558,10 @@ export interface PurseOptions {
  * Before each change the purse takes the lock and reads the holder saved
  * there, makes the change to that, and saves before letting go, so a note
  * another purse took in meanwhile is kept, not saved over. It never holds
- * the lock across a request to the mint, and {@link settle} resends the
- * transfers of the holder saved now. Reads such as {@link notes} and
- * {@link balance} show the holder as this purse last read or saved it.
+ * the lock across a request to the mint. {@link settle} resends the
+ * transfers of the holder saved now, and {@link backup} seals that holder.
+ * Reads such as {@link notes} and {@link balance} show the holder as this
+ * purse last read or saved it.
  */
 export class Purse {
   /** The client requests go through. */
@@ -1189,7 +1190,9 @@ export class Purse {
    * with the purses of other servers and the mint list `options` names. The
    * backup is the purse file of the `worgl` command line, which opens it as
    * a purse; {@link Backup.open} opens it here, and {@link restore} merges
-   * it into a purse.
+   * it into a purse. With a store that has a lock, each purse is sealed as
+   * saved now, read under its store's lock, so the backup holds what other
+   * purses on the store saved, and no lock is held while the key is derived.
    *
    * It holds the secret key of every note: anyone with the backup and the
    * passphrase can spend them. Its key is derived from the passphrase with
@@ -1393,11 +1396,12 @@ export class Purse {
     return result;
   }
 
-  /** The holder as JSON, in turn after the changes before it. */
+  /**
+   * The holder as JSON, in turn after the changes before it: with a store
+   * that has a lock, the holder saved now, read under the lock.
+   */
   #snapshot(): Promise<string> {
-    const json = this.#changes.then(() => this.#holder.toJson());
-    this.#changes = json.catch(() => {});
-    return json;
+    return this.#current(async () => this.#holder.toJson());
   }
 
   /** Like {@link #change}, but a failed save puts the holder back as it was before `apply`. */

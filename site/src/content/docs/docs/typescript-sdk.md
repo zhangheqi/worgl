@@ -279,10 +279,10 @@ Several purses can share a store that has a `lock`, as tabs of one browser
 share an `IndexedDbStore`. Before each change a purse takes the lock, reads
 what is saved, makes the change to that and saves before letting go, so
 none saves over a note another took in. It never holds the lock across a
-request to the mint, and `settle` resends what is saved now. Reads such as
-`notes` and `balance` show what the purse last read or saved. `MemoryStore`
-and `FileStore` have no lock, so give each purse one of its own; a store
-that wraps another passes its `lock` on.
+request to the mint, and `settle` resends and `backup` seals what is saved
+now. Reads such as `notes` and `balance` show what the purse last read or
+saved. `MemoryStore` and `FileStore` have no lock, so give each purse one of
+its own; a store that wraps another passes its `lock` on.
 
 ### In a browser
 
