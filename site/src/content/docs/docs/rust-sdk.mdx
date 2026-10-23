@@ -156,11 +156,11 @@ took in, the notes the other copy spent, the transfers it settled,
 cancelled or forgot, and the transfers that spend a note both copies spent.
 What only the other copy had may be out of date, so it comes in unchecked,
 `Holder::unchecked`, and counts in `Balance::unchecked` until the mint says
-otherwise; `Holder::keep` and `Holder::discard` take its answers. Its
-documentation weighs what asking the mint shows. `Holder::join` takes in a
-part as current, such as the holder of another server's mints for one
-backup of both. With the `vault` feature,
-`worgl_sdk::vault` seals a holder under a passphrase into the
+otherwise; `Holder::keep` and `Holder::discard` take its answers, and a
+later merge leaves out a note discarded so. Its documentation weighs what
+asking the mint shows. `Holder::join` takes in a part as current, such as
+the holder of another server's mints for one backup of both. With the
+`vault` feature, `worgl_sdk::vault` seals a holder under a passphrase into the
 [purse file](../command-line/#the-purse-file) `worgl` keeps, with the server
 of each mint beside it, and opens one, a backup of the TypeScript SDK's
 included.

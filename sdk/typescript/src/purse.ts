@@ -1278,15 +1278,16 @@ export class Purse {
   /**
    * Asks the mint about each of `notes`, by default the {@link unchecked}
    * ones, spaced by random gaps of `spacing`, then saves. Those it reports
-   * spent or expired are discarded; those it reports live or unissued are
-   * kept, and no longer unchecked. An unissued note may come back, as after
-   * the mint restored its state from a backup. A note this purse does not
-   * hold is only reported. The unchecked notes are read in turn after the
-   * changes before it and, with a store that has a lock, under the lock, so
-   * they include those another purse on the store restored. The answers are
-   * kept even when their save is refused with `store_changed`, as when
-   * another purse takes the lock meanwhile: the purse makes the change
-   * again on what is saved now, so no note has to be asked about again.
+   * spent or expired are discarded, and a backup restored later leaves them
+   * out; those it reports live or unissued are kept, and no longer unchecked.
+   * An unissued note may come back, as after the mint restored its state from
+   * a backup. A note this purse does not hold is only reported. The unchecked
+   * notes are read in turn after the changes before it and, with a store that
+   * has a lock, under the lock, so they include those another purse on the
+   * store restored. The answers are kept even when their save is refused with
+   * `store_changed`, as when another purse takes the lock meanwhile: the
+   * purse makes the change again on what is saved now, so no note has to be
+   * asked about again.
    *
    * The mint's answers are not signed, so ask only this purse's server, the
    * mint's own. Each question shows the mint one note, from this machine's

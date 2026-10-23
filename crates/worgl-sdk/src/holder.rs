@@ -31,12 +31,20 @@ pub const PAID_KEYS_KEPT: usize = 4 * MAX_REQUESTED_NOTES;
 /// each of four rotations, for about 60 KiB of the saved store.
 pub const ENDED_TRANSFERS_KEPT: usize = 512;
 
+/// How many of the notes it [discarded](Holder::discard) last a holder
+/// remembers at each mint, so that a [merge](Holder::merge) with a copy of
+/// the purse that still holds one, such as the same backup restored again,
+/// leaves it out: as many as the transfers ended last, for about 16 KiB of
+/// the saved store.
+pub const DISCARDED_NOTES_KEPT: usize = 512;
+
 /// Version of the format [`Holder::to_json`] writes for a store that holds
 /// unconfirmed change or notes owed to payees. A reader of format 1 skips
 /// fields it does not know, so it would drop those unseen and lose their
 /// value. A store without them is still written as format 1, which such a
 /// reader opens, missing only the payments kept, the keys paid last, the
-/// transfers ended last and which notes are [unchecked](Holder::unchecked).
+/// transfers ended last, the notes discarded last and which notes are
+/// [unchecked](Holder::unchecked).
 const FORMAT: u32 = 2;
 
 /// Seconds before a scheduled rotation by which the transfers that
@@ -73,6 +81,9 @@ pub struct Holder {
     paid: VecDeque<PublicKey>,
     /// The transfers this holder ended last at each mint, oldest first.
     ended: BTreeMap<PublicKey, VecDeque<Ended>>,
+    /// The serials of the notes this holder discarded last at each mint,
+    /// oldest first.
+    discarded: BTreeMap<PublicKey, VecDeque<Serial>>,
 }
 
 /// A note and the key that spends it.
@@ -437,6 +448,10 @@ pub(crate) struct Saved {
     // ended no transfer.
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     ended: BTreeMap<PublicKey, VecDeque<Ended>>,
+    // Missing from stores written before it existed, and from those that
+    // discarded no note.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    discarded: BTreeMap<PublicKey, VecDeque<Serial>>,
 }
 
 impl Holder {
@@ -666,6 +681,24 @@ impl Holder {
             }
         }
         let excess = kept.len().saturating_sub(ENDED_TRANSFERS_KEPT);
+        kept.drain(..excess);
+    }
+
+    /// Adds the notes of `serials`, discarded at `mint` and not yet
+    /// remembered, to the notes discarded last there, forgetting the oldest
+    /// beyond [`DISCARDED_NOTES_KEPT`].
+    fn remember_discarded_at(
+        &mut self,
+        mint: PublicKey,
+        serials: impl IntoIterator<Item = Serial>,
+    ) {
+        let kept = self.discarded.entry(mint).or_default();
+        for serial in serials {
+            if !kept.contains(&serial) {
+                kept.push_back(serial);
+            }
+        }
+        let excess = kept.len().saturating_sub(DISCARDED_NOTES_KEPT);
         kept.drain(..excess);
     }
 
@@ -1414,7 +1447,7 @@ impl Holder {
 
     /// The mints this holder has anything of, in key order: a note held or
     /// spent by an outgoing transfer, a key expected, unconfirmed change, a
-    /// payment kept or a transfer ended last, which a
+    /// payment kept, a transfer ended last or a note discarded last, which a
     /// [merge](Self::merge) needs as much.
     pub fn mints(&self) -> Vec<PublicKey> {
         let mut mints: Vec<PublicKey> = self
@@ -1426,6 +1459,7 @@ impl Holder {
             .chain(self.unconfirmed.iter().map(|u| u.change.mint))
             .chain(self.payments.iter().map(|p| p.payment.mint))
             .chain(self.ended.keys().copied())
+            .chain(self.discarded.keys().copied())
             .collect();
         mints.sort_unstable();
         mints.dedup();
@@ -1433,9 +1467,10 @@ impl Holder {
     }
 
     /// A copy of the part of this holder that is of `mints`: their notes,
-    /// keys expected, outgoing transfers, unconfirmed change, payments and
-    /// transfers ended last, as for the purse of a server that serves those
-    /// mints. The keys paid last name no mint, so the copy has all of them.
+    /// keys expected, outgoing transfers, unconfirmed change, payments,
+    /// transfers ended last and notes discarded last, as for the purse of a
+    /// server that serves those mints. The keys paid last name no mint, so
+    /// the copy has all of them.
     pub fn only(&self, mints: &[PublicKey]) -> Holder {
         let of = |mint: &PublicKey| mints.contains(mint);
         Holder {
@@ -1475,6 +1510,12 @@ impl Holder {
                 .iter()
                 .filter(|(mint, _)| of(mint))
                 .map(|(mint, ended)| (*mint, ended.clone()))
+                .collect(),
+            discarded: self
+                .discarded
+                .iter()
+                .filter(|(mint, _)| of(mint))
+                .map(|(mint, discarded)| (*mint, discarded.clone()))
                 .collect(),
         }
     }
@@ -1517,7 +1558,10 @@ impl Holder {
     /// Drops held `notes` that their mint reports spent or expired, such as
     /// [unchecked](Self::unchecked) notes a merge took in that another copy
     /// of the purse spent since, and returns their value. Their keys go with
-    /// them, for good.
+    /// them, for good: the holder remembers the last
+    /// [`DISCARDED_NOTES_KEPT`] it dropped at each mint, and a
+    /// [merge](Self::merge), such as of the same backup again, leaves them
+    /// out.
     ///
     /// Only the mint can tell (`POST /v1/verify`), and its answer is not
     /// signed: drop a note only on an answer for that note from its mint's
@@ -1526,13 +1570,18 @@ impl Holder {
     /// restored its state from a backup: keep it.
     pub fn discard(&mut self, notes: &[Note]) -> u128 {
         let mut value = 0;
+        let mut dropped = Vec::new();
         self.notes.retain(|h| {
             let gone = notes.contains(&h.note);
             if gone {
                 value += u128::from(h.note.amount());
+                dropped.push(h.note);
             }
             !gone
         });
+        for note in dropped {
+            self.remember_discarded_at(*note.issuer(), [note.serial()]);
+        }
         value
     }
 
@@ -1554,6 +1603,11 @@ impl Holder {
     ///   copy spent since. A note one copy holds that the other spent in such
     ///   a transfer, and does not hold, is no longer the purse's: it is
     ///   dropped, or not taken in.
+    /// - Each copy remembers, too, the notes it [discarded](Self::discard)
+    ///   last at each mint, on the mint's word that they are spent or
+    ///   expired: up to [`DISCARDED_NOTES_KEPT`]. A note one copy holds that
+    ///   the other discarded is no longer the purse's either, so a backup
+    ///   merged again does not bring back a note a check found spent.
     /// - Any other transfer outgoing in either copy is outgoing here, unless
     ///   the copies show it answered, holding or spending every note it pays
     ///   this holder, as [`take_answers`](Self::take_answers) judges; then it
@@ -1677,11 +1731,11 @@ impl Holder {
         self.unconfirmed
             .retain(|u| !here_keys.contains(&u.change.key.public_key()));
 
-        // A note the other copy spent in a transfer it ended, and does not
-        // hold, is no longer the purse's.
+        // A note the other copy spent in a transfer it ended, or discarded,
+        // and does not hold, is no longer the purse's.
         let held_there: HashSet<Note> = other.notes.iter().map(|h| h.note).collect();
         self.notes
-            .retain(|h| held_there.contains(&h.note) || !other.ended_spending(&h.note));
+            .retain(|h| held_there.contains(&h.note) || !other.knows_gone(&h.note));
         let mut index: HashMap<Note, usize> = self
             .notes
             .iter()
@@ -1691,7 +1745,7 @@ impl Holder {
         for theirs in &other.notes {
             if let Some(&i) = index.get(&theirs.note) {
                 self.notes[i].unchecked &= doubt || theirs.unchecked;
-            } else if !self.ended_spending(&theirs.note) {
+            } else if !self.knows_gone(&theirs.note) {
                 index.insert(theirs.note, self.notes.len());
                 self.notes.push(Held {
                     unchecked: unchecked(note_known(&theirs.note), theirs.unchecked),
@@ -1788,6 +1842,9 @@ impl Holder {
         for (mint, ended) in &other.ended {
             self.remember_ended_at(*mint, ended.iter().copied());
         }
+        for (mint, discarded) in &other.discarded {
+            self.remember_discarded_at(*mint, discarded.iter().copied());
+        }
         self.settle_received();
 
         let held: HashSet<Note> = self.notes.iter().map(|h| h.note).collect();
@@ -1852,6 +1909,16 @@ impl Holder {
         self.ended
             .get(note.issuer())
             .is_some_and(|kept| kept.iter().any(|e| e.spent == note.serial()))
+    }
+
+    /// Whether this holder knows that `note` is no longer the purse's: it
+    /// remembers spending it in a transfer it ended, or discarding it.
+    fn knows_gone(&self, note: &Note) -> bool {
+        self.ended_spending(note)
+            || self
+                .discarded
+                .get(note.issuer())
+                .is_some_and(|kept| kept.contains(&note.serial()))
     }
 
     /// Whether a payment this holder keeps holds `request`.
@@ -1946,6 +2013,7 @@ impl Holder {
             payments: self.payments.clone(),
             paid: self.paid.clone(),
             ended: self.ended.clone(),
+            discarded: self.discarded.clone(),
         }
     }
 
@@ -1964,6 +2032,7 @@ impl Holder {
             payments: saved.payments,
             paid: saved.paid,
             ended: saved.ended,
+            discarded: saved.discarded,
         })
     }
 }

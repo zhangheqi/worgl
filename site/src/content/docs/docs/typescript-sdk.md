@@ -390,9 +390,11 @@ counts in `balance.unchecked` until the mint says otherwise. A backup
 restored into a new purse is all unchecked.
 
 - `purse.checkNotes()` asks the mint about each unchecked note, discards
-  those it reports spent or expired, and keeps the rest, checked. Each
-  question shows the mint one note, from this machine's address and at its
-  time, so it asks at random gaps, 2 to 60 seconds by default (see the
+  those it reports spent or expired, and keeps the rest, checked. The purse
+  remembers the last 512 notes it discarded at each mint, so the same
+  backup restored again does not bring them back. Each question shows the
+  mint one note, from this machine's address and at its time, so it asks
+  at random gaps, 2 to 60 seconds by default (see the
   [Privacy model](../privacy/#timing)). `purse.prune(mint)` drops the
   expired ones from the mint's info alone, and asking nothing leaves the
   transfers that next spend the notes to find the spent ones, which the

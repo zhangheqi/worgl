@@ -120,9 +120,10 @@ the mint answers with the same notes while it keeps its answers.
   by another copy, so it comes in unchecked (`purse.unchecked()`) and
   counts until the mint says otherwise: `purse.checkNotes()` asks it about
   each, at random gaps, discards the spent ones and keeps the rest, which
-  shows the mint those notes one after another. Deriving a backup's key
-  takes 64 MiB of memory and about a quarter of a second, and an empty
-  passphrase is refused.
+  shows the mint those notes one after another. A backup restored again
+  leaves out the notes discarded so. Deriving a backup's key takes 64 MiB
+  of memory and about a quarter of a second, and an empty passphrase is
+  refused.
 - `Client` makes one call per route and rejects with a `MintError` carrying
   the mint's code (`spent`, `frozen`, `paused`…); `isTransient(error)` says
   whether trying again may work. It counts `layer_full` out: a transfer

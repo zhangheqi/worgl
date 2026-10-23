@@ -293,6 +293,10 @@ describe('restoring a backup', () => {
       unanswered: [],
     });
     assert.equal(await held(copy), 0n);
+    // The copy remembers what the mint said: the same backup, restored
+    // again, gives nothing back either.
+    assert.deepEqual((await copy.restore(old)).notes, []);
+    assert.equal((await copy.balance(server.mint)).total, 0n);
     // A live note is kept, and checked.
     const fresh = await purse();
     await fresh.restore(await backupOf(alice));

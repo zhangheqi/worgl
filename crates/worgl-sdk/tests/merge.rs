@@ -1,7 +1,10 @@
 //! Merging two copies of one purse, against a real issuer in memory.
 
 use worgl::{Issuer, IssuerKey, LedgerConfig, Note, NoteStatus, Policy, TransferRequest};
-use worgl_sdk::{Balance, ENDED_TRANSFERS_KEPT, Holder, Merged, MintInfo, MintView, Spacing};
+use worgl_sdk::{
+    Balance, DISCARDED_NOTES_KEPT, ENDED_TRANSFERS_KEPT, Holder, Merged, MintInfo, MintView,
+    Spacing,
+};
 
 fn issuer() -> Issuer {
     let ledger = LedgerConfig {
@@ -429,6 +432,35 @@ fn notes_a_backup_holds_that_were_spent_since_are_found_by_the_mint() {
 }
 
 #[test]
+fn a_note_the_mint_reported_spent_stays_out_when_a_backup_is_merged_again() {
+    let mut mint = issuer();
+    let (mut alice, mut bob) = (Holder::new(), Holder::new());
+    fund(&mut mint, &mut alice, &[8, 2]);
+    let backup = copy(&alice);
+    // Alice spends the 8 since.
+    let transfer = pay(&mint, &mut alice, &mut bob, 5);
+    mint.transfer(&transfer).unwrap();
+
+    // A new purse restores the backup, and the mint reports the 8 spent.
+    let (mut fresh, _) = merging(&Holder::new(), &backup);
+    assert_eq!(check(&mint, &mut fresh), 8);
+    let checked = balance(&fresh, &mint);
+    assert_eq!((checked.total(), checked.unchecked), (2, 0));
+
+    // Saved, it remembers: the same backup merged again gives nothing back.
+    let (merged, report) = merging(&copy(&fresh), &backup);
+    assert_eq!(report, Merged::default());
+    assert_eq!(balance(&merged, &mint), checked);
+    // And the backup, merging the checked purse in, drops the 8.
+    let (merged, report) = merging(&backup, &fresh);
+    assert_eq!(
+        report.spent.iter().map(Note::amount).collect::<Vec<_>>(),
+        [8]
+    );
+    assert_eq!(counted(&merged, &mint), counted(&fresh, &mint));
+}
+
+#[test]
 fn notes_the_mint_reports_live_are_kept() {
     let mut mint = issuer();
     let mut alice = Holder::new();
@@ -663,4 +695,33 @@ fn the_transfers_ended_last_are_kept_up_to_the_bound_and_saved() {
     assert_eq!(ended.len(), ENDED_TRANSFERS_KEPT);
     // A store that ended nothing saves no record, as before there was one.
     assert!(!Holder::new().to_json().contains("ended"));
+}
+
+#[test]
+fn the_notes_discarded_last_are_kept_up_to_the_bound_and_saved() {
+    let mut mint = issuer();
+    let mut alice = Holder::new();
+    fund(&mut mint, &mut alice, &[1]);
+    let backup = copy(&alice);
+    let first: Vec<Note> = alice.notes().copied().collect();
+    assert_eq!(alice.discard(&first), 1);
+    for _ in 0..DISCARDED_NOTES_KEPT {
+        fund(&mut mint, &mut alice, &[1]);
+        let note: Vec<Note> = alice.notes().copied().collect();
+        assert_eq!(alice.discard(&note), 1);
+    }
+    let alice = copy(&alice);
+    // The oldest is forgotten: a copy that still holds it brings it back, as
+    // from a store that kept no record.
+    let (merged, report) = merging(&alice, &backup);
+    assert_eq!(report.notes, first);
+    assert_eq!(merged.unchecked().copied().collect::<Vec<_>>(), first);
+    let saved: serde_json::Value = serde_json::from_str(&alice.to_json()).unwrap();
+    let discarded = saved["discarded"][mint.public_key().to_string()]
+        .as_array()
+        .unwrap();
+    assert_eq!(discarded.len(), DISCARDED_NOTES_KEPT);
+    // A store that discarded nothing saves no record, as before there was
+    // one.
+    assert!(!Holder::new().to_json().contains("discarded"));
 }

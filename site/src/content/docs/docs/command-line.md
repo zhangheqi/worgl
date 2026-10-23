@@ -210,10 +210,10 @@ server of each mint, with what else the application keeps of it, such as a
 name, and `worgl` keeps that list as it is when it saves; it still talks to
 the server `--server` names. A purse file `worgl` 0.1 wrote has no list and
 opens as before, and `worgl` 0.1 opens a file with one, dropping the list,
-the record of the transfers the purse ended and which notes are unchecked
-when it saves. `worgl` reads a file whose settings ask for up to 256 MiB,
-eight passes and 16 lanes, and refuses one that asks for more before
-deriving anything. Copy the file to back the purse up, and restore a copy
+the records of the transfers the purse ended and of the notes it
+discarded, and which notes are unchecked when it saves. `worgl` reads a
+file whose settings ask for up to 256 MiB, eight passes and 16 lanes, and
+refuses one that asks for more before deriving anything. Copy the file to back the purse up, and restore a copy
 with the TypeScript SDK's `purse.restore`, which merges it with what the
 purse holds now.
 
