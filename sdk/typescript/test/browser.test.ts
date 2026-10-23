@@ -258,6 +258,97 @@ describe('browser store', () => {
       assert.equal(await requested(name), 1n);
     });
 
+    test('keeps an answer in hand though its save loses the lock', waits, async () => {
+      // The tab pays twice, in a transfer each that goes at once, and submits
+      // both. The save that keeps the first answer waits after its read under
+      // the lock, while another tab takes the lock with steal and asks for 1
+      // through a purse of its own.
+      const name = server.url;
+      const store = new IndexedDbStore(name);
+      const tab = await open(name, store);
+      const payee = await Purse.open(server.client(), quick);
+      await server.fund(tab, 16n, 8n);
+      const transfers = [
+        ...(await tab.pay(await payee.request(server.mint, 5n))).transfers,
+        ...(await tab.pay(await payee.request(server.mint, 5n))).transfers,
+      ];
+      const paused = pauseAfterLoad(store);
+      const submitting = tab.submit(transfers);
+      await paused.loaded;
+      await navigator.locks.request(`worgl:${name}`, { steal: true }, async () => {});
+      await (await open(name)).request(server.mint, 1n);
+      paused.resume();
+
+      // The answer is kept all the same, in the purse as the other tab saved
+      // it, and the second transfer goes on.
+      const submitted = await submitting;
+      assert.deepEqual([submitted.answered, submitted.value, submitted.refused], [2, 6n, []]);
+      assert.deepEqual(tab.outgoing(), []);
+      const saved = await (await open(name)).balance(server.mint);
+      assert.deepEqual([saved.outgoing, saved.held, saved.requested], [0n, 6n, 1n]);
+      assert.equal(await payee.accept(submitted.theirs), 10n);
+    });
+
+    test('keeps an answer in hand though its database is deleted meanwhile', waits, async () => {
+      // The save that keeps the answer waits after its read under the lock,
+      // while another tab deletes the database.
+      const name = server.url;
+      const store = new IndexedDbStore(name);
+      const tab = await open(name, store);
+      const payee = await Purse.open(server.client(), quick);
+      await server.fund(tab, 8n, 8n);
+      const { transfers } = await tab.pay(await payee.request(server.mint, 5n));
+      const paused = pauseAfterLoad(store);
+      const submitting = tab.submit(transfers);
+      await paused.loaded;
+      await new Promise<void>((resolve, reject) => {
+        const request = indexedDB.deleteDatabase(`worgl:${name}`);
+        request.onsuccess = () => resolve();
+        request.onblocked = () => reject(new Error('the store blocked the delete'));
+      });
+      paused.resume();
+
+      // The purse saves itself again, answer and all, and counts the answer
+      // once.
+      const submitted = await submitting;
+      assert.deepEqual([submitted.answered, submitted.value, submitted.refused], [1, 3n, []]);
+      const saved = await (await open(name)).balance(server.mint);
+      assert.deepEqual([saved.outgoing, saved.held], [0n, 3n]);
+    });
+
+    test('drops a transfer the mint refused though its save loses the lock', waits, async () => {
+      // A purse elsewhere, on a store of its own that a copy of the tab's
+      // purse is written into, spends first the note the tab pays from.
+      const name = server.url;
+      const store = new IndexedDbStore(name);
+      const tab = await open(name, store);
+      const payee = await Purse.open(server.client(), quick);
+      await server.fund(tab, 8n, 8n);
+      const elsewhere = await open('copy');
+      await write(indexedDB, 'worgl:copy', tab.toJson(), 1);
+      const first = await payee.request(server.mint, 5n);
+      await payee.receive(first, await elsewhere.pay(first));
+      const { transfers } = await tab.pay(await payee.request(server.mint, 5n));
+
+      // The save that drops the tab's transfer, which the mint refuses as
+      // spent, waits after its read under the lock, while another tab takes
+      // the lock with steal and asks for 1 through a purse of its own.
+      const paused = pauseAfterLoad(store);
+      const submitting = tab.submit(transfers);
+      await paused.loaded;
+      await navigator.locks.request(`worgl:${name}`, { steal: true }, async () => {});
+      await (await open(name)).request(server.mint, 1n);
+      paused.resume();
+
+      const submitted = await submitting;
+      assert.deepEqual(
+        submitted.refused.map(({ outcome, atStake }) => [outcome, atStake]),
+        [['dropped', 3n]],
+      );
+      const saved = await (await open(name)).balance(server.mint);
+      assert.deepEqual([saved.outgoing, saved.requested], [0n, 1n]);
+    });
+
     test('saves only under its lock', async () => {
       await assert.rejects(new IndexedDbStore(server.url).save('{}'), {
         name: 'InvalidStateError',

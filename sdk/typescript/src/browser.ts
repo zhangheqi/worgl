@@ -40,7 +40,9 @@ interface Grant {
  * meanwhile, as when another tab takes it with `steal`, saves nothing:
  * its save refuses with the `WorglError` code `store_changed`. So does a
  * save that finds, in its transaction, something saved since the change
- * read the store. An application that holds a lock of its own, such as one
+ * read the store. A purse then undoes the change and rejects, but makes
+ * one that keeps what the mint answered, as a submit's, again on what is
+ * saved now. An application that holds a lock of its own, such as one
  * tab's claim to keep notes alive, must name it otherwise, or every change
  * waits for it.
  *

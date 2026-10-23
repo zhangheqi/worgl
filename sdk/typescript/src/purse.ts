@@ -13,7 +13,7 @@ import {
   transferMint,
   verifyNotes,
 } from './core.ts';
-import { type WorglError, worglError } from './error.ts';
+import { type WorglError, isWorglError, worglError } from './error.ts';
 import { MemoryStore, type Store } from './store.ts';
 
 /**
@@ -724,6 +724,11 @@ export class Purse {
    * is not the mint's, such as one from a server that is not the mint's, nor
    * of one it cannot read the keys to check.
    *
+   * With a store that has a lock, what the mint answered is kept even when
+   * its save is refused with `store_changed`, as when another purse takes
+   * the lock meanwhile: the purse makes the change again on what is saved
+   * now, since a resend gets an answer back only while the mint keeps it.
+   *
    * A refused transfer does not stop the others; it is listed in
    * {@link Submitted.refused}, as is one whose answer the purse did not keep.
    * One this purse made that the mint refused for good is dropped or
@@ -789,15 +794,18 @@ export class Purse {
     // Set while the answer is checked: a rejection then is the answer's, and
     // any other, before or after, is the store's.
     let checking = false;
+    const take = (): { value: bigint; theirs: string[] } => {
+      checking = true;
+      const value = this.#holder.settle(keys, transfer, json);
+      checking = false;
+      return { value, theirs: JSON.parse(this.#holder.theirs(json)) as string[] };
+    };
     try {
-      return await this.#change(
-        () => {
-          checking = true;
-          const value = this.#holder.settle(keys, transfer, json);
-          checking = false;
-          return { value, theirs: JSON.parse(this.#holder.theirs(json)) as string[] };
-        },
-        () => {},
+      // Without a lock, an answer whose save fails stays in the holder, for
+      // the next save to keep. With one, the next change reads the store
+      // again, so the answer is taken out as any change is.
+      return await this.#untilSaved(() =>
+        this.store.lock === undefined ? this.#change(take, () => {}) : this.#changeOrRestore(take),
       );
     } catch (error) {
       if (!checking) {
@@ -822,12 +830,14 @@ export class Purse {
       if (!(error instanceof MintError && error.status === 409)) {
         return { atStake: this.#holder.atStake(transfer), outcome: 'kept' };
       }
-      return this.#changeOrRestore(() => {
-        // Before the transfer is dropped.
-        const atStake = this.#holder.atStake(transfer);
-        const outcome: Outcome = this.#holder.forget(transfer) ? 'dropped' : 'kept';
-        return { atStake, outcome };
-      });
+      return this.#untilSaved(() =>
+        this.#changeOrRestore(() => {
+          // Before the transfer is dropped.
+          const atStake = this.#holder.atStake(transfer);
+          const outcome: Outcome = this.#holder.forget(transfer) ? 'dropped' : 'kept';
+          return { atStake, outcome };
+        }),
+      );
     }
     let cancel: boolean;
     if (code === 'layer_full') {
@@ -854,7 +864,9 @@ export class Purse {
     if (!cancel) {
       return { atStake: undefined, outcome: 'kept' };
     }
-    const cancelled = await this.#changeOrRestore(() => this.#holder.cancel(transfer));
+    const cancelled = await this.#untilSaved(() =>
+      this.#changeOrRestore(() => this.#holder.cancel(transfer)),
+    );
     return { atStake: undefined, outcome: cancelled ? 'cancelled' : 'kept' };
   }
 
@@ -937,6 +949,25 @@ export class Purse {
         this.#holder = restored;
       },
     );
+  }
+
+  /**
+   * Makes `change` again for as long as the store refuses its save with
+   * `store_changed`, as when another purse takes the lock meanwhile or the
+   * store is cleared, each time on the holder saved now. It is for a change
+   * that keeps what the mint answered, which the refusal does not make
+   * wrong and which would be lost with the call.
+   */
+  async #untilSaved<T>(change: () => Promise<T>): Promise<T> {
+    for (;;) {
+      try {
+        return await change();
+      } catch (error) {
+        if (!(isWorglError(error) && error.code === 'store_changed')) {
+          throw error;
+        }
+      }
+    }
   }
 }
 
