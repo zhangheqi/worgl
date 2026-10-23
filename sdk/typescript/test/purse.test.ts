@@ -21,6 +21,7 @@ import {
   type Store,
   type Submitted,
   isTransient,
+  isWorglError,
 } from '../src/index.ts';
 import { FileStore } from '../src/node.ts';
 import { keptPort, TestServer } from './server.ts';
@@ -107,6 +108,7 @@ describe('client', () => {
       assert.ok(error instanceof MintError);
       assert.equal(error.code, 'admin_unauthorized');
       assert.equal(isTransient(error), false);
+      assert.equal(isWorglError(error), false);
       return true;
     });
     await assert.rejects(client.info('00'.repeat(32)), { code: 'unknown_mint' });
@@ -165,7 +167,12 @@ describe('purse', () => {
     // A note whose signature was tampered with is refused.
     const genuine = submitted.notes[0]!;
     const forged = genuine.slice(0, 190) + (genuine[190] === 'A' ? 'B' : 'A') + genuine.slice(191);
-    await assert.rejects(bob.accept([forged]), /signature/);
+    await assert.rejects(bob.accept([forged]), {
+      name: 'WorglError',
+      code: 'bad_signature',
+      details: {},
+      message: 'issuer signature does not verify',
+    });
     assert.equal((await bob.balance(server.mint)).frozen, 0n);
 
     assert.equal(await bob.accept(submitted.notes), 6n);
@@ -238,7 +245,11 @@ describe('purse', () => {
     };
     asked.outputs[0]!.amount = 3;
     const request = PaymentRequest.from(JSON.stringify(asked));
-    await assert.rejects(alice.pay(request, NO_SPACING), /a note of 3, which is not one of/);
+    await assert.rejects(alice.pay(request, NO_SPACING), {
+      code: 'denomination',
+      details: { amount: 3n },
+      message: "the request asks for a note of 3, which is not one of the mint's denominations",
+    });
     // Nothing is parked: no transfer to resend, nothing saved.
     const balance = await alice.balance(server.mint);
     assert.deepEqual([balance.spendable, balance.outgoing, balance.expected], [8n, 0n, 0n]);
@@ -448,8 +459,48 @@ describe('purse', () => {
     const asked = await bob.request(server.mint, 4n);
     const other = await bob.request(server.mint, 4n);
     const payment = await alice.pay(other, NO_SPACING);
-    await assert.rejects(bob.receive(asked, payment));
+    const [unpaid] = asked.notes;
+    await assert.rejects(bob.receive(asked, payment), {
+      code: 'unpaid',
+      details: { amount: unpaid!.amount, holder: unpaid!.holder },
+    });
     assert.equal((await alice.balance(server.mint)).outgoing, 8n);
+  });
+
+  test('a payment the purse cannot make says why in its code and details', async () => {
+    const [alice, bob] = [await purse(), await purse()];
+    await server.fund(alice, 8n, 2n);
+
+    const tooMuch = await bob.request(server.mint, 16n);
+    await assert.rejects(alice.pay(tooMuch, NO_SPACING), (error: unknown) => {
+      assert.ok(isWorglError(error) && error.code === 'unaffordable');
+      assert.deepEqual(error.details, { spendable: 8n, needed: 16n });
+      assert.equal(error.message, '8 is spendable now and 16 is needed');
+      assert.equal(isTransient(error), false);
+      return true;
+    });
+
+    // Enough, but in notes of 2 for the one note of 8 asked: the payee asks
+    // again for notes no larger than the largest Alice holds.
+    const whole = await bob.request(server.mint, 8n);
+    let largest = 0n;
+    await assert.rejects(alice.pay(whole, NO_SPACING), (error: unknown) => {
+      assert.ok(isWorglError(error) && error.code === 'fragmented');
+      largest = error.details.largest;
+      assert.equal(
+        error.message,
+        'the requested notes do not fit the spendable notes; the largest spendable note is 2',
+      );
+      return true;
+    });
+    assert.equal(largest, 2n);
+    const balance = await alice.balance(server.mint);
+    assert.deepEqual([balance.spendable, balance.outgoing], [8n, 0n]);
+
+    const smaller = await bob.requestAtMost(server.mint, 8n, largest);
+    const received = await bob.receive(smaller, await alice.pay(smaller, NO_SPACING));
+    allAnswered(received, 4);
+    assert.equal(received.value, 8n);
   });
 
   test('a paused mint is retried, reported, then paid', async () => {
@@ -735,6 +786,27 @@ describe('faucet', () => {
     assert.equal(purse.notes().length, 2);
   });
 
+  test('a faucet whose notes its mint cannot make whole is refused', async () => {
+    // What a faucet of notes of 3 would say, which the mint makes as 2 and 1.
+    const about = {
+      mint: playground.mint,
+      amount: 3,
+      per_address_per_hour: 3,
+      per_day: 10_000,
+      left_today: 10_000,
+    };
+    const fetch: typeof globalThis.fetch = async () =>
+      new Response(JSON.stringify(about), { headers: { 'content-type': 'application/json' } });
+    const purse = await Purse.open(playground.client(), quick);
+    await assert.rejects(purse.takeFromFaucet(new Client(playground.url, { fetch })), {
+      name: 'WorglError',
+      code: 'faucet_amount',
+      details: { amount: 3n },
+      message: 'the faucet hands out notes of 3, which its mint cannot make as one note',
+    });
+    assert.equal((await purse.balance(playground.mint)).expected, 0n);
+  });
+
   test('a refusal leaves nothing expected', async () => {
     const purse = await Purse.open(playground.client(), quick);
     // The address had two of its three notes above.
@@ -779,6 +851,12 @@ describe('file store', () => {
     const holder = new Holder();
     const copy = Holder.fromJson(holder.toJson());
     assert.equal(copy.toJson(), holder.toJson());
-    assert.throws(() => Holder.fromJson('{"format":9,"notes":[],"expected":[],"outgoing":[]}'));
+    assert.throws(() => Holder.fromJson('{"format":9,"notes":[],"expected":[],"outgoing":[]}'), {
+      name: 'WorglError',
+      code: 'unknown_format',
+      details: { format: 9 },
+      message: 'saved in format 9, which this SDK does not read',
+    });
+    assert.throws(() => PaymentRequest.from('{"mint":'), { name: 'WorglError', code: 'malformed' });
   });
 });

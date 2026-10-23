@@ -13,6 +13,7 @@ import {
   transferMint,
   verifyNotes,
 } from './core.ts';
+import { type WorglError, worglError } from './error.ts';
 import { MemoryStore, type Store } from './store.ts';
 
 /**
@@ -357,7 +358,8 @@ export class Purse {
    * Asks a playground faucet for a note and keeps it. The faucet's mint must
    * be on this purse's server; the faucet may share its URL. The note goes to
    * a fresh key, saved before the faucet is asked, as for any payment
-   * request. Resolves to the faucet's mint and the value kept.
+   * request. Resolves to the faucet's mint and the value kept. A faucet whose
+   * notes its mint cannot make as one note is refused with `faucet_amount`.
    */
   async takeFromFaucet(faucet: Client): Promise<{ mint: string; value: bigint }> {
     const about = await faucet.faucet();
@@ -365,7 +367,9 @@ export class Purse {
     const [output, ...rest] = request.notes;
     if (output === undefined || rest.length > 0) {
       await this.withdraw(request);
-      throw new Error(
+      throw worglError(
+        'faucet_amount',
+        { amount: about.amount },
         `the faucet hands out notes of ${about.amount}, which its mint cannot make as one note`,
       );
     }
@@ -394,7 +398,10 @@ export class Purse {
    * {@link accept}; or {@link settle} later to take it in. A request for a
    * note the mint would not make, of an amount outside its denominations, or
    * to a key this purse has paid already, such as the same request twice, is
-   * refused before anything is signed.
+   * refused before anything is signed. Refusals are {@link WorglError}s,
+   * such as `unaffordable` when too little can be spent now, or `fragmented`
+   * when enough can but in notes too small for those asked for, with the
+   * largest in its details.
    */
   async pay(request: PaymentRequest, spacing: Spacing = DEFAULT_SPACING): Promise<Payment> {
     const info = await this.client.infoText(request.mint);

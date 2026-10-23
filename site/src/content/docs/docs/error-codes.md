@@ -12,7 +12,10 @@ Errors answer with a status code and a body like:
 `error` is one of the stable codes below, listed on `ApiError::code` in
 [`worgl-server`](https://github.com/zhangheqi/worgl/blob/main/crates/worgl-server/src/lib.rs).
 `message` is for people and may change. `worgl-client` keeps the code in
-`Error::code`, and the TypeScript SDK in `MintError.code`.
+`Error::code`, and the TypeScript SDK in `MintError.code`. What the
+TypeScript SDK refuses itself, such as a payment its purse cannot make, has
+codes of its own, on `WorglError`: see
+[TypeScript SDK](../typescript-sdk/#client-and-errors).
 
 ## The request itself
 
