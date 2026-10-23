@@ -9,13 +9,16 @@ use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result, anyhow, bail};
+use clap::builder::BoolishValueParser;
 use clap::{Parser, Subcommand};
 use serde_json::json;
 use tracing_subscriber::EnvFilter;
 use worgl::log::Payload;
 use worgl::{FileLog, LedgerConfig, LogId, MintKey, MintRequest, Policy, PublicKey};
 use worgl_server::files::{read_key, write_secret};
-use worgl_server::{AppState, ClusterConfig, Member, MintSpec, raft_router, router};
+use worgl_server::{
+    AppState, ClusterConfig, Member, MintSpec, raft_router, router, router_without_cors,
+};
 
 const MINT_KEY_FILE: &str = "mint.key";
 
@@ -122,6 +125,11 @@ enum Command {
         /// Write a fresh snapshot of a mint after this many logged events.
         #[arg(long, default_value_t = 100_000)]
         compact_every: u64,
+        /// Send no CORS headers, so that no page on another origin can read
+        /// an answer. Without it, the routes that take no token answer
+        /// pages on any origin.
+        #[arg(long, env = "WORGL_NO_CORS", value_parser = BoolishValueParser::new())]
+        no_cors: bool,
     },
 }
 
@@ -217,16 +225,18 @@ async fn main() -> Result<()> {
             listen,
             raft_listen,
             compact_every,
+            no_cors,
         } => {
+            let routes = if no_cors { router_without_cors } else { router };
             if worgl_server::is_member(&state) {
-                serve_member(&state, listen, raft_listen, compact_every).await
+                serve_member(&state, listen, raft_listen, compact_every, routes).await
             } else if raft_listen.is_some() {
                 bail!(
                     "{} is not a cluster member's, so it has no Raft port",
                     state.display()
                 )
             } else {
-                serve(&state, listen, compact_every).await
+                serve(&state, listen, compact_every, routes).await
             }
         }
     }
@@ -298,7 +308,14 @@ fn export_log(dir: &Path) -> Result<()> {
     Ok(())
 }
 
-async fn serve(state: &Path, listen: SocketAddr, compact_every: u64) -> Result<()> {
+/// Serves every mint in `state` on `listen`, with the public API's
+/// `routes`.
+async fn serve(
+    state: &Path,
+    listen: SocketAddr,
+    compact_every: u64,
+    routes: fn(AppState) -> axum::Router,
+) -> Result<()> {
     let app = AppState::open(state, compact_every)
         .with_context(|| format!("opening {}", state.display()))?;
     tracing::info!(mints = app.mints().len(), "state loaded");
@@ -306,19 +323,21 @@ async fn serve(state: &Path, listen: SocketAddr, compact_every: u64) -> Result<(
         .await
         .with_context(|| format!("binding {listen}"))?;
     tracing::info!(%listen, "serving");
-    axum::serve(listener, router(app))
+    axum::serve(listener, routes(app))
         .with_graceful_shutdown(shutdown_signal())
         .await?;
     tracing::info!("stopped");
     Ok(())
 }
 
-/// Serves a cluster member: its public API on `listen`, and its Raft port.
+/// Serves a cluster member: its public API's `routes` on `listen`, and its
+/// Raft port.
 async fn serve_member(
     state: &Path,
     listen: SocketAddr,
     raft_listen: Option<SocketAddr>,
     compact_every: u64,
+    routes: fn(AppState) -> axum::Router,
 ) -> Result<()> {
     let config = ClusterConfig::read(state)?;
     let app = AppState::open_member(state, compact_every)
@@ -349,7 +368,7 @@ async fn serve_member(
             })
             .await
     });
-    axum::serve(listener, router(app.clone()))
+    axum::serve(listener, routes(app.clone()))
         .with_graceful_shutdown(shutdown_signal())
         .await?;
     // Stop the replicas while the Raft port still answers, so the others
