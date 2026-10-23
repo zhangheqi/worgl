@@ -41,6 +41,9 @@ getrandom = "0.4"
 hex = "0.4"
 http-body-util = "0.1"
 httpdate = "1"
+# Without its default features, js-sys leaves out the bindings that need a
+# page's Content Security Policy to allow `unsafe-eval`.
+js-sys = { version = "0.3.106", default-features = false }
 # With `loosen-follower-log-revert`, a leader that finds a follower lacks
 # entries the leader had counted it as holding, as after the member was
 # restored from an older copy of its directory, logs a warning ("follower
@@ -65,8 +68,10 @@ tempfile = "3"
 thiserror = "2"
 tokio = { version = "1", features = ["macros", "rt-multi-thread", "signal", "sync", "time"] }
 tower = { version = "0.5", features = ["util"] }
+tower-http = { version = "0.6", features = ["cors"] }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+url = "2"
 wasm-bindgen = "0.2.129"
 zeroize = "1"
 

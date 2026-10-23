@@ -53,6 +53,7 @@ Settings, as environment variables for `docker compose up`:
 | `PLAYGROUND_HOST` | `localhost` | The address Caddy serves and gets a certificate for. |
 | `WORGL_LAYERS`, `WORGL_LAYER_SIZE`, `WORGL_ROTATE_EVERY` | `4`, `4194304`, `28800` | The mint's ledger and rotation period, read once by setup. |
 | `FAUCET_AMOUNT`, `FAUCET_PER_ADDRESS`, `FAUCET_PER_DAY` | `64`, `10`, `10000` | The faucet's limits. |
+| `FAUCET_ALLOW_ORIGIN` | none | The origins whose pages may ask the faucet from a browser, separated by commas, as `https://purse.example`; see [Running a faucet](../../site/src/content/docs/docs/running-a-faucet.md#pages-in-a-browser). Without any, the faucet sends no CORS headers. |
 | `RUST_LOG` | `info` | Log level of the members and the faucet. |
 
 A new note sits in the second-to-last layer, so one nobody moves dies at the

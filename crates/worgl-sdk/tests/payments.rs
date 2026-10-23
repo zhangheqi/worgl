@@ -145,7 +145,10 @@ fn small_notes_pay_a_request_for_small_notes() {
     let request = bob.request(&view(&mint), 8).unwrap();
     assert_eq!(
         alice.pay(&view(&mint), &request, Spacing::default()),
-        Err(PayError::Fragmented { largest: 1 })
+        Err(PayError::Fragmented {
+            largest: 1,
+            at_most: Some(1)
+        })
     );
     bob.withdraw(&request);
     assert_eq!(alice.balance(&view(&mint)).spendable, 8);
@@ -166,6 +169,69 @@ fn small_notes_pay_a_request_for_small_notes() {
     let received: u128 = answers.iter().map(|notes| bob.absorb(notes)).sum();
     assert_eq!(received, 8);
     assert_eq!(bob.balance(&view(&mint)).expected, 0);
+}
+
+#[test]
+fn a_fragmented_payment_names_the_notes_that_fit() {
+    let mut mint = issuer(4);
+    let (mut alice, mut bob) = (Holder::new(), Holder::new());
+    fund(&mut mint, &mut alice, &[4, 1, 1, 1, 1]);
+
+    // The largest note is 4, but in notes of 4 the second would have to
+    // come from the notes of 1, and so would two of the notes of 2. Only
+    // notes of 1 fit.
+    let request = bob.request(&view(&mint), 8).unwrap();
+    assert_eq!(
+        alice.pay(&view(&mint), &request, Spacing::default()),
+        Err(PayError::Fragmented {
+            largest: 4,
+            at_most: Some(1)
+        })
+    );
+    bob.withdraw(&request);
+    let fours = bob.request_at_most(&view(&mint), 8, 4).unwrap();
+    assert!(matches!(
+        alice.pay(&view(&mint), &fours, Spacing::default()),
+        Err(PayError::Fragmented { .. })
+    ));
+    bob.withdraw(&fours);
+
+    let request = bob.request_at_most(&view(&mint), 8, 1).unwrap();
+    let payment = alice
+        .pay(&view(&mint), &request, Spacing::default())
+        .unwrap();
+    assert_eq!(request.check(&payment), Ok(()));
+    let answers = submit(&mut mint, &payment);
+    let received: u128 = answers.iter().map(|notes| bob.absorb(notes)).sum();
+    assert_eq!(received, 8);
+}
+
+#[test]
+fn a_fragmented_payment_names_none_when_no_request_fits() {
+    let mut mint = issuer(4);
+    let (mut alice, mut bob) = (Holder::new(), Holder::new());
+    fund(&mut mint, &mut alice, &[64, 1, 1]);
+
+    // In any size, 66 asks for a note of 2 or more beside those the 64
+    // pays, which the notes of 1 cannot pay, or, in notes of 1, for more
+    // than one transfer from the 64 may make.
+    let request = bob.request(&view(&mint), 66).unwrap();
+    assert_eq!(
+        alice.pay(&view(&mint), &request, Spacing::default()),
+        Err(PayError::Fragmented {
+            largest: 64,
+            at_most: None
+        })
+    );
+    for size in [64, 32, 16, 8, 4, 2, 1] {
+        let smaller = bob.request_at_most(&view(&mint), 66, size).unwrap();
+        assert!(
+            alice
+                .pay(&view(&mint), &smaller, Spacing::default())
+                .is_err(),
+            "{size}"
+        );
+    }
 }
 
 #[test]
@@ -1115,12 +1181,28 @@ proptest! {
                 prop_assert!(held < u128::from(amount));
                 prop_assert_eq!(alice.to_json(), before);
             }
+            Err(PayError::Fragmented { largest, at_most }) => {
+                prop_assert!(held >= u128::from(amount));
+                prop_assert_eq!(alice.to_json(), before);
+                // A request in notes of at most `at_most` can be paid, and
+                // none in larger notes, up to the largest Alice holds.
+                bob.withdraw(&request);
+                let sizes = (0..64).map(|bit| 1u64 << bit).take_while(|&size| size <= largest);
+                for size in sizes.filter(|&size| at_most.is_none_or(|fits| size >= fits)) {
+                    let pays = bob
+                        .request_at_most(&view(&mint), amount, size)
+                        .is_ok_and(|smaller| {
+                            alice
+                                .clone()
+                                .pay(&view(&mint), &smaller, Spacing::default())
+                                .is_ok()
+                        });
+                    prop_assert_eq!(pays, at_most == Some(size), "{}", size);
+                }
+            }
             Err(error) => {
                 prop_assert!(held >= u128::from(amount));
-                prop_assert!(
-                    matches!(error, PayError::Fragmented { .. } | PayError::TooManyOutputs { .. }),
-                    "{error}"
-                );
+                prop_assert!(matches!(error, PayError::TooManyOutputs { .. }), "{error}");
                 prop_assert_eq!(alice.to_json(), before);
             }
         }

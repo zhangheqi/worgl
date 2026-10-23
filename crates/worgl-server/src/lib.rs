@@ -63,6 +63,21 @@
 //! stopped, and `mints`, a list of `{"mint", "state"}` naming each such mint
 //! and `failing`, `ahead` or `stopped`.
 //!
+//! # Browsers
+//!
+//! The routes that take no token answer pages on any origin, so that a page
+//! served from elsewhere, such as a purse in a browser, can use the mints
+//! here: their answers, errors included, and the `404` for a path no route
+//! serves carry `Access-Control-Allow-Origin: *` and expose `Date` and
+//! `Retry-After`, which the SDKs plan and wait by. Each answers a preflight
+//! by allowing its own method and the `Content-Type` header, and lets the
+//! browser keep that answer for a day. None allows credentials, which they
+//! never need: a request carries its own signatures. On a cluster member,
+//! the answers relayed from the leader carry these headers too. The routes
+//! that take a token send no CORS headers and answer a preflight `405`, so
+//! no page on another origin can use a token, even one it holds.
+//! [`router_without_cors`] serves every route that way.
+//!
 //! # Clusters
 //!
 //! A server can also be one member of a cluster that replicates every mint
@@ -102,7 +117,7 @@ use std::time::{Duration, Instant};
 use anyhow::{Context, bail};
 use axum::extract::rejection::JsonRejection;
 use axum::extract::{DefaultBodyLimit, Path as UrlPath, State};
-use axum::http::{HeaderMap, HeaderValue, StatusCode, header};
+use axum::http::{HeaderMap, HeaderValue, Method, StatusCode, header};
 use axum::middleware;
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
@@ -111,6 +126,7 @@ use serde::{Deserialize, Serialize};
 use subtle::ConstantTimeEq;
 use tokio::sync::watch;
 use tokio::task::JoinHandle;
+use tower_http::cors::{Any, CorsLayer};
 use worgl::issuer::LayerSummary;
 use worgl::{
     BurnRequest, CommitError, Error, Kek, KeySet, MintRequest, Note, NoteStatus, Policy, PublicKey,
@@ -132,6 +148,10 @@ pub const MIN_ADMIN_TOKEN_LEN: usize = 32;
 
 /// Most changes a mint's committer carries out with one flush.
 pub const MAX_BATCH: usize = 256;
+
+/// How long a browser may keep a preflight's answer: a day, the most
+/// Firefox keeps one for. Chromium keeps one for two hours at most.
+const PREFLIGHT_MAX_AGE: Duration = Duration::from_secs(24 * 60 * 60);
 
 /// Shared state of the HTTP handlers: every mint the server hosts.
 #[derive(Clone)]
@@ -519,29 +539,83 @@ pub(crate) fn check_bearer(headers: &HeaderMap, token: &str, which: &str) -> Res
     }
 }
 
-/// The HTTP routes. See the [crate documentation](crate).
+/// The HTTP routes, with CORS on those that take no token, so that pages on
+/// any origin can use them. See the [crate documentation](crate#browsers).
 pub fn router(state: AppState) -> Router {
-    let mut router = Router::new()
+    routes(state, true)
+}
+
+/// The HTTP routes of [`router`] with no CORS headers, as `worgl-server
+/// serve --no-cors` serves them: every route answers a preflight `405`, and
+/// only pages on the server's own origin can read its answers.
+///
+/// Serve these where something else sets the CORS headers, such as a CORS
+/// layer of your own or a proxy in front: a layer wrapped around [`router`]
+/// leaves its `Access-Control-Allow-Origin: *` on the answers to origins it
+/// does not allow, and a browser refuses an answer that carries the header
+/// twice.
+pub fn router_without_cors(state: AppState) -> Router {
+    routes(state, false)
+}
+
+fn routes(state: AppState, cors: bool) -> Router {
+    let forward = state
+        .cluster
+        .is_some()
+        .then(|| middleware::from_fn_with_state(state.clone(), cluster::forward));
+    let forwarded = |routes: Router<AppState>| match &forward {
+        Some(forward) => routes.layer(forward.clone()),
+        None => routes,
+    };
+    // The routes that take no token answer pages on any origin. CORS wraps
+    // `forward`, so that the answers it relays from the leader, which keep
+    // only three of the leader's headers, carry the CORS headers too.
+    let open = |routes: Router<AppState>, methods: &[Method]| {
+        let routes = forwarded(routes);
+        if cors {
+            routes.layer(holder_cors(methods))
+        } else {
+            routes
+        }
+    };
+    let reads = Router::new()
         .route("/healthz", get(|| async { "ok" }))
         .route("/readyz", get(readyz))
+        .route("/v1/mints/{mint}/info", get(info))
+        .route("/v1/mints/{mint}/keys", get(keys));
+    let changes = Router::new()
         .route("/v1/verify", post(verify))
         .route("/v1/transfer", post(transfer))
         .route("/v1/burn", post(burn))
-        .route("/v1/mints/{mint}/info", get(info))
-        .route("/v1/mints/{mint}/keys", get(keys))
-        .route("/v1/mints/{mint}/mint", post(mint))
+        .route("/v1/mints/{mint}/mint", post(mint));
+    // The routes that take a token, which answer no page on another origin.
+    let admin = Router::new()
         .route("/v1/mints/{mint}/rotate", post(rotate))
         .route("/v1/mints/{mint}/pause", post(pause))
         .route("/v1/mints/{mint}/resume", post(resume))
-        .route("/v1/admin/mints", get(list_mints).post(new_mint))
-        .layer(DefaultBodyLimit::max(BODY_LIMIT));
-    if state.cluster.is_some() {
-        router = router.layer(middleware::from_fn_with_state(
-            state.clone(),
-            cluster::forward,
-        ));
-    }
-    router.with_state(state)
+        .route("/v1/admin/mints", get(list_mints).post(new_mint));
+    // Paths no route serves answer `404` to pages too, so that a page that
+    // calls the wrong server, or a route an older server lacks, reads the
+    // `404` rather than a network error it would take for a passing one.
+    let unknown = Router::new().fallback(|| async { StatusCode::NOT_FOUND });
+    open(reads, &[Method::GET])
+        .merge(open(changes, &[Method::POST]))
+        .merge(open(unknown, &[Method::GET, Method::POST]))
+        .merge(forwarded(admin))
+        .layer(DefaultBodyLimit::max(BODY_LIMIT))
+        .with_state(state)
+}
+
+/// CORS for routes that take no token and serve `methods`: any origin may
+/// call them, without credentials, and read their answers' `Date` and
+/// `Retry-After`.
+fn holder_cors(methods: &[Method]) -> CorsLayer {
+    CorsLayer::new()
+        .allow_origin(Any)
+        .allow_methods(methods.to_vec())
+        .allow_headers([header::CONTENT_TYPE])
+        .expose_headers([header::DATE, header::RETRY_AFTER])
+        .max_age(PREFLIGHT_MAX_AGE)
 }
 
 /// The routes cluster members send each other Raft's RPCs on, with

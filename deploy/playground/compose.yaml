@@ -65,11 +65,13 @@ services:
         --server http://member1:8080 --server http://member2:8080 --server http://member3:8080
         --listen 0.0.0.0:8090 --behind-proxy
         --amount "$$FAUCET_AMOUNT" --per-address "$$FAUCET_PER_ADDRESS" --per-day "$$FAUCET_PER_DAY"
+        $${FAUCET_ALLOW_ORIGIN:+--allow-origin "$$FAUCET_ALLOW_ORIGIN"}
     environment:
       RUST_LOG: ${RUST_LOG:-info}
       FAUCET_AMOUNT: ${FAUCET_AMOUNT:-64}
       FAUCET_PER_ADDRESS: ${FAUCET_PER_ADDRESS:-10}
       FAUCET_PER_DAY: ${FAUCET_PER_DAY:-10000}
+      FAUCET_ALLOW_ORIGIN: ${FAUCET_ALLOW_ORIGIN:-}
     volumes: [faucet:/state:ro]
 
   proxy:
