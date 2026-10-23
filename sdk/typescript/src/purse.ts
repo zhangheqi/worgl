@@ -1283,7 +1283,10 @@ export class Purse {
    * the mint restored its state from a backup. A note this purse does not
    * hold is only reported. The unchecked notes are read in turn after the
    * changes before it and, with a store that has a lock, under the lock, so
-   * they include those another purse on the store restored.
+   * they include those another purse on the store restored. The answers are
+   * kept even when their save is refused with `store_changed`, as when
+   * another purse takes the lock meanwhile: the purse makes the change
+   * again on what is saved now, so no note has to be asked about again.
    *
    * The mint's answers are not signed, so ask only this purse's server, the
    * mint's own. Each question shows the mint one note, from this machine's
@@ -1318,10 +1321,12 @@ export class Purse {
     if (checked.discarded.length > 0 || checked.kept.length > 0) {
       const gone = JSON.stringify(checked.discarded);
       const kept = JSON.stringify(checked.kept);
-      checked.value = await this.#changeOrRestore(() => {
-        this.#holder.keep(kept);
-        return this.#holder.discard(gone);
-      });
+      checked.value = await this.#untilSaved(() =>
+        this.#changeOrRestore(() => {
+          this.#holder.keep(kept);
+          return this.#holder.discard(gone);
+        }),
+      );
     }
     return checked;
   }

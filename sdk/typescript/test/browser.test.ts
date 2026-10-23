@@ -581,6 +581,53 @@ describe('browser store', () => {
       const after = await (await open(name)).balance(server.mint);
       assert.deepEqual([after.held, after.unchecked, after.requested], [0n, 0n, 2n]);
     });
+
+    test('keeps what the mint said of the notes, though its save loses the lock', backupWaits, async () => {
+      // A purse elsewhere is backed up with two notes, then spends one.
+      const elsewhere = await Purse.open(server.client(), quick);
+      await server.fund(elsewhere, 16n, 8n);
+      const sealed = await elsewhere.backup(PASSPHRASE);
+      const payee = await Purse.open(server.client(), quick);
+      const request = await payee.request(server.mint, 5n);
+      await payee.receive(request, await elsewhere.pay(request, NO_SPACING));
+
+      // The tab restores the backup and asks the mint about both notes. Once
+      // it asks, its next load is the one under the lock that saves the
+      // answers: it waits after its read, while another tab takes the lock
+      // with steal and asks for 2 through a purse of its own.
+      const name = server.url;
+      const store = new IndexedDbStore(name);
+      let verifies = 0;
+      let asking = (_: ReturnType<typeof pauseAfterLoad>): void => {};
+      const saving = new Promise<ReturnType<typeof pauseAfterLoad>>((resolve) => (asking = resolve));
+      const fetch: typeof globalThis.fetch = (input, init) => {
+        if (String(input).endsWith('/v1/verify')) {
+          verifies += 1;
+          if (verifies === 1) {
+            asking(pauseAfterLoad(store));
+          }
+        }
+        return globalThis.fetch(input, init);
+      };
+      const tab = await Purse.open(new Client(server.url, { fetch }), { store, ...quick });
+      await tab.restore(await Backup.open(sealed, PASSPHRASE));
+      const checking = tab.checkNotes(undefined, NO_SPACING);
+      const paused = await saving;
+      await paused.loaded;
+      await navigator.locks.request(`worgl:${name}`, { steal: true }, async () => {});
+      await (await open(name)).request(server.mint, 2n);
+      paused.resume();
+
+      // The answers are kept, in the purse as the other tab saved it, with no
+      // note asked about again.
+      const checked = await checking;
+      assert.deepEqual(
+        [checked.value, checked.discarded.length, checked.kept.length, verifies],
+        [8n, 1, 1, 2],
+      );
+      const after = await (await open(name)).balance(server.mint);
+      assert.deepEqual([after.held, after.unchecked, after.requested], [8n, 0n, 2n]);
+    });
   });
 });
 
