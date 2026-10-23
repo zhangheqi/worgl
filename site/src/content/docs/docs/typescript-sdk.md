@@ -109,7 +109,8 @@ run purses against a real server.
   keeping them once they are handed over.
 - `purse.takeFromFaucet(new Client(faucetUrl))` asks a playground
   [faucet](../running-a-faucet/) for a note, to a fresh key like any other,
-  and keeps it.
+  and keeps it. A page on another origin than the faucet's can ask it only
+  if the faucet [names that origin](../running-a-faucet/#pages-in-a-browser).
 
 ## Client and errors
 

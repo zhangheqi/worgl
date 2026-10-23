@@ -142,6 +142,7 @@ impl Setup {
             authority: MintKey::from_secret_bytes(&secret),
             limits: worgl_faucet::Limits::default(),
             behind_proxy: false,
+            allow_origins: Vec::new(),
         });
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let url = format!("http://{}", listener.local_addr().unwrap());

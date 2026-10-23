@@ -9,7 +9,7 @@ use clap::Parser;
 use tracing_subscriber::EnvFilter;
 use worgl::{MintKey, PublicKey};
 use worgl_client::Client;
-use worgl_faucet::{Config, Faucet, Limits, router};
+use worgl_faucet::{Config, Faucet, Limits, Origin, router};
 
 #[derive(Parser)]
 #[command(version, about)]
@@ -46,6 +46,17 @@ struct Cli {
     /// proxy that appends it.
     #[arg(long)]
     behind_proxy: bool,
+    /// An origin whose pages may ask the faucet from a browser, as
+    /// https://purse.example. Repeat it, or separate origins with commas.
+    /// Without any, the faucet sends no CORS headers. `*` is refused: any
+    /// website could then collect notes through its visitors' addresses.
+    #[arg(
+        long = "allow-origin",
+        env = "WORGL_FAUCET_ALLOW_ORIGIN",
+        value_name = "ORIGIN",
+        value_delimiter = ','
+    )]
+    allow_origins: Vec<Origin>,
 }
 
 fn read_key(path: &Path) -> Result<MintKey> {
@@ -78,6 +89,7 @@ async fn main() -> Result<()> {
             per_day: cli.per_day,
         },
         behind_proxy: cli.behind_proxy,
+        allow_origins: cli.allow_origins,
     });
     let listener = tokio::net::TcpListener::bind(cli.listen)
         .await

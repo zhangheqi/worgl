@@ -16,6 +16,8 @@
 //! "message": text}`:
 //!
 //! - `400 malformed`: the body is not `{"holder": <key>}`.
+//! - `403 unknown_origin`: a browser sent the request from a page on an
+//!   origin the faucet does not answer; see below.
 //! - `429 rate_limited`: this client address had its notes for the hour.
 //!   `Retry-After` says when it may ask again.
 //! - `429 exhausted`: the faucet handed out its notes for the day (UTC).
@@ -31,6 +33,21 @@
 //! whole /64 to pick addresses from. Every request counts against the
 //! limits, whether or not the mint then answers.
 //!
+//! A browser lets a page read the faucet's answers if the page is on the
+//! faucet's own origin, or on one that [`Config::allow_origins`] names. For
+//! a named origin the faucet answers preflights and sends
+//! `Access-Control-Allow-Origin`, exposing `Retry-After`, and every answer
+//! carries `Vary: Origin`; with none named it sends no CORS headers.
+//! [`Origin`] refuses `*`, with which any website could collect notes
+//! through its visitors' addresses. A request for a note from a page on any
+//! other origin is refused before it counts, so that no such page can use
+//! up its visitors' notes for the hour, whatever a browser lets it send.
+//! The faucet takes the page's origin from the `Origin` header, and knows
+//! its own by `Sec-Fetch-Site: same-origin`; a request with no `Origin`, as
+//! from outside a browser, is not checked. Browsers send `Sec-Fetch-Site`
+//! only to `https` and loopback addresses, so a page served beside a faucet
+//! on plain `http` elsewhere must have its origin named as well.
+//!
 //! Mint requests go to the server one at a time, since the issuer accepts
 //! an authority's requests only in rising order of their sequence numbers.
 //! The faucet numbers them by microseconds since the Unix epoch, rising by
@@ -41,17 +58,21 @@
 //! the note it already made.
 
 use std::collections::{HashMap, VecDeque};
+use std::fmt;
 use std::net::{IpAddr, Ipv6Addr, SocketAddr};
+use std::str::FromStr;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use axum::extract::rejection::JsonRejection;
 use axum::extract::{ConnectInfo, State};
-use axum::http::{HeaderMap, HeaderValue, StatusCode, header};
+use axum::http::{HeaderMap, HeaderValue, Method, StatusCode, header};
 use axum::response::{IntoResponse, Response};
 use axum::routing::get;
 use axum::{Json, Router};
 use serde::{Deserialize, Serialize};
+use tower_http::cors::{AllowOrigin, CorsLayer};
+use url::Url;
 use worgl::{MintKey, MintRequest, Note, PublicKey};
 use worgl_client::{Client, Error};
 
@@ -63,6 +84,10 @@ const GIVE_UP: Duration = Duration::from_secs(30);
 const RESEND_AFTER: Duration = Duration::from_millis(250);
 
 const HOUR: Duration = Duration::from_secs(3600);
+
+/// How long a browser may keep the faucet's answer to a preflight: two
+/// hours, the most Chromium keeps one.
+const PREFLIGHT_MAX_AGE: Duration = Duration::from_secs(7200);
 
 /// How much the faucet hands out.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -102,6 +127,95 @@ pub struct Config {
     /// Turn it on only behind such a proxy: otherwise any client can name
     /// any address.
     pub behind_proxy: bool,
+    /// The origins whose pages may ask the faucet from a browser, besides
+    /// its own. See the [crate documentation](crate).
+    pub allow_origins: Vec<Origin>,
+}
+
+/// A web origin whose pages may ask the faucet from a browser, as
+/// `https://purse.example`.
+///
+/// It parses from an `http` or `https` URL that ends at the host and port,
+/// with no path, not even a trailing `/`, and names one origin, not a
+/// pattern: `*` is refused, alone or in a host. It keeps the form browsers
+/// send in the `Origin` header, which the faucet matches exactly:
+/// lowercase, without the scheme's default port, an international host in
+/// ASCII.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct Origin(String);
+
+impl Origin {
+    /// The origin as browsers send it.
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+impl fmt::Display for Origin {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
+/// Text was not an [`Origin`] the faucet can answer.
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+#[non_exhaustive]
+pub enum OriginError {
+    /// `*`, any origin at all.
+    #[error(
+        "`*` would let any website collect the faucet's notes through its visitors' \
+         addresses; name each origin whose pages may ask, as https://purse.example"
+    )]
+    Any,
+    /// A host with `*` in it, as `https://*.purse.example`. URLs allow it,
+    /// but no browser sends such an origin, and the faucet takes no patterns.
+    #[error(
+        "origins are matched exactly, so `*` in a host matches no page; name each origin \
+         whose pages may ask, as https://purse.example"
+    )]
+    Wildcard,
+    /// `null`, which browsers send for sandboxed frames and local files.
+    #[error(
+        "`null` is what browsers send from sandboxed frames and local files, which any \
+         website can open; name the origin the pages are served from, as https://purse.example"
+    )]
+    Null,
+    /// Not an `http` or `https` URL.
+    #[error("expected http:// or https:// and a host, as https://purse.example")]
+    Malformed,
+    /// A URL with more than an origin: a path, even `/`, a query, a
+    /// fragment or a user name. Holds the origin it would be.
+    #[error(
+        "an origin is a scheme, a host and a port, with no path, not even a trailing /: give {0}"
+    )]
+    NotAnOrigin(Origin),
+}
+
+impl FromStr for Origin {
+    type Err = OriginError;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        match s {
+            "*" => return Err(OriginError::Any),
+            "null" => return Err(OriginError::Null),
+            _ => {}
+        }
+        let (Ok(url), Some((_, rest))) = (Url::parse(s), s.split_once("://")) else {
+            return Err(OriginError::Malformed);
+        };
+        if !matches!(url.scheme(), "http" | "https") {
+            return Err(OriginError::Malformed);
+        }
+        if url.host_str().is_some_and(|host| host.contains('*')) {
+            return Err(OriginError::Wildcard);
+        }
+        let origin = Self(url.origin().ascii_serialization());
+        // `\` is `/` in an http URL.
+        if rest.contains(['/', '\\', '?', '#', '@']) {
+            return Err(OriginError::NotAnOrigin(origin));
+        }
+        Ok(origin)
+    }
 }
 
 /// Answer of `GET /v1/faucet`.
@@ -133,6 +247,7 @@ pub struct Faucet {
     authority: MintKey,
     limits: Limits,
     behind_proxy: bool,
+    allow_origins: Vec<Origin>,
     /// Held while a request is with the mint.
     minting: tokio::sync::Mutex<Minting>,
     counts: Mutex<Counts>,
@@ -213,6 +328,7 @@ impl Faucet {
             authority: config.authority,
             limits: config.limits,
             behind_proxy: config.behind_proxy,
+            allow_origins: config.allow_origins,
             minting: tokio::sync::Mutex::default(),
             counts: Mutex::default(),
         })
@@ -239,6 +355,43 @@ impl Faucet {
             .and_then(|value| value.rsplit(',').next())
             .and_then(|last| last.trim().parse().ok());
         counted(forwarded.unwrap_or(peer))
+    }
+
+    /// Whether pages on `origin`, as an `Origin` header names it, may read
+    /// the faucet's answers.
+    fn answers(&self, origin: &HeaderValue) -> bool {
+        self.allow_origins
+            .iter()
+            .any(|allowed| allowed.as_str().as_bytes() == origin.as_bytes())
+    }
+
+    /// Refuses a request a browser sent from a page on an origin the faucet
+    /// does not answer. A browser sends `Origin` with a `POST` from the
+    /// faucet's own origin too, and then `Sec-Fetch-Site: same-origin`,
+    /// which no page can set. It sends that header only to `https` and
+    /// loopback addresses, and an old browser not at all, so such a page on
+    /// a faucet served over plain `http` elsewhere is refused unless the
+    /// faucet names its own origin. Comparing `Origin` with `Host` instead
+    /// would let a page whose name was made to resolve to the faucet's
+    /// address pass as its own.
+    fn check_origin(&self, headers: &HeaderMap) -> Result<(), Refused> {
+        let Some(origin) = headers.get(header::ORIGIN) else {
+            return Ok(());
+        };
+        let own = headers
+            .get("sec-fetch-site")
+            .is_some_and(|site| site == "same-origin");
+        if own || self.answers(origin) {
+            return Ok(());
+        }
+        Err(Refused::new(
+            StatusCode::FORBIDDEN,
+            "unknown_origin",
+            format!(
+                "the faucet does not answer pages on {}",
+                String::from_utf8_lossy(origin.as_bytes())
+            ),
+        ))
     }
 
     /// Counts a request from `address`, or says why it may not have a note.
@@ -393,10 +546,29 @@ fn until_tomorrow() -> Duration {
 /// [`into_make_service_with_connect_info::<SocketAddr>`](Router::into_make_service_with_connect_info),
 /// since requests are counted by the client's address.
 pub fn router(faucet: Arc<Faucet>) -> Router {
-    Router::new()
+    let cors = (!faucet.allow_origins.is_empty()).then(|| cors(faucet.clone()));
+    let router = Router::new()
         .route("/healthz", get(|| async { "ok" }))
         .route("/v1/faucet", get(about).post(give))
-        .with_state(faucet)
+        .with_state(faucet);
+    match cors {
+        Some(cors) => router.layer(cors),
+        None => router,
+    }
+}
+
+/// CORS for the origins `faucet` answers. Its answers differ by `Origin`
+/// alone: a preflight's lists are the same for every request.
+fn cors(faucet: Arc<Faucet>) -> CorsLayer {
+    CorsLayer::new()
+        .allow_origin(AllowOrigin::predicate(move |origin, _| {
+            faucet.answers(origin)
+        }))
+        .allow_methods([Method::GET, Method::POST])
+        .allow_headers([header::CONTENT_TYPE])
+        .expose_headers([header::RETRY_AFTER])
+        .max_age(PREFLIGHT_MAX_AGE)
+        .vary([header::ORIGIN])
 }
 
 async fn about(State(faucet): State<Arc<Faucet>>) -> Json<About> {
@@ -409,6 +581,7 @@ async fn give(
     headers: HeaderMap,
     ask: Result<Json<Ask>, JsonRejection>,
 ) -> Result<Json<Given>, Refused> {
+    faucet.check_origin(&headers)?;
     let Json(ask) = ask.map_err(|rejection| {
         Refused::new(
             StatusCode::BAD_REQUEST,
@@ -440,5 +613,66 @@ mod tests {
     fn tomorrow_is_within_a_day() {
         let wait = until_tomorrow();
         assert!(wait > Duration::ZERO && wait <= Duration::from_secs(86_400));
+    }
+
+    #[test]
+    fn an_origin_takes_the_form_browsers_send() {
+        for (text, sent) in [
+            ("https://purse.example", "https://purse.example"),
+            ("HTTPS://Purse.Example:443", "https://purse.example"),
+            ("http://purse.example:80", "http://purse.example"),
+            ("https://purse.example:8443", "https://purse.example:8443"),
+            ("http://localhost:5173", "http://localhost:5173"),
+            ("http://127.0.0.1:5173", "http://127.0.0.1:5173"),
+            ("http://[0:0::1]:5173", "http://[::1]:5173"),
+            ("https://bücher.example", "https://xn--bcher-kva.example"),
+        ] {
+            let origin: Origin = text.parse().unwrap();
+            assert_eq!(origin.as_str(), sent, "{text}");
+        }
+    }
+
+    #[test]
+    fn only_an_origin_parses() {
+        assert_eq!("*".parse::<Origin>(), Err(OriginError::Any));
+        assert_eq!("null".parse::<Origin>(), Err(OriginError::Null));
+        for text in [
+            "https://*.purse.example",
+            "https://*",
+            "https://%2A.purse.example",
+            "https://*.purse.example/",
+        ] {
+            assert_eq!(text.parse::<Origin>(), Err(OriginError::Wildcard), "{text}");
+        }
+        let purse = Origin("https://purse.example".into());
+        for text in [
+            "https://purse.example/",
+            "https://purse.example/purse",
+            "https://purse.example\\",
+            "https://purse.example?",
+            "https://purse.example#top",
+            "https://someone@purse.example",
+        ] {
+            assert_eq!(
+                text.parse::<Origin>(),
+                Err(OriginError::NotAnOrigin(purse.clone())),
+                "{text}"
+            );
+        }
+        for text in [
+            "",
+            "purse.example",
+            "https:purse.example",
+            "https://",
+            "https://purse.example:65536",
+            "ftp://purse.example",
+            "file:///purse",
+        ] {
+            assert_eq!(
+                text.parse::<Origin>(),
+                Err(OriginError::Malformed),
+                "{text}"
+            );
+        }
     }
 }
