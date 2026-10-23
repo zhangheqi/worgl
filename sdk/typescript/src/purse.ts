@@ -97,8 +97,9 @@ export interface Balance {
  * A note a purse holds and where it stands at its mint, from the mint's info
  * alone: see {@link Purse.notesAt}. It holds no more of the note than its
  * serial and value. Times are Unix seconds by the mint's clock, from the next
- * rotation its info names, and are `undefined` when the mint has no schedule
- * or is paused.
+ * rotation its info names. Both are `undefined` when the mint has no schedule
+ * or is paused, or when the note is `expired` or `unknown`, and `spendableAt`
+ * is `undefined` too for a note that is not `frozen`.
  */
 export interface HeldNote {
   /** Its serial, by which the mint knows it. */
@@ -126,9 +127,16 @@ export interface HeldNote {
    * now.
    */
   position: number | undefined;
-  /** For a frozen note, when it can move: the time of the next rotation. */
+  /**
+   * For a frozen note, when it can move: the time of the next rotation.
+   * `undefined` for any other note.
+   */
   spendableAt: bigint | undefined;
-  /** When the rotation that drops its layer comes, unless it moves first. */
+  /**
+   * When the rotation that drops its layer comes, unless it moves first.
+   * `undefined` for an expired or unknown note, and for every note at a mint
+   * with no schedule or paused.
+   */
   expiresAt: bigint | undefined;
 }
 

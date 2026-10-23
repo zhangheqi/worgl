@@ -282,14 +282,17 @@ impl HeldNote {
     }
 
     /// For a frozen note, Unix time of the scheduled rotation after which it
-    /// can move; see [`MintView::spendable_at`].
+    /// can move, if the mint has a schedule and is not paused; see
+    /// [`MintView::spendable_at`].
     #[wasm_bindgen(getter, js_name = spendableAt)]
     pub fn spendable_at(&self) -> Option<u64> {
         self.spendable_at
     }
 
-    /// Unix time of the scheduled rotation that drops its layer, unless it
-    /// moves first; see [`MintView::expires_at`].
+    /// For a note the info places, neither expired nor unknown, Unix time of
+    /// the scheduled rotation that drops its layer unless it moves first, if
+    /// the mint has a schedule and is not paused; see
+    /// [`MintView::expires_at`].
     #[wasm_bindgen(getter, js_name = expiresAt)]
     pub fn expires_at(&self) -> Option<u64> {
         self.expires_at

@@ -703,12 +703,23 @@ describe('note states', () => {
         const headers = { 'content-type': 'application/json' };
         return Promise.resolve(new Response(stale, { headers }));
       };
-      const behind = await Purse.open(new Client(own.url, { fetch: stub }), {
-        store: new MemoryStore(alice.toJson()),
-      });
+      const behindClient = new Client(own.url, { fetch: stub });
+      const behind = await Purse.open(behindClient, { store: new MemoryStore(alice.toJson()) });
+      const staleNext = (await behindClient.info(own.mint)).rotation?.nextAt ?? 0n;
+      // It still has a schedule, yet tells no time for the notes it cannot
+      // place.
       assert.deepEqual(
-        (await behind.notesAt(own.mint)).map((note) => [note.state, note.position]),
-        [['spendable', 2], ['unknown', undefined], ['unknown', undefined]],
+        (await behind.notesAt(own.mint)).map((note) => [
+          note.state,
+          note.position,
+          note.spendableAt,
+          note.expiresAt,
+        ]),
+        [
+          ['spendable', 2, undefined, staleNext + 2n * day],
+          ['unknown', undefined, undefined, undefined],
+          ['unknown', undefined, undefined, undefined],
+        ],
       );
       // Another mint's info places none of them.
       const elsewhere = await Purse.open(server.client(), {
