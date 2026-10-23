@@ -807,7 +807,7 @@ fn a_balance_adds_up_through_a_payment_a_refresh_and_a_cancel() {
 
     // She submits it: her change is back, and Bob's 3 is his once handed over.
     let answers = submit(&mut mint, &payment);
-    settle_all(&mut alice, &payment, &answers);
+    settle_all(&mut alice, &mint, &payment, &answers);
     let b = balance(&alice, &mint);
     assert_eq!(parts(&b), [9, 0, 0, 0, 0, 0]);
     assert_eq!((b.frozen, b.total(), b.outgoing), (1, 9, 0));
@@ -827,7 +827,10 @@ fn a_balance_adds_up_through_a_payment_a_refresh_and_a_cancel() {
     assert_eq!(parts(&b), [1, 0, 0, 8, 0, 0]);
     assert_eq!((b.total(), b.outgoing, b.expected), (9, 8, 8));
     let answer = mint.transfer(&refreshes[0].request).unwrap();
-    assert_eq!(alice.settle(&refreshes[0].request, &answer), 8);
+    assert_eq!(
+        alice.settle(mint.keys(), &refreshes[0].request, &answer),
+        Ok(8)
+    );
     assert_eq!(parts(&balance(&alice, &mint)), [9, 0, 0, 0, 0, 0]);
 
     // She pays Carol 2 from the 8, then cancels: the 8 is back, and its
