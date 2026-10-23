@@ -75,7 +75,10 @@ run purses against a real server.
   It keeps none of an answer that is not the mint's, such as a forged note
   from a server that is not the mint's, nor of one whose keys it cannot
   read. The transfer is listed in `submitted.refused` with outcome `kept`,
-  and one the purse made stays outgoing, for `settle` to send again.
+  and one the purse made stays outgoing, for `settle` to send again. Its
+  error is a `WorglError` that says what is wrong with the answer
+  (`miscounted`, `unasked`, `unsigned` or `wrong_issuer`), or why the keys
+  could not be read.
 - `purse.refresh(mint)` pays the notes about to expire back to the purse,
   each at a random moment before the next rotation, and resends the
   outgoing transfers that must land before it. `planRefresh` and `submit`
@@ -175,7 +178,10 @@ purse calls built on them.
 | `not_one_input` | | `receive`: a transfer of the payment spends more or fewer than one note. |
 | `bad_signature` | | `accept`: a note's signature does not verify: it is forged or altered. |
 | `unknown_generation` | `generation` | `accept`: the mint's keys hold none for a note's `generation`, because its layer was dropped or the keys predate it. |
-| `wrong_issuer` | | `accept`: the keys the server gave for a note's mint are another mint's. |
+| `wrong_issuer` | | `accept`: the keys the server gave for a note's mint are another mint's. `Submitted.refused`: the keys it gave for a transfer's mint are another mint's, so the purse kept none of the answer. |
+| `miscounted` | `outputs`, `answered` | `Submitted.refused`, from `submit`, `receive`, `settle` or `refresh`: an answer to a transfer holds `answered` notes for its `outputs` outputs. It is not the mint's, and the purse kept none of it. |
+| `unasked` | `index` | `Submitted.refused`: note `index` of an answer is not the transfer's output in its place, but another mint's, or of another amount or key. The purse kept none of the answer. |
+| `unsigned` | `index` | `Submitted.refused`: note `index` of an answer does not carry the mint's signature: it is forged or altered, or the keys do not know its generation. The purse kept none of the answer. |
 | `faucet_amount` | `amount` | `takeFromFaucet`: the faucet hands out notes of `amount`, which its mint cannot make as one note. |
 | `unknown_format` | `format` | `Purse.open`: the saved purse is in `format`, a newer one this SDK does not read. |
 | `malformed` | | Any call: something it was given is not the JSON it takes, such as a payment request, a payment, notes, a mint's info or keys, or, for `Purse.open`, a saved purse; or a transfer spends no notes. |

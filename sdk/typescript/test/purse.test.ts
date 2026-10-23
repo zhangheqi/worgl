@@ -20,6 +20,7 @@ import {
   type ScheduledTransfer,
   type Store,
   type Submitted,
+  type WorglErrorCode,
   isTransient,
   isWorglError,
 } from '../src/index.ts';
@@ -92,9 +93,16 @@ function tampering(server: TestServer, tamper: (notes: string[]) => string[]): C
 
 /**
  * Checks that `lost`, which held what `purse` holds, kept nothing of the one
- * answer in `submitted`, and reported it with an error that `why` matches.
+ * answer in `submitted`, and reported it with an error that `why` matches: a
+ * WorglError of `code` when one is given.
  */
-function keptNothing(lost: Purse, purse: Purse, submitted: Submitted, why: RegExp): void {
+function keptNothing(
+  lost: Purse,
+  purse: Purse,
+  submitted: Submitted,
+  why: RegExp,
+  code?: WorglErrorCode,
+): void {
   assert.deepEqual(
     [submitted.answered, submitted.value, submitted.notes, submitted.theirs],
     [0, 0n, [], []],
@@ -102,6 +110,7 @@ function keptNothing(lost: Purse, purse: Purse, submitted: Submitted, why: RegEx
   assert.equal(submitted.refused.length, 1);
   const refused = submitted.refused[0]!;
   assert.match(String(refused.error), why);
+  assert.equal(isWorglError(refused.error) ? refused.error.code : undefined, code);
   assert.equal(isTransient(refused.error), false);
   assert.equal(refused.outcome, 'kept');
   assert.equal(lost.toJson(), purse.toJson());
@@ -346,22 +355,24 @@ describe('purse', () => {
       {
         tamper: ([first, ...rest]: string[]) => [forged(first!), ...rest],
         why: /note 0 of the answer is not signed by the mint: issuer signature does not verify/,
+        code: 'unsigned' as const,
       },
       // A genuine note of the mint, of the amount asked for, to another key.
       {
         tamper: ([first, ...rest]: string[]) => [strangers.get(amount(first!))!, ...rest],
         why: /note 0 of the answer is not the transfer's output 0/,
+        code: 'unasked' as const,
       },
     ];
-    for (const { tamper, why } of tamperings) {
+    for (const { tamper, why, code } of tamperings) {
       // Neither the payer resending nor the payee submitting keeps any of it:
       // the payer's transfer stays outgoing, for the next settle.
       const open = (from: Purse) =>
         Purse.open(tampering(server, tamper), { store: new MemoryStore(from.toJson()), ...quick });
       const payer = await open(alice);
-      keptNothing(payer, alice, await payer.settle(NO_SPACING), why);
+      keptNothing(payer, alice, await payer.settle(NO_SPACING), why, code);
       const payee = await open(bob);
-      keptNothing(payee, bob, await payee.receive(request, payment), why);
+      keptNothing(payee, bob, await payee.receive(request, payment), why, code);
     }
 
     // Nor without the mint's keys to check an answer with.

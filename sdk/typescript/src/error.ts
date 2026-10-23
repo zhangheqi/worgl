@@ -75,6 +75,22 @@ export interface WorglErrorDetails {
   unknown_generation: { generation: bigint };
   /** A note's signature does not verify: it is forged or altered. */
   bad_signature: NoFields;
+  /**
+   * An answer to a transfer holds `answered` notes for the transfer's
+   * `outputs` outputs, so it is not the mint's.
+   */
+  miscounted: { outputs: number; answered: number };
+  /**
+   * Note `index` of an answer to a transfer is not the transfer's output in
+   * its place: it is another mint's, or of another amount or key.
+   */
+  unasked: { index: number };
+  /**
+   * Note `index` of an answer to a transfer does not carry the mint's
+   * signature: it is forged or altered, or the keys do not know its
+   * generation.
+   */
+  unsigned: { index: number };
   /** The faucet hands out notes of `amount`, which its mint cannot make as one note. */
   faucet_amount: { amount: bigint };
 }
