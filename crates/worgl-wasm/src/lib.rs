@@ -213,17 +213,23 @@ impl Holder {
         Ok(self.inner.prune(&view(info)?))
     }
 
-    /// Value held at the mint, by what it can do now.
+    /// Value the holder has at the mint, in parts that do not overlap.
     pub fn balance(&self, info: &str) -> Result<Balance, Error> {
         let balance = self.inner.balance(&view(info)?);
         Ok(Balance {
+            total: balance.total(),
+            held: balance.held(),
             spendable: balance.spendable,
             frozen: balance.frozen,
             expiring: balance.expiring,
             unknown: balance.unknown,
+            sending: balance.sending,
+            change: balance.change,
+            refreshing: balance.refreshing,
+            requested: balance.requested,
+            unconfirmed: balance.unconfirmed,
             outgoing: balance.outgoing,
             expected: balance.expected,
-            unconfirmed: balance.unconfirmed,
         })
     }
 
@@ -402,32 +408,58 @@ fn scheduled(transfers: Vec<ScheduledTransfer>) -> Vec<Scheduled> {
         .collect()
 }
 
-/// Value held at one mint; see [`worgl_sdk::Balance`].
+/// Value a holder has at one mint; see [`worgl_sdk::Balance`]. Held,
+/// sending, change, refreshing and requested never overlap; outgoing and
+/// expected sum some of them, expiring is part of what is held, and
+/// unconfirmed may come instead of value held.
 #[wasm_bindgen]
 #[derive(Debug, Clone, Copy)]
 pub struct Balance {
-    /// Value that can be spent now.
+    /// Value held now, or on its way back as change or refreshing.
+    #[wasm_bindgen(readonly)]
+    pub total: u128,
+    /// Value held now: spendable, frozen and unknown together.
+    #[wasm_bindgen(readonly)]
+    pub held: u128,
+    /// Value held that can be spent now.
     #[wasm_bindgen(readonly)]
     pub spendable: u128,
-    /// Value frozen in the last layer until the next rotation.
+    /// Value held frozen in the last layer until the next rotation.
     #[wasm_bindgen(readonly)]
     pub frozen: u128,
-    /// Value that dies at the next rotation unless refreshed.
+    /// Value held that dies at the next rotation unless refreshed.
     #[wasm_bindgen(readonly)]
     pub expiring: u128,
-    /// Value in notes newer than the mint's info.
+    /// Value held in notes newer than the mint's info.
     #[wasm_bindgen(readonly)]
     pub unknown: u128,
-    /// Value in transfers sent and not yet seen answered.
+    /// Value that transfers not yet answered pay others.
     #[wasm_bindgen(readonly)]
-    pub outgoing: u128,
-    /// Value asked for and not yet received.
+    pub sending: u128,
+    /// Change that transfers not yet answered pay back to the holder.
     #[wasm_bindgen(readonly)]
-    pub expected: u128,
+    pub change: u128,
+    /// Value that transfers not yet answered that pay the holder alone, such
+    /// as refreshes, pay it back.
+    #[wasm_bindgen(readonly)]
+    pub refreshing: u128,
+    /// Value asked for in payment requests and not yet received.
+    #[wasm_bindgen(readonly)]
+    pub requested: u128,
     /// Change of transfers dropped or cancelled, which comes only if the
-    /// counterparty hands it over.
+    /// counterparty hands it over. It is in neither held nor the total:
+    /// after a cancel, it comes only if the mint spent the note taken back.
     #[wasm_bindgen(readonly)]
     pub unconfirmed: u128,
+    /// Value in notes spent by transfers not yet answered: sending, change
+    /// and refreshing together, plus any of their notes for the holder taken
+    /// in before they were settled.
+    #[wasm_bindgen(readonly)]
+    pub outgoing: u128,
+    /// Value expected from keys handed out and not yet paid: requested,
+    /// change and refreshing together.
+    #[wasm_bindgen(readonly)]
+    pub expected: u128,
 }
 
 /// One note a payment request asks for.

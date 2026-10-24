@@ -78,7 +78,7 @@ note of 3 from a mint whose notes are powers of two.
 |---|---|
 | `init` | Creates an empty purse. |
 | `info MINT` | Shows a mint's layers, rotation schedule and supply. |
-| `balance MINT` | Shows what the purse holds at a mint: spendable, frozen, expiring, outgoing and expected, and unconfirmed change of dropped or cancelled transfers when there is some. |
+| `balance MINT` | Shows the purse's total at a mint, what it holds plus what comes back to it as change and refreshes, then parts that do not overlap: what it holds (spendable and frozen, with what of it expires at the next rotation), change on its way back, what it is sending to payees, and what it asked for. Refreshes not yet answered and notes newer than the mint's info show when there are some. So does unconfirmed change of dropped or cancelled transfers, which is in no total: after a cancel it comes only if the mint spent the note taken back. |
 | `notes` | Lists the notes held and what each can do now. |
 | `request MINT AMOUNT` | Asks to be paid: writes a payment request to send to the payer. `--at-most N` asks for notes no larger than N, for a payer whose notes are small. `-o` names the file (default `-`). |
 | `withdraw REQUEST` | Stops expecting the notes of a request that will not be paid. |

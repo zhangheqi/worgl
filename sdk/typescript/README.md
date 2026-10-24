@@ -94,6 +94,16 @@ the mint answers with the same notes while it keeps its answers.
   `owed`, the payee's notes from every answer the purse got itself by
   settling, refreshing or submitting; `purse.forgetOwed(notes)` stops
   keeping them once they are handed over.
+- `purse.balance(mint)` splits what the purse has at a mint into parts that
+  do not overlap: `held` now (`spendable`, `frozen` and `unknown`),
+  `sending` to payees in transfers not yet answered, `change` and
+  `refreshing` on their way back from them, and `requested`. Its `total`,
+  held plus change and refreshing, counts no note twice: paying lowers it by
+  the amount paid, and submitting, settling and refreshing leave it as it
+  is. `outgoing` and `expected` sum some of those parts, and `expiring` is
+  part of what is held. `unconfirmed`, change of transfers dropped or
+  cancelled, is in no part: after a cancel it comes only if the mint spent
+  the note taken back.
 - `purse.takeFromFaucet(new Client(faucetUrl))` asks a playground faucet
   (`worgl-faucet`) for a note, to a fresh key like any other, and keeps it.
   A page on another origin than the faucet's can ask it only if the faucet

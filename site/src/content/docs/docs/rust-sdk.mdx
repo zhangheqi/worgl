@@ -84,7 +84,7 @@ for a note, to a fresh key like any other.
 | `holder().payments()` / `forget_owed(&notes)` | The payments the purse made and keeps, each with the `Payment` to send again (less any transfer cancelled or forgotten) and the payee's notes from every answer the purse got itself, by settling, refreshing or submitting; then stops keeping those notes once they are handed over. |
 | `submit(&transfers)` / `accept(&notes)` | One side submits; the other keeps what it is handed, and settles the transfers it answers. |
 | `withdraw(&request)` | Stops expecting the notes of a request that will not be paid. |
-| `balance(&mint)` | What the purse holds at a mint, by what it can do now. |
+| `balance(&mint)` | What the purse has at a mint, in parts that do not overlap: held now (spendable, frozen, unknown), sending to payees, change and refreshing on their way back, and requested. `Balance::total` adds what it holds and what comes back, counting no note twice. Unconfirmed change of dropped or cancelled transfers is in no part: after a cancel it comes only if the mint spent the note taken back. |
 | `refresh(&mint)` | Pays the notes that die at the next rotation back to the purse, each at a random moment before it by the server's clock, and resends the transfers not yet seen answered that must land before it. Returns once the last is done, which may be most of a period away. |
 | `plan_refresh(&mint)` | The same plan, for an application with its own scheduler to `submit`. |
 | `prune(&mint)` | Drops notes whose layer the mint's info says it has dropped, and returns the value lost. This machine's clock plays no part. |
