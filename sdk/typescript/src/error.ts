@@ -93,6 +93,18 @@ export interface WorglErrorDetails {
   unsigned: { index: number };
   /** The faucet hands out notes of `amount`, which its mint cannot make as one note. */
   faucet_amount: { amount: bigint };
+  /**
+   * A browser store could not open its database: another tab holds it open
+   * in an older version and did not close it when asked to.
+   */
+  store_blocked: NoFields;
+  /**
+   * A browser store saved nothing: the change lost the store's lock while it
+   * was made, as when another tab took the lock with `steal`, or another
+   * writer saved since the change read the store. The purse undid the
+   * change, and reads the store again before the next.
+   */
+  store_changed: NoFields;
 }
 
 /** The stable code of a {@link WorglError}. */
