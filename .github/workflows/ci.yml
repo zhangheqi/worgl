@@ -111,6 +111,42 @@ jobs:
       - run: npm run check
       - run: npm test
 
+  # The purse depends on the SDK by path, so the SDK is built first, as the
+  # TypeScript SDK job builds it.
+  purse:
+    name: Worgl Purse
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: purse
+    steps:
+      - uses: actions/checkout@v5
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: wasm32-unknown-unknown
+      - uses: Swatinem/rust-cache@v2
+      - name: Find the wasm-bindgen version Cargo.lock pins
+        run: echo "WASM_BINDGEN=$(grep -A1 '^name = "wasm-bindgen"$' ../Cargo.lock | sed -n 's/^version = "\(.*\)"$/\1/p')" >> "$GITHUB_ENV"
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: wasm-bindgen@${{ env.WASM_BINDGEN }}
+      - uses: actions/setup-node@v5
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: |
+            sdk/typescript/package-lock.json
+            purse/package-lock.json
+      - name: Build the TypeScript SDK
+        working-directory: sdk/typescript
+        run: |
+          npm ci
+          npm run build
+      - run: npm ci
+      - run: npm run check
+      - run: npm test
+      - run: npm run build
+
   playground:
     name: playground deploy
     runs-on: ubuntu-latest
