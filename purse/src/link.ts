@@ -43,9 +43,22 @@ export function parseMintLink(text: string): ParsedLink {
   if (!/^[0-9a-fA-F]{64}$/.test(mint)) {
     return { ok: false, problem: 'key' };
   }
+  const server = parseServer(at);
+  return server.ok ? { ok: true, link: { mint: mint.toLowerCase(), server: server.server } } : server;
+}
+
+/** Why a text is not a server URL the purse can use: see {@link LinkProblem}'s `server` and `insecure`. */
+export type ServerProblem = 'server' | 'insecure';
+
+/**
+ * Reads a server's URL, as a mint link or a request link names it: http or
+ * https, with no user, query or fragment, and plain http only to this
+ * machine. Its trailing slash is dropped, as the SDK's `Client` writes it.
+ */
+export function parseServer(text: string): { ok: true; server: string } | { ok: false; problem: ServerProblem } {
   let url: URL;
   try {
-    url = new URL(at);
+    url = new URL(text);
   } catch {
     return { ok: false, problem: 'server' };
   }
@@ -62,7 +75,7 @@ export function parseMintLink(text: string): ParsedLink {
     return { ok: false, problem: 'insecure' };
   }
   // from its parts, so that an empty `?` or `#`, which `search` and `hash` do not show, is left out too
-  return { ok: true, link: { mint: mint.toLowerCase(), server: `${url.origin}${url.pathname}`.replace(/\/+$/, '') } };
+  return { ok: true, server: `${url.origin}${url.pathname}`.replace(/\/+$/, '') };
 }
 
 /** Whether a location's fragment is meant as a mint link, whether or not it is a good one. */

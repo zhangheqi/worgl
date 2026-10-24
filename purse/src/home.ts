@@ -7,13 +7,15 @@
 import type { FaucetInfo } from 'worgl';
 
 import { type Child, h } from './dom.ts';
+import { recentRow } from './flow-words.ts';
 import { f2, hm, periodWords, shortDay, change } from './format.ts';
 import type { Holdings, LaneKey } from './holdings.ts';
 import { shortKey } from './link.ts';
 import { face } from './marks.ts';
+import { postmarkWrap } from './postmark.ts';
 import type { LogEntry, MintRecord } from './records.ts';
 import { brand, deskbar } from './shell.ts';
-import { caption, comeBackHeading, comeBackRow, fieldLabel, firstToGo, numberDescription, sentence } from './words.ts';
+import { type Received, KEEPS_ALIVE, caption, comeBackHeading, comeBackRow, fieldLabel, firstToGo, numberDescription, sentence } from './words.ts';
 
 /** What the purse last read of the mint it shows. */
 export interface HomeData {
@@ -41,9 +43,15 @@ export interface HomeInput {
   delta: { v: number; t: number } | undefined;
   /** Whether the purse is taking from the faucet now. */
   taking: boolean;
+  /** Tokens just taken in from a hand-back, while Holdings shows them: the postmark and the sentence's clause. */
+  received: { amount: number; t: number; lane: LaneKey | undefined } | undefined;
+  /** The requests whose hand-back this purse still keeps, by id: their Sent rows open it again. */
+  kept: ReadonlySet<string>;
   now: number;
   take: () => void;
   toggleLane: (lane: LaneKey) => void;
+  /** A Recent row that opens something on Send. */
+  openRow: (entry: LogEntry) => void;
 }
 
 /** Holdings. */
@@ -51,7 +59,7 @@ export function homeView(input: HomeInput): HTMLElement {
   return h(
     'div',
     { class: 'view v-home' },
-    deskbar(true),
+    deskbar(true, 'home'),
     h('main', { class: 'vmain', 'aria-busy': input.data === undefined && input.error === undefined ? 'true' : undefined }, paperBand(input), cobaltBand(input)),
   );
 }
@@ -81,7 +89,7 @@ function paperBand(input: HomeInput): HTMLElement {
       h('header', { class: 'tb' }, brand(true)),
       h(
         'div',
-        { class: 'hero' },
+        { class: `hero${input.received !== undefined ? ' has-pm' : ''}` },
         h(
           'div',
           { class: 'hero-l' },
@@ -95,6 +103,7 @@ function paperBand(input: HomeInput): HTMLElement {
             known ? h('i', {}, holdings.total === 1 ? 'token' : 'tokens') : null,
             chip(input.delta, now),
           ),
+          input.received === undefined ? null : postmarkWrap(input.received.amount, input.received.t, now),
         ),
         h('div', { class: 'hero-r' }, h('p', { class: 'sentence', id: 'sentence' }, ...(known ? words(input, holdings) : []))),
       ),
@@ -143,7 +152,9 @@ function chip(delta: HomeInput['delta'], now: number): HTMLElement | null {
 
 /** The sentence, its numbers as buttons that open their lane's tip. */
 function words(input: HomeInput, holdings: Holdings): Child[] {
-  return sentence(holdings, input.now).map((part) => {
+  const lane = input.received?.lane;
+  const received: Received | undefined = input.received === undefined || lane === undefined ? undefined : { amount: input.received.amount, lane };
+  return sentence(holdings, input.now, KEEPS_ALIVE, received).map((part) => {
     if (typeof part === 'string') {
       return part;
     }
@@ -175,7 +186,8 @@ function backRow(holdings: Holdings, now: number): HTMLElement {
 }
 
 function cobaltBand(input: HomeInput): HTMLElement {
-  const empty = input.data !== undefined && input.data.holdings.notes.length === 0;
+  // empty, not between a send and its change: only then is the faucet the way on
+  const empty = input.data !== undefined && input.data.holdings.notes.length === 0 && input.data.holdings.total === 0;
   const faucet = empty ? input.data?.faucet : undefined;
   return h(
     'section',
@@ -191,14 +203,24 @@ function cobaltBand(input: HomeInput): HTMLElement {
           'div',
           { class: 'col-recent' },
           h('div', { class: 'recent-h col-h' }, h('h2', { class: 'lab' }, 'Recent')),
-          h('div', { class: 'phone-only recent-p' }, ...recent(input.log, 3, input.now)),
-          h('div', { class: 'desk-only' }, ...recent(input.log, 4, input.now)),
+          h('div', { class: 'phone-only recent-p' }, ...recent(input, 3, 'p')),
+          h('div', { class: 'desk-only' }, ...recent(input, 4, 'd')),
         ),
         mintColumn(input),
       ),
-      faucet === undefined
-        ? null
-        : h('div', { class: 'home-acts phone-only' }, takeButton(input, faucet, 'home-take', true), takeError(input)),
+      h(
+        'div',
+        { class: 'home-acts phone-only' },
+        faucet === undefined ? null : takeButton(input, faucet, 'home-take', true),
+        faucet === undefined ? null : takeError(input),
+        h(
+          'div',
+          { class: 'btn-row' },
+          h('a', { class: 'btn', href: '#receive' }, 'Receive'),
+          // on an empty purse the faucet is the one way on: Send would only say the purse is empty
+          h('a', { class: `btn${faucet === undefined ? ' solid' : ''}`, href: '#send' }, 'Send'),
+        ),
+      ),
     ),
   );
 }
@@ -240,21 +262,37 @@ function takeButton(input: HomeInput, faucet: FaucetInfo, key: string, wide: boo
 const takeError = (input: HomeInput): HTMLElement | null =>
   input.error?.at === 'take' ? h('p', { class: 'err home-err', role: 'alert' }, input.error.words) : null;
 
-/** The last `n` entries of the purse's log, or that there are none yet. */
-function recent(log: readonly LogEntry[], n: number, now: number): HTMLElement[] {
+/**
+ * The last `n` entries of the purse's log, or that there are none yet. A
+ * send's row whose hand-back or send can still be shown is a button that
+ * shows it on Send; `where` keeps the phone's and the desktop's apart.
+ */
+function recent(input: HomeInput, n: number, where: 'p' | 'd'): HTMLElement[] {
+  const { log, now } = input;
   if (log.length === 0) {
     return [h('p', { class: 'note-line muted recent-none' }, 'Nothing yet.')];
   }
   return log.slice(0, n).map((entry) => {
     const age = now - entry.t;
-    const title = entry.kind === 'faucet' ? `Took ${entry.amount} from the faucet` : `Faded ${entry.amount}`;
-    const delta = entry.kind === 'faucet' ? entry.amount : -entry.amount;
-    return h(
-      'div',
-      { class: 'act' },
+    const row = recentRow(entry, entry.ask !== undefined && input.kept.has(entry.ask), now);
+    const parts: Child[] = [
       h('time', { datetime: new Date(entry.t).toISOString() }, shortDay(entry.t, now)),
-      h('span', {}, age >= 0 && age < PINK_MS ? newDot(age) : null, title),
-      delta === 0 ? h('b', { class: 'n', 'aria-label': 'no change' }, '—') : h('b', {}, change(delta)),
+      h('span', {}, age >= 0 && age < PINK_MS ? newDot(age) : null, row.title, row.small === undefined ? null : h('small', {}, row.small)),
+      row.delta === undefined || row.delta === 0 ? h('b', { class: 'n', 'aria-label': 'no change' }, '—') : h('b', {}, change(row.delta)),
+    ];
+    if (row.opens === undefined) {
+      return h('div', { class: 'act' }, ...parts);
+    }
+    return h(
+      'button',
+      {
+        class: 'act go',
+        type: 'button',
+        'aria-label': row.label,
+        'data-fk': `act-${where}${entry.id ?? entry.t}`,
+        on: { click: () => input.openRow(entry) },
+      },
+      ...parts,
     );
   });
 }

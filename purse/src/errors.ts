@@ -19,7 +19,15 @@ export type Doing =
   /** Taking a note from the faucet. */
   | 'take'
   /** Opening the purse, or reading what it holds. */
-  | 'open';
+  | 'open'
+  /** Making a request (Receive). */
+  | 'ask'
+  /** Reading what can go for a request, or paying it (Send). */
+  | 'send'
+  /** Taking in a hand-back. */
+  | 'accept'
+  /** Sending again what a send kept for later. */
+  | 'settle';
 
 /** What the words may name. */
 export interface Context {
@@ -54,12 +62,33 @@ export const notListed = (host: string): string => `The server at ${host} does n
 
 /**
  * The words when the mint's server cannot be reached: from a link, check
- * it; from Holdings, which reads the mint again each minute, wait.
+ * it; from Holdings, which reads the mint again each minute, wait; for a
+ * request, a send, a take or a resend, what it means for that.
  */
-const noAnswer = (host: string, doing: Doing): string =>
-  doing === 'open'
-    ? `The mint at ${host} did not answer. The purse asks again in a minute.`
-    : `The mint at ${host} did not answer. Check the link, or try again later.`;
+function noAnswer(host: string, doing: Doing): string {
+  const first = `The mint at ${host} did not answer.`;
+  switch (doing) {
+    case 'open':
+      return `${first} The purse asks again in a minute.`;
+    case 'ask':
+      return `${first} A request needs the mint’s answer; try again in a moment.`;
+    case 'send':
+      return `${first} Nothing was sent; try again in a moment.`;
+    case 'accept':
+      return `${first} Taking in needs its keys. The hand-back keeps until its tokens fade, so try again later.`;
+    case 'settle':
+      return `${first} This purse tries again the next time it opens; you can also try now.`;
+    default:
+      return `${first} Check the link, or try again later.`;
+  }
+}
+
+/** A detail of an SDK error, as text: amounts are bigints. */
+const detail = (fields: Record<string, unknown>, key: string): string => {
+  const details = fields['details'];
+  const value = typeof details === 'object' && details !== null ? (details as Record<string, unknown>)[key] : undefined;
+  return typeof value === 'bigint' || typeof value === 'number' || typeof value === 'string' ? String(value) : '';
+};
 
 /** Plain words for `error`, met while `doing` it. */
 export function say(error: unknown, doing: Doing, context: Context): Said {
@@ -71,6 +100,27 @@ export function say(error: unknown, doing: Doing, context: Context): Said {
   const retryAfterMs = typeof fields['retryAfterMs'] === 'number' ? fields['retryAfterMs'] : undefined;
 
   if (name === 'WorglError') {
+    // what a request, a send or a take refuses, in its own words
+    if (doing === 'ask' && code === 'unsplittable') {
+      return { words: `This mint cannot make ${detail(fields, 'amount')} from its notes. Try another amount.` };
+    }
+    if (doing === 'ask' && code === 'too_many_notes') {
+      return { words: `That would take more than ${detail(fields, 'max')} notes. Ask for less, or in larger notes.` };
+    }
+    if (doing === 'accept' && (code === 'bad_signature' || code === 'wrong_issuer' || code === 'unsigned')) {
+      return { words: 'This hand-back did not check out against the mint’s keys. Nothing was taken in.' };
+    }
+    if (doing === 'accept' && code === 'unknown_generation') {
+      return { words: 'Some of these tokens have faded: the mint has dropped their layer. Nothing was taken in.' };
+    }
+    if (doing === 'send' && code === 'denomination') {
+      return {
+        words: `This request asks for a note of ${detail(fields, 'amount')}, which this mint does not make. Ask them for a new request.`,
+      };
+    }
+    if (doing === 'send' && code === 'policy') {
+      return { words: 'This mint’s rules refuse this send as it stands. Ask them for a new request.' };
+    }
     switch (code) {
       case 'store_blocked':
         return { words: 'The purse is open in another tab with an older version. Close its other tabs, then try again.' };
@@ -92,7 +142,10 @@ export function say(error: unknown, doing: Doing, context: Context): Said {
       case 'unsplittable':
       case 'too_many_notes':
       case 'zero_amount':
-        return { words: 'This faucet hands out notes its mint cannot make. Nothing was kept.', noFaucet: true };
+        // from a take, the faucet's; from anything else, these never name the faucet
+        return doing === 'take'
+          ? { words: 'This faucet hands out notes its mint cannot make. Nothing was kept.', noFaucet: true }
+          : { words: fallback(doing) };
       default:
         return { words: fallback(doing) };
     }
@@ -142,6 +195,12 @@ export function say(error: unknown, doing: Doing, context: Context): Said {
   }
   return { words: fallback(doing) };
 }
+
+/** The words when the purse's records refused a request it had made, which it then withdrew. */
+export const notRecorded = 'This browser refused to save the request, so it was not made.';
+
+/** The words when the purse's records refused to mark a request cancelled: its keys are kept, and it stays open. */
+export const notCancelled = 'This browser refused to save, so the request was not cancelled. It stays open.';
 
 /** For what nothing above names: never a raw message. */
 function fallback(doing: Doing): string {

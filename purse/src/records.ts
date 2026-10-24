@@ -1,58 +1,24 @@
 // The purse's own records, apart from the tokens: the mints the person
-// added and a small log of what happened, such as "Took 64 from the
-// faucet". They live in an IndexedDB database of the purse's own, `purse`,
+// added, the requests it made, and a small log of what happened, such as
+// "Took 64 from the faucet" or "Sent 5". They live in an IndexedDB database of the purse's own, `purse`,
 // which can never be taken for an SDK store (those are `worgl:<server>`).
 // The tokens themselves live only in the SDK's IndexedDbStore, one per
 // server. Every write is strict, so it resolves only once it is on disk.
 
+import { endedToDrop } from './asks.ts';
+import type { AskRecord, LogEntry, MintRecord } from './entries.ts';
+
+export type { AskRecord, LogEntry, MintRecord, SavedInfo } from './entries.ts';
+
 /** The database, and the version of its layout. */
 const DATABASE = 'purse';
-const VERSION = 1;
+const VERSION = 2;
+
+/** How many ended requests (taken in full, or cancelled) the purse keeps; open ones it always keeps. */
+export const ASKS_ENDED_KEPT = 50;
 
 /** How many log entries the purse keeps: Holdings shows the last few, History (later) more. */
 const LOG_KEPT = 200;
-
-/** What the purse last read of a mint's info. */
-export interface SavedInfo {
-  layers: number;
-  /** Seconds between rotations, if it rotates on its own. */
-  periodSecs: number | undefined;
-  paused: boolean;
-  /** When the purse read it, by this device's clock. */
-  readAt: number;
-}
-
-/** A mint the person added. */
-export interface MintRecord {
-  /** Its issuer key, in hex: the record's key. */
-  mint: string;
-  /** The server it was added at: one SDK purse and store per server. */
-  server: string;
-  /** What the purse calls it: the build's playground, or the server's host until the person names it. */
-  name: string;
-  /** What its tokens are called. */
-  unit: string;
-  /** When it was added. */
-  added: number;
-  /** The info last read. */
-  info: SavedInfo | undefined;
-}
-
-/** One entry in the purse's log. */
-export interface LogEntry {
-  /** Its place in the log, given when it is added. */
-  id?: number;
-  /** When it happened. */
-  t: number;
-  /** `faucet`: a note taken from the faucet; `faded`: notes a rotation dropped. */
-  kind: 'faucet' | 'faded';
-  /** The mint. */
-  mint: string;
-  /** Tokens it brought (faucet) or took away (faded). */
-  amount: number;
-  /** The serials of the notes it brought, `generation:index`, so a note can say where it came from. */
-  serials: string[];
-}
 
 /** The purse's records in this browser. */
 export class Records {
@@ -78,6 +44,10 @@ export class Records {
         }
         if (!database.objectStoreNames.contains('log')) {
           database.createObjectStore('log', { keyPath: 'id', autoIncrement: true });
+        }
+        // version 2: the requests made; each store is made only if missing, so the upgrade works from any earlier version
+        if (!database.objectStoreNames.contains('asks')) {
+          database.createObjectStore('asks', { keyPath: 'id' });
         }
       };
       request.onsuccess = () => {
@@ -110,6 +80,46 @@ export class Records {
     });
   }
 
+  /** Every request this purse made and keeps, newest first. */
+  async asks(): Promise<AskRecord[]> {
+    let all: AskRecord[] = [];
+    await this.#run('asks', 'readonly', (store) => {
+      const request = store.getAll();
+      request.onsuccess = () => {
+        all = request.result as AskRecord[];
+      };
+    });
+    return all.sort((a, b) => b.t - a.t);
+  }
+
+  /**
+   * Keeps a request, or saves what changed of one, and drops the ended
+   * requests past the newest {@link ASKS_ENDED_KEPT}, in the same
+   * transaction. Open requests are never dropped: their keys stay in the
+   * SDK until they are cancelled.
+   */
+  async putAsk(record: AskRecord): Promise<void> {
+    await this.#run('asks', 'readwrite', (store) => {
+      store.put(record);
+      const all = store.getAll();
+      all.onsuccess = () => {
+        for (const id of endedToDrop(all.result as AskRecord[], ASKS_ENDED_KEPT)) {
+          store.delete(id);
+        }
+      };
+    });
+  }
+
+  /** Saves what changed of a log entry that has an id already. */
+  async updateLog(entry: LogEntry): Promise<void> {
+    if (entry.id === undefined) {
+      throw new RangeError('a log entry to update has an id');
+    }
+    await this.#run('log', 'readwrite', (store) => {
+      store.put(entry);
+    });
+  }
+
   /** The last `limit` log entries, newest first. */
   async log(limit = LOG_KEPT): Promise<LogEntry[]> {
     const entries: LogEntry[] = [];
@@ -126,10 +136,14 @@ export class Records {
     return entries;
   }
 
-  /** Adds an entry to the log, and drops the oldest past {@link LOG_KEPT}. */
-  async addLog(entry: Omit<LogEntry, 'id'>): Promise<void> {
+  /** Adds an entry to the log, and drops the oldest past {@link LOG_KEPT}. Resolves to the entry's id. */
+  async addLog(entry: Omit<LogEntry, 'id'>): Promise<number> {
+    let id = 0;
     await this.#run('log', 'readwrite', (store) => {
-      store.add(entry);
+      const added = store.add(entry);
+      added.onsuccess = () => {
+        id = added.result as number;
+      };
       const count = store.count();
       count.onsuccess = () => {
         let extra = count.result - LOG_KEPT;
@@ -147,6 +161,7 @@ export class Records {
         };
       };
     });
+    return id;
   }
 
   /**

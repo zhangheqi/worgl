@@ -100,8 +100,9 @@ describe('the sentence', () => {
     assert.ok(parts.some((part) => typeof part === 'object' && 'em' in part && part.em === 'alive'));
   });
 
-  test('says when the purse is empty', () => {
+  test('says when the purse is empty, and not while a send’s change is on its way', () => {
     assert.equal(plain(sentence(holdings([]), NOW)), 'This purse is empty.');
+    assert.equal(plain(sentence(holdings([], { total: 59 }), NOW)), 'Nothing is held this moment: 59 is on its way back from the mint.');
   });
 
   test('names the next rotation as a weekday once it is not today', () => {
@@ -346,5 +347,26 @@ describe('until keep-alive comes', () => {
     for (const words of said) {
       assert.doesNotMatch(words, /alive|keeps? (it|them)|open (the purse )?again|stays closed|left closed/i, words);
     }
+  });
+
+  test('say where tokens just taken in landed, in that lane’s clause', () => {
+    const h = holdings([...READY(), ...RESTING()]);
+    assert.equal(
+      plain(sentence(h, NOW, false, { amount: 20, lane: 'rest' })),
+      '69 are ready; 123 rest until 16:00, including the 20 you just took. Nothing fades before Thu 08:00.',
+    );
+    assert.equal(
+      plain(sentence(h, NOW, false, { amount: 5, lane: 'ready' })),
+      '69 are ready, including the 5 you just took; 123 rest until 16:00. Nothing fades before Thu 08:00.',
+    );
+    assert.equal(plain(sentence(h, NOW, false, undefined)), '69 are ready; 123 rest until 16:00. Nothing fades before Thu 08:00.');
+  });
+
+  test('say where a note came from: the faucet, a hand-back, or a send’s change', () => {
+    const h = holdings([...READY(), ...RESTING()]);
+    const came = at(21, 14, 2);
+    assert.equal(noteTip(h, note(4, 3, { arrivedAt: came, source: 'received' }), 'Playground', NOW).lines[0], 'Received at 14:02.');
+    assert.equal(noteTip(h, note(4, 3, { arrivedAt: came, source: 'change' }), 'Playground', NOW).lines[0], 'Change from your send at 14:02.');
+    assert.equal(noteTip(h, note(4, 3, { arrivedAt: came, source: 'faucet' }), 'Playground', NOW).lines[0], 'From the Playground faucet at 14:02.');
   });
 });

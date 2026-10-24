@@ -90,11 +90,15 @@ export function listWords(items: readonly (number | string)[]): string {
   return `${items.slice(0, -1).join(', ')} and ${String(items[items.length - 1])}`;
 }
 
+/** Largest first, whatever order a request lists its notes in. */
+const largestFirst = (values: readonly number[]): number[] => [...values].sort((a, b) => b - a);
+
 /**
- * Notes by their values, largest first as given: `one note of 64`,
- * `notes of 16 and 4`, `three notes of 64 and one of 8`.
+ * Notes by their values, largest first: `one note of 64`, `notes of 16 and
+ * 4`, `three notes of 64 and one of 8`.
  */
-export function notesWords(values: readonly number[]): string {
+export function notesWords(given: readonly number[]): string {
+  const values = largestFirst(given);
   if (values.length === 1) {
     return `one note of ${values[0]}`;
   }
@@ -117,6 +121,13 @@ export function notesWords(values: readonly number[]): string {
     ),
   );
 }
+
+/** Notes by their values, largest first: `16 and 4` when every one differs, else as {@link notesWords} names them. */
+export const notesShort = (values: readonly number[]): string =>
+  values.length > 1 && new Set(values).size === values.length ? listWords(largestFirst(values)) : notesWords(values);
+
+/** `64 + 4 + 1`. */
+export const plusJoin = (values: readonly number[]): string => values.join(' + ');
 
 /** A change in tokens: `+64`, `−5` (with the minus sign), `—` for none. */
 export function change(delta: number | undefined): string {

@@ -1,7 +1,7 @@
 import assert from 'node:assert/strict';
 import { describe, test } from 'node:test';
 
-import { hostOf, isMintHash, mintHash, parseMintLink, shortKey } from '../src/link.ts';
+import { hostOf, isMintHash, mintHash, parseMintLink, parseServer, shortKey } from '../src/link.ts';
 
 const KEY = '0d4e4453'.padEnd(64, 'a7');
 
@@ -92,5 +92,15 @@ describe('mint links', () => {
     assert.equal(hostOf('https://mint.example.org/worgl'), 'mint.example.org');
     assert.equal(hostOf('http://127.0.0.1:8080'), '127.0.0.1:8080');
     assert.equal(shortKey(KEY), '0d4e4453');
+  });
+
+  test('read a server on its own, as the client writes it', () => {
+    assert.deepEqual(parseServer('https://x.example/'), { ok: true, server: 'https://x.example' });
+    assert.deepEqual(parseServer(' https://x.example:8443/worgl/ '), { ok: true, server: 'https://x.example:8443/worgl' });
+    assert.deepEqual(parseServer('http://127.0.0.1:8080'), { ok: true, server: 'http://127.0.0.1:8080' });
+    for (const text of ['', 'x.example', 'ftp://x', 'https://u@x', 'https://x/?a=1', 'javascript:alert(1)']) {
+      assert.deepEqual(parseServer(text), { ok: false, problem: 'server' }, text);
+    }
+    assert.deepEqual(parseServer('http://example.com'), { ok: false, problem: 'insecure' });
   });
 });

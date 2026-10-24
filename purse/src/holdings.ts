@@ -23,8 +23,8 @@ export interface Note {
   readyAt: number | undefined;
   /** When it came into the purse, from the purse's own log, if the log has it. */
   arrivedAt: number | undefined;
-  /** Where it came from, if the log knows: so far only a faucet. */
-  source: 'faucet' | undefined;
+  /** Where it came from, if the log knows: a faucet, a hand-back taken in, or the change of a send. */
+  source: Source | undefined;
 }
 
 /** The mint's rotation, by this device's clock. */
@@ -109,10 +109,13 @@ export function comeBackAt(holdings: Holdings, now: number): number | undefined 
 export const noteId = (serial: { generation: bigint; index: number }): string =>
   `${serial.generation}:${serial.index}`;
 
+/** Where a note came from, as the purse's log knows it. */
+export type Source = 'faucet' | 'received' | 'change';
+
 /** What the purse's own log knows of a note: when it came, and from where. */
 export interface Arrival {
   at: number;
-  source: 'faucet';
+  source: Source;
 }
 
 /**

@@ -15,8 +15,8 @@ const GLYPHS: Record<string, string[]> = {
   l: ['XX.', '.X.', '.X.', '.X.', '.X.', '.X.', '.XX', '...', '...'],
 };
 
-/** The lit cells of `worgl`, and its size in cells. */
-const WORD = (() => {
+/** The lit cells of `worgl`, and its size in cells: the wordmark's, and the postmark's. */
+export const WORD = (() => {
   const px: [number, number][] = [];
   let x = 0;
   for (const ch of 'worgl') {
