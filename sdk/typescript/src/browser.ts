@@ -41,10 +41,10 @@ interface Grant {
  * its save refuses with the `WorglError` code `store_changed`. So does a
  * save that finds, in its transaction, something saved since the change
  * read the store. A purse then undoes the change and rejects, but makes
- * one that keeps what the mint answered, as a submit's, again on what is
- * saved now. An application that holds a lock of its own, such as one
- * tab's claim to keep notes alive, must name it otherwise, or every change
- * waits for it.
+ * one that keeps what the mint answered, in a submit or `checkNotes`,
+ * again on what is saved now. An application that holds a lock of its
+ * own, such as one tab's claim to keep notes alive, must name it
+ * otherwise, or every change waits for it.
  *
  * Name each store after its purse's server, such as by the server's URL,
  * and the purses of two servers live side by side.

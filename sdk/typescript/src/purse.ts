@@ -1,4 +1,11 @@
-import { type Client, MintError, type RequestOptions, isTransient } from './client.ts';
+import { type Backup, type BackupMint, mintList, seal } from './backup.ts';
+import {
+  type Client,
+  MintError,
+  type NoteState,
+  type RequestOptions,
+  isTransient,
+} from './client.ts';
 import {
   Holder,
   type Scheduled,
@@ -89,9 +96,9 @@ export interface ScheduledTransfer {
  * forgetting one lowers it by its change. Either way the change moves to
  * unconfirmed.
  *
- * `expiring` is part of what is held, `outgoing` and `expected` sum some of
- * the parts, and `unconfirmed` may come instead of value held, so a screen
- * adds none of them in.
+ * `expiring` is part of what is held, `unchecked` part of the total,
+ * `outgoing` and `expected` sum some of the parts, and `unconfirmed` may
+ * come instead of value held, so a screen adds none of them in.
  */
 export interface Balance {
   /** Held now, or on its way back as change or refreshing. */
@@ -104,6 +111,14 @@ export interface Balance {
   frozen: bigint;
   /** Held, and dies at the next rotation unless refreshed. */
   expiring: bigint;
+  /**
+   * Part of the total that came from another copy of the purse in a
+   * {@link Purse.restore}, which may have spent it since: the notes
+   * {@link Purse.unchecked} lists, and change and refreshes paid to keys
+   * that copy handed out. It counts until the mint says otherwise: see
+   * {@link Purse.checkNotes}.
+   */
+  unchecked: bigint;
   /** Held in notes newer than the mint's info. */
   unknown: bigint;
   /** What transfers not yet answered pay others: the payees' notes. */
@@ -350,6 +365,95 @@ export interface SubmitOptions {
 }
 
 /**
+ * What {@link Purse.restore} took in from a backup, what the backup showed
+ * was done with, and what only the mint can settle. Notes and transfers are
+ * JSON.
+ *
+ * What only the backup had may be out of date: since it was sealed, another
+ * copy of the purse, such as this one before it lost its storage, may have
+ * spent its notes, or settled its transfers and spent their change. So what
+ * this purse knew nothing of comes in unchecked ({@link Purse.unchecked}),
+ * and counts in {@link Balance.unchecked} until the mint says otherwise. A
+ * backup restored into a new purse is all such.
+ */
+export interface Restored {
+  /**
+   * Notes held now that were not before, from the backup. Those this purse
+   * knew nothing of are unchecked. A backup a day old mostly holds spent
+   * notes on a mint that rotates every few hours: {@link Purse.prune} drops
+   * the expired ones from the mint's info alone, and
+   * {@link Purse.checkNotes} asks the mint about the rest.
+   */
+  notes: string[];
+  /**
+   * Notes held before that the backup spent, in a transfer it settled or
+   * forgot: no longer this purse's, they are dropped.
+   */
+  spent: string[];
+  /**
+   * Transfers outgoing now that were not before, from the backup.
+   * {@link Purse.settle} resends them: the mint carries out one it never
+   * applied, answers one it applied with the notes it first gave while it
+   * keeps the answer, and refuses one whose note another transfer spent,
+   * which is then dropped. The notes of an answer that pay this purse are
+   * unchecked, since another copy may have settled the transfer and spent
+   * them. Cancel one that should not go ({@link Purse.cancel}): another copy
+   * may have cancelled it.
+   */
+  outgoing: string[];
+  /**
+   * Transfers outgoing before that the backup showed done with: settled,
+   * cancelled or forgotten there, or answered, by holding or spending every
+   * note they pay this purse. They are ended here too, keeping what the
+   * backup did with their notes.
+   */
+  ended: string[];
+  /**
+   * Transfers outgoing now that spend a note another one spends: this purse
+   * and the backup each spent it, in a transfer of its own. The mint applies
+   * at most one, and {@link Purse.settle} tells which; until then that
+   * note's value counts in both.
+   */
+  conflicts: string[];
+  /**
+   * The mints of the backup left out, each with the server the backup names
+   * for it: restore those into a purse of that server.
+   */
+  others: BackupMint[];
+}
+
+/** What {@link Purse.checkNotes} found. */
+export interface Checked {
+  /** Value this purse held in the notes the mint reported spent or expired, now discarded. */
+  value: bigint;
+  /** The notes the mint reported spent or expired. This purse holds none of them now. */
+  discarded: string[];
+  /** The notes the mint reported live or unissued. They are kept, and no longer unchecked. */
+  kept: string[];
+  /** The notes the mint could not be asked about, each with the last error. They are kept. */
+  unanswered: { note: string; error: unknown }[];
+}
+
+/** What {@link Purse.backup} seals with a purse. */
+export interface BackupOptions {
+  /**
+   * Purses of other servers to seal in the same backup, so that one backup
+   * and one passphrase hold them all: each names its own server for its
+   * mints, and {@link Purse.restore} on a purse of each server takes its
+   * part back. A mint may be in only one of the purses.
+   */
+  purses?: Purse[];
+  /**
+   * Entries for the backup's mint list, such as the person's mints with the
+   * name and unit given to each in {@link BackupMint.extra}, which every
+   * reader gives back. A mint one of the purses holds anything of is named
+   * with that purse's server, keeping the other members of its entry here;
+   * a mint none holds is sealed as listed, if it names a server.
+   */
+  mints?: BackupMint[];
+}
+
+/**
  * What a payee asks to be paid: one fresh key of its own for each note.
  * Send {@link json} to the payer, who reads it with {@link PaymentRequest.from}.
  */
@@ -454,9 +558,11 @@ export interface PurseOptions {
  * Before each change the purse takes the lock and reads the holder saved
  * there, makes the change to that, and saves before letting go, so a note
  * another purse took in meanwhile is kept, not saved over. It never holds
- * the lock across a request to the mint, and {@link settle} resends the
- * transfers of the holder saved now. Reads such as {@link notes} and
- * {@link balance} show the holder as this purse last read or saved it.
+ * the lock across a request to the mint. {@link settle} resends the
+ * transfers of the holder saved now, {@link backup} seals that holder, and
+ * {@link checkNotes} asks about its unchecked notes. Reads such as
+ * {@link notes} and {@link balance} show the holder as this purse last read
+ * or saved it.
  */
 export class Purse {
   /** The client requests go through. */
@@ -492,6 +598,17 @@ export class Purse {
     return JSON.parse(this.#holder.notes()) as string[];
   }
 
+  /**
+   * The notes held that came from another copy of the purse in a
+   * {@link restore}, which may have spent them since, or that a transfer
+   * the restore brought back paid to this purse: see {@link Restored}. They
+   * count, in {@link Balance.unchecked}, until {@link checkNotes} asks the
+   * mint about them, and only the mint can tell.
+   */
+  unchecked(): string[] {
+    return JSON.parse(this.#holder.unchecked()) as string[];
+  }
+
   /** The transfers this purse made and has not seen answered, as JSON. */
   outgoing(): string[] {
     return this.#holder.outgoing();
@@ -524,6 +641,7 @@ export class Purse {
         spendable: balance.spendable,
         frozen: balance.frozen,
         expiring: balance.expiring,
+        unchecked: balance.unchecked,
         unknown: balance.unknown,
         sending: balance.sending,
         change: balance.change,
@@ -1068,6 +1186,155 @@ export class Purse {
   }
 
   /**
+   * Seals this purse into a backup under `passphrase`, in turn after the
+   * changes before it, naming this purse's server for each of its mints,
+   * with the purses of other servers and the mint list `options` names. The
+   * backup is the purse file of the `worgl` command line, which opens it as
+   * a purse; {@link Backup.open} opens it here, and {@link restore} merges
+   * it into a purse. With a store that has a lock, each purse is sealed as
+   * saved now, read under its store's lock, so the backup holds what other
+   * purses on the store saved, and no lock is held while the key is derived.
+   *
+   * It holds the secret key of every note: anyone with the backup and the
+   * passphrase can spend them. Its key is derived from the passphrase with
+   * Argon2id over 64 MiB, which takes a moment and blocks the thread
+   * meanwhile, and a fresh salt each time. An empty passphrase is refused
+   * with the {@link WorglError} `empty_passphrase`, and a mint two of the
+   * purses hold with a `TypeError`. With a store that has a lock, the read
+   * of a purse can reject as a change's does, such as with `unknown_format`
+   * once another purse on the store saved it with a newer SDK.
+   */
+  async backup(passphrase: string, options: BackupOptions = {}): Promise<string> {
+    const purses = [...new Set([this, ...(options.purses ?? [])])];
+    const parts = await Promise.all(
+      purses.map(async (purse) => ({
+        server: purse.client.baseUrl,
+        json: await purse.#snapshot(),
+      })),
+    );
+    const holder = new Holder();
+    try {
+      const held: { server: string; mints: string[] }[] = [];
+      for (const { server, json } of parts) {
+        const part = Holder.fromJson(json);
+        try {
+          held.push({ server, mints: part.mints() });
+          holder.join(part);
+        } finally {
+          part.free();
+        }
+      }
+      return seal(holder, passphrase, mintList(held, options.mints ?? []));
+    } finally {
+      holder.free();
+    }
+  }
+
+  /**
+   * Merges `backup`, a copy of this purse such as an older backup or
+   * another device's, into it and saves. What is the purse's in either is
+   * kept, and nothing is counted twice that the two can tell apart: see
+   * {@link Restored} for what only the mint can tell. A backup of another
+   * purse merges as the union of the two.
+   *
+   * It takes the part of the backup that is of `mints`: by default every
+   * mint it names this purse's server for, or no server, as in a purse file
+   * of the `worgl` command line. The others are listed in
+   * {@link Restored.others}. The mint is asked nothing.
+   */
+  async restore(backup: Backup, mints?: string[]): Promise<Restored> {
+    const here = this.client.baseUrl;
+    const taken =
+      mints ??
+      backup.mints
+        .filter((m) => m.server === undefined || m.server === here)
+        .map((m) => m.mint);
+    const whole = Holder.fromJson(backup.toJson());
+    let part: Holder;
+    try {
+      part = whole.only(JSON.stringify(taken));
+    } finally {
+      whole.free();
+    }
+    try {
+      const restored = await this.#changeOrRestore(() => {
+        const merged = this.#holder.merge(part);
+        try {
+          return {
+            notes: JSON.parse(merged.notes) as string[],
+            spent: JSON.parse(merged.spent) as string[],
+            outgoing: merged.outgoing,
+            ended: merged.ended,
+            conflicts: merged.conflicts,
+          };
+        } finally {
+          merged.free();
+        }
+      });
+      return { ...restored, others: backup.mints.filter((m) => !taken.includes(m.mint)) };
+    } finally {
+      part.free();
+    }
+  }
+
+  /**
+   * Asks the mint about each of `notes`, by default the {@link unchecked}
+   * ones, spaced by random gaps of `spacing`, then saves. Those it reports
+   * spent or expired are discarded, and a backup restored later leaves them
+   * out; those it reports live or unissued are kept, and no longer unchecked.
+   * An unissued note may come back, as after the mint restored its state from
+   * a backup. A note this purse does not hold is only reported. The unchecked
+   * notes are read in turn after the changes before it and, with a store that
+   * has a lock, under the lock, so they include those another purse on the
+   * store restored. The answers are kept even when their save is refused with
+   * `store_changed`, as when another purse takes the lock meanwhile: the
+   * purse makes the change again on what is saved now, so no note has to be
+   * asked about again.
+   *
+   * The mint's answers are not signed, so ask only this purse's server, the
+   * mint's own. Each question shows the mint one note, from this machine's
+   * address and at its time, so asking about notes one after another
+   * invites the guess that they have one owner. Ask only when that is
+   * acceptable, with gaps as wide as you can wait for; or ask nothing, and
+   * let the transfers that next spend the notes find the spent ones, which
+   * the mint refuses. {@link prune} drops the expired ones without asking.
+   */
+  async checkNotes(notes?: string[], spacing: Spacing = DEFAULT_SPACING): Promise<Checked> {
+    // Read in turn, and under the store's lock if it has one, as settle
+    // reads the transfers it resends.
+    const asked = notes ?? (await this.#current(async () => this.unchecked()));
+    const checked: Checked = { value: 0n, discarded: [], kept: [], unanswered: [] };
+    for (const [index, note] of asked.entries()) {
+      if (index > 0) {
+        await sleep(gap(spacing) * 1000);
+      }
+      let state: NoteState;
+      try {
+        state = await this.#retrying(() => this.client.verify(note));
+      } catch (error) {
+        checked.unanswered.push({ note, error });
+        continue;
+      }
+      if (state.state === 'spent' || state.state === 'expired') {
+        checked.discarded.push(note);
+      } else {
+        checked.kept.push(note);
+      }
+    }
+    if (checked.discarded.length > 0 || checked.kept.length > 0) {
+      const gone = JSON.stringify(checked.discarded);
+      const kept = JSON.stringify(checked.kept);
+      checked.value = await this.#untilSaved(() =>
+        this.#changeOrRestore(() => {
+          this.#holder.keep(kept);
+          return this.#holder.discard(gone);
+        }),
+      );
+    }
+    return checked;
+  }
+
+  /**
    * Makes the request `call` makes, again while the failure is transient, as
    * {@link Retry} says. Once `signal` aborts, a wait between tries ends and
    * no try follows: a transient failure then rejects with the signal's
@@ -1138,6 +1405,14 @@ export class Purse {
     const result = this.#changes.then(run, run);
     this.#changes = result.catch(() => {});
     return result;
+  }
+
+  /**
+   * The holder as JSON, in turn after the changes before it: with a store
+   * that has a lock, the holder saved now, read under the lock.
+   */
+  #snapshot(): Promise<string> {
+    return this.#current(async () => this.#holder.toJson());
   }
 
   /** Like {@link #change}, but a failed save puts the holder back as it was before `apply`. */
@@ -1215,6 +1490,12 @@ function sleep(ms: number, ...signals: (AbortSignal | undefined)[]): Promise<voi
       signal.addEventListener('abort', done);
     }
   });
+}
+
+/** A gap drawn at random from `spacing`, in seconds. */
+function gap(spacing: Spacing): number {
+  const [drawn = 0] = crypto.getRandomValues(new Uint32Array(1));
+  return spacing.minSecs + (drawn / 2 ** 32) * Math.max(0, spacing.maxSecs - spacing.minSecs);
 }
 
 /**

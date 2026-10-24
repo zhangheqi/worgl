@@ -49,7 +49,12 @@ shuffled too, so the payee's notes are not always first.
 Asking about a note, with `POST /v1/verify`, shows the mint that note just
 as a transfer does, so asking about several in a row invites the same guess.
 The SDKs and `worgl notes` tell where the notes they hold stand from the
-mint's info instead, which says nothing about any one note.
+mint's info instead, which says nothing about any one note. A restored
+backup is where asking tempts most: a note it holds may have been spent
+since, and only the mint knows. The TypeScript SDK's `checkNotes` asks about
+such unchecked notes at random gaps, 2 to 60 seconds apart by default. A purse that
+asks nothing finds the spent ones when the transfers that next spend them
+are refused, which shows the mint no more than spending them would.
 
 ## What each party sees
 

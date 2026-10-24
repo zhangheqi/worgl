@@ -589,7 +589,8 @@ async fn balance(purse: &Purse<Vault>, mint: &PublicKey) -> Result<()> {
     // For the time to the next rotation, by the mint's clock.
     let (view, now) = purse.client().view_and_time(mint).await?;
     // The total, then parts that do not overlap; expiring is part of what is
-    // held, and unconfirmed change is in no total.
+    // held, unchecked part of the total, and unconfirmed change is in no
+    // total.
     let balance = purse.holder().balance(&view);
     println!(
         "total      {}  (held, plus change and refreshes on their way back)",
@@ -610,6 +611,12 @@ async fn balance(purse: &Purse<Vault>, mint: &PublicKey) -> Result<()> {
         "expiring   {}  (dies at the next rotation unless refreshed)",
         balance.expiring
     );
+    if balance.unchecked > 0 {
+        println!(
+            "unchecked  {}  (from another copy of the purse, which may have spent it since)",
+            balance.unchecked
+        );
+    }
     println!(
         "change     {}  (from payments not yet seen answered)",
         balance.change
@@ -988,23 +995,18 @@ fn passphrase(purse: &Path) -> Result<Zeroizing<String>> {
     ))
 }
 
+/// A passphrase for a new purse file. The vault refuses an empty one.
 fn new_passphrase(purse: &Path) -> Result<Zeroizing<String>> {
-    let passphrase = match env_passphrase() {
-        Some(passphrase) => passphrase,
-        None => {
-            let prompt = format!("New passphrase for {}: ", purse.display());
-            let first = Zeroizing::new(rpassword::prompt_password(prompt)?);
-            let again = Zeroizing::new(rpassword::prompt_password("Again: ")?);
-            if first != again {
-                bail!("the passphrases differ");
-            }
-            first
-        }
-    };
-    if passphrase.is_empty() {
-        bail!("the passphrase is empty");
+    if let Some(passphrase) = env_passphrase() {
+        return Ok(passphrase);
     }
-    Ok(passphrase)
+    let prompt = format!("New passphrase for {}: ", purse.display());
+    let first = Zeroizing::new(rpassword::prompt_password(prompt)?);
+    let again = Zeroizing::new(rpassword::prompt_password("Again: ")?);
+    if first != again {
+        bail!("the passphrases differ");
+    }
+    Ok(first)
 }
 
 fn env_passphrase() -> Option<Zeroizing<String>> {

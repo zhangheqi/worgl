@@ -31,7 +31,9 @@ worgl-sdk = { path = "crates/worgl-sdk", version = "0.1.0" }
 worgl-server = { path = "crates/worgl-server" }
 
 anyhow = "1"
-argon2 = "0.6"
+# Without its default features, argon2 leaves out the PHC password-hash
+# strings, which purse files do not use.
+argon2 = { version = "0.6", default-features = false }
 axum = "0.8"
 base64 = "0.23"
 chacha20poly1305 = "0.11"

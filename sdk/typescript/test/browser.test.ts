@@ -12,7 +12,7 @@ import {
   forceCloseDatabase,
 } from 'fake-indexeddb';
 
-import { Client, NO_SPACING, Purse, isWorglError } from '../src/index.ts';
+import { Backup, Client, NO_SPACING, Purse, isWorglError } from '../src/index.ts';
 import { IndexedDbStore } from '../src/browser.ts';
 import { TestServer } from './server.ts';
 
@@ -21,6 +21,12 @@ const quick = { retry: { attempts: 2, firstDelayMs: 10 } };
 
 /** For a test that a store which waits on another tab would hang, not fail. */
 const waits = { timeout: 5000 };
+
+/** As {@link waits}, for a test that also seals and opens backups, which take a moment each. */
+const backupWaits = { timeout: 20_000 };
+
+/** The passphrase of the backups the tests seal. */
+const PASSPHRASE = 'correct horse battery staple';
 
 /** A callback that runs under a lock. */
 type Locked<T> = (lock: { name: string }) => Promise<T>;
@@ -134,6 +140,13 @@ function open(name: string, store = new IndexedDbStore(name)): Promise<Purse> {
 /** What a purse opened now on the store named `name` has asked the mint for. */
 async function requested(name: string): Promise<bigint> {
   return (await (await open(name)).balance(server.mint)).requested;
+}
+
+/** What a new purse that restores the backup `sealed` has asked the mint for. */
+async function requestedIn(sealed: string): Promise<bigint> {
+  const purse = await Purse.open(server.client(), quick);
+  await purse.restore(await Backup.open(sealed, PASSPHRASE));
+  return (await purse.balance(server.mint)).requested;
 }
 
 /**
@@ -499,6 +512,121 @@ describe('browser store', () => {
       const settled = await reopened.settle(NO_SPACING);
       assert.deepEqual([settled.answered, settled.refused, settled.unsent], [1, [], []]);
       assert.equal(await payee.accept([...stopped.theirs, ...settled.theirs]), 10n);
+    });
+
+    test('backs up what another tab saved, once it lets go of the lock', backupWaits, async () => {
+      // The tab opens the purse before another asks for 1, then backs up
+      // while the other's next change, for 2, holds the lock.
+      const name = server.url;
+      const tab = await open(name);
+      const store = new IndexedDbStore(name);
+      const other = await open(name, store);
+      await other.request(server.mint, 1n);
+      const paused = pauseAfterLoad(store);
+      const change = other.request(server.mint, 2n);
+      await paused.loaded;
+      const sealing = tab.backup(PASSPHRASE);
+      await new Promise((resolve) => setTimeout(resolve, 50));
+      paused.resume();
+
+      await change;
+      assert.equal(await requestedIn(await sealing), 1n + 2n);
+    });
+
+    test('backs up what it read, though another tab steals the lock', backupWaits, async () => {
+      // The tab opens the purse before another asks for 1. Its backup waits
+      // after its read under the lock, while a third tab takes the lock with
+      // steal and asks for 2 through a purse of its own.
+      const name = server.url;
+      const store = new IndexedDbStore(name);
+      const tab = await open(name, store);
+      await (await open(name)).request(server.mint, 1n);
+      const paused = pauseAfterLoad(store);
+      const sealing = tab.backup(PASSPHRASE);
+      await paused.loaded;
+      await navigator.locks.request(`worgl:${name}`, { steal: true }, async () => {});
+      await (await open(name)).request(server.mint, 2n);
+      paused.resume();
+
+      // The backup holds the purse as saved when it read it, and the next
+      // one what was saved since.
+      assert.equal(await requestedIn(await sealing), 1n);
+      assert.equal(await requestedIn(await tab.backup(PASSPHRASE)), 1n + 2n);
+    });
+
+    test('checks the notes another tab restored, as saved now', backupWaits, async () => {
+      // A purse elsewhere is backed up, then spends its note.
+      const elsewhere = await Purse.open(server.client(), quick);
+      await server.fund(elsewhere, 8n, 8n);
+      const sealed = await elsewhere.backup(PASSPHRASE);
+      const payee = await Purse.open(server.client(), quick);
+      const request = await payee.request(server.mint, 5n);
+      await payee.receive(request, await elsewhere.pay(request, NO_SPACING));
+
+      // Two tabs open the purse before a third asks for 2, and one of them
+      // restores the backup into what the third saved.
+      const name = server.url;
+      const [restoring, checking] = [await open(name), await open(name)];
+      await (await open(name)).request(server.mint, 2n);
+      const restored = await restoring.restore(await Backup.open(sealed, PASSPHRASE));
+      assert.equal(restored.notes.length, 1);
+      const balance = await (await open(name)).balance(server.mint);
+      assert.deepEqual([balance.unchecked, balance.requested], [8n, 2n]);
+
+      // The other tab asks the mint about the note restored, which it had
+      // not read, and drops it as spent.
+      assert.deepEqual(checking.unchecked(), []);
+      const checked = await checking.checkNotes(undefined, NO_SPACING);
+      assert.deepEqual(checked, { value: 8n, discarded: restored.notes, kept: [], unanswered: [] });
+      const after = await (await open(name)).balance(server.mint);
+      assert.deepEqual([after.held, after.unchecked, after.requested], [0n, 0n, 2n]);
+    });
+
+    test('keeps what the mint said of the notes, though its save loses the lock', backupWaits, async () => {
+      // A purse elsewhere is backed up with two notes, then spends one.
+      const elsewhere = await Purse.open(server.client(), quick);
+      await server.fund(elsewhere, 16n, 8n);
+      const sealed = await elsewhere.backup(PASSPHRASE);
+      const payee = await Purse.open(server.client(), quick);
+      const request = await payee.request(server.mint, 5n);
+      await payee.receive(request, await elsewhere.pay(request, NO_SPACING));
+
+      // The tab restores the backup and asks the mint about both notes. Once
+      // it asks, its next load is the one under the lock that saves the
+      // answers: it waits after its read, while another tab takes the lock
+      // with steal and asks for 2 through a purse of its own.
+      const name = server.url;
+      const store = new IndexedDbStore(name);
+      let verifies = 0;
+      let asking = (_: ReturnType<typeof pauseAfterLoad>): void => {};
+      const saving = new Promise<ReturnType<typeof pauseAfterLoad>>((resolve) => (asking = resolve));
+      const fetch: typeof globalThis.fetch = (input, init) => {
+        if (String(input).endsWith('/v1/verify')) {
+          verifies += 1;
+          if (verifies === 1) {
+            asking(pauseAfterLoad(store));
+          }
+        }
+        return globalThis.fetch(input, init);
+      };
+      const tab = await Purse.open(new Client(server.url, { fetch }), { store, ...quick });
+      await tab.restore(await Backup.open(sealed, PASSPHRASE));
+      const checking = tab.checkNotes(undefined, NO_SPACING);
+      const paused = await saving;
+      await paused.loaded;
+      await navigator.locks.request(`worgl:${name}`, { steal: true }, async () => {});
+      await (await open(name)).request(server.mint, 2n);
+      paused.resume();
+
+      // The answers are kept, in the purse as the other tab saved it, with no
+      // note asked about again.
+      const checked = await checking;
+      assert.deepEqual(
+        [checked.value, checked.discarded.length, checked.kept.length, verifies],
+        [8n, 1, 1, 2],
+      );
+      const after = await (await open(name)).balance(server.mint);
+      assert.deepEqual([after.held, after.unchecked, after.requested], [8n, 0n, 2n]);
     });
   });
 });

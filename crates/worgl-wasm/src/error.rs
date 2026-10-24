@@ -4,6 +4,7 @@ use std::fmt::Display;
 
 use wasm_bindgen::JsValue;
 use worgl::{NoteError, PublicKey};
+use worgl_sdk::vault::VaultError;
 use worgl_sdk::{
     AnswerError, CheckError, LoadError, MAX_REQUESTED_NOTES, NoLayers, PayError, RequestError,
 };
@@ -132,6 +133,26 @@ impl From<LoadError> for Error {
         match &error {
             LoadError::Json(_) => thrown("malformed"),
             LoadError::Format(format) => thrown("unknown_format").with("format", *format),
+        }
+    }
+}
+
+impl From<VaultError> for Error {
+    fn from(error: VaultError) -> Self {
+        let thrown = |code| Self::new(code, &error);
+        match &error {
+            VaultError::NotSealed => thrown("not_sealed"),
+            VaultError::Version(version) => thrown("unknown_version").with("version", *version),
+            // The file opened under its key, so whoever sealed it wrote a
+            // holder no SDK reads: as damaged as a file altered after.
+            VaultError::Damaged(_) | VaultError::Holder(LoadError::Json(_)) => thrown("damaged"),
+            VaultError::Holder(LoadError::Format(format)) => {
+                thrown("unknown_format").with("format", *format)
+            }
+            VaultError::Passphrase => thrown("wrong_passphrase"),
+            VaultError::EmptyPassphrase => thrown("empty_passphrase"),
+            VaultError::Memory => thrown("out_of_memory"),
+            VaultError::Random => thrown("no_randomness"),
         }
     }
 }
@@ -344,5 +365,22 @@ mod tests {
         let format = ("format", Detail::Count(9));
         check(LoadError::Format(9), "unknown_format", &[format]);
         check(NoLayers, "no_layers", &[]);
+    }
+
+    #[test]
+    fn purse_files_that_do_not_open_or_seal_have_codes() {
+        check(VaultError::NotSealed, "not_sealed", &[]);
+        let version = ("version", Detail::Count(2));
+        check(VaultError::Version(2), "unknown_version", &[version]);
+        check(VaultError::Damaged("nonce"), "damaged", &[]);
+        let json = serde_json::from_str::<u8>("{").unwrap_err();
+        check(VaultError::Holder(LoadError::Json(json)), "damaged", &[]);
+        let format = ("format", Detail::Count(9));
+        let newer = VaultError::Holder(LoadError::Format(9));
+        check(newer, "unknown_format", &[format]);
+        check(VaultError::Passphrase, "wrong_passphrase", &[]);
+        check(VaultError::EmptyPassphrase, "empty_passphrase", &[]);
+        check(VaultError::Memory, "out_of_memory", &[]);
+        check(VaultError::Random, "no_randomness", &[]);
     }
 }

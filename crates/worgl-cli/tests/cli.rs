@@ -8,7 +8,8 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use worgl::{LedgerConfig, MintKey, MintRequest, Note, Policy, PublicKey};
 use worgl_client::{Client, MemoryStore, Purse};
-use worgl_sdk::{PaymentRequest, Spacing};
+use worgl_sdk::vault::{MintEntry, Vault};
+use worgl_sdk::{Holder, MintView, PaymentRequest, Spacing};
 use worgl_server::{AppState, MintSpec, init_state, router};
 
 const PASSPHRASE: &str = "correct horse battery staple";
@@ -1162,6 +1163,91 @@ async fn the_purse_is_encrypted() {
     assert!(again.stderr.contains("already exists"), "{}", again.stderr);
     let missing = setup.worgl("nobody.worgl", &["notes"]).await;
     assert!(missing.stderr.contains("worgl init"), "{}", missing.stderr);
+    let empty = setup.worgl_with("empty.worgl", "", &["init"]).await;
+    assert!(!empty.ok);
+    assert!(
+        empty.stderr.contains("the passphrase is empty"),
+        "{}",
+        empty.stderr
+    );
+    assert!(!setup.path("empty.worgl").exists());
+}
+
+/// A purse `worgl` 0.1 wrote, under the test passphrase: notes of 8 and 4,
+/// and the request below expected, all of a mint no test serves.
+const WRITTEN_BY_0_1: &str = include_str!("../../worgl-sdk/tests/fixtures/purse-v1.worgl");
+const ITS_MINT: &str = "eefdebef624c7eca2dc7010746dfcb64a7e85459dfe31dd0068da35d208d3104";
+const ITS_REQUEST: &str = r#"{
+  "mint": "eefdebef624c7eca2dc7010746dfcb64a7e85459dfe31dd0068da35d208d3104",
+  "outputs": [
+    {"amount": 4, "holder": "83be289f23271b938ab19cffd9c441f288942d07c648ecebdb08cc564ef7d390"},
+    {"amount": 1, "holder": "71df4b2c94d1645c5a75b210a5fa934db5bc2073b78859a056f02b1593a54ecc"}
+  ]
+}"#;
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_purse_worgl_0_1_wrote_opens_and_saves() {
+    let setup = Setup::start().await;
+    fs::write(setup.path("old.worgl"), WRITTEN_BY_0_1).unwrap();
+    fs::write(setup.path("request.json"), ITS_REQUEST).unwrap();
+    let run = setup.ok("old.worgl", &["withdraw", "request.json"]).await;
+    assert!(
+        run.stderr.contains("No longer expecting 5"),
+        "{}",
+        run.stderr
+    );
+
+    let saved = fs::read_to_string(setup.path("old.worgl")).unwrap();
+    assert_ne!(saved, WRITTEN_BY_0_1);
+    let (_, opened) = Vault::open(&saved, PASSPHRASE).unwrap();
+    assert!(opened.mints.is_empty());
+    let view = MintView {
+        issuer: ITS_MINT.parse().unwrap(),
+        layers: 4,
+        oldest: 0,
+        policy: Policy::cash_like(),
+        schedule: None,
+        paused: false,
+    };
+    let balance = opened.holder.balance(&view);
+    assert_eq!((balance.spendable, balance.requested), (12, 0));
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_mint_list_in_the_purse_is_kept() {
+    let setup = Setup::start().await;
+    setup.ok("alice.worgl", &["init"]).await;
+    setup.mint_into("alice.worgl", 8).await;
+    // Restored into a new purse and sealed again with the server of its
+    // mint and a name for it, as the TypeScript SDK seals a backup.
+    let saved = fs::read_to_string(setup.path("alice.worgl")).unwrap();
+    let (vault, opened) = Vault::open(&saved, PASSPHRASE).unwrap();
+    assert!(opened.mints.is_empty());
+    let mut restored = Holder::new();
+    restored.merge(&opened.holder);
+    let mut entry = MintEntry::new(setup.mint, &setup.url);
+    entry.extra.insert("name".into(), "Playground".into());
+    let backup = vault.seal(&restored, std::slice::from_ref(&entry)).unwrap();
+    fs::write(setup.path("alice.worgl"), backup).unwrap();
+
+    let mint = setup.mint.to_string();
+    setup
+        .ok(
+            "alice.worgl",
+            &["request", &mint, "5", "-o", "request.json"],
+        )
+        .await;
+    let balance = setup.balance("alice.worgl").await;
+    assert!(balance.contains("spendable  8\n"), "{balance}");
+    assert!(balance.contains("unchecked  8 "), "{balance}");
+    assert!(balance.contains("requested  5 "), "{balance}");
+    let saved = fs::read_to_string(setup.path("alice.worgl")).unwrap();
+    let (_, reopened) = Vault::open(&saved, PASSPHRASE).unwrap();
+    assert_eq!(reopened.mints, [entry]);
+    assert_eq!(
+        reopened.holder.notes().count(),
+        opened.holder.notes().count()
+    );
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

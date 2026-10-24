@@ -23,6 +23,7 @@
  * @module
  */
 
+export { Backup, type BackupMint } from './backup.ts';
 export {
   Client,
   type ClientOptions,
@@ -34,7 +35,9 @@ export {
   isTransient,
 } from './client.ts';
 export {
+  type BackupOptions,
   type Balance,
+  type Checked,
   DEFAULT_RETRY,
   DEFAULT_SPACING,
   type HeldNote,
@@ -47,6 +50,7 @@ export {
   Purse,
   type PurseOptions,
   type Refused,
+  type Restored,
   type Retry,
   type ScheduledTransfer,
   type Spacing,

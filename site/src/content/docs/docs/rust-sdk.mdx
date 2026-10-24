@@ -55,10 +55,10 @@ stays outgoing, for `settle` to send again.
 `Purse::open` keeps the purse in a JSON file. The file holds every note's
 secret key, and the notes are bearer, so keep it private and encrypted at
 rest. Implement `Store` to keep it elsewhere; the `worgl` command keeps its
-purse encrypted under a passphrase this way. Several processes can share
-the file: before each change a purse locks it and reads it again, so none
-saves over another's change. A `Store` of your own does the same by
-implementing `lock`.
+purse encrypted under a passphrase this way, with `worgl_sdk::vault`.
+Several processes can share the file: before each change a purse locks it
+and reads it again, so none saves over another's change. A `Store` of your
+own does the same by implementing `lock`.
 
 The mint's answers to a payment hold notes for both sides, and
 `Submitted::theirs` lists the other side's. The payee hands them back to the
@@ -149,6 +149,21 @@ transfers to resend before the next rotation. Both spread them over the time
 left from a `now` by the mint's clock, which `Client::view_and_time` reads
 from the `Date` of the server's answer, and plan them all at once when that
 time has passed the rotation's. The holder saves to JSON with its secret keys.
+
+`Holder::merge` takes another copy of a holder's purse into it, such as a
+backup or another device's copy, and returns what changed, `Merged`: what it
+took in, the notes the other copy spent, the transfers it settled,
+cancelled or forgot, and the transfers that spend a note both copies spent.
+What only the other copy had may be out of date, so it comes in unchecked,
+`Holder::unchecked`, and counts in `Balance::unchecked` until the mint says
+otherwise; `Holder::keep` and `Holder::discard` take its answers, and a
+later merge leaves out a note discarded so. Its documentation weighs what
+asking the mint shows. `Holder::join` takes in a part as current, such as
+the holder of another server's mints for one backup of both. With the
+`vault` feature, `worgl_sdk::vault` seals a holder under a passphrase into the
+[purse file](../command-line/#the-purse-file) `worgl` keeps, with the server
+of each mint beside it, and opens one, a backup of the TypeScript SDK's
+included.
 
 ## Reference
 

@@ -18,7 +18,7 @@ serde.workspace = true
 serde_json.workspace = true
 wasm-bindgen.workspace = true
 worgl.workspace = true
-worgl-sdk.workspace = true
+worgl-sdk = { workspace = true, features = ["vault"] }
 
 # Browsers and Node give WebAssembly its randomness through crypto.getRandomValues.
 [target.'cfg(target_arch = "wasm32")'.dependencies]

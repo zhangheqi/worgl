@@ -100,14 +100,30 @@ the mint answers with the same notes while it keeps its answers.
   `refreshing` on their way back from them, and `requested`. Its `total`,
   held plus change and refreshing, counts no note twice: paying lowers it by
   the amount paid, and submitting, settling and refreshing leave it as it
-  is. `outgoing` and `expected` sum some of those parts, and `expiring` is
-  part of what is held. `unconfirmed`, change of transfers dropped or
-  cancelled, is in no part: after a cancel it comes only if the mint spent
-  the note taken back.
+  is. `outgoing` and `expected` sum some of those parts, `expiring` is part
+  of what is held, and `unchecked` is the part of the total a restore took
+  in from another copy of the purse, until the mint says it was not spent
+  since. `unconfirmed`, change of transfers dropped or cancelled, is in no
+  part: after a cancel it comes only if the mint spent the note taken back.
 - `purse.takeFromFaucet(new Client(faucetUrl))` asks a playground faucet
   (`worgl-faucet`) for a note, to a fresh key like any other, and keeps it.
   A page on another origin than the faucet's can ask it only if the faucet
   names that origin with `--allow-origin`.
+- `purse.backup(passphrase)` seals the purse into a backup, the file the
+  `worgl` command line keeps its purse in, naming the purse's server for
+  each mint; `{ purses, mints }` adds the purses of other servers, and what
+  the application keeps of each mint, such as a name, which every reader
+  gives back in `backup.mints`. `Backup.open(sealed, passphrase)` opens one,
+  or a purse file of `worgl`, and `purse.restore(backup)` merges it in: a
+  note in both is held once, and a transfer either copy settled, cancelled
+  or forgot stays ended. What only the backup had may have been spent since
+  by another copy, so it comes in unchecked (`purse.unchecked()`) and
+  counts until the mint says otherwise: `purse.checkNotes()` asks it about
+  each, at random gaps, discards the spent ones and keeps the rest, which
+  shows the mint those notes one after another. A backup restored again
+  leaves out the notes discarded so. Deriving a backup's key takes 64 MiB
+  of memory and about a quarter of a second, and an empty passphrase is
+  refused.
 - `Client` makes one call per route and rejects with a `MintError` carrying
   the mint's code (`spent`, `frozen`, `paused`…); `isTransient(error)` says
   whether trying again may work. It counts `layer_full` out: a transfer
@@ -123,10 +139,11 @@ the mint answers with the same notes while it keeps its answers.
   browser share an `IndexedDbStore`. Before each change a purse takes the
   lock, reads what is saved, makes the change to that and saves before
   letting go, so none saves over a note another took in; it never holds
-  the lock across a request to the mint, and `settle` resends what is
-  saved now. Reads such as `notes` and `balance` show what the purse last
-  read or saved. `MemoryStore` and `FileStore` have no lock, so give each
-  purse one of its own; a store that wraps another passes its `lock` on.
+  the lock across a request to the mint, and `settle` resends, `backup`
+  seals and `checkNotes` asks about what is saved now. Reads such as
+  `notes` and `balance` show what the purse last read or saved.
+  `MemoryStore` and `FileStore` have no lock, so give each purse one of its
+  own; a store that wraps another passes its `lock` on.
 
 Importing the package loads the WebAssembly module: from disk under Node,
 through `fetch` relative to the module in a browser or bundler. It needs
@@ -159,8 +176,9 @@ rejects with `store_changed`, as does one whose save finds something saved
 since the change read the store; the change is undone, and the next one
 reads the store again. A submit keeps what the mint answered all the same:
 it makes that change again on what is saved now, since a resend gets an
-answer back only while the mint keeps it. The store saves only under its
-lock, as a purse does: a `save` outside it throws a `DOMException` named
+answer back only while the mint keeps it. So does `checkNotes`, so that no
+note has to be asked about again. The store saves only under its lock, as
+a purse does: a `save` outside it throws a `DOMException` named
 `InvalidStateError`.
 
 Web Locks exist only in a secure context, so the page must be served over
@@ -172,7 +190,8 @@ blocks, holding the database open in an older version, rejects with
 `store_blocked` rather than waiting. What the store holds lasts until the
 site's data is cleared or a private window closes, and the browser may
 clear it to free space unless the page holds persistent storage
-(`navigator.storage.persist()`).
+(`navigator.storage.persist()`). A backup from `purse.backup`, kept outside
+the browser, restores the purse once the store is gone.
 
 ## Following a submit
 
@@ -281,10 +300,17 @@ purse calls built on them.
 | `unasked` | `index` | `Submitted.refused`: note `index` of an answer is not the transfer's output in its place, but another mint's, or of another amount or key. The purse kept none of the answer. |
 | `unsigned` | `index` | `Submitted.refused`: note `index` of an answer does not carry the mint's signature: it is forged or altered, or the keys do not know its generation. The purse kept none of the answer. |
 | `faucet_amount` | `amount` | `takeFromFaucet`: the faucet hands out notes of `amount`, which its mint cannot make as one note. |
-| `store_blocked` | | `Purse.open`, or a change, on an `IndexedDbStore`: another tab holds its database open in an older version and did not close it when asked to. The next call tries again. |
-| `store_changed` | | A change of a purse on an `IndexedDbStore`: the change lost the store's lock while it was made, as when another tab took it with `steal`, or another writer saved since the change read the store. The change is undone, and the next one reads the store again. |
-| `unknown_format` | `format` | `Purse.open`: the saved purse is in `format`, a newer one this SDK does not read. |
-| `malformed` | | Any call: something it was given is not the JSON it takes, such as a payment request, a payment, notes, a mint's info or keys, or, for `Purse.open`, a saved purse; or a transfer spends no notes. |
+| `store_blocked` | | `Purse.open`, or any call that takes the store's lock, on an `IndexedDbStore`: another tab holds its database open in an older version and did not close it when asked to. The next call tries again. |
+| `store_changed` | | A change of a purse on an `IndexedDbStore`: the change lost the store's lock while it was made, as when another tab took it with `steal`, or another writer saved since the change read the store. The change is undone, and the next one reads the store again. A change that keeps what the mint answered, in a submit or `checkNotes`, is made again instead. |
+| `wrong_passphrase` | | `Backup.open`: the passphrase is wrong, or the backup was altered after it was sealed: the two look the same. |
+| `not_sealed` | | `Backup.open`: the text is not a backup or purse file. |
+| `unknown_version` | `version` | `Backup.open`: the backup is of `version`, a newer one this SDK does not read. |
+| `damaged` | | `Backup.open`: a part of the backup does not read, such as its salt, settings or ciphertext, or it opened to no purse. The message says which. |
+| `out_of_memory` | | `Backup.open`, `backup`: too little memory to derive the key: 64 MiB, or up to 256 MiB for a backup whose settings ask for more. |
+| `no_randomness` | | `backup`: the system's random number generator failed. |
+| `empty_passphrase` | | `backup`: the passphrase is empty, which would let anyone who gets the backup spend its notes. |
+| `unknown_format` | `format` | `Purse.open`, `Backup.open`, or any call that takes the lock of a store that has one, once another tab saved the purse with a newer SDK: the saved purse, or the one a backup holds, is in `format`, a newer one this SDK does not read. Reloading the page loads the newer SDK. |
+| `malformed` | | Any call: something it was given is not the JSON it takes, such as a payment request, a payment, notes, a mint's info or keys, or, for `Purse.open` and any call that takes the lock of a store that has one, a saved purse; or a transfer spends no notes. |
 | `no_layers` | | Any call that reads a mint's info: the info lists no layers. |
 
 ## Building and testing
@@ -292,7 +318,7 @@ purse calls built on them.
 ```sh
 rustup target add wasm32-unknown-unknown
 cargo install wasm-bindgen-cli --version 0.2.129 --locked  # the version Cargo.lock pins
-cargo build -p worgl-server -p worgl-faucet   # the tests run against them
+cargo build -p worgl-server -p worgl-faucet -p worgl-cli   # the tests run against them
 npm ci
 npm run build   # compiles the Rust core to wasm/ and the package to dist/
 npm run check   # type-checks the package and its tests
