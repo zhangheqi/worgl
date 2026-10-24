@@ -31,6 +31,7 @@ export {
   type MintInfo,
   MintError,
   type NoteState,
+  type RequestOptions,
   isTransient,
 } from './client.ts';
 export {
@@ -53,6 +54,8 @@ export {
   type Retry,
   type ScheduledTransfer,
   type Spacing,
+  type SubmitOptions,
+  type SubmitProgress,
   type Submitted,
 } from './purse.ts';
 export {

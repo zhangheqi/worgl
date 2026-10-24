@@ -1,5 +1,11 @@
 import { type Backup, type BackupMint, mintList, seal } from './backup.ts';
-import { type Client, MintError, type NoteState, isTransient } from './client.ts';
+import {
+  type Client,
+  MintError,
+  type NoteState,
+  type RequestOptions,
+  isTransient,
+} from './client.ts';
 import {
   Holder,
   type Scheduled,
@@ -14,7 +20,7 @@ import {
   transferMint,
   verifyNotes,
 } from './core.ts';
-import { type WorglError, worglError } from './error.ts';
+import { type WorglError, isWorglError, worglError } from './error.ts';
 import { MemoryStore, type Store } from './store.ts';
 
 /**
@@ -254,9 +260,108 @@ export interface Submitted {
   /**
    * Transfers the mint refused, that kept failing on the way, or whose answer
    * the purse kept none of: one that is not the mint's, or that it could not
-   * read the mint's keys to check.
+   * read the mint's keys to check. A transfer on its way when
+   * {@link SubmitOptions.signal} aborted is here too, as one whose answer was
+   * lost.
    */
   refused: Refused[];
+  /**
+   * Transfers not sent, because {@link SubmitOptions.signal} aborted before
+   * their turn, in the order they would have gone, as they were given. Those
+   * this purse made stay outgoing, for {@link Purse.settle}; submit the others
+   * again to carry them out.
+   */
+  unsent: ScheduledTransfer[];
+}
+
+/**
+ * Where one transfer of a {@link Purse.submit} stands, as
+ * {@link SubmitOptions.onProgress} hears of it.
+ */
+export interface SubmitProgress {
+  /**
+   * What just happened to the transfer:
+   *
+   * - `waiting`: it waits for its time, `sendAt`. A transfer whose time has
+   *   come, or every one after {@link SubmitOptions.sendNow}, skips this step.
+   * - `sending`: it is on its way to the mint, retries included; the purse
+   *   then checks the answer against the mint's keys and keeps it.
+   * - `answered`: the mint answered it and the purse kept the answer.
+   * - `refused`: it did not go through, or its answer was not kept, and it
+   *   is listed in {@link Submitted.refused}; `refusal` says why, and
+   *   whether the purse keeps it for later.
+   * - `unsent`: it is listed in {@link Submitted.unsent}.
+   */
+  step: 'waiting' | 'sending' | 'answered' | 'refused' | 'unsent';
+  /** The transfer, as it was given. */
+  transfer: ScheduledTransfer;
+  /** Its place in the order the transfers are sent in, from 0. */
+  index: number;
+  /** Transfers in all. */
+  total: number;
+  /** Transfers answered so far. */
+  answered: number;
+  /** Transfers refused so far. */
+  refused: number;
+  /**
+   * For `waiting`, when the transfer is sent unless the waits are cut short:
+   * milliseconds since the epoch by this machine's clock, as `Date.now()`
+   * counts them. `undefined` for the other steps.
+   */
+  sendAt: number | undefined;
+  /**
+   * For `refused`, the transfer's entry in {@link Submitted.refused}: the
+   * error, and with {@link Refused.outcome} whether the purse kept it for a
+   * later {@link Purse.settle}, as after a lost answer or a mint that is
+   * busy, or dropped or cancelled it for good. `undefined` for the other
+   * steps.
+   */
+  refusal: Refused | undefined;
+}
+
+/**
+ * How a screen follows a {@link Purse.submit} and cuts it short.
+ * {@link Purse.receive}, {@link Purse.settle} and {@link Purse.refresh}, which
+ * submit too, take the same.
+ */
+export interface SubmitOptions {
+  /**
+   * Called as each transfer moves on, in the order they are sent in: it is
+   * `waiting` for its time, then `sending`, then `answered` or `refused`, or
+   * `unsent` once submitting stopped before its turn (see
+   * {@link SubmitProgress}). Each call carries the counts so far, for a
+   * screen to draw "2 of 3" and when the next transfer goes. It is called
+   * synchronously, so it should return quickly. The purse goes on past an
+   * exception it throws and reports it as uncaught, as an event listener's
+   * is: a browser logs it, and Node ends the process, as for any uncaught
+   * exception, unless the application handles `uncaughtException`.
+   */
+  onProgress?: (progress: SubmitProgress) => void;
+  /**
+   * Cuts the waits short once it aborts: each transfer not yet sent goes at
+   * once, one after another. This gives up the spacing between them, so the
+   * mint can tell from when they arrive that their notes had one owner (see
+   * the {@link https://github.com/zhangheqi/worgl/blob/main/site/src/content/docs/docs/privacy.md#timing | Privacy model}):
+   * offer it as "send the rest now" to a person who would rather be quick.
+   * A retry after a failure still waits as {@link Retry} says.
+   */
+  sendNow?: AbortSignal;
+  /**
+   * Stops submitting once it aborts, as when the person leaves the page: no
+   * wait goes on, no transfer is sent after it, and the call resolves with
+   * what was done, once a change being saved is saved, so the holder is
+   * never left half-saved. The transfer on its way, if any, is abandoned
+   * and treated as one whose answer was lost, since the mint may have
+   * applied it: it is listed in {@link Submitted.refused} with outcome
+   * `kept` and the signal's reason as its error, by default an `AbortError`
+   * that {@link isTransient} accepts, and one this purse made stays
+   * outgoing, for {@link Purse.settle} to send again. An answer the mint
+   * has given already is not abandoned, since a resend gets it again only
+   * while the mint keeps it: the purse still reads the mint's keys to check
+   * it, within the client's timeout and as {@link Retry} says, and keeps
+   * it. The transfers not yet sent are listed in {@link Submitted.unsent}.
+   */
+  signal?: AbortSignal;
 }
 
 /**
@@ -447,6 +552,15 @@ export interface PurseOptions {
  * Nothing that depends on a change leaves the purse before the change is
  * saved. If a save fails, the change is undone and the call rejects.
  * Changes are applied and saved one at a time, so calls may overlap.
+ *
+ * Several purses can share a store that has a {@link Store.lock | lock},
+ * as the tabs of a browser share an `IndexedDbStore` from `worgl/browser`.
+ * Before each change the purse takes the lock and reads the holder saved
+ * there, makes the change to that, and saves before letting go, so a note
+ * another purse took in meanwhile is kept, not saved over. It never holds
+ * the lock across a request to the mint, and {@link settle} resends the
+ * transfers of the holder saved now. Reads such as {@link notes} and
+ * {@link balance} show the holder as this purse last read or saved it.
  */
 export class Purse {
   /** The client requests go through. */
@@ -699,12 +813,17 @@ export class Purse {
   /**
    * Takes a payment for `request`: checks that it pays what was asked, then
    * submits each transfer at its time and takes in the notes. Resolves once
-   * the last transfer is answered or refused. The payer chose the times.
-   * Hand {@link Submitted.theirs}, the payer's change, back to the payer.
+   * the last transfer is answered or refused, or once `options.signal`
+   * aborts (see {@link submit}). The payer chose the times. Hand
+   * {@link Submitted.theirs}, the payer's change, back to the payer.
    */
-  async receive(request: PaymentRequest, payment: Payment): Promise<Submitted> {
+  async receive(
+    request: PaymentRequest,
+    payment: Payment,
+    options: SubmitOptions = {},
+  ): Promise<Submitted> {
     checkPayment(request.json, payment.json);
-    return this.submit(payment.transfers);
+    return this.submit(payment.transfers, options);
   }
 
   /**
@@ -739,7 +858,9 @@ export class Purse {
   /**
    * Resends the transfers this purse made and has not seen answered, at
    * random gaps, and takes in their change. Call it once a payee has had
-   * time to submit a payment, or after a restart. The answer to a payment's
+   * time to submit a payment, or after a restart. With a store that has a
+   * lock, the transfers are those of the holder saved now, so they include
+   * any another purse on the store made. The answer to a payment's
    * transfer keeps the payee's notes for it, in case the payee has not
    * submitted the payment and the resend carried it out (see
    * {@link MadePayment.owed}), and a transfer refused for good is dropped or
@@ -753,10 +874,17 @@ export class Purse {
    * `expired`, with {@link Refused.atStake} set, and its change can only
    * come from the counterparty, for {@link accept}. {@link refresh} resends
    * the transfers whose chance the next rotation ends.
+   *
+   * `options` follow it and cut it short as they do {@link submit}.
    */
-  async settle(spacing: Spacing = DEFAULT_SPACING): Promise<Submitted> {
-    const transfers = read(this.#holder.resend(BigInt(spacing.minSecs), BigInt(spacing.maxSecs)));
-    return this.submit(transfers);
+  async settle(
+    spacing: Spacing = DEFAULT_SPACING,
+    options: SubmitOptions = {},
+  ): Promise<Submitted> {
+    const transfers = await this.#current(async () =>
+      read(this.#holder.resend(BigInt(spacing.minSecs), BigInt(spacing.maxSecs))),
+    );
+    return this.submit(transfers, options);
   }
 
   /**
@@ -774,23 +902,43 @@ export class Purse {
    * due at once.
    */
   async planRefresh(mint: string): Promise<ScheduledTransfer[]> {
-    const { info, time } = await this.client.infoTextAndTime(mint);
-    const { refreshes, resends } = await this.#changeOrRestore(() => {
-      // Before the refreshes join the outgoing transfers.
-      const resends = read(this.#holder.dueResends(info, time));
-      return { refreshes: read(this.#holder.refresh(info, time)), resends };
-    });
-    return [...refreshes, ...resends].sort((a, b) => a.afterSecs - b.afterSecs);
+    return this.#planRefresh(await this.client.infoTextAndTime(mint));
   }
 
   /**
    * Refreshes `mint`'s notes that die at the next rotation, each at a random
    * moment before it, and resends the outgoing transfers that must land
    * before it. Resolves once the last is done, which may be most of a
-   * rotation period away.
+   * rotation period away, or once `options.signal` aborts (see
+   * {@link submit}). The refreshes it did not send then stay outgoing, for
+   * {@link settle} or the next refresh. Once the signal has aborted before
+   * the mint's info is read, it plans none.
    */
-  async refresh(mint: string): Promise<Submitted> {
-    return this.submit(await this.planRefresh(mint));
+  async refresh(mint: string, options: SubmitOptions = {}): Promise<Submitted> {
+    const { signal } = options;
+    let answer: { info: string; time: bigint } | undefined;
+    if (!signal?.aborted) {
+      try {
+        answer = await this.client.infoTextAndTime(mint, requestOptions(signal));
+      } catch (error) {
+        // Stopped before anything was planned, it has nothing to submit.
+        if (!stoppedBy(signal, error)) {
+          throw error;
+        }
+      }
+    }
+    const plan = answer === undefined || signal?.aborted ? [] : await this.#planRefresh(answer);
+    return this.submit(plan, options);
+  }
+
+  /** {@link planRefresh}, from a mint's info and the time it was read. */
+  async #planRefresh({ info, time }: { info: string; time: bigint }): Promise<ScheduledTransfer[]> {
+    const { refreshes, resends } = await this.#changeOrRestore(() => {
+      // Before the refreshes join the outgoing transfers.
+      const resends = read(this.#holder.dueResends(info, time));
+      return { refreshes: read(this.#holder.refresh(info, time)), resends };
+    });
+    return [...refreshes, ...resends].sort((a, b) => a.afterSecs - b.afterSecs);
   }
 
   /**
@@ -821,43 +969,113 @@ export class Purse {
    * is not the mint's, such as one from a server that is not the mint's, nor
    * of one it cannot read the keys to check.
    *
+   * With a store that has a lock, what the mint answered is kept even when
+   * its save is refused with `store_changed`, as when another purse takes
+   * the lock meanwhile: the purse makes the change again on what is saved
+   * now, since a resend gets an answer back only while the mint keeps it.
+   *
    * A refused transfer does not stop the others; it is listed in
    * {@link Submitted.refused}, as is one whose answer the purse did not keep.
    * One this purse made that the mint refused for good is dropped or
    * cancelled ({@link Refused.outcome}); the rest stay outgoing. To confirm a
    * `policy` refusal, the purse reads the mint's info again. Rejects only if
-   * a save fails.
+   * the store fails: a save, or the read of a store with a lock before a
+   * change.
+   *
+   * With `options`, a screen follows each transfer as it waits, goes and is
+   * answered, can cut the waits short, and can stop the call, as when the
+   * person leaves the page: see {@link SubmitOptions}. Stopped, it resolves
+   * with each transfer answered and kept, or listed in
+   * {@link Submitted.refused} or {@link Submitted.unsent}.
    */
-  async submit(transfers: ScheduledTransfer[]): Promise<Submitted> {
+  async submit(transfers: ScheduledTransfer[], options: SubmitOptions = {}): Promise<Submitted> {
+    const { onProgress, sendNow, signal } = options;
     const order = [...transfers].sort((a, b) => a.afterSecs - b.afterSecs);
     const start = Date.now();
-    const submitted: Submitted = { value: 0n, answered: 0, notes: [], theirs: [], refused: [] };
-    for (const transfer of order) {
-      await sleepUntil(start + Math.min(transfer.afterSecs, MAX_DELAY_SECS) * 1000);
-      let notes: string[];
+    const submitted: Submitted = {
+      value: 0n,
+      answered: 0,
+      notes: [],
+      theirs: [],
+      refused: [],
+      unsent: [],
+    };
+    const report = (
+      step: SubmitProgress['step'],
+      index: number,
+      { sendAt, refusal }: { sendAt?: number; refusal?: Refused } = {},
+    ): void => {
+      if (onProgress === undefined) {
+        return;
+      }
+      const progress: SubmitProgress = {
+        step,
+        transfer: order[index]!,
+        index,
+        total: order.length,
+        answered: submitted.answered,
+        refused: submitted.refused.length,
+        sendAt,
+        refusal,
+      };
       try {
-        notes = await this.#retrying(() => this.client.transfer(transfer.request));
+        onProgress(progress);
       } catch (error) {
-        const { atStake, outcome } = await this.#refused(transfer.request, error);
-        submitted.refused.push({ request: transfer.request, error, atStake, outcome });
+        // Reported as an event listener's would be, without stopping here.
+        queueMicrotask(() => {
+          throw error;
+        });
+      }
+    };
+    const request = requestOptions(signal);
+    for (const [index, transfer] of order.entries()) {
+      const sendAt = start + Math.min(transfer.afterSecs, MAX_DELAY_SECS) * 1000;
+      if (!signal?.aborted && !sendNow?.aborted && sendAt > Date.now()) {
+        report('waiting', index, { sendAt });
+        await sleepUntil(sendAt, signal, sendNow);
+      }
+      if (signal?.aborted) {
+        submitted.unsent.push(transfer);
+        report('unsent', index);
         continue;
       }
+      report('sending', index);
+      let notes: string[];
+      try {
+        notes = await this.#retrying(() => this.client.transfer(transfer.request, request), signal);
+      } catch (error) {
+        // Stopped on its way, it is as a transfer whose answer was lost: the
+        // mint may have applied it, so it stays outgoing.
+        const { atStake, outcome } = stoppedBy(signal, error)
+          ? { atStake: undefined, outcome: 'kept' as const }
+          : await this.#refused(transfer.request, error, signal);
+        const refusal: Refused = { request: transfer.request, error, atStake, outcome };
+        submitted.refused.push(refusal);
+        report('refused', index, { refusal });
+        continue;
+      }
+      // The answer is in hand, so it is checked and kept even once the
+      // signal has aborted: a resend gets it again only while the mint
+      // keeps it.
       const taken = await this.#takeAnswer(transfer.request, notes);
       if ('error' in taken) {
         // Nothing changed: a transfer this purse made stays outgoing, for the
         // next settle.
-        submitted.refused.push({
+        const refusal: Refused = {
           request: transfer.request,
           error: taken.error,
           atStake: undefined,
           outcome: 'kept',
-        });
+        };
+        submitted.refused.push(refusal);
+        report('refused', index, { refusal });
         continue;
       }
       submitted.value += taken.value;
       submitted.answered += 1;
       submitted.notes.push(...notes);
       submitted.theirs.push(...taken.theirs);
+      report('answered', index);
     }
     return submitted;
   }
@@ -866,7 +1084,7 @@ export class Purse {
    * Records the answer to `transfer` once it checks out against the keys of
    * the transfer's mint, and resolves to the value taken in and the
    * counterparty's notes, or to why the answer was not kept: it is not the
-   * mint's, or the keys could not be read. Rejects only if a save fails.
+   * mint's, or the keys could not be read. Rejects only if the store fails.
    */
   async #takeAnswer(
     transfer: string,
@@ -882,19 +1100,24 @@ export class Purse {
       return { error };
     }
     const json = JSON.stringify(notes);
-    // Set once the answer checked out: a rejection after it is the save's.
-    let checked = false;
+    // Set while the answer is checked: a rejection then is the answer's, and
+    // any other, before or after, is the store's.
+    let checking = false;
+    const take = (): { value: bigint; theirs: string[] } => {
+      checking = true;
+      const value = this.#holder.settle(keys, transfer, json);
+      checking = false;
+      return { value, theirs: JSON.parse(this.#holder.theirs(json)) as string[] };
+    };
     try {
-      return await this.#change(
-        () => {
-          const value = this.#holder.settle(keys, transfer, json);
-          checked = true;
-          return { value, theirs: JSON.parse(this.#holder.theirs(json)) as string[] };
-        },
-        () => {},
+      // Without a lock, an answer whose save fails stays in the holder, for
+      // the next save to keep. With one, the next change reads the store
+      // again, so the answer is taken out as any change is.
+      return await this.#untilSaved(() =>
+        this.store.lock === undefined ? this.#change(take, () => {}) : this.#changeOrRestore(take),
       );
     } catch (error) {
-      if (checked) {
+      if (!checking) {
         throw error;
       }
       return { error };
@@ -903,11 +1126,14 @@ export class Purse {
 
   /**
    * Drops or cancels a transfer the mint refused, when the refusal shows it
-   * can never be applied. A transfer that is not outgoing is left as it is.
+   * can never be applied. A transfer that is not outgoing is left as it is,
+   * and so is one whose refusal could be confirmed only after `signal`
+   * aborted.
    */
   async #refused(
     transfer: string,
     error: unknown,
+    signal: AbortSignal | undefined,
   ): Promise<{ atStake: bigint | undefined; outcome: Outcome }> {
     const code = error instanceof MintError ? error.code : undefined;
     if (code === 'spent' || code === 'expired') {
@@ -916,12 +1142,14 @@ export class Purse {
       if (!(error instanceof MintError && error.status === 409)) {
         return { atStake: this.#holder.atStake(transfer), outcome: 'kept' };
       }
-      return this.#changeOrRestore(() => {
-        // Before the transfer is dropped.
-        const atStake = this.#holder.atStake(transfer);
-        const outcome: Outcome = this.#holder.forget(transfer) ? 'dropped' : 'kept';
-        return { atStake, outcome };
-      });
+      return this.#untilSaved(() =>
+        this.#changeOrRestore(() => {
+          // Before the transfer is dropped.
+          const atStake = this.#holder.atStake(transfer);
+          const outcome: Outcome = this.#holder.forget(transfer) ? 'dropped' : 'kept';
+          return { atStake, outcome };
+        }),
+      );
     }
     let cancel: boolean;
     if (code === 'layer_full') {
@@ -933,7 +1161,8 @@ export class Purse {
       // under a looser policy is refused too: its change keys stay. Cancel
       // only if the policy published now agrees.
       try {
-        cancel = breaksPolicy(await this.client.infoText(transferMint(transfer)), transfer);
+        const info = await this.client.infoText(transferMint(transfer), requestOptions(signal));
+        cancel = breaksPolicy(info, transfer);
       } catch {
         cancel = false;
       }
@@ -948,7 +1177,9 @@ export class Purse {
     if (!cancel) {
       return { atStake: undefined, outcome: 'kept' };
     }
-    const cancelled = await this.#changeOrRestore(() => this.#holder.cancel(transfer));
+    const cancelled = await this.#untilSaved(() =>
+      this.#changeOrRestore(() => this.#holder.cancel(transfer)),
+    );
     return { atStake: undefined, outcome: cancelled ? 'cancelled' : 'kept' };
   }
 
@@ -1091,29 +1322,38 @@ export class Purse {
 
   /**
    * Makes the request `call` makes, again while the failure is transient, as
-   * {@link Retry} says.
+   * {@link Retry} says. Once `signal` aborts, a wait between tries ends and
+   * no try follows: a transient failure then rejects with the signal's
+   * reason, as does `call` when the signal stopped it, while a refusal
+   * rejects as itself.
    */
-  async #retrying<T>(call: () => Promise<T>): Promise<T> {
+  async #retrying<T>(call: () => Promise<T>, signal?: AbortSignal): Promise<T> {
     let delay = this.#retry.firstDelayMs;
     for (let attempt = 1; ; attempt += 1) {
       try {
         return await call();
       } catch (error) {
-        if (!isTransient(error) || attempt >= this.#retry.attempts) {
+        if (!isTransient(error)) {
           throw error;
         }
-        await sleep(nextWait(delay, error));
+        signal?.throwIfAborted();
+        if (attempt >= this.#retry.attempts) {
+          throw error;
+        }
+        await sleep(nextWait(delay, error), signal);
+        signal?.throwIfAborted();
         delay *= 2;
       }
     }
   }
 
   /**
-   * Changes the holder and saves it, after any change before it is saved.
-   * If the save fails, `undo` takes the change back and the call rejects.
+   * Changes the holder as saved now and saves it, after any change before
+   * it, holding the store's lock throughout if it has one. If the save
+   * fails, `undo` takes the change back and the call rejects.
    */
   #change<T>(apply: () => T, undo: (value: T) => void): Promise<T> {
-    const run = async (): Promise<T> => {
+    return this.#current(async () => {
       const value = apply();
       try {
         await this.store.save(this.#holder.toJson());
@@ -1122,6 +1362,31 @@ export class Purse {
         throw error;
       }
       return value;
+    });
+  }
+
+  /**
+   * Runs `use` after any change before it. With a store that has a lock, it
+   * runs holding it, on the holder saved now: read again if it is not this
+   * purse's, as when another purse saved since this one last read or saved.
+   */
+  #current<T>(use: () => Promise<T>): Promise<T> {
+    const run = (): Promise<T> => {
+      if (this.store.lock === undefined) {
+        return use();
+      }
+      return this.store.lock(async () => {
+        const saved = await this.store.load();
+        // Read in only if it differs: writing a holder out to compare takes
+        // a small part of the time reading one in does, and leaves no copy
+        // of its keys behind.
+        if (saved !== undefined && saved !== this.#holder.toJson()) {
+          const holder = Holder.fromJson(saved);
+          this.#holder.free();
+          this.#holder = holder;
+        }
+        return use();
+      });
     };
     const result = this.#changes.then(run, run);
     this.#changes = result.catch(() => {});
@@ -1150,6 +1415,25 @@ export class Purse {
       },
     );
   }
+
+  /**
+   * Makes `change` again for as long as the store refuses its save with
+   * `store_changed`, as when another purse takes the lock meanwhile or the
+   * store is cleared, each time on the holder saved now. It is for a change
+   * that keeps what the mint answered, which the refusal does not make
+   * wrong and which would be lost with the call.
+   */
+  async #untilSaved<T>(change: () => Promise<T>): Promise<T> {
+    for (;;) {
+      try {
+        return await change();
+      } catch (error) {
+        if (!(isWorglError(error) && error.code === 'store_changed')) {
+          throw error;
+        }
+      }
+    }
+  }
 }
 
 /** Copies scheduled transfers out of WebAssembly memory. */
@@ -1161,8 +1445,36 @@ function read(transfers: Scheduled[]): ScheduledTransfer[] {
   });
 }
 
-function sleep(ms: number): Promise<void> {
-  return new Promise((resolve) => setTimeout(resolve, ms));
+/** The options that send a request with `signal`, if there is one. */
+function requestOptions(signal: AbortSignal | undefined): RequestOptions {
+  return signal === undefined ? {} : { signal };
+}
+
+/** Whether `error` is the reason `signal` aborted with: a call it stopped. */
+function stoppedBy(signal: AbortSignal | undefined, error: unknown): boolean {
+  return signal?.aborted === true && error === signal.reason;
+}
+
+/** Waits `ms`, or until one of `signals` aborts if that comes first. */
+function sleep(ms: number, ...signals: (AbortSignal | undefined)[]): Promise<void> {
+  const watched = signals.filter((signal) => signal !== undefined);
+  return new Promise((resolve) => {
+    if (watched.some((signal) => signal.aborted)) {
+      resolve();
+      return;
+    }
+    const done = (): void => {
+      clearTimeout(timer);
+      for (const signal of watched) {
+        signal.removeEventListener('abort', done);
+      }
+      resolve();
+    };
+    const timer = setTimeout(done, ms);
+    for (const signal of watched) {
+      signal.addEventListener('abort', done);
+    }
+  });
 }
 
 /** A gap drawn at random from `spacing`, in seconds. */
@@ -1187,9 +1499,19 @@ function nextWait(delay: number, error: unknown): number {
   return asked === undefined ? delay : Math.max(delay, Math.min(asked, MAX_RETRY_AFTER_MS));
 }
 
-/** Waits until `deadline`, in milliseconds since the epoch, in steps that timers can hold. */
-async function sleepUntil(deadline: number): Promise<void> {
-  for (let left = deadline - Date.now(); left > 0; left = deadline - Date.now()) {
-    await sleep(Math.min(left, 2 ** 31 - 1));
+/**
+ * Waits until `deadline`, in milliseconds since the epoch, in steps that
+ * timers can hold, or until one of `signals` aborts if that comes first.
+ */
+async function sleepUntil(
+  deadline: number,
+  ...signals: (AbortSignal | undefined)[]
+): Promise<void> {
+  for (
+    let left = deadline - Date.now();
+    left > 0 && !signals.some((signal) => signal?.aborted);
+    left = deadline - Date.now()
+  ) {
+    await sleep(Math.min(left, 2 ** 31 - 1), ...signals);
   }
 }

@@ -129,14 +129,115 @@ the mint answers with the same notes while it keeps its answers.
   refused so is refused every time, though a mint request may pass after
   the next rotation. What the SDK refuses itself is a `WorglError`, with a
   code of its own (see [Errors](#errors)).
-- Stores: `MemoryStore`, and `FileStore` from `worgl/node`, which replaces
-  its file atomically, readable by its owner only. The JSON holds every
-  note's secret key, so keep it private and encrypted at rest. Implement
-  `Store` to keep it elsewhere.
+- Stores: `MemoryStore`; `FileStore` from `worgl/node`, which replaces
+  its file atomically, readable by its owner only; and `IndexedDbStore`
+  from `worgl/browser` (see [In a browser](#in-a-browser)). The JSON holds
+  every note's secret key, so keep it private and encrypted at rest.
+  Implement `Store` to keep it elsewhere.
+- Several purses can share a store that has a `lock`, as tabs of one
+  browser share an `IndexedDbStore`. Before each change a purse takes the
+  lock, reads what is saved, makes the change to that and saves before
+  letting go, so none saves over a note another took in; it never holds
+  the lock across a request to the mint, and `settle` resends what is
+  saved now. Reads such as `notes` and `balance` show what the purse last
+  read or saved. `MemoryStore` and `FileStore` have no lock, so give each
+  purse one of its own; a store that wraps another passes its `lock` on.
 
 Importing the package loads the WebAssembly module: from disk under Node,
 through `fetch` relative to the module in a browser or bundler. It needs
 Node 22.18 or later, or a browser with top-level `await`.
+
+## In a browser
+
+```ts
+import { Client, Purse } from 'worgl';
+import { IndexedDbStore } from 'worgl/browser';
+
+const server = 'https://mint.example.com';
+const purse = await Purse.open(new Client(server), { store: new IndexedDbStore(server) });
+```
+
+`IndexedDbStore` keeps a purse in the browser's IndexedDB, in the database
+`worgl:<name>`. Name each store after its server, as above, and the purses
+of several servers live side by side. Each save is one transaction with
+strict durability: it resolves only once the browser has flushed it to
+disk, not once it has handed it to the operating system, which a power cut
+can undo and which Chrome does by default.
+
+Every tab and worker of the page's origin can open a purse on the store,
+and purses can share one `IndexedDbStore`. Each change takes the Web Lock
+of the same name, `worgl:<name>`, so an application that holds a lock of
+its own, such as for the one tab that keeps notes alive, names it
+otherwise, or every change waits for it. A change that loses the lock
+meanwhile, as when another tab takes it with `steal`, saves nothing and
+rejects with `store_changed`, as does one whose save finds something saved
+since the change read the store; the change is undone, and the next one
+reads the store again. A submit keeps what the mint answered all the same:
+it makes that change again on what is saved now, since a resend gets an
+answer back only while the mint keeps it. The store saves only under its
+lock, as a purse does: a `save` outside it throws a `DOMException` named
+`InvalidStateError`.
+
+Web Locks exist only in a secure context, so the page must be served over
+https or from localhost; elsewhere `new IndexedDbStore` throws a
+`DOMException` named `NotSupportedError`. A save the browser refuses
+rejects with its `DOMException`, such as a `QuotaExceededError` when the
+origin is out of space, and the change is undone. An open that another tab
+blocks, holding the database open in an older version, rejects with
+`store_blocked` rather than waiting. What the store holds lasts until the
+site's data is cleared or a private window closes, and the browser may
+clear it to free space unless the page holds persistent storage
+(`navigator.storage.persist()`).
+
+## Following a submit
+
+`submit`, and `receive`, `settle` and `refresh`, which submit too, take
+options for a screen that shows a payment or a refresh as it goes:
+
+```ts
+const rest = new AbortController();  // the "Send the rest now" button calls rest.abort()
+const leave = new AbortController();
+addEventListener('pagehide', () => leave.abort());
+
+const submitted = await alice.submit(payment.transfers, {
+  onProgress: ({ step, answered, refused, total, sendAt }) => {
+    // Draws "2 of 3", and while a transfer is waiting, when it goes.
+  },
+  sendNow: rest.signal,
+  signal: leave.signal,
+});
+```
+
+- `onProgress` hears of each transfer, in the order they go, as it is
+  `waiting` for its time (until `sendAt`, in `Date.now()` milliseconds),
+  `sending`, then `answered` or `refused`, or `unsent`, with the counts so
+  far. A `refused` one carries its entry of `submitted.refused` as
+  `refusal`, whose `outcome` tells a transfer kept for a later `settle`
+  from one dropped or cancelled for good. The purse goes on past an
+  exception it throws and reports it as uncaught, as an event listener's
+  is: a browser logs it, and Node ends the process unless the application
+  handles `uncaughtException`.
+- `sendNow` cuts the waits short once it aborts: the transfers left go one
+  after another. That gives up the spacing that keeps the mint from linking
+  their notes by when they arrive (see the
+  [Privacy model](../../site/src/content/docs/docs/privacy.md#timing)), so
+  offer it rather than make it the default. Retries after a failure still
+  wait.
+- `signal` stops the call once it aborts: no wait goes on, nothing more is
+  sent, and it resolves with what was done. A transfer on its way is
+  treated as one whose answer was lost, since the mint may have applied it:
+  it is in `submitted.refused` with outcome `kept` and the signal's reason
+  as its error. An answer the mint has given already is still checked and
+  kept, since a resend gets it again only while the mint keeps it, so the
+  stop takes effect from the next transfer. The transfers not sent are in
+  `submitted.unsent`. Those the purse made stay outgoing, so `settle` sends
+  them again later, and the mint answers one it applied with the same notes
+  while it keeps its answer. A change being saved is saved first, so the
+  purse is never left half-saved. A `refresh` stopped before it has read the
+  mint's info plans nothing.
+
+Every `Client` call takes `{ signal }` too, and rejects with the signal's
+reason once it aborts.
 
 ## Errors
 
@@ -195,6 +296,8 @@ purse calls built on them.
 | `unasked` | `index` | `Submitted.refused`: note `index` of an answer is not the transfer's output in its place, but another mint's, or of another amount or key. The purse kept none of the answer. |
 | `unsigned` | `index` | `Submitted.refused`: note `index` of an answer does not carry the mint's signature: it is forged or altered, or the keys do not know its generation. The purse kept none of the answer. |
 | `faucet_amount` | `amount` | `takeFromFaucet`: the faucet hands out notes of `amount`, which its mint cannot make as one note. |
+| `store_blocked` | | `Purse.open`, or a change, on an `IndexedDbStore`: another tab holds its database open in an older version and did not close it when asked to. The next call tries again. |
+| `store_changed` | | A change of a purse on an `IndexedDbStore`: the change lost the store's lock while it was made, as when another tab took it with `steal`, or another writer saved since the change read the store. The change is undone, and the next one reads the store again. |
 | `wrong_passphrase` | | `Backup.open`: the passphrase is wrong, or the backup was altered after it was sealed: the two look the same. |
 | `not_sealed` | | `Backup.open`: the text is not a backup or purse file. |
 | `unknown_version` | `version` | `Backup.open`: the backup is of `version`, a newer one this SDK does not read. |
@@ -217,5 +320,10 @@ npm run build   # compiles the Rust core to wasm/ and the package to dist/
 npm run check   # type-checks the package and its tests
 npm test        # runs the tests against a real server on a local port
 ```
+
+The tests of `IndexedDbStore` run under Node, on an IndexedDB in memory
+(`fake-indexeddb`) and Web Locks as a browser grants them. What only a
+browser shows, such as durability on disk, quota and private windows, they
+do not cover.
 
 The package is not published.
