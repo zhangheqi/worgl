@@ -147,3 +147,46 @@ export function say(error: unknown, doing: Doing, context: Context): Said {
 function fallback(doing: Doing): string {
   return doing === 'take' ? 'The faucet did not answer. Try again in a moment.' : 'Something went wrong. Try again in a moment.';
 }
+
+/** An error's name, code and status, as the SDK and the browser set them; empty where it has none. */
+export function fieldsOf(error: unknown): { name: string; code: string; status: number } {
+  const fields = typeof error === 'object' && error !== null ? (error as Record<string, unknown>) : {};
+  return {
+    name: typeof fields['name'] === 'string' ? fields['name'] : '',
+    code: typeof fields['code'] === 'string' ? fields['code'] : '',
+    status: typeof fields['status'] === 'number' ? fields['status'] : 0,
+  };
+}
+
+/**
+ * Whether trying again later may succeed, as the SDK's `isTransient` tells
+ * it: a request that never completed, or a mint that was paused, busy or
+ * could not store the change. `layer_full` is refused every time until the
+ * note's own layer goes.
+ */
+export function transient(error: unknown): boolean {
+  const { name, code, status } = fieldsOf(error);
+  if (name === 'MintError') {
+    return code !== 'layer_full' && (['paused', 'busy', 'storage', 'internal'].includes(code) || status >= 500);
+  }
+  return name === 'TypeError' || (typeof DOMException === 'function' && error instanceof DOMException);
+}
+
+/**
+ * What went wrong with the store, if it was the store: another tab holds it
+ * in an older version (`blocked`), another change saved first (`changed`),
+ * or the browser refused to save (`refused`).
+ */
+export function storeKind(error: unknown): 'blocked' | 'changed' | 'refused' | undefined {
+  const { name, code } = fieldsOf(error);
+  if (name === 'WorglError' && code === 'store_blocked') {
+    return 'blocked';
+  }
+  if (name === 'WorglError' && code === 'store_changed') {
+    return 'changed';
+  }
+  if (['QuotaExceededError', 'UnknownError', 'InvalidStateError', 'AbortError', 'VersionError'].includes(name)) {
+    return 'refused';
+  }
+  return undefined;
+}

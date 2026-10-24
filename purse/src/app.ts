@@ -1,13 +1,14 @@
-// The app: its state, its two routes, what the person's actions do, and
-// what keeps Holdings current while it is open. The views (first.ts,
-// home.ts) and the field (field.ts) are drawn from the state on every
-// change; the SDK is reached only through purses.ts, which is loaded once
-// the shell has painted.
+// The app: its state, its two routes, what the person's actions do, what
+// keeps Holdings current while it is open, and keep-alive's wiring: when
+// the keeper runs, what other tabs hear of it, and how a run shows. The
+// views (first.ts, home.ts) and the field (field.ts) are drawn from the
+// state on every change; the SDK is reached only through purses.ts, which is
+// loaded once the shell has painted.
 
 import type { FaucetInfo, MintInfo } from 'worgl';
 
-import { $, announce, reduced } from './dom.ts';
-import { type Said, linkWords, say } from './errors.ts';
+import { $, announce as speak, reduced } from './dom.ts';
+import { type Said, linkWords, say, transient } from './errors.ts';
 import {
   type FieldInput,
   type Opened,
@@ -16,15 +17,30 @@ import {
   dismissHover,
   drawMain,
   fieldTook,
+  hop as hopNote,
   moveNeedle,
 } from './field.ts';
 import { type FirstInput, type FirstState, firstView } from './first.ts';
-import { type Arrival, type LaneKey, fadedAt, holdingsFrom, laneOf } from './holdings.ts';
-import { type HomeData, type HomeInput, homeView, placeholder } from './home.ts';
+import {
+  type Arrival,
+  type Holdings,
+  type LaneKey,
+  type LastFade,
+  arrivalsOf,
+  comeBackAt,
+  fadedAt,
+  firstFade,
+  holdingsFrom,
+  laneOf,
+  savedHoldings,
+} from './holdings.ts';
+import { type Elsewhere, type HomeData, type HomeInput, type KeepShown, homeView, placeholder, renderBack } from './home.ts';
+import type { Moved } from './keep.ts';
+import { Keeper, type KeptServer, Keeping, type Shown } from './keeper.ts';
 import { type MintLink, hostOf, isMintHash, mintHash, parseMintLink } from './link.ts';
 import type { About, Read } from './purses.ts';
 import { type LogEntry, type MintRecord, Records, type SavedInfo } from './records.ts';
-import { rotatedWords, tookWords } from './words.ts';
+import { keptWords, rotatedWords, tookWords, unreachableFor } from './words.ts';
 
 type Sdk = typeof import('./purses.ts');
 
@@ -48,6 +64,24 @@ interface HomeState {
   took: { amount: number; ids: string[] } | undefined;
   /** What the last read drew, so that a read that finds nothing new draws nothing (and moves no focus). */
   drawn: string | undefined;
+  /** The error words last drawn: drawn again, they are not an alert again, so a screen reader says them once. */
+  alerted: string | undefined;
+}
+
+/** A keep-alive run, as Holdings shows it. */
+interface KeepState {
+  /** The shown mint's run in this tab: its hops' value, how many are done, of how many. */
+  progress: Shown | undefined;
+  /** Another tab's run of the shown mint, as it last said, and when. */
+  watching: { amount: number; done: number; total: number; at: number } | undefined;
+  /** The shown mint's hops answered, by the note each spent, until a read shows the note it brought. */
+  hops: Map<string, { v: number; generation: bigint; at: number }>;
+  /** Notes keep-alive just moved a layer on, by when: their thread, and their place until the run's log entry is in. */
+  hopped: Map<string, number>;
+  /** The layers a run's hops pass through, kept open from its first moving note until the notes change after it. */
+  lanes: Set<number>;
+  /** The notes as the run left them; undefined while it runs. */
+  lanesSig: string | undefined;
 }
 
 const blankFirst = (): FirstState => ({
@@ -82,7 +116,16 @@ const state = {
     arriving: [],
     took: undefined,
     drawn: undefined,
+    alerted: undefined,
   } as HomeState,
+  keep: {
+    progress: undefined,
+    watching: undefined,
+    hops: new Map(),
+    hopped: new Map(),
+    lanes: new Set(),
+    lanesSig: undefined,
+  } as KeepState,
 };
 
 /** The mint Holdings shows: the first one added, until the Mints screen comes. */
@@ -131,6 +174,9 @@ function render(): void {
   }
   const active = document.activeElement;
   const key = active instanceof HTMLElement || active instanceof SVGElement ? active.dataset['fk'] : undefined;
+  // on Holdings drawn again, where focus goes when what had it is not drawn: a number whose notes all moved, a tip that closed
+  const again = state.route === 'home' && document.documentElement.dataset['view'] === 'home';
+  const near = key === undefined || !again ? [] : nearKeys(key, active);
   const selection =
     active instanceof HTMLInputElement ? ([active.selectionStart, active.selectionEnd] as const) : undefined;
   const y = window.scrollY;
@@ -141,10 +187,13 @@ function render(): void {
   if (state.route === 'home' && record !== undefined) {
     mountField();
     state.home.drawn = shownSignature(Date.now());
+    state.home.alerted = homeError(record)?.words;
   }
   if (key !== undefined) {
-    const el = app.querySelector<HTMLElement>(`[data-fk="${CSS.escape(key)}"]`);
-    if (el !== null) {
+    const el = [key, ...near]
+      .map((each) => app.querySelector<HTMLElement>(`[data-fk="${CSS.escape(each)}"]`))
+      .find((each) => each !== null && each.getClientRects().length > 0);
+    if (el !== undefined && el !== null) {
       el.focus({ preventScroll: true });
       if (selection !== undefined && el instanceof HTMLInputElement) {
         try {
@@ -158,6 +207,24 @@ function render(): void {
   if (Math.abs(window.scrollY - y) > 1) {
     window.scrollTo(0, y);
   }
+}
+
+/**
+ * Where focus goes, in order, when the element with `key` is not drawn
+ * again: a number in the sentence goes to its lane's label, a tip's own
+ * button to the label of the lane the tip is about; else the heading.
+ */
+function nearKeys(key: string, active: Element | null): string[] {
+  const lane = /^num-(fade|ready|rest)$/.exec(key)?.[1];
+  if (lane !== undefined) {
+    return [`lane-${lane}`, 'h1'];
+  }
+  if (active?.closest('.f-tip') != null) {
+    // the field marks the lane its open tip is about, as it was drawn
+    const of = $('#field')?.dataset['sel'];
+    return of === undefined ? ['h1'] : [`lane-${of}`, 'h1'];
+  }
+  return ['h1'];
 }
 
 function firstInput(): FirstInput {
@@ -183,8 +250,13 @@ function homeInput(record: MintRecord): HomeInput {
   return {
     record,
     data: state.home.data,
+    saved: savedShown(record, Date.now()),
     log: state.log.filter((entry) => entry.mint === record.mint),
-    error: state.home.error,
+    error: homeError(record),
+    alert: homeError(record)?.words !== state.home.alerted,
+    keeps: keeps(record),
+    keep: keepShown(),
+    elsewhere: elsewhere(record, Date.now()),
     openLane: opened !== undefined && 'lane' in opened ? opened.lane : undefined,
     delta: state.home.delta,
     taking: state.home.taking,
@@ -200,6 +272,9 @@ function fieldInput(record: MintRecord): FieldInput {
     mintName: record.name,
     opened: state.home.opened,
     pink: state.home.pink,
+    keeps: keeps(record),
+    busy: state.keep.lanes,
+    hopped: state.keep.hopped,
     toggleLane,
     toggleNote,
     showNote,
@@ -423,12 +498,16 @@ function submitPaste(): void {
   readLink(parsed.link, true);
 }
 
-/** What the purse keeps of a mint's info: enough to draw its lanes before it answers. */
-const savedInfo = (info: MintInfo): SavedInfo => ({
+/**
+ * What the purse keeps of a mint's info: enough to draw its lanes before it
+ * answers, and what fades first, to say when it does not.
+ */
+const savedInfo = (info: MintInfo, fades: LastFade | null): SavedInfo => ({
   layers: info.layers,
   periodSecs: info.rotation === undefined ? undefined : Number(info.rotation.periodSecs),
   paused: info.paused,
   readAt: Date.now(),
+  fades,
 });
 
 /** Adds a mint to the purse's records. */
@@ -443,7 +522,8 @@ async function saveMint(link: MintLink, about: About): Promise<void> {
     name: isPlayground(link) ? 'Playground' : hostOf(link.server),
     unit: 'tokens',
     added: Date.now(),
-    info: savedInfo(about.info),
+    // nothing is held at a mint just added
+    info: savedInfo(about.info, null),
   });
   state.mints = await records.mints();
   tell();
@@ -568,13 +648,21 @@ async function takeHome(): Promise<void> {
   }
 }
 
-/** Adds an entry to the purse's log and reads the log back. */
-async function logEntry(entry: Omit<LogEntry, 'id'>): Promise<void> {
+/**
+ * Adds an entry to the purse's log and reads the log back. Keep-alive's
+ * entry for a rotation joins the one the log has for it already (`spent`:
+ * the notes its run moved, see `Records.addKept`).
+ */
+async function logEntry(entry: Omit<LogEntry, 'id'>, spent?: readonly Moved[]): Promise<void> {
   const records = state.records;
   if (records === undefined) {
     return;
   }
-  await records.addLog(entry);
+  if (entry.kind === 'kept' && entry.round !== undefined) {
+    await records.addKept(entry, spent ?? []);
+  } else {
+    await records.addLog(entry);
+  }
   state.log = await records.log();
 }
 
@@ -602,18 +690,8 @@ function refreshHome(): Promise<void> {
   return reading;
 }
 
-/** What the purse's log knows of each note of `mint`: when it came, and from where. */
-function arrivals(mint: string): Map<string, Arrival> {
-  const known = new Map<string, Arrival>();
-  for (const entry of state.log) {
-    if (entry.mint === mint && entry.kind === 'faucet') {
-      for (const id of entry.serials) {
-        known.set(id, { at: entry.t, source: 'faucet' });
-      }
-    }
-  }
-  return known;
-}
+/** What the purse's log knows of each note of `mint`, and of the notes keep-alive just moved: see `arrivalsOf`. */
+const arrivals = (mint: string): Map<string, Arrival> => arrivalsOf(state.log, mint, state.keep.hopped);
 
 /** The shown mint's faucet being asked now, if it is. */
 let askingFaucet: Promise<void> | undefined;
@@ -668,21 +746,20 @@ async function readHome(): Promise<void> {
   }
   let read: Read;
   try {
-    const loaded = await loadSdk();
-    read = await loaded.read(record.server, record.mint);
-    if (read.notes.some((note) => note.state === 'expired')) {
-      const { lost, generation } = await loaded.prune(record.server, record.mint);
-      if (lost > 0n && generation !== undefined) {
-        const t = fadedAt(generation, read.info, read.skew, Date.now());
-        await logEntry({ t, kind: 'faded', mint: record.mint, amount: Number(lost), serials: [] }).catch(() => undefined);
-        tell();
-      }
-      read = await loaded.read(record.server, record.mint);
-    }
+    read = await readPruned(record.server, record.mint);
   } catch (error) {
-    const said = say(error, 'open', { host: hostOf(record.server) });
+    const host = hostOf(record.server);
+    const said = say(error, 'open', { host });
     heed(said);
-    state.home.error = { words: said.words, at: 'read' };
+    // a mint that does not answer: what fades, and when, unless the purse reaches it
+    const fades = transient(error) ? unreachableFor(host, state.home.data?.holdings, record.info?.fades, Date.now()) : undefined;
+    state.home.error = { words: fades ?? said.words, at: 'read' };
+    // the visit's first pass runs all the same: the other mints are kept, and what a closed tab left outgoing is
+    // settled while the mints still keep their answers; the keeper asks this mint again each minute after it
+    if (!finishing && !pokedOnOpen) {
+      pokedOnOpen = true;
+      keeper.poke();
+    }
     if (state.route === 'home' && shownSignature(Date.now()) !== state.home.drawn) {
       render();
     }
@@ -692,7 +769,9 @@ async function readHome(): Promise<void> {
     return;
   }
   const before = state.home.data?.holdings;
-  const holdings = holdingsFrom(read.info, read.notes, read.total, read.firstExpiry, read.skew, arrivals(record.mint));
+  const holdings = holdingsFrom(read.info, read.notes, read.total, read.firstExpiry, read.skew, arrivals(record.mint), read.moving);
+  landHops(before, holdings);
+  keepLanes(holdings);
   const rotated = state.home.oldest !== undefined && read.info.oldest > state.home.oldest;
   state.home.oldest = read.info.oldest;
   state.home.data = { holdings, faucet: state.home.data?.faucet };
@@ -704,7 +783,13 @@ async function readHome(): Promise<void> {
     state.home.opened = undefined;
   }
   arrive(state.home.arriving.splice(0));
-  void keepInfo(record, read.info);
+  void keepInfo(record, read.info, firstFade(holdings));
+  // fading tokens, or tokens left on their way, call for a pass; and the first read of a visit, to settle what is outgoing
+  const calls = keeping.saw(record.mint, read);
+  if (!finishing && (!pokedOnOpen || calls === 'due' || (calls === 'moving' && !keeper.running))) {
+    pokedOnOpen = true;
+    keeper.poke();
+  }
   if (state.route !== 'home') {
     return;
   }
@@ -744,14 +829,20 @@ async function readHome(): Promise<void> {
 function shownSignature(now: number): string {
   const holdings = state.home.data?.holdings;
   const delta = state.home.delta;
+  const record = shown();
+  const keep = keepShown();
   return JSON.stringify([
     holdings?.total,
-    holdings?.notes.map((note) => [note.id, note.pos, note.expiresAt, note.readyAt]),
+    holdings?.notes.map((note) => [note.id, note.pos, note.expiresAt, note.readyAt, note.moving]),
     holdings?.schedule?.nextMs,
     holdings?.paused,
     holdings?.firstExpiry,
     state.home.data?.faucet?.amount.toString(),
-    state.home.error?.words,
+    record === undefined ? undefined : homeError(record)?.words,
+    record === undefined ? undefined : keeps(record),
+    keep === undefined ? undefined : [keep.amount, keep.done, keep.total, keep.spaced, keep.watching],
+    record === undefined ? undefined : elsewhereSig(record, now),
+    record === undefined ? undefined : savedShown(record, now)?.notes.map((note) => [note.v, note.pos, note.expiresAt]),
     state.log.length,
     state.log[0]?.id,
     delta !== undefined && now - delta.t < 60 * 60_000,
@@ -759,13 +850,23 @@ function shownSignature(now: number): string {
   ]);
 }
 
-/** Saves the mint's info when its shape changed, so that the next open draws its lanes at once. */
-async function keepInfo(record: MintRecord, info: MintInfo): Promise<void> {
-  const saved = savedInfo(info);
+/**
+ * Saves the mint's info when its shape changed, so that the next open draws
+ * its lanes at once, or when what fades first changed, so that an open the
+ * mint does not answer can say when.
+ */
+async function keepInfo(record: MintRecord, info: MintInfo, fades: LastFade | null): Promise<void> {
+  const saved = savedInfo(info, fades);
   const was = record.info;
   if (
     state.records === undefined ||
-    (was !== undefined && was.layers === saved.layers && was.periodSecs === saved.periodSecs && was.paused === saved.paused)
+    (was !== undefined &&
+      was.layers === saved.layers &&
+      was.periodSecs === saved.periodSecs &&
+      was.paused === saved.paused &&
+      was.fades !== undefined &&
+      was.fades?.at === fades?.at &&
+      was.fades?.amount === fades?.amount)
   ) {
     return;
   }
@@ -806,8 +907,65 @@ function tell(): void {
   channel?.postMessage('changed');
 }
 
-/** Another tab changed something: read the stores and the records again. */
-async function heard(): Promise<void> {
+/** What another tab's keep-alive says on the channel. */
+type KeepMessage =
+  | { kind: 'keeping'; mint: string; amount: number; done: number; total: number }
+  | { kind: 'kept'; mint: string }
+  | { kind: 'ask' };
+
+const count = (n: unknown): n is number => typeof n === 'number' && Number.isInteger(n) && n >= 0;
+
+/** A keep-alive message, if `data` is one; anything else is read as a change. */
+function keepMessage(data: unknown): KeepMessage | undefined {
+  if (typeof data !== 'object' || data === null || !('kind' in data)) {
+    return undefined;
+  }
+  const m = data as Record<string, unknown>;
+  if (m['kind'] === 'ask') {
+    return { kind: 'ask' };
+  }
+  if (typeof m['mint'] !== 'string') {
+    return undefined;
+  }
+  if (m['kind'] === 'kept') {
+    return { kind: 'kept', mint: m['mint'] };
+  }
+  if (m['kind'] === 'keeping' && count(m['amount']) && count(m['done']) && count(m['total'])) {
+    return { kind: 'keeping', mint: m['mint'], amount: m['amount'], done: m['done'], total: m['total'] };
+  }
+  return undefined;
+}
+
+/**
+ * Another tab said something: its run moved on (draw it, and watch it), its
+ * run is over, it asks how this tab's run stands, or it changed something
+ * (read the stores and the records again).
+ */
+async function heard(data: unknown): Promise<void> {
+  const message = keepMessage(data);
+  if (message?.kind === 'ask') {
+    const progress = state.keep.progress;
+    const record = shown();
+    if (keeper.running && progress !== undefined && record !== undefined) {
+      postKeeping(record.mint, progress);
+    }
+    return;
+  }
+  if (message?.kind === 'keeping') {
+    if (message.mint === shown()?.mint && !keeper.running && message.total > 0) {
+      const { amount, done, total } = message;
+      drawBack(() => {
+        state.keep.watching = { amount, done, total, at: Date.now() };
+      });
+      keeper.watch();
+    }
+    return;
+  }
+  if (message?.kind === 'kept' && state.keep.watching !== undefined) {
+    drawBack(() => {
+      state.keep.watching = undefined;
+    });
+  }
   reopen();
   const records = state.records;
   if (records !== undefined) {
@@ -822,6 +980,363 @@ async function heard(): Promise<void> {
     await refreshHome();
   } else {
     render();
+  }
+}
+
+// ---------- keep-alive ----------
+
+/** The lock a keep-alive pass holds, so one tab runs at a time; never the SDK store's own `worgl:<server URL>`. */
+const TRANSFERS_LOCK = 'purse:transfers';
+/** A hop whose new note no read has shown after this long slides nowhere. */
+const HOP_MS = 10_000;
+/** How long a note keep-alive moved keeps its place by its hop, while its run's log entry is on its way. */
+const HOPPED_MS = 10 * 60_000;
+
+/** The pass is reading the shown mint after its work: that read calls for no pass of its own. */
+let finishing = false;
+/** Whether this visit poked the keeper on open, once the first read was drawn, or failed. */
+let pokedOnOpen = false;
+
+/** The servers the purse knows, with their mints: the shown mint's server first, and the shown mint first in it. */
+function keptServers(): KeptServer[] {
+  const first = shown();
+  const records = first === undefined ? state.mints : [first, ...state.mints.filter((record) => record !== first)];
+  const servers = new Map<string, KeptServer>();
+  for (const record of records) {
+    const server = servers.get(record.server) ?? { server: record.server, mints: [] };
+    server.mints.push({ mint: record.mint, host: hostOf(record.server) });
+    servers.set(record.server, server);
+  }
+  return [...servers.values()];
+}
+
+/** What the purse holds at `mint`, once what faded is dropped and logged. */
+async function readPruned(server: string, mint: string): Promise<Read> {
+  const loaded = await loadSdk();
+  const read = await loaded.read(server, mint);
+  return read.notes.some((note) => note.state === 'expired') ? pruneAndLog(loaded, server, mint, read) : read;
+}
+
+/** Drops the notes whose layer the mint dropped, logs "Faded N", and reads again: for Holdings' reads and the keeper's alike. */
+async function pruneAndLog(loaded: Sdk, server: string, mint: string, read: Read): Promise<Read> {
+  const { lost, generation } = await loaded.prune(server, mint);
+  if (lost > 0n && generation !== undefined) {
+    const t = fadedAt(generation, read.info, read.skew, Date.now());
+    await logEntry({ t, kind: 'faded', mint, amount: Number(lost), serials: [] }).catch(() => undefined);
+    tell();
+  }
+  return loaded.read(server, mint);
+}
+
+/** Runs `work` holding the lock `purse:transfers`, if no other tab holds it; false, without running it, if one does. */
+async function withTransfersLock(work: () => Promise<void>): Promise<boolean> {
+  if (!('locks' in navigator)) {
+    // no Web Locks: the SDK's store cannot open either, and the pass's reads say so
+    await work();
+    return true;
+  }
+  return navigator.locks.request(TRANSFERS_LOCK, { ifAvailable: true }, async (lock) => {
+    if (lock === null) {
+      return false;
+    }
+    await work();
+    return true;
+  });
+}
+
+/** Says words in the live region for a run, only where the page shows it: Holdings. */
+function announce(words: string): void {
+  if (state.route === 'home') {
+    speak(words);
+  }
+}
+
+const keeping: Keeping = new Keeping({
+  servers: keptServers,
+  shown: () => shown()?.mint,
+  read: async (server, mint) => {
+    const read = await readPruned(server, mint);
+    // what fades first at each mint the purse keeps, for an open the mint does not answer
+    const record = state.mints.find((each) => each.mint === mint);
+    if (record !== undefined) {
+      void keepInfo(record, read.info, firstFade(holdingsOf(read)));
+    }
+    return read;
+  },
+  saved: (mint) => state.mints.find((each) => each.mint === mint)?.info?.fades,
+  outgoing: async (server) => (await loadSdk()).outgoingAt(server),
+  keepServer: async (server, work) => (await loadSdk()).keepServer(server, work),
+  log: async ({ spent, ...entry }) => {
+    // the tokens are safe in the SDK's store by now: a log that cannot be written loses only the entry
+    await logEntry(entry, spent).catch(() => undefined);
+    tell();
+  },
+  progress: keepProgress,
+  hop: (spent) => {
+    state.keep.hops.set(spent.id, { v: spent.v, generation: spent.generation, at: Date.now() });
+    tell();
+    void refreshHome();
+  },
+  troubled: () => {
+    const record = shown();
+    if (state.route === 'home' && record !== undefined && shownSignature(Date.now()) !== state.home.drawn) {
+      render();
+    }
+  },
+  kept: (mint) => channel?.postMessage({ kind: 'kept', mint }),
+  announce,
+  finish: finishPass,
+  reopen,
+  now: () => Date.now(),
+  random: () => Math.random(),
+});
+
+const keeper: Keeper = new Keeper({
+  pass: (run) => keeping.pass(run),
+  lock: withTransfersLock,
+  hidden: () => document.hidden,
+  wakeLock: () => ('wakeLock' in navigator ? navigator.wakeLock : undefined),
+  // the first run shows no run: one of a few seconds there keeps the screen as it is
+  shows: () => state.route === 'home',
+  // another tab runs a pass: it says how its run stands
+  busy: () => channel?.postMessage({ kind: 'ask' }),
+  quiet: () => {
+    if (state.keep.watching !== undefined) {
+      drawBack(() => {
+        state.keep.watching = undefined;
+      });
+    }
+  },
+  setTimeout: (run, ms) => setTimeout(run, ms),
+  clearTimeout: (timer) => clearTimeout(timer as ReturnType<typeof setTimeout> | undefined),
+  now: () => Date.now(),
+});
+
+/** Tells the other tabs how the shown mint's run stands here. */
+function postKeeping(mint: string, p: Shown): void {
+  channel?.postMessage({ kind: 'keeping', mint, amount: p.amount, done: p.done, total: p.total });
+}
+
+/** The shown mint's run moved on, or ended: count it in the back row and column, and tell the other tabs. */
+function keepProgress(p: Shown | undefined): void {
+  const record = shown();
+  const was = state.keep.progress;
+  drawBack(() => {
+    state.keep.progress = p;
+  });
+  if (record === undefined) {
+    return;
+  }
+  if (p === undefined) {
+    // the run is over here, or stopped: the tabs watching it stop showing it
+    channel?.postMessage({ kind: 'kept', mint: record.mint });
+    return;
+  }
+  postKeeping(record.mint, p);
+  if (p.total > (was?.total ?? 0)) {
+    // more hops planned, and saved as outgoing: their notes are moving now, here and in the other tabs
+    tell();
+    void refreshHome();
+  }
+}
+
+/** The pass is over: read the shown mint again, then say what was kept of it and the new date to come back by. */
+async function finishPass(kept: number): Promise<void> {
+  finishing = true;
+  try {
+    await refreshHome();
+  } finally {
+    finishing = false;
+  }
+  if (kept > 0) {
+    const holdings = state.home.data?.holdings;
+    const now = Date.now();
+    announce(keptWords(kept, holdings === undefined ? undefined : comeBackAt(holdings, now), now));
+  }
+}
+
+/** The run Holdings shows: this tab's, or another's it hears of. */
+function keepShown(): KeepShown | undefined {
+  const { progress, watching } = state.keep;
+  if (progress !== undefined && progress.total > 0) {
+    return { ...progress, watching: false };
+  }
+  if (watching !== undefined && watching.total > 0) {
+    return { amount: watching.amount, done: watching.done, total: watching.total, spaced: true, watching: true };
+  }
+  return undefined;
+}
+
+/** Whether the purse can keep the shown mint's tokens alive now: not while it is paused, stuck, or its read fails. */
+function keeps(record: MintRecord): boolean {
+  if (state.home.error?.at === 'read') {
+    // what the purse cannot read now, it cannot move either
+    return false;
+  }
+  const paused = state.home.data?.holdings.paused ?? record.info?.paused ?? false;
+  return keeping.canKeep(record.mint, paused);
+}
+
+/**
+ * The shown mint's first fade as the purse saved it, once the visit's read
+ * failed before any came back: the come-back row and column say it, as the
+ * words under the field do. Before that, nothing, as while a read is on its way.
+ */
+function savedShown(record: MintRecord, now: number): Holdings | undefined {
+  return state.home.data === undefined && state.home.error?.at === 'read' && record.info !== undefined
+    ? savedHoldings(record.info, now)
+    : undefined;
+}
+
+/**
+ * What Holdings says went wrong: a take's error at its button; a read's
+ * under the field, in the keeper's words when the mint did not answer it
+ * either, since those say what could not move; else why keep-alive is
+ * stuck, at the shown mint or, naming it, at another the purse keeps.
+ */
+function homeError(record: MintRecord): HomeInput['error'] {
+  const error = state.home.error;
+  const trouble = keeping.trouble.get(record.mint);
+  if (error?.at === 'read' && trouble?.kind === 'unreachable') {
+    return { words: trouble.words, at: 'read' };
+  }
+  if (error !== undefined) {
+    return error;
+  }
+  if (trouble !== undefined) {
+    return { words: trouble.words, at: 'keep' };
+  }
+  const other = state.mints.flatMap((each) => {
+    const elsewhere = each.mint === record.mint ? undefined : keeping.trouble.get(each.mint);
+    return elsewhere === undefined ? [] : [elsewhere];
+  })[0];
+  return other === undefined ? undefined : { words: other.words, at: 'keep' };
+}
+
+/** A mint's holdings from a read, for the words and the come-back date. */
+const holdingsOf = (read: Read): Holdings =>
+  holdingsFrom(read.info, read.notes, read.total, read.firstExpiry, read.skew, new Map(), read.moving);
+
+/**
+ * The mint whose tokens go first, when it is not the shown one: the date to
+ * come back by is the earliest of every mint the purse keeps, and Holdings
+ * shows only the first mint added until the Mints screen comes. A mint this
+ * page has not read, since it has not answered yet or does not, counts by
+ * what the purse saved of what fades there first.
+ */
+function elsewhere(record: MintRecord, now: number): Elsewhere | undefined {
+  let found: Elsewhere | undefined;
+  let soonest = (state.home.data?.holdings ?? savedShown(record, now))?.firstExpiry ?? Number.POSITIVE_INFINITY;
+  for (const other of state.mints) {
+    if (other.mint === record.mint) {
+      continue;
+    }
+    const read = keeping.last(other.mint);
+    const holdings = read !== undefined ? holdingsOf(read) : other.info === undefined ? undefined : savedHoldings(other.info, now);
+    if (holdings === undefined) {
+      continue;
+    }
+    const first = holdings.firstExpiry;
+    if (holdings.notes.length > 0 && first !== undefined && first > now && first < soonest) {
+      soonest = first;
+      found = { name: other.name, holdings, keeps: keeping.canKeep(other.mint, holdings.paused) };
+    }
+  }
+  return found;
+}
+
+/** What the come-back date shows of another mint, for the signature. */
+function elsewhereSig(record: MintRecord, now: number): unknown {
+  const other = elsewhere(record, now);
+  return other === undefined
+    ? undefined
+    : [other.name, other.keeps, other.holdings.firstExpiry, other.holdings.notes.map((note) => [note.v, note.pos])];
+}
+
+/**
+ * Changes what the come-back row and column show, and draws only those two
+ * again: the count moves every few seconds, and focus, an open tip and the
+ * field stay as they are. When the view was current before, it is current
+ * after, so the next read that finds nothing else new draws nothing.
+ */
+function drawBack(change: () => void): void {
+  const record = shown();
+  const current = state.route === 'home' && record !== undefined && state.home.drawn === shownSignature(Date.now());
+  change();
+  if (state.route !== 'home' || record === undefined) {
+    return;
+  }
+  renderBack(homeInput(record));
+  if (current) {
+    state.home.drawn = shownSignature(Date.now());
+  }
+}
+
+/** The notes as drawn, by place: a run's open lanes stay while it is unchanged. */
+const noteSig = (holdings: Holdings): string => holdings.notes.map((note) => `${note.id}:${note.pos}`).join(',');
+
+/**
+ * A read after hops were answered: each new note takes its old note's place
+ * in the field, so it slides one lane on from there, turns pink and draws its
+ * thread. A hop whose note no read shows within {@link HOP_MS} is dropped.
+ */
+function landHops(before: Holdings | undefined, holdings: Holdings): void {
+  const now = Date.now();
+  for (const [id, at] of state.keep.hopped) {
+    if (now - at > HOPPED_MS) {
+      state.keep.hopped.delete(id);
+    }
+  }
+  const { hops } = state.keep;
+  if (hops.size === 0) {
+    return;
+  }
+  const old = new Set(before?.notes.map((note) => note.id) ?? []);
+  const ids = new Set(holdings.notes.map((note) => note.id));
+  const taken = new Set<string>();
+  for (const [oldId, hop] of hops) {
+    const fresh = ids.has(oldId)
+      ? undefined
+      : holdings.notes.find(
+          (note) => !old.has(note.id) && !taken.has(note.id) && note.v === hop.v && note.id.startsWith(`${hop.generation + 1n}:`),
+        );
+    if (fresh !== undefined) {
+      taken.add(fresh.id);
+      hopNote(oldId, fresh.id);
+      state.home.pink.set(fresh.id, hop.at);
+      state.keep.hopped.set(fresh.id, hop.at);
+      hops.delete(oldId);
+    } else if (now - hop.at > HOP_MS) {
+      hops.delete(oldId);
+    }
+  }
+}
+
+/**
+ * The lanes a run passes through stay open: each moving note's layer and
+ * the next, from its first read until the notes change after the run.
+ */
+function keepLanes(holdings: Holdings): void {
+  const keep = state.keep;
+  const moving = holdings.notes.filter((note) => note.moving);
+  if (moving.length > 0 || keep.progress !== undefined) {
+    if (keep.lanesSig !== undefined) {
+      // a new run
+      keep.lanes = new Set();
+      keep.lanesSig = undefined;
+    }
+    for (const note of moving) {
+      keep.lanes.add(note.pos);
+      keep.lanes.add(note.pos + 1);
+    }
+  } else if (keep.lanes.size > 0) {
+    const sig = noteSig(holdings);
+    if (keep.lanesSig === undefined) {
+      keep.lanesSig = sig;
+    } else if (keep.lanesSig !== sig) {
+      keep.lanes = new Set();
+      keep.lanesSig = undefined;
+    }
   }
 }
 
@@ -902,13 +1417,35 @@ function listen(): void {
   });
   void document.fonts?.ready.then(redrawField);
   document.addEventListener('visibilitychange', () => {
-    if (!document.hidden && state.route === 'home') {
-      // another tab may have changed the store meanwhile
-      reopen();
+    if (document.hidden) {
+      // keep-alive stops at the next safe step: a page in the background keeps nothing alive
+      keeper.hide();
+      return;
+    }
+    // another tab may have changed the store meanwhile
+    reopen();
+    keeping.forget();
+    if (state.route === 'home') {
       void refreshHome();
     }
+    // on every route: what is held is kept, and what an abort left is settled
+    keeper.show();
   });
-  channel?.addEventListener('message', () => void heard());
+  // the page goes: stop at once; what is in hand is saved, and the next open settles the rest
+  window.addEventListener('pagehide', () => keeper.leave());
+  // back from the back/forward cache, which skips start()
+  window.addEventListener('pageshow', (event) => {
+    if (!event.persisted) {
+      return;
+    }
+    reopen();
+    keeping.forget();
+    if (state.route === 'home') {
+      void refreshHome();
+    }
+    keeper.show();
+  });
+  channel?.addEventListener('message', (event) => void heard(event.data));
 
   // the needle creeps once a second, or jumps once a minute for less motion
   let moved = 0;
@@ -924,10 +1461,16 @@ function listen(): void {
     moved = now;
     moveNeedle(host);
   }, 1000);
-  // and the mint is asked again each minute, for a rotation by hand, a pause, or another device's change
+  // and the mint is asked again each minute, for a rotation by hand, a pause, or another device's change; on the
+  // first run, keep-alive looks again at what it keeps, as Holdings' read would have it do
   setInterval(() => {
-    if (state.route === 'home' && !document.hidden) {
+    if (document.hidden) {
+      return;
+    }
+    if (state.route === 'home') {
       void refreshHome();
+    } else {
+      keeper.poke();
     }
   }, 60_000);
 }
@@ -965,6 +1508,15 @@ export async function start(): Promise<void> {
     setRoute(route, { focus: false });
   }
   requestAnimationFrame(() => {
-    void loadSdk().catch(() => undefined);
+    void loadSdk().then(
+      () => {
+        // on the first run, the mints already held are kept too; Holdings pokes once its first read is drawn, or has failed
+        if (state.route === 'first') {
+          pokedOnOpen = true;
+          keeper.poke();
+        }
+      },
+      () => undefined,
+    );
   });
 }

@@ -6,14 +6,19 @@
 // the server's URL as the SDK's Client writes it, so every mint on that
 // server goes through that one purse. The store is made once; after
 // another tab changed it, a new Purse is opened on it (see current.ts).
-// The purse takes no lock of its own.
+// The SDK takes the store's lock for each change; the purse's own lock,
+// `purse:transfers`, which keeper.ts takes for a keep-alive pass, is named
+// otherwise, so no change waits for it.
 
 import { Client, type FaucetInfo, type HeldNote, type MintInfo, Purse, type RequestOptions } from 'worgl';
 import { IndexedDbStore } from 'worgl/browser';
 
 import { Current } from './current.ts';
 import { noteId } from './holdings.ts';
+import { type Moving, movingNotes, spentBy, spentKey } from './keep.ts';
 import type { MintLink } from './link.ts';
+
+export type { Moving } from './keep.ts';
 
 /** Info requests on their way, by URL. */
 const asked = new Map<string, Promise<Response>>();
@@ -139,6 +144,8 @@ export interface Read {
   notes: HeldNote[];
   total: bigint;
   firstExpiry: bigint | undefined;
+  /** This mint's notes on their way in refresh transfers, which `notes` no longer lists and `total` still counts. */
+  moving: Moving[];
 }
 
 /**
@@ -158,7 +165,40 @@ export async function read(server: string, mint: string): Promise<Read> {
   // the Date header counts whole seconds: a skew under two seconds is that, not a clock that is off
   const raw = Number(clock.time) - (sent + clock.back) / 2000;
   const skew = Math.abs(raw) < 2 ? 0 : Math.round(raw);
-  return { info, skew, notes, total: balance.total, firstExpiry };
+  const { outgoing, sendInputs } = outgoingOf(purse);
+  return { info, skew, notes, total: balance.total, firstExpiry, moving: movingNotes(outgoing, sendInputs, mint) };
+}
+
+/** A purse's outgoing transfers, and the notes its sends (the SDK's payments) spend, by `spentKey`. */
+function outgoingOf(purse: Purse): { outgoing: string[]; sendInputs: Set<string> } {
+  const sendInputs = new Set<string>();
+  for (const made of purse.payments()) {
+    for (const transfer of made.payment.transfers) {
+      for (const spent of spentBy(transfer.request)) {
+        sendInputs.add(spentKey(spent));
+      }
+    }
+  }
+  return { outgoing: purse.outgoing(), sendInputs };
+}
+
+/**
+ * The outgoing transfers of `server`'s purse, and the notes the purse's
+ * payments spend: a transfer that spends one of those is a send's, not a
+ * hop. Told apart by the note spent, never by the request's text, since
+ * two JSON strings of one transfer need not match byte for byte.
+ */
+export async function outgoingAt(server: string): Promise<{ outgoing: string[]; sendInputs: Set<string> }> {
+  return outgoingOf(await purseFor(server));
+}
+
+/**
+ * Runs `work` on the server's current purse as one change (`Current.change`),
+ * so the purse is not opened again in the middle: a settle, or a
+ * `planRefresh` and the submit of its plan, respaced.
+ */
+export async function keepServer<R>(server: string, work: (purse: Purse) => Promise<R>): Promise<R> {
+  return serverAt(server).purse.change(work);
 }
 
 /** Thrown when the faucet at a mint's server hands out another mint's notes by the time Take is pressed. */

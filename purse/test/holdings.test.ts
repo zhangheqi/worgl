@@ -3,7 +3,17 @@ import { describe, test } from 'node:test';
 
 import type { HeldNote, MintInfo } from 'worgl';
 
-import { fadedAt, holdingsFrom, laneOf, lanePositions, laneTotal } from '../src/holdings.ts';
+import {
+  arrivalsOf,
+  comeBackAt,
+  fadedAt,
+  firstFade,
+  holdingsFrom,
+  laneOf,
+  lanePositions,
+  laneTotal,
+  savedHoldings,
+} from '../src/holdings.ts';
 
 const MINT = 'ab'.repeat(32);
 const NEXT = 1_792_400_400n; // a rotation, in Unix seconds by the mint's clock
@@ -78,6 +88,66 @@ describe('holdings', () => {
   });
 });
 
+describe('notes on their way a layer on', () => {
+  test('are drawn where they were until the mint answers, and the total stays the SDK’s', () => {
+    const notes = [held(0, 64n, 'spendable', 1)];
+    const moving = [
+      { id: '5:7', v: 64, generation: 5n },
+      { id: '6:8', v: 4, generation: 6n },
+      // one past the last layer: not drawn
+      { id: '9:1', v: 1, generation: 9n },
+    ];
+    const arrivals = new Map([['5:7', { at: 1_792_390_000_000, source: 'kept' as const }]]);
+    const h = holdingsFrom(info(), notes, 999n, NEXT - 3600n, 2, arrivals, moving);
+    assert.deepEqual(
+      h.notes.map((n) => [n.id, n.v, n.pos, n.moving]),
+      [['6:0', 64, 1, false], ['5:7', 64, 0, true], ['6:8', 4, 1, true]],
+    );
+    assert.equal(h.total, 999);
+    const first = h.notes[1];
+    assert.equal(first === undefined ? undefined : laneOf(first.pos, h.layers), 'fade');
+    assert.equal(first?.expiresAt, (Number(NEXT) - 2) * 1000);
+    assert.equal(first?.readyAt, undefined);
+    assert.equal(h.notes[2]?.expiresAt, (Number(NEXT + PERIOD) - 2) * 1000);
+    assert.equal(laneTotal(h, 'fade'), 64);
+    // a note keep-alive moved says so
+    assert.equal(first?.source, 'kept');
+    assert.equal(first?.arrivedAt, 1_792_390_000_000);
+  });
+
+  test('whose layer went since are drawn in the first, where an answer would land; two layers back, they are gone', () => {
+    // oldest 5: generation 4 went at the last rotation, generation 3 the one before
+    const moving = [
+      { id: '4:2', v: 64, generation: 4n },
+      { id: '3:5', v: 32, generation: 3n },
+    ];
+    const h = holdingsFrom(info(), [held(0, 64n, 'spendable', 1)], 160n, NEXT, 0, new Map(), moving);
+    assert.deepEqual(
+      h.notes.map((n) => [n.id, n.pos, n.moving]),
+      [['6:0', 1, false], ['4:2', 0, true]],
+    );
+    assert.equal(h.notes[1]?.expiresAt, Number(NEXT) * 1000);
+    // the SDK counts the 32 still; its note and the one it would bring are both gone, so the purse does not
+    assert.equal(h.total, 128);
+    assert.equal(laneTotal(h, 'fade') + laneTotal(h, 'ready'), h.total);
+  });
+
+  test('are none by default', () => {
+    const h = holdingsFrom(info(), [held(0, 64n, 'expiring', 0)], 64n, NEXT, 0, new Map());
+    assert.deepEqual(h.notes.map((n) => n.moving), [false]);
+  });
+});
+
+describe('what fades first', () => {
+  test('is the lowest layer’s notes at the first expiry, or nothing', () => {
+    const notes = [held(0, 64n, 'expiring', 0), held(1, 4n, 'expiring', 0), held(2, 64n, 'spendable', 1)];
+    const h = holdingsFrom(info(), notes, 132n, NEXT, 0, new Map());
+    assert.deepEqual(firstFade(h), { at: Number(NEXT) * 1000, amount: 68 });
+    assert.equal(firstFade(holdingsFrom(info(), [], 0n, undefined, 0, new Map())), null);
+    assert.equal(firstFade(holdingsFrom(info({ paused: true }), notes, 132n, undefined, 0, new Map())), null);
+  });
+});
+
 describe('a faded note', () => {
   test('faded at the rotation that dropped its layer', () => {
     const now = (Number(NEXT) - 100) * 1000;
@@ -87,5 +157,60 @@ describe('a faded note', () => {
     assert.equal(fadedAt(4n, info(), 2, now), (Number(NEXT - PERIOD) - 2) * 1000);
     assert.equal(fadedAt(4n, info({ rotation: undefined }), 0, now), now);
     assert.equal(fadedAt(5n, info(), 0, now), now);
+  });
+});
+
+describe('where a note came from', () => {
+  const OTHER = 'cd'.repeat(32);
+  // newest first, as the log reads back
+  const log = [
+    { t: 3000, kind: 'kept' as const, mint: MINT, serials: ['7:1', '7:2'] },
+    { t: 2500, kind: 'faucet' as const, mint: OTHER, serials: ['7:3'] },
+    { t: 2000, kind: 'lost' as const, mint: MINT, serials: [] },
+    { t: 1500, kind: 'faded' as const, mint: MINT, serials: ['6:9'] },
+    { t: 1000, kind: 'kept' as const, mint: MINT, serials: ['7:1'] },
+    { t: 500, kind: 'faucet' as const, mint: MINT, serials: ['7:2', '8:4'] },
+  ];
+
+  test('is the latest of the mint’s faucet and kept entries', () => {
+    const known = arrivalsOf(log, MINT, new Map());
+    assert.deepEqual([...known].sort(), [
+      ['7:1', { at: 3000, source: 'kept' }],
+      ['7:2', { at: 3000, source: 'kept' }],
+      ['8:4', { at: 500, source: 'faucet' }],
+    ]);
+  });
+
+  test('for a note keep-alive just moved, is its hop until its run’s entry is in', () => {
+    const known = arrivalsOf(log, MINT, new Map([['9:5', 4000], ['7:1', 4000]]));
+    assert.deepEqual(known.get('9:5'), { at: 4000, source: 'kept' });
+    // the log's entry wins over the hop
+    assert.deepEqual(known.get('7:1'), { at: 3000, source: 'kept' });
+    assert.equal(arrivalsOf(log, OTHER, new Map()).get('7:3')?.source, 'faucet');
+  });
+});
+
+describe('holdings as the purse saved them', () => {
+  const at = Number(NEXT) * 1000;
+  const saved = { layers: 4, periodSecs: Number(PERIOD), paused: false, readAt: 0, fades: { at: at + 28_800_000, amount: 64 } };
+
+  test('place what fades first by its time, so the date to come back by can be worked out without the mint', () => {
+    const now = at - 3_600_000;
+    const h = savedHoldings(saved, now);
+    assert.deepEqual(h?.notes.map((n) => [n.v, n.pos, n.expiresAt]), [[64, 1, at + 28_800_000]]);
+    assert.equal(h?.firstExpiry, at + 28_800_000);
+    assert.deepEqual(h?.schedule, { startMs: at - 28_800_000, nextMs: at, periodMs: 28_800_000 });
+    // an hour before they fade, as for a mint that answers
+    assert.equal(h === undefined ? undefined : comeBackAt(h, now), at + 25_200_000);
+    // in the last period before it, they are in the first layer
+    assert.equal(savedHoldings(saved, at + 1000)?.notes[0]?.pos, 0);
+  });
+
+  test('are none when nothing fades, the mint was paused, or the time has gone', () => {
+    assert.equal(savedHoldings({ ...saved, fades: null }, 0), undefined);
+    assert.equal(savedHoldings({ ...saved, fades: undefined }, 0), undefined);
+    assert.equal(savedHoldings({ ...saved, paused: true }, 0), undefined);
+    assert.equal(savedHoldings({ ...saved, periodSecs: undefined }, 0), undefined);
+    assert.equal(savedHoldings(saved, at + 28_800_000), undefined);
   });
 });

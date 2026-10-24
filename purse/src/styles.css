@@ -122,7 +122,7 @@ em { font-style: italic; }
 .back-row { display: flex; align-items: center; gap: 12px; min-height: 48px; margin-top: 4px; position: relative; }
 .back-row p, .back-row h2 { flex: 1; font-size: 15.5px; line-height: 1.35; }
 .back-row h2 b { font-weight: 600; }
-.back-row p .muted { font-size: 14px; }
+.back-row p .muted, .back-row h2 .muted { font-size: 14px; font-weight: 400; }
 /* recent */
 .recent-h { display: flex; justify-content: space-between; align-items: center; margin-top: -8px; }
 .act { display: grid; grid-template-columns: 48px 1fr auto; align-items: center; min-height: 44px; border-top: 1px solid var(--rule-cobalt); gap: 8px; }
@@ -317,6 +317,8 @@ em { font-style: italic; }
   .mintc h3 { font-family: var(--f-serif); font-size: 34px; line-height: 1; letter-spacing: -.01em; overflow-wrap: anywhere; }
   .m-short { display: none; }
   .cb-act { min-height: 54px; display: flex; align-items: center; }
+  .cb-act .ka-steps i { width: 12px; height: 12px; border-color: var(--on-cobalt); }
+  .cb-act .ka-steps i.on { background: var(--on-cobalt); }
   .mintc dl { display: grid; grid-template-columns: auto 1fr; margin-top: 12px; }
   .mintc dt, .mintc dd { padding: 9px 0; border-top: 1px solid var(--rule-cobalt); font-size: 14.5px; }
   .mintc dt { color: var(--on-cobalt-muted); }
@@ -354,9 +356,17 @@ em { font-style: italic; }
   .v-first .mstamp .denom i { font-size: 24px; }
   .v-first .mstamp .bits svg { width: 79px; }
 }
-/* the come-back note keeps one height whichever state the column is in, so the band under the field never changes */
-@media (min-width: 1100px) { .v-home .col-back .note-line { min-height: calc(2 * 1.45em); } }
-@media (min-width: 1100px) and (max-width: 1279px) { .v-home .col-back .note-line { min-height: calc(3 * 1.45em); } }
+/* the come-back note keeps one height whichever state the column is in, so the band under the field never changes:
+   three lines, the most the idle line takes with a date a week out in the narrowest column (267 px at 1100 px wide) */
+@media (min-width: 1100px) { .v-home .col-back .note-line { min-height: calc(3 * 1.45em); } }
+/* while a run goes, its step boxes sit right under the note, as in the prototype, and what the note leaves of its
+   three lines goes under them: the note's lines, its margins and the act slot keep the same height between them */
+@media (min-width: 1100px) {
+  .v-home .cb-body { display: flex; flex-direction: column; min-height: calc(3 * 14px * 1.45 + 26px + 54px); }
+  .v-home .cb-body .note-line { min-height: 0; }
+}
+@media (min-width: 1100px) and (max-height: 899px) { .v-home .cb-body { min-height: calc(3 * 14px * 1.45 + 20px + 48px); } }
+@media (min-width: 1100px) and (max-height: 767px) { .v-home .cb-body { min-height: calc(3 * 14px * 1.45 + 16px + 48px); } }
 /* 720 px tall laptops */
 @media (min-width: 1100px) and (max-height: 767px) {
   .db-in { min-height: 60px; }
@@ -402,8 +412,21 @@ em { font-style: italic; }
 .stamp-wait { padding: 20px 0; }
 /* Recent with no entries yet */
 .recent-none { padding: 10px 0; }
-/* what went wrong on Holdings, under the field */
+/* what went wrong on Holdings, under the field; on desktop a measure of its own, apart from the caption under it */
 .home-err { margin-top: 8px; }
+@media (min-width: 1100px) { .band-p .home-err { max-width: 38em; margin: 12px 0 4px; } }
+/* keep-alive: the back row's lead, and the step boxes (prototype L151, L156-159) */
+.back-row p b { font-weight: 600; }
+.ka-box { flex: none; min-height: 44px; display: inline-flex; align-items: center; }
+.ka-steps { display: inline-flex; gap: 4px; }
+.ka-steps i { width: 8px; height: 8px; border: 1.5px solid var(--sq); }
+.ka-steps i.on { background: var(--sq); }
+/* at most eight a row on the phone, in two rows at most */
+.back-row .ka-steps { flex-wrap: wrap; justify-content: flex-end; max-width: 92px; }
+/* "In another tab" goes under the count, and "For your tokens at …" under the date, in .back-row .muted above */
+/* the thread from where a note was to where it moved (prototype L300-301) */
+.f-thread { fill: none; stroke: var(--pink); stroke-width: 1.4; stroke-dasharray: 3 2.5; animation: thread 2s ease forwards; }
+@keyframes thread { 0%, 50% { opacity: 1; } 100% { opacity: 0; } }
 /* the first run's spacing */
 .v-first .intro-lab { margin-top: 12px; }
 .v-first .h1 { margin-top: 10px; }
