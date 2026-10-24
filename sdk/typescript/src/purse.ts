@@ -13,7 +13,7 @@ import {
   transferMint,
   verifyNotes,
 } from './core.ts';
-import { type WorglError, worglError } from './error.ts';
+import { type WorglError, isWorglError, worglError } from './error.ts';
 import { MemoryStore, type Store } from './store.ts';
 
 /**
@@ -448,6 +448,15 @@ export interface PurseOptions {
  * Nothing that depends on a change leaves the purse before the change is
  * saved. If a save fails, the change is undone and the call rejects.
  * Changes are applied and saved one at a time, so calls may overlap.
+ *
+ * Several purses can share a store that has a {@link Store.lock | lock},
+ * as the tabs of a browser share an `IndexedDbStore` from `worgl/browser`.
+ * Before each change the purse takes the lock and reads the holder saved
+ * there, makes the change to that, and saves before letting go, so a note
+ * another purse took in meanwhile is kept, not saved over. It never holds
+ * the lock across a request to the mint, and {@link settle} resends the
+ * transfers of the holder saved now. Reads such as {@link notes} and
+ * {@link balance} show the holder as this purse last read or saved it.
  */
 export class Purse {
   /** The client requests go through. */
@@ -733,7 +742,9 @@ export class Purse {
   /**
    * Resends the transfers this purse made and has not seen answered, at
    * random gaps, and takes in their change. Call it once a payee has had
-   * time to submit a payment, or after a restart. The answer to a payment's
+   * time to submit a payment, or after a restart. With a store that has a
+   * lock, the transfers are those of the holder saved now, so they include
+   * any another purse on the store made. The answer to a payment's
    * transfer keeps the payee's notes for it, in case the payee has not
    * submitted the payment and the resend carried it out (see
    * {@link MadePayment.owed}), and a transfer refused for good is dropped or
@@ -754,7 +765,9 @@ export class Purse {
     spacing: Spacing = DEFAULT_SPACING,
     options: SubmitOptions = {},
   ): Promise<Submitted> {
-    const transfers = read(this.#holder.resend(BigInt(spacing.minSecs), BigInt(spacing.maxSecs)));
+    const transfers = await this.#current(async () =>
+      read(this.#holder.resend(BigInt(spacing.minSecs), BigInt(spacing.maxSecs))),
+    );
     return this.submit(transfers, options);
   }
 
@@ -840,12 +853,18 @@ export class Purse {
    * is not the mint's, such as one from a server that is not the mint's, nor
    * of one it cannot read the keys to check.
    *
+   * With a store that has a lock, what the mint answered is kept even when
+   * its save is refused with `store_changed`, as when another purse takes
+   * the lock meanwhile: the purse makes the change again on what is saved
+   * now, since a resend gets an answer back only while the mint keeps it.
+   *
    * A refused transfer does not stop the others; it is listed in
    * {@link Submitted.refused}, as is one whose answer the purse did not keep.
    * One this purse made that the mint refused for good is dropped or
    * cancelled ({@link Refused.outcome}); the rest stay outgoing. To confirm a
    * `policy` refusal, the purse reads the mint's info again. Rejects only if
-   * a save fails.
+   * the store fails: a save, or the read of a store with a lock before a
+   * change.
    *
    * With `options`, a screen follows each transfer as it waits, goes and is
    * answered, can cut the waits short, and can stop the call, as when the
@@ -949,7 +968,7 @@ export class Purse {
    * Records the answer to `transfer` once it checks out against the keys of
    * the transfer's mint, and resolves to the value taken in and the
    * counterparty's notes, or to why the answer was not kept: it is not the
-   * mint's, or the keys could not be read. Rejects only if a save fails.
+   * mint's, or the keys could not be read. Rejects only if the store fails.
    */
   async #takeAnswer(
     transfer: string,
@@ -965,19 +984,24 @@ export class Purse {
       return { error };
     }
     const json = JSON.stringify(notes);
-    // Set once the answer checked out: a rejection after it is the save's.
-    let checked = false;
+    // Set while the answer is checked: a rejection then is the answer's, and
+    // any other, before or after, is the store's.
+    let checking = false;
+    const take = (): { value: bigint; theirs: string[] } => {
+      checking = true;
+      const value = this.#holder.settle(keys, transfer, json);
+      checking = false;
+      return { value, theirs: JSON.parse(this.#holder.theirs(json)) as string[] };
+    };
     try {
-      return await this.#change(
-        () => {
-          const value = this.#holder.settle(keys, transfer, json);
-          checked = true;
-          return { value, theirs: JSON.parse(this.#holder.theirs(json)) as string[] };
-        },
-        () => {},
+      // Without a lock, an answer whose save fails stays in the holder, for
+      // the next save to keep. With one, the next change reads the store
+      // again, so the answer is taken out as any change is.
+      return await this.#untilSaved(() =>
+        this.store.lock === undefined ? this.#change(take, () => {}) : this.#changeOrRestore(take),
       );
     } catch (error) {
-      if (checked) {
+      if (!checking) {
         throw error;
       }
       return { error };
@@ -1002,12 +1026,14 @@ export class Purse {
       if (!(error instanceof MintError && error.status === 409)) {
         return { atStake: this.#holder.atStake(transfer), outcome: 'kept' };
       }
-      return this.#changeOrRestore(() => {
-        // Before the transfer is dropped.
-        const atStake = this.#holder.atStake(transfer);
-        const outcome: Outcome = this.#holder.forget(transfer) ? 'dropped' : 'kept';
-        return { atStake, outcome };
-      });
+      return this.#untilSaved(() =>
+        this.#changeOrRestore(() => {
+          // Before the transfer is dropped.
+          const atStake = this.#holder.atStake(transfer);
+          const outcome: Outcome = this.#holder.forget(transfer) ? 'dropped' : 'kept';
+          return { atStake, outcome };
+        }),
+      );
     }
     let cancel: boolean;
     if (code === 'layer_full') {
@@ -1035,7 +1061,9 @@ export class Purse {
     if (!cancel) {
       return { atStake: undefined, outcome: 'kept' };
     }
-    const cancelled = await this.#changeOrRestore(() => this.#holder.cancel(transfer));
+    const cancelled = await this.#untilSaved(() =>
+      this.#changeOrRestore(() => this.#holder.cancel(transfer)),
+    );
     return { atStake: undefined, outcome: cancelled ? 'cancelled' : 'kept' };
   }
 
@@ -1067,11 +1095,12 @@ export class Purse {
   }
 
   /**
-   * Changes the holder and saves it, after any change before it is saved.
-   * If the save fails, `undo` takes the change back and the call rejects.
+   * Changes the holder as saved now and saves it, after any change before
+   * it, holding the store's lock throughout if it has one. If the save
+   * fails, `undo` takes the change back and the call rejects.
    */
   #change<T>(apply: () => T, undo: (value: T) => void): Promise<T> {
-    const run = async (): Promise<T> => {
+    return this.#current(async () => {
       const value = apply();
       try {
         await this.store.save(this.#holder.toJson());
@@ -1080,6 +1109,31 @@ export class Purse {
         throw error;
       }
       return value;
+    });
+  }
+
+  /**
+   * Runs `use` after any change before it. With a store that has a lock, it
+   * runs holding it, on the holder saved now: read again if it is not this
+   * purse's, as when another purse saved since this one last read or saved.
+   */
+  #current<T>(use: () => Promise<T>): Promise<T> {
+    const run = (): Promise<T> => {
+      if (this.store.lock === undefined) {
+        return use();
+      }
+      return this.store.lock(async () => {
+        const saved = await this.store.load();
+        // Read in only if it differs: writing a holder out to compare takes
+        // a small part of the time reading one in does, and leaves no copy
+        // of its keys behind.
+        if (saved !== undefined && saved !== this.#holder.toJson()) {
+          const holder = Holder.fromJson(saved);
+          this.#holder.free();
+          this.#holder = holder;
+        }
+        return use();
+      });
     };
     const result = this.#changes.then(run, run);
     this.#changes = result.catch(() => {});
@@ -1100,6 +1154,25 @@ export class Purse {
         this.#holder = restored;
       },
     );
+  }
+
+  /**
+   * Makes `change` again for as long as the store refuses its save with
+   * `store_changed`, as when another purse takes the lock meanwhile or the
+   * store is cleared, each time on the holder saved now. It is for a change
+   * that keeps what the mint answered, which the refusal does not make
+   * wrong and which would be lost with the call.
+   */
+  async #untilSaved<T>(change: () => Promise<T>): Promise<T> {
+    for (;;) {
+      try {
+        return await change();
+      } catch (error) {
+        if (!(isWorglError(error) && error.code === 'store_changed')) {
+          throw error;
+        }
+      }
+    }
   }
 }
 
