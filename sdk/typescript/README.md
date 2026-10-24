@@ -157,8 +157,10 @@ otherwise, or every change waits for it. A change that loses the lock
 meanwhile, as when another tab takes it with `steal`, saves nothing and
 rejects with `store_changed`, as does one whose save finds something saved
 since the change read the store; the change is undone, and the next one
-reads the store again. The store saves only under its lock, as a purse
-does: a `save` outside it throws a `DOMException` named
+reads the store again. A submit keeps what the mint answered all the same:
+it makes that change again on what is saved now, since a resend gets an
+answer back only while the mint keeps it. The store saves only under its
+lock, as a purse does: a `save` outside it throws a `DOMException` named
 `InvalidStateError`.
 
 Web Locks exist only in a secure context, so the page must be served over
@@ -171,6 +173,56 @@ blocks, holding the database open in an older version, rejects with
 site's data is cleared or a private window closes, and the browser may
 clear it to free space unless the page holds persistent storage
 (`navigator.storage.persist()`).
+
+## Following a submit
+
+`submit`, and `receive`, `settle` and `refresh`, which submit too, take
+options for a screen that shows a payment or a refresh as it goes:
+
+```ts
+const rest = new AbortController();  // the "Send the rest now" button calls rest.abort()
+const leave = new AbortController();
+addEventListener('pagehide', () => leave.abort());
+
+const submitted = await alice.submit(payment.transfers, {
+  onProgress: ({ step, answered, refused, total, sendAt }) => {
+    // Draws "2 of 3", and while a transfer is waiting, when it goes.
+  },
+  sendNow: rest.signal,
+  signal: leave.signal,
+});
+```
+
+- `onProgress` hears of each transfer, in the order they go, as it is
+  `waiting` for its time (until `sendAt`, in `Date.now()` milliseconds),
+  `sending`, then `answered` or `refused`, or `unsent`, with the counts so
+  far. A `refused` one carries its entry of `submitted.refused` as
+  `refusal`, whose `outcome` tells a transfer kept for a later `settle`
+  from one dropped or cancelled for good. The purse goes on past an
+  exception it throws and reports it as uncaught, as an event listener's
+  is: a browser logs it, and Node ends the process unless the application
+  handles `uncaughtException`.
+- `sendNow` cuts the waits short once it aborts: the transfers left go one
+  after another. That gives up the spacing that keeps the mint from linking
+  their notes by when they arrive (see the
+  [Privacy model](../../site/src/content/docs/docs/privacy.md#timing)), so
+  offer it rather than make it the default. Retries after a failure still
+  wait.
+- `signal` stops the call once it aborts: no wait goes on, nothing more is
+  sent, and it resolves with what was done. A transfer on its way is
+  treated as one whose answer was lost, since the mint may have applied it:
+  it is in `submitted.refused` with outcome `kept` and the signal's reason
+  as its error. An answer the mint has given already is still checked and
+  kept, since a resend gets it again only while the mint keeps it, so the
+  stop takes effect from the next transfer. The transfers not sent are in
+  `submitted.unsent`. Those the purse made stay outgoing, so `settle` sends
+  them again later, and the mint answers one it applied with the same notes
+  while it keeps its answer. A change being saved is saved first, so the
+  purse is never left half-saved. A `refresh` stopped before it has read the
+  mint's info plans nothing.
+
+Every `Client` call takes `{ signal }` too, and rejects with the signal's
+reason once it aborts.
 
 ## Errors
 
