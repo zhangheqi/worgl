@@ -597,16 +597,3 @@ export function recentTitle(entry: RecentEntry): string {
       return `Lost ${entry.amount}`;
   }
 }
-
-/** What a log entry changed the total by: keep-alive moves notes and changes nothing. */
-export function recentChange(entry: RecentEntry): number {
-  switch (entry.kind) {
-    case 'faucet':
-      return entry.amount;
-    case 'kept':
-      return 0;
-    case 'faded':
-    case 'lost':
-      return -entry.amount;
-  }
-}

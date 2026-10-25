@@ -30,7 +30,6 @@ import {
   pausedKeepWords,
   plain,
   policyWords,
-  recentChange,
   recentTitle,
   rotatedWords,
   rotatesQuickly,
@@ -724,12 +723,5 @@ describe('Recent', () => {
     assert.equal(recentTitle(entry('faded', 4)), 'Faded 4');
     assert.equal(recentTitle(entry('kept', 128)), 'Kept 128 alive');
     assert.equal(recentTitle(entry('lost', 64)), 'Lost 64');
-  });
-
-  test('shows what each changed: keep-alive changes nothing', () => {
-    assert.equal(recentChange(entry('faucet', 64)), 64);
-    assert.equal(recentChange(entry('faded', 4)), -4);
-    assert.equal(recentChange(entry('kept', 128)), 0);
-    assert.equal(recentChange(entry('lost', 64)), -64);
   });
 });

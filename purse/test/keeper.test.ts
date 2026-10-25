@@ -700,6 +700,7 @@ describe('a pass', () => {
         mint: ISSUER,
         amount: 128,
         serials: ['8:101', '8:102'],
+        values: [64, 64],
         round: String(OLDEST),
         spent: [
           { id: '7:1', v: 64 },
@@ -929,6 +930,8 @@ describe('a pass', () => {
         ['kept', 64],
       ],
     );
+    // the note that faded, so the purse never logs the fade before it came
+    assert.deepEqual(t.logged[0]?.ids, [`${OLDEST - 2n}:2`]);
   });
 
   test('says the same words from one refused hop to the next and from one pass to the next', async () => {

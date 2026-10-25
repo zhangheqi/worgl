@@ -6,7 +6,7 @@ at `purse.worgl.1y.io` on Cloudflare Pages, built with Vite and TypeScript
 and no UI framework, on the [TypeScript SDK](../sdk/typescript/README.md),
 which runs the Rust core as WebAssembly.
 
-This version is the shell, Holdings, keep-alive, Receive and Send:
+This version is the shell, Holdings, keep-alive, Receive, Send and History:
 
 - **The first run** (`#first`): what the purse is and how its field reads,
   then a way in. A mint link (`#mint=<issuer key hex>&at=<server URL>`)
@@ -47,8 +47,56 @@ This version is the shell, Holdings, keep-alive, Receive and Send:
   themselves (their value, and the one-time key each is paid to), never
   from the link's own amount or request id.
 
-Not yet: History, Backup, the Mints screen (Holdings shows the mint used
-last), and a service worker.
+- **History** (`#history`): the shown mint's register, by day, newest
+  first: each entry's time, what it was, what it changed and what the
+  purse held after it, under "What came and went". Each row opens to what
+  was behind it: the notes a take brought and the request it answered, what
+  keep-alive moved and why, what faded and when, a send's transfers, what
+  went and what came back; a send whose hand-back or send can still be shown
+  opens it on Send from there. Under the register: what faded and was lost
+  since the oldest entry kept, and that the register is kept in this
+  browser alone. Holdings' Recent leads there, and so does the desktop bar.
+
+Not yet: Backup, the Mints screen (Holdings shows the mint used last), a
+menu on the phone, and a service worker.
+
+## History
+
+History is the purse's own log (below), the shown mint's entries, by when
+each happened rather than when it was written: a fade is written on the
+open after it, one entry for each layer that went, at the time of the
+rotation that took that layer by the mint's schedule. When that time falls before its notes came (a mint rotated by
+hand), the fade is put just after the last of them came and says "some
+time after"; with no schedule to go by, it is put when the purse saw the
+notes gone and says "or before" (the entry's `fadeAt`). What is held after
+each row is not kept with the entry but worked back from what the purse
+holds now (the SDK's `Balance.total`, which counts a send's change while it
+is on its way and leaves out what goes to the receiver): the newest row's
+number is the one on Holdings, and each row before it is its next row's,
+less that row's change, the number in its Tokens column. So a send that
+ended hours after it began counts once, as it ended, and the column always
+adds up. A send's change counts what its answered transfers gave the
+receiver and every note a transfer the mint dropped spent; a transfer it
+turned away changes nothing, as its note came back. So a send's entry keeps
+what was dropped (`lost`, `lostTheirs`, `dropped`) and how many transfers
+were turned away (`turnedAway`) from the first submit on, and is `lost`
+once nothing of it is on its way if any was dropped. A lost send that part
+went through is "Sent 16 of 20 · 8 lost". A send some of whose transfers
+ended where the purse never saw (a settle that kept no answer for them and
+counted them neither dropped nor turned away) is marked `blind`. A row
+whose change is not known (part of a send whose answers gave no value, one
+the mint turned part of away while the rest waits, or a `blind` one) shows
+"?", as its Recent row on Holdings does, and leaves the rows before it
+without a number, and so does a number that would go below
+nothing, which only a log entry that could not be written would cause. The
+column is empty until the shown mint is read, and again from when an entry
+is logged until a read that began after it comes back.
+
+Each entry since this version also carries the values of its notes, so a
+row can say "As 4 + 1": a take's and keep-alive's in `values`, beside
+their serials; a fade's in `gone`; a send's spent notes in `spentValues`,
+from the read its plan was checked on. An entry written before says the
+tokens instead.
 
 ## Keep-alive
 
@@ -171,6 +219,7 @@ under the hosted Content-Security-Policy, with the local mint allowed.
 | `npm run mint` | the local mint and faucet (`scripts/dev-mint.mjs`) |
 | `npm run screenshots` | `scripts/preview.mjs`: the first run and Holdings, below |
 | `npm run screenshots:send` | `scripts/preview-send.mjs`: Receive and Send between two purses, below |
+| `npm run screenshots:history` | `scripts/preview-history.mjs`: History, from the entries of real sends, takes, keep-alive and a fade |
 | `npm run plan-check` | `scripts/plan-check.mjs`: the planner's choice of notes, checked against the SDK's own `pay` on a local mint |
 | `npm run grain` | draws `public/grain-*.png` again (`scripts/grain.ts`) |
 
@@ -206,6 +255,16 @@ After every view it checks the mint's supply and the camera's
 Permissions-Policy, and it fails on any console error, page error or
 policy violation, or on a view wider than the phone. For the camera it
 needs Playwright's full Chromium rather than its headless shell.
+
+`scripts/preview-history.mjs` makes a register between two purses: takes
+from the faucet, a send from one note, one the mint turns away and one
+from two notes, the hand-backs taken in, a keep-alive run, and a fade over
+rotations with the page closed. It shoots the sender's Holdings and
+History, closed and with rows open, and the receiver's History with a
+received row open, into `target/purse-preview/history-shots/` unless
+`--out` says. It checks that the Held column ends at Holdings' total, that
+every row has a number, that each is the one after it and its change, and
+that the oldest is its own change, as each purse began empty.
 
 ## Camera
 
@@ -258,9 +317,10 @@ no server.
   and of the ended ones the newest 50 stay), and a log of up to 200
   entries, every write strict: `faucet` ("Took 64 from the faucet"),
   `faded` ("Faded 5"), `kept` ("Kept 128 alive", one for each mint and
-  rotation, with the serials of the new notes; a later pass adds to it,
+  rotation, with the serials and values of the new notes; a later pass adds to it,
   and a token moved twice counts once), `lost` ("Lost 64": a transfer the
-  mint applied whose answer it no longer keeps), `sent` ("Sent 5") and
+  mint applied whose answer it no longer keeps), `sent` ("Sent 5", or "Sent
+  16 of 20 · 8 lost" when the mint dropped part of it) and
   `received` ("Received 20"). A send still on its way is never trimmed,
   however old, since its settle writes what it came to there.
 - **Sends and hand-backs.** The SDK keeps each payment and what it owes the
@@ -304,7 +364,8 @@ A faucet answers the hosted purse only when it names its origin:
 | `src/keep.ts` | keep-alive's pure logic: the time budget and spacing, which note a transfer spends, moving and kept notes, when a mint is due, the step count and boxes |
 | `src/keeper.ts` | keep-alive's runner: when passes run and stop (`Keeper`), and one pass over a server (`Keeping`), every browser and SDK dependency injected |
 | `src/lock.ts` | the one Web Lock that keep-alive passes, sends and settles take |
-| `src/first.ts`, `src/home.ts`, `src/receive.ts`, `src/send.ts`, `src/shell.ts` | the views, and the bars and brand they share |
+| `src/first.ts`, `src/home.ts`, `src/receive.ts`, `src/send.ts`, `src/history.ts`, `src/shell.ts` | the views, and the bars and brand they share |
+| `src/register.ts` | History's register: the rows by day, what was held after each, and what each row says |
 | `src/flow.ts`, `src/flow-words.ts`, `src/slice.ts`, `src/postmark.ts`, `src/icons.ts` | what Receive and Send draw: the stamps, codes, ticket and scanner, their words, the slice of the field a send takes from, the postmark of what came in |
 | `src/plan.ts`, `src/amount.ts`, `src/asks.ts`, `src/entries.ts` | which notes a send takes, the amount typed, the open requests, and the log's sends and receipts |
 | `src/links.ts`, `src/deflate.ts`, `src/qr.ts`, `src/camera.ts` | request and hand-back links, their deflate, the QR codes, and the camera |

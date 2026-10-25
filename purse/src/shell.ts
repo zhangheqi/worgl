@@ -20,23 +20,31 @@ export function brand(link: boolean, key = 'brand'): HTMLElement {
 }
 
 /** Where the desktop bar is drawn: the first run (the brand alone), or one of the views it leads to. */
-export type Bar = 'first' | 'home' | 'receive' | 'send';
+export type Bar = 'first' | 'home' | 'receive' | 'send' | 'history';
 
 /**
- * The desktop bar, from 1100 px: the brand, and on Holdings and the flows,
- * Receive and Send at its right, the one shown marked as the current page.
+ * The desktop bar, from 1100 px: the brand, and past the first run the
+ * purse's sections after it and Receive and Send at its right, the one
+ * shown marked as the current page.
  */
 export function deskbar(link: boolean, current: Bar = 'first'): HTMLElement {
-  const acts =
-    current === 'first'
-      ? null
-      : h(
-          'div',
-          { class: 'acts' },
-          h('a', { class: 'btn', href: '#receive', 'aria-current': current === 'receive' ? 'page' : undefined, 'data-fk': 'db-receive' }, downIcon(), 'Receive'),
-          h('a', { class: 'btn solid', href: '#send', 'aria-current': current === 'send' ? 'page' : undefined, 'data-fk': 'db-send' }, upIcon(), 'Send'),
-        );
-  return h('header', { class: 'db' }, h('div', { class: 'db-in' }, brand(link, 'brand-d'), acts));
+  if (current === 'first') {
+    return h('header', { class: 'db' }, h('div', { class: 'db-in' }, brand(link, 'brand-d')));
+  }
+  const page = (bar: Bar): string | undefined => (current === bar ? 'page' : undefined);
+  const nav = h(
+    'nav',
+    { 'aria-label': 'Purse sections' },
+    h('a', { href: '#home', 'aria-current': page('home'), 'data-fk': 'db-home' }, 'Purse'),
+    h('a', { href: '#history', 'aria-current': page('history'), 'data-fk': 'db-history' }, 'History'),
+  );
+  const acts = h(
+    'div',
+    { class: 'acts' },
+    h('a', { class: 'btn', href: '#receive', 'aria-current': page('receive'), 'data-fk': 'db-receive' }, downIcon(), 'Receive'),
+    h('a', { class: 'btn solid', href: '#send', 'aria-current': page('send'), 'data-fk': 'db-send' }, upIcon(), 'Send'),
+  );
+  return h('header', { class: 'db' }, h('div', { class: 'db-in' }, brand(link, 'brand-d'), nav, acts));
 }
 
 /**

@@ -264,10 +264,10 @@ describe('what a run kept', () => {
         { hop: fading, brought: '8:5' },
         { hop: again, brought: '8:102' },
       ]),
-      { amount: 68, serials: ['8:5', '8:102'], spent: [{ id: '6:1', v: 64 }, { id: '7:2', v: 4 }] },
+      { amount: 68, serials: ['8:5', '8:102'], values: [4, 64], spent: [{ id: '6:1', v: 64 }, { id: '7:2', v: 4 }] },
     );
     // a hop whose answer note was not found still counts
-    assert.deepEqual(keptOf([{ hop: fading, brought: undefined }]), { amount: 4, serials: [], spent: [{ id: '7:2', v: 4 }] });
+    assert.deepEqual(keptOf([{ hop: fading, brought: undefined }]), { amount: 4, serials: [], values: [], spent: [{ id: '7:2', v: 4 }] });
   });
 
   test('joins the rotation’s entry already in the log: both runs, each token once', () => {
@@ -283,6 +283,23 @@ describe('what a run kept', () => {
       kind: 'kept',
       amount: 64,
       serials: ['9:3'],
+    });
+  });
+
+  test('joins the notes’ values too, while both runs have them', () => {
+    const old = { kind: 'kept', amount: 68, serials: ['8:1', '8:2'], values: [64, 4] };
+    assert.deepEqual(mergeKept(old, { kind: 'kept', amount: 4, serials: ['9:3'], values: [4] }, [{ id: '8:2', v: 4 }]), {
+      kind: 'kept',
+      amount: 68,
+      serials: ['8:1', '9:3'],
+      values: [64, 4],
+    });
+    // an entry written before the purse kept values: the joined one has none, rather than values that miss notes
+    const older = { kind: 'kept', amount: 64, serials: ['8:1'] };
+    assert.deepEqual(mergeKept(older, { kind: 'kept', amount: 8, serials: ['8:5'], values: [8] }, [{ id: '7:9', v: 8 }]), {
+      kind: 'kept',
+      amount: 72,
+      serials: ['8:1', '8:5'],
     });
   });
 });

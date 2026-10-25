@@ -303,24 +303,29 @@ export interface Moved {
 export function keptOf(hops: readonly { hop: Spent; brought: string | undefined }[]): {
   amount: number;
   serials: string[];
+  values: number[];
   spent: Moved[];
 } {
   const serials: string[] = [];
+  // a refresh keeps a note's value: the note a hop brought is worth what it spent
+  const values: number[] = [];
   const spent: Moved[] = [];
   let amount = 0;
   for (const { hop, brought } of hops) {
     const again = serials.indexOf(hop.id);
     if (again >= 0) {
       serials.splice(again, 1);
+      values.splice(again, 1);
     } else {
       amount += hop.v;
       spent.push({ id: hop.id, v: hop.v });
     }
     if (brought !== undefined) {
       serials.push(brought);
+      values.push(hop.v);
     }
   }
-  return { amount, serials, spent };
+  return { amount, serials, values, spent };
 }
 
 /**
@@ -329,18 +334,26 @@ export function keptOf(hops: readonly { hop: Spent; brought: string | undefined 
  * runs' tokens, a note `more` spent that `old` brought counted once, and
  * the notes the two left.
  */
-export function mergeKept<E extends { amount: number; serials: string[] }>(
-  old: { amount: number; serials: readonly string[] },
+export function mergeKept<E extends { amount: number; serials: string[]; values?: number[] }>(
+  old: { amount: number; serials: readonly string[]; values?: readonly number[] | undefined },
   more: E,
   spent: readonly Moved[],
 ): E {
   const again = spent.filter((each) => old.serials.includes(each.id));
   const gone = new Set(again.map((each) => each.id));
-  return {
+  const merged: E = {
     ...more,
     amount: old.amount + more.amount - again.reduce((total, each) => total + each.v, 0),
     serials: [...old.serials.filter((id) => !gone.has(id)), ...more.serials],
   };
+  // the values only while both runs have them, each in its serials' order
+  const oldValues = old.values;
+  if (oldValues === undefined || oldValues.length !== old.serials.length || more.values === undefined) {
+    delete merged.values;
+  } else {
+    merged.values = [...oldValues.filter((_, i) => !gone.has(old.serials[i] ?? '')), ...more.values];
+  }
+  return merged;
 }
 
 // ---------- when a mint is due ----------

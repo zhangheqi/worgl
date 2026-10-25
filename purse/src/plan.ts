@@ -453,3 +453,36 @@ function spentBy(transfer: string): number | undefined {
   const amounts = outputs.map((output) => record(output)['amount']);
   return amounts.every(whole) ? total(amounts) : undefined;
 }
+
+/** What a send's log entry keeps of the transfers the mint dropped or turned away (entries.ts `LogEntry`). */
+export interface Refusals {
+  lost?: number;
+  lostTheirs?: number;
+  dropped?: number;
+  turnedAway?: number;
+}
+
+/**
+ * A send's dropped and turned-away transfers so far (`entry`), with those
+ * among `refused`, a submit's or a settle's refusals, added. What the mint
+ * dropped is lost whatever comes of the rest, so the entry keeps it from
+ * the first; a refusal the purse kept to send again counts for neither.
+ */
+export function withRefused(
+  entry: Refusals,
+  refused: readonly { request: string; atStake: bigint | undefined; outcome: string }[],
+): Refusals {
+  const dropped = refused.filter((refusal) => refusal.outcome === 'dropped' && refusal.atStake !== undefined);
+  const turned = refused.filter((refusal) => refusal.outcome === 'cancelled').length;
+  const out: Refusals = {};
+  if (dropped.length > 0) {
+    const { lost, theirs } = droppedValue(dropped);
+    out.lost = (entry.lost ?? 0) + lost;
+    out.lostTheirs = (entry.lostTheirs ?? 0) + theirs;
+    out.dropped = (entry.dropped ?? 0) + dropped.length;
+  }
+  if (turned > 0) {
+    out.turnedAway = (entry.turnedAway ?? 0) + turned;
+  }
+  return out;
+}

@@ -1,6 +1,7 @@
 // What the purse's records hold: the mints added, the requests made and
-// the log. Types only, apart from the database itself (records.ts), so
-// the pure modules and their tests can name them without the DOM.
+// the log. Types only, and the log's length, apart from the database
+// itself (records.ts), so the pure modules and their tests can name them
+// without the DOM.
 
 import type { LastFade } from './holdings.ts';
 
@@ -61,6 +62,9 @@ export interface AskRecord {
   endedAt: number | undefined;
 }
 
+/** How many log entries the purse keeps, past a send still on its way: Holdings shows the last few, History all. */
+export const LOG_KEPT = 200;
+
 /** One entry in the purse's log. */
 export interface LogEntry {
   /** Its place in the log, given when it is added. */
@@ -88,6 +92,18 @@ export interface LogEntry {
    * send, its change.
    */
   serials: string[];
+  /** faucet, received, kept: the values of the notes in `serials`, in their order, where the entry was written with them. */
+  values?: number[];
+  /** faded: the values of the notes that faded, where they were read. */
+  gone?: number[];
+  /**
+   * faded: how far `t` can be trusted: missing when it is the mint's
+   * scheduled rotation; `after` when that fell before the notes came (a mint
+   * rotated by hand), so `t` is when the last of them came and they faded
+   * some time after; `by` when there was no schedule to go by, so `t` is
+   * when the purse saw them gone.
+   */
+  fadeAt?: 'after' | 'by';
   /** kept: the mint's first layer (its generation) when they moved, so one rotation's runs make one entry. */
   round?: string;
   /** sent, received: the request's id. */
@@ -104,12 +120,28 @@ export interface LogEntry {
   transfers?: number;
   /** sent: serials of the notes spent. */
   spent?: string[];
+  /** sent: the values of the notes spent, in the order of `spent`, where the entry was written with them. */
+  spentValues?: number[];
   /** sent: change that came back (its notes' serials are in `serials`). */
   back?: number;
-  /** sent, state lost: the value lost, the notes the dropped transfers spent: theirs and the change together. */
+  /**
+   * sent: the value lost, the notes the transfers the mint dropped spent,
+   * theirs and the change together, in whatever state: a send that lost
+   * any is `lost` once nothing of it is on its way.
+   */
   lost?: number;
-  /** sent, state lost: the part of `lost` that was for the receiver. */
+  /** sent: the part of `lost` that was for the receiver. */
   lostTheirs?: number;
+  /** sent: how many of its transfers the mint dropped (`lost`). */
+  dropped?: number;
+  /** sent: how many of its transfers the mint turned away: their notes came back. */
+  turnedAway?: number;
+  /**
+   * sent: the purse never saw what some of its transfers came to: its first
+   * submit ended after the page closed, before its end was written, and a
+   * settle found fewer of them than it made. What it changed is not known.
+   */
+  blind?: boolean;
   /** sent, state turned: whether the mint turned it away because its newest layer was full (it can go after the rotation). */
   layerFull?: boolean;
   /** sent: when it was last updated: when its change came. */

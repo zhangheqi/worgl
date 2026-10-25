@@ -334,15 +334,27 @@ export function savedHoldings(saved: Saved, now: number): Holdings | undefined {
  * When the rotation came that dropped the layer of `generation`, by this
  * device's clock: the first layer is generation `oldest` since the last
  * rotation, so that layer went `oldest - generation - 1` rotations before
- * it. Without a schedule, or for a time still to come, `now`. A mint
- * rotated by hand keeps its schedule, so this is then only a guess.
+ * it. `undefined` without a schedule, or when the schedule puts it still to
+ * come: then only that it went by `now` is known. A mint rotated by hand
+ * keeps its schedule, so this is then only a guess.
  */
-export function fadedAt(generation: bigint, info: MintInfo, skew: number, now: number): number {
+export function fadedAt(generation: bigint, info: MintInfo, skew: number, now: number): number | undefined {
   const rotation = info.paused ? undefined : info.rotation;
   if (rotation === undefined || generation >= info.oldest) {
-    return now;
+    return undefined;
   }
   const back = info.oldest - generation;
   const t = (Number(rotation.nextAt - rotation.periodSecs * back) - skew) * 1000;
-  return Math.min(now, t);
+  return t <= now ? t : undefined;
+}
+
+/**
+ * When the notes `ids` faded, from {@link fadedAt}'s `t`, but never before
+ * the last of them came, as far as the log knows (`arrivals`): on a mint
+ * rotated by hand the guess can fall before they came, and History would
+ * then put the fade before the notes it took.
+ */
+export function fadedAfter(t: number, ids: readonly string[], arrivals: ReadonlyMap<string, Arrival>, now: number): number {
+  const came = ids.reduce((last, id) => Math.max(last, arrivals.get(id)?.at ?? -Infinity), -Infinity);
+  return came < t ? t : Math.min(now, came + 1);
 }

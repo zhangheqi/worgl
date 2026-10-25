@@ -652,6 +652,8 @@ em { font-style: italic; }
   *, *::before, *::after { animation-duration: 1ms !important; animation-delay: 0s !important; animation-iteration-count: 1 !important; transition-duration: 1ms !important; }
   .lo-drift { animation: none !important; }
   .press .postmark { animation: none !important; opacity: 1; }
+  /* a new entry's dot stays, without fading, until it is taken away */
+  .act .new, .hrow .t .new { animation: none !important; }
 }
 /* ---------- the purse's own rules ---------- */
 /* the lane a tip is about stays lit, by its key, so any number of layers works */
@@ -812,3 +814,41 @@ span.ib.face:hover { background: none; }
 /* a flow step with only buttons in its cobalt: the paper takes the height, the cobalt is their strip */
 .flow.low .band-p { flex: 1 0 auto; }
 .flow.low .band-c { flex: none; }
+/* ---------- History: the register ---------- */
+/* Recent's way to History, on the cobalt */
+.recent-h .to-hist { color: var(--on-cobalt); min-height: 44px; display: inline-flex; align-items: center; gap: 8px; text-decoration: none; }
+.recent-h .to-hist:hover { text-decoration: underline; text-underline-offset: .4em; }
+.hist-h1 { margin-top: 10px; }
+.hist-where { margin-top: 12px; }
+.reg-none { padding: 22px 0 6px; }
+.reg-cols, .hrow > button { display: grid; grid-template-columns: 48px minmax(0, 1fr) 54px 46px; gap: 8px; }
+.reg-cols { padding: 18px 0 7px; border-bottom: 3px double var(--rule-strong); color: var(--muted); }
+.reg-cols span:nth-child(n+3) { text-align: right; }
+.day { display: flex; align-items: center; gap: 10px; padding: 16px 0 6px; color: var(--accent-text); font-size: inherit; }
+.day .rule { flex: 1; height: 1px; background: var(--rule-strong); }
+.hrow { border-bottom: 1px solid var(--rule); }
+.hrow > button { align-items: baseline; width: 100%; min-height: 56px; padding: 11px 0; text-align: left; }
+.hrow > button:hover { background: var(--hover); }
+.hrow time { font-family: var(--f-mono); font-size: 11.5px; letter-spacing: .04em; font-stretch: 87.5%; color: var(--muted); }
+.hrow .t { font-size: 15.5px; font-weight: 500; line-height: 1.3; min-width: 0; overflow-wrap: anywhere; }
+.hrow .t small { display: block; font-size: 13.5px; font-weight: 400; color: var(--muted); line-height: 1.35; margin-top: 1px; }
+.hrow .t .new { display: inline-block; width: 8px; height: 8px; background: var(--pink); margin-right: 6px; transform: translateY(-1px); animation: newdot 6s ease forwards; }
+.hrow b { font-family: var(--f-serif); font-weight: 400; font-size: 24px; letter-spacing: -.01em; line-height: 1; text-align: right; white-space: nowrap; }
+.hrow b.n { color: var(--muted); }
+.hrow .held { font-family: var(--f-mono); font-size: 11.5px; font-stretch: 87.5%; color: var(--muted); text-align: right; }
+.hrow .det { padding: 0 0 14px 56px; display: flex; flex-direction: column; gap: 10px; align-items: flex-start; }
+.hrow .det p { font-size: 14.5px; line-height: 1.45; color: var(--muted); max-width: 34em; }
+.hrow.open > button { background: var(--hover); }
+.hrow.open .det { background: var(--hover); padding-bottom: 16px; margin-top: -1px; }
+.hist-foot { display: flex; flex-direction: column; gap: 8px; }
+.hist-foot .body { max-width: 34em; }
+@media (min-width: 1100px) {
+  /* the desktop bar's sections, after the brand */
+  .db nav { display: flex; gap: 6px; margin-left: 24px; }
+  .db nav a { min-height: 44px; min-width: 44px; padding: 0 12px; display: inline-flex; align-items: center; text-decoration: none; font-size: 15.5px; }
+  .db nav a:hover { text-decoration: underline; text-underline-offset: .4em; }
+  .db nav a[aria-current="page"] { text-decoration: underline; text-decoration-thickness: 1.5px; text-underline-offset: .45em; }
+  .v-hist .h1 { font-size: 72px; }
+  .reg-cols, .hrow > button { grid-template-columns: 60px minmax(0, 1fr) 72px 60px; gap: 12px; }
+  .hrow .det { padding-left: 72px; }
+}

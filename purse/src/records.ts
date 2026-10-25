@@ -7,7 +7,7 @@
 // server. Every write is strict, so it resolves only once it is on disk.
 
 import { endedToDrop } from './asks.ts';
-import type { AskRecord, LogEntry, MintRecord } from './entries.ts';
+import { type AskRecord, LOG_KEPT, type LogEntry, type MintRecord } from './entries.ts';
 import { type Moved, mergeKept } from './keep.ts';
 
 export type { AskRecord, LogEntry, MintRecord, SavedInfo } from './entries.ts';
@@ -27,8 +27,6 @@ const VERSION = 3;
 /** How many ended requests (taken in full, or cancelled) the purse keeps; open ones it always keeps. */
 export const ASKS_ENDED_KEPT = 50;
 
-/** How many log entries the purse keeps: Holdings shows the last few, History (later) more. */
-const LOG_KEPT = 200;
 /** How far back a run's entry looks for its rotation's: a rotation adds a few entries at most. */
 const KEPT_SCAN = 50;
 

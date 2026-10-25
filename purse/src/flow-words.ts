@@ -8,8 +8,9 @@ import type { AmountProblem } from './amount.ts';
 import { cap, hm, listWords, notesShort, notesWords, plusJoin, shortDay, when, word } from './format.ts';
 import type { LinkKind, LinkProblem } from './links.ts';
 import type { ChangeLands, ShortCase } from './plan.ts';
+import { effectOf, gaveOf } from './effect.ts';
 import type { AskRecord, LogEntry } from './entries.ts';
-import { recentChange, recentTitle } from './words.ts';
+import { recentTitle } from './words.ts';
 
 /** A piece of a line: words, words in italics, or words in bold. */
 export type Rich = string | { em: string } | { b: string };
@@ -30,7 +31,7 @@ export type RowOpens = 'sending' | 'waiting' | 'handback' | 'lost';
 export interface RecentRow {
   title: string;
   small: string | undefined;
-  /** The change, or `undefined` for none (drawn as —). */
+  /** The change, effect.ts's, as History's Held column steps by it: 0 for none (drawn as —), `undefined` when it is not known. */
   delta: number | undefined;
   opens: RowOpens | undefined;
   /** For a row that opens something: what it is and what it opens, for assistive tech. */
@@ -42,64 +43,50 @@ export interface RecentRow {
  * is still kept, so that a row whose hand-back is gone opens nothing.
  */
 export function recentRow(entry: LogEntry, kept: boolean, now: number): RecentRow {
-  const plain = (title: string, delta: number | undefined): RecentRow => ({ title, small: undefined, delta, opens: undefined, label: undefined });
+  const delta = effectOf(entry);
+  const plain = (title: string): RecentRow => ({ title, small: undefined, delta, opens: undefined, label: undefined });
   if (entry.kind !== 'sent' && entry.kind !== 'received') {
     // a take from the faucet, a fade and keep-alive's entries: words.ts says them
-    const own = { kind: entry.kind, amount: entry.amount };
-    return plain(recentTitle(own), recentChange(own));
+    return plain(recentTitle({ kind: entry.kind, amount: entry.amount }));
   }
   if (entry.kind === 'received') {
-    return plain(`Received ${entry.amount}`, entry.amount);
+    return plain(`Received ${entry.amount}`);
   }
   const asked = entry.asked ?? entry.amount;
   const went = entry.went;
   const at = when(entry.t, now);
   switch (entry.state) {
     case 'sending':
-      return { title: `Sending ${asked}`, small: undefined, delta: -asked, opens: 'sending', label: `Sending ${asked}. Show the send` };
+      return { title: `Sending ${asked}`, small: undefined, delta, opens: 'sending', label: `Sending ${asked}. Show the send` };
     case 'waiting':
-      return { title: `Sent ${asked}`, small: ' · waiting', delta: -asked, opens: 'waiting', label: `Sent ${asked} at ${at}. Waiting for the mint` };
+      return { title: `Sent ${asked}`, small: ' · waiting', delta, opens: 'waiting', label: `Sent ${asked} at ${at}. Waiting for the mint` };
     case 'turned':
-      return plain(`Turned away: ${asked}`, undefined);
+      return plain(`Turned away: ${asked}`);
     case 'lost': {
       const lost = entry.lost ?? asked;
-      return {
-        title: `Lost ${lost} on a send of ${asked}`,
-        small: undefined,
-        delta: -lost,
-        opens: 'lost',
-        label: `Lost ${lost} on a send of ${asked}. Show what happened`,
-      };
+      const went = gaveOf(entry);
+      // part of it went: what went, and what was lost besides
+      const title = went !== undefined && went > 0 ? `Sent ${went} of ${asked}` : `Lost ${lost} on a send of ${asked}`;
+      const small = went !== undefined && went > 0 ? ` · ${lost} lost` : undefined;
+      return { title, small, delta, opens: 'lost', label: `${title}${small ?? ''}. Show what happened` };
     }
     case 'partial': {
       const title = went === undefined ? `Sent part of ${asked}` : `Sent ${went} of ${asked}`;
       if (!kept) {
         // as any send that went, once its hand-back is gone; "Sent {asked}" would say more went than did
-        return went === undefined ? plain(title, undefined) : plain(`Sent ${went}`, -went);
+        return plain(went === undefined ? title : `Sent ${went}`);
       }
-      return {
-        title,
-        small: ' · hand-back',
-        delta: went === undefined ? undefined : -went,
-        opens: 'handback',
-        label: `${title} at ${at}. Show the hand-back again`,
-      };
+      return { title, small: ' · hand-back', delta, opens: 'handback', label: `${title} at ${at}. Show the hand-back again` };
     }
     case 'handback': {
       const sent = went ?? asked;
       if (!kept) {
-        return plain(`Sent ${sent}`, -sent);
+        return plain(`Sent ${sent}`);
       }
-      return {
-        title: `Sent ${sent}`,
-        small: ' · hand-back',
-        delta: -sent,
-        opens: 'handback',
-        label: `Sent ${sent} at ${at}. Show the hand-back again`,
-      };
+      return { title: `Sent ${sent}`, small: ' · hand-back', delta, opens: 'handback', label: `Sent ${sent} at ${at}. Show the hand-back again` };
     }
     default:
-      return plain(`Sent ${went ?? asked}`, -(went ?? asked));
+      return plain(`Sent ${went ?? asked}`);
   }
 }
 
@@ -560,6 +547,10 @@ export const sentWords = (amount: number, away: boolean): string =>
 /** What the live region says when a send kept for later went through on a later open. */
 export const settledWords = (amount: number): string => `The send of ${amount} went through. Its hand-back is on Send.`;
 
+/** The same, for a send part of which went through while the mint no longer kept the answer for some of it. */
+export const partLostWords = (went: number | undefined, amount: number): string =>
+  `${went === undefined ? 'Part' : went} of the send of ${amount} went through, and the mint no longer kept the answer for some of it. Its hand-back is on Send.`;
+
 // ---------- Send: hand-back ----------
 
 export const sentLine = (amount: number, t: number, now: number): string => `Sent ${amount} · ${when(t, now)}`;
@@ -598,11 +589,11 @@ export function partialLine(went: number | undefined, amount: number, turned: nu
   };
 }
 
-/** The body of a partial hand-back. */
-export const partialBody = (went: number | undefined, amount: number): string =>
+/** The body of a partial hand-back: `it` names the hand-back, as `It` does under its QR on Send. */
+export const partialBody = (went: number | undefined, amount: number, it = 'It'): string =>
   went === undefined
-    ? `It carries part of their ${amount}. Their purse says how much when they take it in.`
-    : `It carries their ${went}. Ask them to make a new request for the other ${amount - went}.`;
+    ? `${it} carries part of their ${amount}. Their purse says how much when they take it in.`
+    : `${it} carries their ${went}. Ask them to make a new request for the other ${amount - went}.`;
 
 export const handBackQrLabel = (amount: number): string => `QR code: a hand-back carrying ${amount} tokens`;
 export const handBackStamp = (amount: number, mint: string): string => `${amount} tokens · ${mint} · for one receiver`;
