@@ -108,10 +108,10 @@ What it does not do:
   (one the mint does not answer, and those after it, stay outgoing for the
   next pass). The send waits for that, which takes seconds unless the mint
   is slow to answer, since a transfer on its way is answered first, and
-  then for the lock. A pass of another tab's waits ten seconds before it
-  tries again, so the send takes the lock first, and that tab tries again
-  half a minute after; the sending tab's next pass runs once the send is
-  over. While Send shows a request's plan, not yet sent, that tab's
+  then for the lock. Another tab's pass, once it has ended, waits ten
+  seconds before it tries again, so that the send takes the lock first,
+  and it runs again as soon as the sending tab says its send is over
+  (`sent`). While Send shows a request's plan, not yet sent, that tab's
   keep-alive leaves the mint alone too (a pass at its server ends that way
   before Send reads, and later ones neither move its notes nor resend what
   is outgoing that spends them; the other mints' are settled as ever), so
@@ -274,7 +274,8 @@ no server.
 - **Other tabs** hear of each change on the `BroadcastChannel` named
   `purse`, and read the stores again; so does a tab that comes back into
   view. A running pass also posts its progress there (`keeping`, then
-  `kept`), and a send posts `yield`, which ends a pass in every other tab.
+  `kept`), and a send posts `yield`, which ends a pass in every other tab,
+  and `sent` once it is over, when their passes run again.
 - On the first take the purse asks the browser to keep its storage
   (`navigator.storage.persist()`). Clearing the site's data still empties
   it, and a private window forgets it when it closes.

@@ -1375,10 +1375,29 @@ async function pruneAndLog(loaded: Sdk, server: string, mint: string, read: Read
 /** This tab's sends and settles from Send that hold the lock, or wait for it: a pass gives way to them. */
 let sendsHere = 0;
 
-/** How long after another tab's send asked this tab's pass to end the next pass waits, so that the send takes the lock first. */
+/**
+ * How long after another tab's send asked this tab's pass to end the next
+ * pass waits, so that the send takes the lock first: should that tab never
+ * say its send is over (`sent`), as when it closes first.
+ */
 const YIELD_MS = 10_000;
-/** Until when this tab's passes wait for another tab's send. */
-let yieldUntil = 0;
+/**
+ * The other tabs' sends this tab's passes wait for, by the id each posted
+ * with its `yield`: until when (for good while this tab's pass is being
+ * ended for it), unless its `sent` comes first.
+ */
+const yields = new Map<string, number>();
+
+/** Whether a send of another tab's is about to take the lock, as far as this tab has heard. */
+function yielding(now: number): boolean {
+  for (const [id, until] of yields) {
+    if (now < until) {
+      return true;
+    }
+    yields.delete(id);
+  }
+  return false;
+}
 
 /**
  * A keep-alive pass's lock (lock.ts), if nothing else holds it: false,
@@ -1391,7 +1410,7 @@ async function passLock(work: () => Promise<void>): Promise<boolean> {
   if (sendsHere > 0) {
     return true;
   }
-  if (Date.now() < yieldUntil) {
+  if (yielding(Date.now())) {
     return false;
   }
   return (
@@ -1411,12 +1430,15 @@ async function passLock(work: () => Promise<void>): Promise<boolean> {
 async function sending<R>(work: () => Promise<R>): Promise<R> {
   // counted first, so that a pass poked while this tab's ends gives way rather than take the lock before the send
   sendsHere++;
+  const id = Math.random().toString(36).slice(2);
   try {
-    channel?.postMessage({ kind: 'yield' });
+    channel?.postMessage({ kind: 'yield', id });
     await keeper.stop();
     return await work();
   } finally {
     sendsHere--;
+    // the other tabs' passes run again now, rather than once their wait is out
+    channel?.postMessage({ kind: 'sent', id });
     keeper.poke();
   }
 }
@@ -3583,7 +3605,7 @@ type KeepMessage =
   | { kind: 'keeping'; mint: string; amount: number; done: number; total: number }
   | { kind: 'kept'; mint: string }
   | { kind: 'ask' }
-  | { kind: 'yield' };
+  | { kind: 'yield' | 'sent'; id: string };
 
 const count = (n: unknown): n is number => typeof n === 'number' && Number.isInteger(n) && n >= 0;
 
@@ -3593,8 +3615,11 @@ function keepMessage(data: unknown): KeepMessage | undefined {
     return undefined;
   }
   const m = data as Record<string, unknown>;
-  if (m['kind'] === 'ask' || m['kind'] === 'yield') {
-    return { kind: m['kind'] };
+  if (m['kind'] === 'ask') {
+    return { kind: 'ask' };
+  }
+  if (m['kind'] === 'yield' || m['kind'] === 'sent') {
+    return { kind: m['kind'], id: typeof m['id'] === 'string' ? m['id'] : '' };
   }
   if (typeof m['mint'] !== 'string') {
     return undefined;
@@ -3618,14 +3643,25 @@ function keepMessage(data: unknown): KeepMessage | undefined {
 async function heard(data: unknown): Promise<void> {
   const message = keepMessage(data);
   if (message?.kind === 'yield') {
-    yieldUntil = Number.POSITIVE_INFINITY;
+    const { id } = message;
+    yields.set(id, Number.POSITIVE_INFINITY);
     try {
       await keeper.stop();
     } finally {
-      yieldUntil = Date.now() + YIELD_MS;
+      // unless that tab said meanwhile that its send is over
+      if (yields.has(id)) {
+        yields.set(id, Date.now() + YIELD_MS);
+      }
     }
     // this tab tries again once that tab's send and the pass after it are over, whether or not that pass comes
     keeper.watch();
+    return;
+  }
+  if (message?.kind === 'sent') {
+    // that send is over and the lock is free: this tab's keep-alive runs now, not half a minute on, even when its wait
+    // ran out first and a pass found the lock taken
+    yields.delete(message.id);
+    keeper.poke();
     return;
   }
   if (message?.kind === 'ask') {
