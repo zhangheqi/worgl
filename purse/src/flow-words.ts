@@ -9,6 +9,7 @@ import { cap, hm, listWords, notesShort, notesWords, plusJoin, shortDay, when, w
 import type { LinkKind, LinkProblem } from './links.ts';
 import type { ChangeLands, ShortCase } from './plan.ts';
 import type { AskRecord, LogEntry } from './entries.ts';
+import { recentChange, recentTitle } from './words.ts';
 
 /** A piece of a line: words, words in italics, or words in bold. */
 export type Rich = string | { em: string } | { b: string };
@@ -42,11 +43,10 @@ export interface RecentRow {
  */
 export function recentRow(entry: LogEntry, kept: boolean, now: number): RecentRow {
   const plain = (title: string, delta: number | undefined): RecentRow => ({ title, small: undefined, delta, opens: undefined, label: undefined });
-  if (entry.kind === 'faucet') {
-    return plain(`Took ${entry.amount} from the faucet`, entry.amount);
-  }
-  if (entry.kind === 'faded') {
-    return plain(`Faded ${entry.amount}`, -entry.amount);
+  if (entry.kind !== 'sent' && entry.kind !== 'received') {
+    // a take from the faucet, a fade and keep-alive's entries: words.ts says them
+    const own = { kind: entry.kind, amount: entry.amount };
+    return plain(recentTitle(own), recentChange(own));
   }
   if (entry.kind === 'received') {
     return plain(`Received ${entry.amount}`, entry.amount);

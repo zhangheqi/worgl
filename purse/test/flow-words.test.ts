@@ -381,6 +381,8 @@ describe('Recent', () => {
     };
     assert.deepEqual(row({ t: NOW, kind: 'faucet', mint: 'm', amount: 64, serials: [] }), ['Took 64 from the faucet', undefined, 64, undefined]);
     assert.deepEqual(row({ t: NOW, kind: 'faded', mint: 'm', amount: 4, serials: [] }), ['Faded 4', undefined, -4, undefined]);
+    assert.deepEqual(row({ t: NOW, kind: 'kept', mint: 'm', amount: 128, serials: [] }), ['Kept 128 alive', undefined, 0, undefined]);
+    assert.deepEqual(row({ t: NOW, kind: 'lost', mint: 'm', amount: 64, serials: [] }), ['Lost 64', undefined, -64, undefined]);
     assert.deepEqual(row({ t: NOW, kind: 'received', mint: 'm', amount: 5, serials: [] }), ['Received 5', undefined, 5, undefined]);
     assert.deepEqual(row(sent({ state: 'sending' })), ['Sending 5', undefined, -5, 'sending']);
     assert.deepEqual(row(sent({ state: 'waiting' })), ['Sent 5', ' · waiting', -5, 'waiting']);

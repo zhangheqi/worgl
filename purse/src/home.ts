@@ -2,7 +2,11 @@
 // and its caption, the date to come back by, Recent and the mint. One tree
 // for every width; the CSS shows the phone's or the desktop's parts. The
 // field itself is drawn into `#field` once the view is in the page (see
-// field.ts), since it fills the height the page leaves it.
+// field.ts), since it fills the height the page leaves it. While a
+// keep-alive run goes, the come-back row and column count its transfers;
+// `renderBack` redraws only those two as the count moves, so focus, an open
+// tip and the field are left alone. The date to come back by is the
+// earliest of every mint the purse keeps, and says so when it is another's.
 
 import type { FaucetInfo } from 'worgl';
 
@@ -10,12 +14,29 @@ import { type Child, h } from './dom.ts';
 import { recentRow } from './flow-words.ts';
 import { f2, hm, periodWords, shortDay, change } from './format.ts';
 import type { Holdings, LaneKey } from './holdings.ts';
+import { type Progress, boxes } from './keep.ts';
 import { shortKey } from './link.ts';
 import { face } from './marks.ts';
 import { postmarkWrap } from './postmark.ts';
 import type { LogEntry, MintRecord } from './records.ts';
 import { brand, deskbar } from './shell.ts';
-import { type Received, KEEPS_ALIVE, caption, comeBackHeading, comeBackRow, fieldLabel, firstToGo, numberDescription, sentence } from './words.ts';
+import {
+  KEEPING_ELSEWHERE,
+  KEEPING_ELSEWHERE_NOTE,
+  type Received,
+  caption,
+  comeBackHeading,
+  comeBackRow,
+  elsewhereNote,
+  elsewhereRow,
+  fieldLabel,
+  firstToGo,
+  keepingCount,
+  keepingLead,
+  keepingNote,
+  numberDescription,
+  sentence,
+} from './words.ts';
 
 /** What the purse last read of the mint it shows. */
 export interface HomeData {
@@ -28,15 +49,46 @@ export interface HomeData {
 const CHIP_MS = 60 * 60_000;
 const PINK_MS = 6000;
 
+/** A keep-alive run of the shown mint's tokens, as the come-back row and column count it. */
+export interface KeepShown extends Progress {
+  /** Whether its hops go a few seconds apart, or a near rotation squeezed them. */
+  spaced: boolean;
+  /** Whether another tab of the purse runs it, and this one only shows it. */
+  watching: boolean;
+}
+
+/** Another mint the purse keeps, whose tokens go before the shown mint's: the date to come back by is for them. */
+export interface Elsewhere {
+  /** What the purse calls it. */
+  name: string;
+  holdings: Holdings;
+  /** Whether the purse can keep its tokens alive now. */
+  keeps: boolean;
+}
+
+/** At most this many step boxes: eight on the phone (two rows at most), sixteen in the desktop column. */
+const PHONE_BOXES = 8;
+const DESK_BOXES = 16;
+
 /** Everything Holdings draws from. */
 export interface HomeInput {
   record: MintRecord;
   /** What the purse read; `undefined` until the first read comes back. */
   data: HomeData | undefined;
+  /** Before any read came back, when the read failed: what fades first as the purse saved it, for the come-back row and column. */
+  saved: Holdings | undefined;
   /** This mint's log entries, newest first. */
   log: readonly LogEntry[];
-  /** What went wrong reading the mint, or taking from its faucet, in plain words. */
-  error: { words: string; at: 'read' | 'take' } | undefined;
+  /** What went wrong reading the mint, taking from its faucet, or keeping its tokens alive, in plain words. */
+  error: { words: string; at: 'read' | 'take' | 'keep' } | undefined;
+  /** Whether the error is new since the last draw: only then is it an alert, so a screen reader says it once, not at each redraw. */
+  alert: boolean;
+  /** Whether the purse can keep these tokens alive now: false while the mint is paused or keep-alive is stuck (the words then say what happens without it). */
+  keeps: boolean;
+  /** The keep-alive run going now, if one moves the shown mint's tokens. */
+  keep: KeepShown | undefined;
+  /** Another mint whose tokens go first, when there is one: the come-back row and column are about it. */
+  elsewhere: Elsewhere | undefined;
   /** The lane whose tip is open, for its numbers' state. */
   openLane: LaneKey | undefined;
   /** The last change and when it came, for the chip. */
@@ -119,7 +171,7 @@ function paperBand(input: HomeInput): HTMLElement {
         }),
       ),
       h('div', { class: 'tip-slot phone-only' }),
-      input.error?.at === 'read' ? h('p', { class: 'err home-err', role: 'alert' }, input.error.words) : null,
+      input.error?.at === 'read' || input.error?.at === 'keep' ? errorLine(input, input.error.words) : null,
       h(
         'div',
         { class: 'f-cap desk-only' },
@@ -132,7 +184,7 @@ function paperBand(input: HomeInput): HTMLElement {
           h('span', {}, h('i', { class: 'lg-f' }), 'Fading'),
         ),
       ),
-      h('div', { class: 'back-row phone-only' }, known ? backRow(holdings, now) : h('p', {})),
+      h('div', { class: 'back-row phone-only' }, ...backRow(input)),
     ),
   );
 }
@@ -154,7 +206,7 @@ function chip(delta: HomeInput['delta'], now: number): HTMLElement | null {
 function words(input: HomeInput, holdings: Holdings): Child[] {
   const lane = input.received?.lane;
   const received: Received | undefined = input.received === undefined || lane === undefined ? undefined : { amount: input.received.amount, lane };
-  return sentence(holdings, input.now, KEEPS_ALIVE, received).map((part) => {
+  return sentence(holdings, input.now, input.keeps, received).map((part) => {
     if (typeof part === 'string') {
       return part;
     }
@@ -179,10 +231,63 @@ function words(input: HomeInput, holdings: Holdings): Child[] {
   });
 }
 
-/** The phone's come-back row: a heading, as the desktop's column is, when it names a date. */
-function backRow(holdings: Holdings, now: number): HTMLElement {
-  const row = comeBackRow(holdings, now);
-  return 'none' in row ? h('p', { class: 'muted' }, row.none) : h('h2', {}, row.lead, h('b', {}, row.date));
+/**
+ * The phone's come-back row: a heading, as the desktop's column is, when it
+ * names a date; while a run goes, its count and step boxes, a paragraph
+ * since it reports progress.
+ */
+function backRow(input: HomeInput): HTMLElement[] {
+  const { data, keep, now } = input;
+  if (keep !== undefined) {
+    return [
+      h(
+        'p',
+        {},
+        h('b', {}, keepingLead(keep.amount)),
+        ` · ${keepingCount(keep)}`,
+        keep.watching ? h('br') : null,
+        keep.watching ? h('span', { class: 'muted' }, KEEPING_ELSEWHERE) : null,
+      ),
+      h('span', { class: 'ka-box' }, steps(keep, PHONE_BOXES)),
+    ];
+  }
+  const own = data?.holdings ?? input.saved;
+  if (own === undefined) {
+    return [h('p', {})];
+  }
+  const { elsewhere } = input;
+  const row = comeBackRow(elsewhere?.holdings ?? own, now, elsewhere?.keeps ?? input.keeps);
+  if ('none' in row) {
+    return [h('p', { class: 'muted' }, row.none)];
+  }
+  return [
+    h(
+      'h2',
+      {},
+      row.lead,
+      h('b', {}, row.date),
+      elsewhere === undefined ? null : h('br'),
+      elsewhere === undefined ? null : h('span', { class: 'muted' }, elsewhereRow(elsewhere.name)),
+    ),
+  ];
+}
+
+/** The step boxes: one per transfer, up to `max`; filled once done. Hidden from screen readers, since the words say the count. */
+function steps(keep: Progress, max: number): HTMLElement {
+  return h('span', { class: 'ka-steps', 'aria-hidden': 'true' }, ...boxes(keep, max).map((on) => h('i', { class: on ? 'on' : undefined })));
+}
+
+/**
+ * Draws the come-back row and column again from `input`, and nothing else:
+ * the run's count moves every few seconds, and the rest of the view, its
+ * focus and its open tip stay as they are.
+ */
+export function renderBack(input: HomeInput, root: ParentNode = document): void {
+  const row = root.querySelector('.back-row');
+  const column = root.querySelector('.col-back');
+  const empty = input.data !== undefined && input.data.holdings.notes.length === 0;
+  row?.replaceChildren(...backRow(input));
+  column?.replaceChildren(...backColumn(input, empty ? input.data?.faucet : undefined).filter((child): child is HTMLElement => child instanceof HTMLElement));
 }
 
 function cobaltBand(input: HomeInput): HTMLElement {
@@ -216,23 +321,44 @@ function cobaltBand(input: HomeInput): HTMLElement {
         h(
           'div',
           { class: 'btn-row' },
-          h('a', { class: 'btn', href: '#receive' }, 'Receive'),
+          h('a', { class: 'btn', href: '#receive', 'data-fk': 'home-receive' }, 'Receive'),
           // on an empty purse the faucet is the one way on: Send would only say the purse is empty
-          h('a', { class: `btn${faucet === undefined ? ' solid' : ''}`, href: '#send' }, 'Send'),
+          h('a', { class: `btn${faucet === undefined ? ' solid' : ''}`, href: '#send', 'data-fk': 'home-send' }, 'Send'),
         ),
       ),
     ),
   );
 }
 
-/** The desktop's come-back column. */
+/**
+ * The desktop's come-back column. Its last slot (`.cb-act`) is there in
+ * every state with notes, empty when idle, so the cobalt band, and with it
+ * the field, keeps its height when a run starts or ends.
+ */
 function backColumn(input: HomeInput, faucet: FaucetInfo | undefined): Child[] {
-  const head = h('div', { class: 'col-h' }, h('h2', { class: 'lab' }, comeBackHeading()));
-  if (input.data === undefined) {
+  const { keep } = input;
+  if (keep !== undefined) {
+    return [
+      h('div', { class: 'col-h' }, h('h2', { class: 'lab' }, keepingLead(keep.amount))),
+      h('p', { class: 'cb-date' }, keepingCount(keep)),
+      // the boxes right under the note, as in the prototype: the two keep the idle note's three lines between them (styles.css)
+      h(
+        'div',
+        { class: 'cb-body' },
+        h('p', { class: 'note-line' }, keep.watching ? KEEPING_ELSEWHERE_NOTE : keepingNote(keep.amount, keep.spaced)),
+        h('div', { class: 'cb-act' }, steps(keep, DESK_BOXES)),
+      ),
+    ];
+  }
+  const { elsewhere } = input;
+  const keeps = elsewhere?.keeps ?? input.keeps;
+  const head = h('div', { class: 'col-h' }, h('h2', { class: 'lab' }, comeBackHeading(keeps)));
+  const own = input.data?.holdings ?? input.saved;
+  if (own === undefined) {
     return [head];
   }
-  const holdings = input.data.holdings;
-  const row = comeBackRow(holdings, input.now);
+  const holdings = elsewhere?.holdings ?? own;
+  const row = comeBackRow(holdings, input.now, keeps);
   if ('none' in row) {
     return [
       head,
@@ -241,7 +367,16 @@ function backColumn(input: HomeInput, faucet: FaucetInfo | undefined): Child[] {
       faucet === undefined ? null : takeError(input),
     ];
   }
-  return [head, h('p', { class: 'cb-date' }, row.date), h('p', { class: 'note-line' }, firstToGo(holdings, input.now))];
+  return [
+    head,
+    h('p', { class: 'cb-date' }, row.date),
+    h(
+      'p',
+      { class: 'note-line' },
+      elsewhere === undefined ? firstToGo(holdings, input.now, keeps) : elsewhereNote(elsewhere.name, holdings, input.now, keeps),
+    ),
+    h('div', { class: 'cb-act', 'aria-hidden': 'true' }),
+  ];
 }
 
 /** The faucet button of an empty purse. */
@@ -260,7 +395,11 @@ function takeButton(input: HomeInput, faucet: FaucetInfo, key: string, wide: boo
 }
 
 const takeError = (input: HomeInput): HTMLElement | null =>
-  input.error?.at === 'take' ? h('p', { class: 'err home-err', role: 'alert' }, input.error.words) : null;
+  input.error?.at === 'take' ? errorLine(input, input.error.words) : null;
+
+/** What went wrong, as an alert when it is new, and as a plain line when it is only drawn again. */
+const errorLine = (input: HomeInput, words: string): HTMLElement =>
+  h('p', { class: 'err home-err', role: input.alert ? 'alert' : undefined }, words);
 
 /**
  * The last `n` entries of the purse's log, or that there are none yet. A

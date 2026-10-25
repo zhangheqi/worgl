@@ -91,7 +91,7 @@ function outputsOf(json: string): { amount: number; holder: string }[] | undefin
 }
 
 /** The serials of the notes `transfers` (each a transfer's JSON, `{"inputs": [{"note", "signature"}], …}`) spend. */
-export function spentBy(transfers: readonly string[]): string[] {
+export function serialsSpent(transfers: readonly string[]): string[] {
   return transfers.flatMap((transfer) => {
     let parsed: unknown;
     try {

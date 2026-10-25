@@ -7,10 +7,11 @@
 // server goes through that one purse. The store is made once; after
 // another tab changed it, a new Purse is opened on it (see current.ts).
 //
-// What sends transfers to a mint (a send, and settling what a send kept
-// for later) also holds the purse's own Web Lock for that server,
-// `worgl-purse:<server>`, so two tabs never submit the same transfers at
-// once. The SDK store's lock (`worgl:<server>`) is held only for each save.
+// What sends transfers to a mint (a send, settling what a send kept for
+// later, and a keep-alive pass) holds the purse's own Web Lock,
+// `purse:transfers` (lock.ts), so two tabs never submit the same transfers
+// at once. The SDK store's lock (`worgl:<server>`) is held only for each
+// save, so no change waits for the purse's.
 
 import {
   Client,
@@ -21,6 +22,8 @@ import {
   Purse,
   type Refused,
   type RequestOptions,
+  type Spacing,
+  type SubmitOptions,
   type SubmitProgress,
   type Submitted,
   isTransient,
@@ -29,9 +32,14 @@ import { IndexedDbStore } from 'worgl/browser';
 
 import { Current } from './current.ts';
 import { noteId } from './holdings.ts';
+import { type Moving, movingNotes, spentBy, spentKey } from './keep.ts';
+import type { KeepPurse } from './keeper.ts';
 import type { MintLink } from './link.ts';
-import { holdersOf, readNote, sentTo, spentBy, valueOf } from './notes.ts';
+import { withTransfersLock } from './lock.ts';
+import { holdersOf, readNote, sentTo, serialsSpent, valueOf } from './notes.ts';
 import { type Policy, policyFrom } from './plan.ts';
+
+export type { Moving } from './keep.ts';
 
 /** Info requests on their way, by URL. */
 const asked = new Map<string, Promise<Response>>();
@@ -157,6 +165,8 @@ export interface Read {
   notes: HeldNote[];
   total: bigint;
   firstExpiry: bigint | undefined;
+  /** This mint's notes on their way in refresh transfers, which `notes` no longer lists and `total` still counts. */
+  moving: Moving[];
 }
 
 /**
@@ -176,7 +186,56 @@ export async function read(server: string, mint: string): Promise<Read> {
   // the Date header counts whole seconds: a skew under two seconds is that, not a clock that is off
   const raw = Number(clock.time) - (sent + clock.back) / 2000;
   const skew = Math.abs(raw) < 2 ? 0 : Math.round(raw);
-  return { info, skew, notes, total: balance.total, firstExpiry };
+  const { outgoing, sendInputs } = outgoingOf(purse);
+  return { info, skew, notes, total: balance.total, firstExpiry, moving: movingNotes(outgoing, sendInputs, mint) };
+}
+
+/** A purse's outgoing transfers, and the notes its sends (the SDK's payments) spend, by `spentKey`. */
+function outgoingOf(purse: Purse): { outgoing: string[]; sendInputs: Set<string> } {
+  const sendInputs = new Set<string>();
+  for (const made of purse.payments()) {
+    for (const transfer of made.payment.transfers) {
+      for (const spent of spentBy(transfer.request)) {
+        sendInputs.add(spentKey(spent));
+      }
+    }
+  }
+  return { outgoing: purse.outgoing(), sendInputs };
+}
+
+/**
+ * The outgoing transfers of `server`'s purse, and the notes the purse's
+ * payments spend: a transfer that spends one of those is a send's, not a
+ * hop. Told apart by the note spent, never by the request's text, since
+ * two JSON strings of one transfer need not match byte for byte.
+ */
+export async function outgoingAt(server: string): Promise<{ outgoing: string[]; sendInputs: Set<string> }> {
+  return outgoingOf(await purseFor(server));
+}
+
+/**
+ * Runs `work` on the server's current purse as one change (`Current.change`),
+ * so the purse is not opened again in the middle: a settle, or a
+ * `planRefresh` and the submit of its plan, respaced. A settle resends a
+ * send's transfers as well as keep-alive's: `settled` hears what each of
+ * the purse's payments came to, before the change is over.
+ */
+export async function keepServer<R>(
+  server: string,
+  work: (purse: KeepPurse) => Promise<R>,
+  settled: (what: Settled) => Promise<void>,
+): Promise<R> {
+  return serverAt(server).purse.change((purse) =>
+    work({
+      planRefresh: (mint) => purse.planRefresh(mint),
+      submit: (transfers, options) => purse.submit(transfers, options),
+      settle: async (spacing, options) => {
+        const what = await settling(purse, spacing, options);
+        await settled(what);
+        return what.submitted;
+      },
+    }),
+  );
 }
 
 /** Thrown when the faucet at a mint's server hands out another mint's notes by the time Take is pressed. */
@@ -297,14 +356,10 @@ async function placed(purse: Purse, mint: string, notes: readonly string[]): Pro
 }
 
 /**
- * Runs `work` under the purse's lock for `server`: waiting for it, or, with
- * `ifAvailable`, resolving to `undefined` at once when another tab holds it.
+ * Runs `work` under the purse's lock (lock.ts): waiting for it, or, with
+ * `ifAvailable`, resolving to `undefined` at once when it is held.
  */
-async function locked<R>(server: string, work: () => Promise<R>, ifAvailable = false): Promise<R | undefined> {
-  return navigator.locks.request(`worgl-purse:${server}`, { ifAvailable }, async (lock) =>
-    lock === null ? undefined : work(),
-  );
-}
+const locked = <R>(work: () => Promise<R>, ifAvailable = false): Promise<R | undefined> => withTransfersLock(work, ifAvailable);
 
 /** A request made: its JSON, its notes' amounts in its order, and its id (its first note's key). */
 export interface Asked {
@@ -466,7 +521,7 @@ export interface Sent {
  * the answers, nothing after it can throw for want of the mint.
  */
 export async function send(server: string, json: string, hooks: SendHooks): Promise<Sent | { stopped: 'changed' | 'short' | 'already' }> {
-  const done = await locked(server, () =>
+  const done = await locked(() =>
     serverAt(server).purse.change(async (purse): Promise<Sent | { stopped: 'changed' | 'short' | 'already' }> => {
       const request = PaymentRequest.from(json);
       const mint = request.mint;
@@ -480,7 +535,7 @@ export async function send(server: string, json: string, hooks: SendHooks): Prom
       }
       const made = await purse.pay(request, SEND_SPACING);
       // the notes it spends, from the transfers themselves: no read of the mint before the log has it
-      const spent = spentBy(made.transfers.map((transfer) => transfer.request));
+      const spent = serialsSpent(made.transfers.map((transfer) => transfer.request));
       await hooks.signed({
         transfers: made.transfers.length,
         afterSecs: made.transfers.map((transfer) => transfer.afterSecs),
@@ -556,17 +611,28 @@ export interface Settled {
   fresh: Map<string, Came[]>;
 }
 
-/** Resends what `server`'s purse sent and has not seen answered, and tells what each payment came to. */
-async function settling(purse: Purse, signal: AbortSignal): Promise<Settled> {
+/**
+ * Resends what `purse` sent and has not seen answered, `spacing` apart, and
+ * tells what each payment came to: for keep-alive's settle, and for "Try
+ * again now" on Send.
+ */
+async function settling(purse: Purse, spacing: Spacing, options: SubmitOptions): Promise<Settled> {
   const before = kept(purse);
   const mints = [...new Set(before.map((each) => each.mint))];
-  const was = new Map(await Promise.all(mints.map(async (mint) => [mint, new Set(await serials(purse, mint))] as const)));
+  // what each mint's change is told apart from; a mint that does not answer now leaves only its change's pink unknown
+  const was = new Map(
+    await Promise.all(mints.map(async (mint) => [mint, await serials(purse, mint).then((ids) => new Set(ids), () => undefined)] as const)),
+  );
   const byTransfer = new Map(before.flatMap((each) => each.transfers.map((transfer) => [transfer, each.id] as const)));
-  const submitted = await purse.settle(SEND_SPACING, { signal });
+  const submitted = await purse.settle(spacing, options);
   const now = new Map(kept(purse).map((each) => [each.id, each]));
-  // the answers are in: a mint that does not answer now leaves only the change's pink unknown
   const fresh = new Map(
-    await Promise.all(mints.map(async (mint) => [mint, await came(purse, mint, was.get(mint) ?? new Set()).catch(() => [])] as const)),
+    await Promise.all(
+      mints.map(async (mint) => {
+        const held = was.get(mint);
+        return [mint, held === undefined ? [] : await came(purse, mint, held).catch(() => [])] as const;
+      }),
+    ),
   );
   return {
     submitted,
@@ -581,23 +647,13 @@ async function settling(purse: Purse, signal: AbortSignal): Promise<Settled> {
 }
 
 /**
- * Settles `server` on open: when its purse has transfers outgoing, resends
- * them under the lock, unless another tab holds it. `undefined` when there
- * was nothing to settle or the lock was held.
+ * "Try again now" on Send: resends what `server`'s purse has outgoing,
+ * waiting for the lock. `undefined` when nothing was outgoing by then.
  */
-export async function settleServer(server: string, signal: AbortSignal): Promise<Settled | undefined> {
-  const purse = await purseFor(server);
-  if (purse.outgoing().length === 0) {
-    return undefined;
-  }
-  return locked(server, () => serverAt(server).purse.change((current) => (current.outgoing().length === 0 ? Promise.resolve(undefined) : settling(current, signal))), true).then(
-    (settled) => settled ?? undefined,
-  );
-}
-
-/** As {@link settleServer}, from "Try again now": waits for the lock. */
 export async function retrySettle(server: string, signal: AbortSignal): Promise<Settled | undefined> {
-  return locked(server, () => serverAt(server).purse.change((purse) => (purse.outgoing().length === 0 ? Promise.resolve(undefined) : settling(purse, signal)))).then(
-    (settled) => settled ?? undefined,
-  );
+  return locked(() =>
+    serverAt(server).purse.change((purse) =>
+      purse.outgoing().length === 0 ? Promise.resolve(undefined) : settling(purse, SEND_SPACING, { signal }),
+    ),
+  ).then((settled) => settled ?? undefined);
 }

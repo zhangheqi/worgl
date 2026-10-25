@@ -2,7 +2,7 @@ import assert from 'node:assert/strict';
 import { describe, test } from 'node:test';
 
 import { base64url } from '../src/links.ts';
-import { holdersOf, readNote, sentTo, spentBy, valueOf } from '../src/notes.ts';
+import { holdersOf, readNote, sentTo, serialsSpent, valueOf } from '../src/notes.ts';
 
 const hex = (b: Uint8Array): string => [...b].map((x) => x.toString(16).padStart(2, '0')).join('');
 const key = (seed: number): Uint8Array => Uint8Array.from({ length: 32 }, (_, i) => (seed * 31 + i * 7) & 255);
@@ -71,7 +71,7 @@ describe('notes', () => {
     assert.deepEqual(sentTo([], theirs.map(hex)), { theirs: 0, change: 0 });
     assert.equal(sentTo(['{"outputs": [{"amount": "1", "holder": "aa"}]}'], []), undefined);
     assert.equal(sentTo(['not json'], []), undefined);
-    assert.deepEqual(spentBy(transfers), ['2:105', '2:106']);
-    assert.deepEqual(spentBy(['not json', '{"inputs": [{"note": "junk"}]}']), []);
+    assert.deepEqual(serialsSpent(transfers), ['2:105', '2:106']);
+    assert.deepEqual(serialsSpent(['not json', '{"inputs": [{"note": "junk"}]}']), []);
   });
 });

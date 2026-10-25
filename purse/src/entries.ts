@@ -2,6 +2,8 @@
 // the log. Types only, apart from the database itself (records.ts), so
 // the pure modules and their tests can name them without the DOM.
 
+import type { LastFade } from './holdings.ts';
+
 /** What the purse last read of a mint's info. */
 export interface SavedInfo {
   layers: number;
@@ -10,6 +12,12 @@ export interface SavedInfo {
   paused: boolean;
   /** When the purse read it, by this device's clock. */
   readAt: number;
+  /**
+   * What fades first, and when, as the last read saw it: said when the mint
+   * does not answer the next open. `null` when nothing does (no notes, or no
+   * schedule); missing when no read of this version saved it.
+   */
+  fades?: LastFade | null;
 }
 
 /** A mint the person added. */
@@ -61,19 +69,27 @@ export interface LogEntry {
   t: number;
   /**
    * `faucet`: a note taken from the faucet; `faded`: notes a rotation
-   * dropped; `sent`: a send to someone's request; `received`: a hand-back
-   * taken in.
+   * dropped; `kept`: notes moved a layer on by keep-alive (the amount moved;
+   * the log shows no change); `lost`: a hop the mint applied whose answer
+   * it no longer keeps; `sent`: a send to someone's request; `received`: a
+   * hand-back taken in.
    */
-  kind: 'faucet' | 'faded' | 'sent' | 'received';
+  kind: 'faucet' | 'faded' | 'kept' | 'lost' | 'sent' | 'received';
   /** The mint. */
   mint: string;
-  /** Tokens it brought (faucet, received) or took away (faded, sent: what went, or what was asked until that is known). */
+  /**
+   * Tokens it brought (faucet, received), moved on (kept) or took away
+   * (faded, lost, sent: what went, or what was asked until that is known).
+   */
   amount: number;
   /**
    * The serials of the notes it brought, `generation:index`, so a note can
-   * say where it came from: for a send, its change.
+   * say where it came from: for keep-alive, the notes it moved on; for a
+   * send, its change.
    */
   serials: string[];
+  /** kept: the mint's first layer (its generation) when they moved, so one rotation's runs make one entry. */
+  round?: string;
   /** sent, received: the request's id. */
   ask?: string;
   /** sent: the server whose payments() keeps it. */

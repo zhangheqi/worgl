@@ -6,6 +6,8 @@
 
 import type { HeldNote, MintInfo } from 'worgl';
 
+import type { Moving } from './keep.ts';
+
 /** A lane of the field: what the notes in it can do now. */
 export type LaneKey = 'fade' | 'ready' | 'rest';
 
@@ -23,8 +25,10 @@ export interface Note {
   readyAt: number | undefined;
   /** When it came into the purse, from the purse's own log, if the log has it. */
   arrivedAt: number | undefined;
-  /** Where it came from, if the log knows: a faucet, a hand-back taken in, or the change of a send. */
+  /** Where it came from, if the log knows: a faucet, keep-alive (which moved it a layer on), a hand-back taken in, or the change of a send. */
   source: Source | undefined;
+  /** On its way a layer on in a refresh transfer the mint has not answered yet: drawn where it was. */
+  moving: boolean;
 }
 
 /** The mint's rotation, by this device's clock. */
@@ -110,7 +114,7 @@ export const noteId = (serial: { generation: bigint; index: number }): string =>
   `${serial.generation}:${serial.index}`;
 
 /** Where a note came from, as the purse's log knows it. */
-export type Source = 'faucet' | 'received' | 'change';
+export type Source = 'faucet' | 'kept' | 'received' | 'change';
 
 /** What the purse's own log knows of a note: when it came, and from where. */
 export interface Arrival {
@@ -118,10 +122,63 @@ export interface Arrival {
   source: Source;
 }
 
+/** An entry of the purse's log (records.ts `LogEntry`, which needs IndexedDB to load), as far as arrivals read it. */
+export interface Logged {
+  t: number;
+  kind: 'faucet' | 'faded' | 'kept' | 'lost' | 'sent' | 'received';
+  mint: string;
+  serials: readonly string[];
+  /** sent: when its change came. */
+  t2?: number | undefined;
+}
+
+/** Where the notes an entry of the log names came from, if it brought any. */
+const SOURCES: Partial<Record<Logged['kind'], Source>> = { faucet: 'faucet', kept: 'kept', received: 'received', sent: 'change' };
+
+/**
+ * What the purse's log knows of each note of `mint`: when it came, and from
+ * where, a faucet, keep-alive, a hand-back or a send's change (which comes
+ * when its answer does, not at pay). The log is newest first, so a note's
+ * latest entry wins. A note keep-alive just moved (`hopped`, by when)
+ * counts from its hop until its run's entry is written, so it keeps its
+ * place in the field.
+ */
+export function arrivalsOf(
+  log: readonly Logged[],
+  mint: string,
+  hopped: ReadonlyMap<string, number>,
+): Map<string, Arrival> {
+  const known = new Map<string, Arrival>();
+  for (const entry of log) {
+    const source = SOURCES[entry.kind];
+    if (entry.mint !== mint || source === undefined) {
+      continue;
+    }
+    const at = entry.kind === 'sent' ? (entry.t2 ?? entry.t) : entry.t;
+    for (const id of entry.serials) {
+      if (!known.has(id)) {
+        known.set(id, { at, source });
+      }
+    }
+  }
+  for (const [id, at] of hopped) {
+    if (!known.has(id)) {
+      known.set(id, { at, source: 'kept' });
+    }
+  }
+  return known;
+}
+
 /**
  * Holdings from what the SDK reports, with its times (Unix seconds by the
  * mint's clock) turned into this device's milliseconds: `skew` is the
- * mint's clock less this device's, in seconds.
+ * mint's clock less this device's, in seconds. The notes on their way in
+ * refresh transfers (`moving`), which the SDK no longer lists but still
+ * counts in the total, are drawn in the layer they leave until the mint
+ * answers. One whose layer the mint dropped since is drawn in the first
+ * layer, where its answer would land if the mint applied it before the
+ * rotation; one dropped two layers back is gone either way, so it is not
+ * drawn and not counted, as a note the purse prunes is not.
  */
 export function holdingsFrom(
   info: MintInfo,
@@ -130,6 +187,7 @@ export function holdingsFrom(
   firstExpiry: bigint | undefined,
   skew: number,
   arrivals: ReadonlyMap<string, Arrival>,
+  moving: readonly Moving[] = [],
 ): Holdings {
   const local = (t: bigint | undefined): number | undefined =>
     t === undefined ? undefined : (Number(t) - skew) * 1000;
@@ -148,14 +206,38 @@ export function holdingsFrom(
       readyAt: local(note.spendableAt),
       arrivedAt: arrival?.at,
       source: arrival?.source,
+      moving: false,
     });
   }
   const rotation = info.paused ? undefined : info.rotation;
+  let gone = 0;
+  for (const note of moving) {
+    const layer = Number(note.generation - info.oldest);
+    if (layer < -1) {
+      gone += note.v;
+      continue;
+    }
+    const pos = Math.max(0, layer);
+    if (pos >= info.layers) {
+      continue;
+    }
+    const arrival = arrivals.get(note.id);
+    notes.push({
+      id: note.id,
+      v: note.v,
+      pos,
+      expiresAt: rotation === undefined ? undefined : local(rotation.nextAt + BigInt(pos) * rotation.periodSecs),
+      readyAt: undefined,
+      arrivedAt: arrival?.at,
+      source: arrival?.source,
+      moving: true,
+    });
+  }
   const nextMs = local(rotation?.nextAt);
   return {
     layers: info.layers,
     notes,
-    total: Number(total),
+    total: Number(total) - gone,
     schedule:
       rotation === undefined || nextMs === undefined
         ? undefined
@@ -166,6 +248,62 @@ export function holdingsFrom(
           },
     paused: info.paused,
     firstExpiry: local(firstExpiry),
+  };
+}
+
+/** What fades first, and when, as the purse last saw it: kept with its records, for an open the mint does not answer. */
+export interface LastFade {
+  /** When, by this device's clock. */
+  at: number;
+  /** How many tokens. */
+  amount: number;
+}
+
+/** What fades first in `holdings`, and when; `null` when nothing does (no notes, or no schedule). */
+export function firstFade(holdings: Holdings): LastFade | null {
+  if (holdings.notes.length === 0 || holdings.schedule === undefined || holdings.firstExpiry === undefined) {
+    return null;
+  }
+  const low = Math.min(...holdings.notes.map((note) => note.pos));
+  return { at: holdings.firstExpiry, amount: sum(holdings.notes.filter((note) => note.pos === low)) };
+}
+
+/** What the purse saved of a mint's info (records.ts `SavedInfo`), as far as {@link savedHoldings} reads it. */
+export interface Saved {
+  layers: number;
+  periodSecs: number | undefined;
+  paused: boolean;
+  /** `null`: nothing fades; missing: never saved. */
+  fades?: LastFade | null | undefined;
+}
+
+/**
+ * A mint's holdings as the purse saved them with the mint (`SavedInfo`), for
+ * one this page has not read, since it has not answered yet or does not:
+ * only the tokens that fade first, as one note in the layer their time puts
+ * them in, and the period, so that the date to come back by and its words
+ * can be worked out without the mint. Never drawn. Undefined when, as the
+ * purse last saw it, nothing fades or the mint was paused, or the time has
+ * gone.
+ */
+export function savedHoldings(saved: Saved, now: number): Holdings | undefined {
+  const fades = saved.fades;
+  if (fades === undefined || fades === null || saved.paused || saved.periodSecs === undefined || fades.at <= now) {
+    return undefined;
+  }
+  const periodMs = saved.periodSecs * 1000;
+  // they fade at a rotation, a whole number of periods after the next one
+  const pos = Math.min(saved.layers - 1, Math.max(0, Math.ceil((fades.at - now) / periodMs) - 1));
+  const nextMs = fades.at - pos * periodMs;
+  return {
+    layers: saved.layers,
+    notes: [
+      { id: 'saved', v: fades.amount, pos, expiresAt: fades.at, readyAt: undefined, arrivedAt: undefined, source: undefined, moving: false },
+    ],
+    total: fades.amount,
+    schedule: { startMs: nextMs - periodMs, nextMs, periodMs },
+    paused: false,
+    firstExpiry: fades.at,
   };
 }
 

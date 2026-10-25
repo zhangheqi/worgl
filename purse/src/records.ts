@@ -1,24 +1,34 @@
 // The purse's own records, apart from the tokens: the mints the person
 // added, the requests it made, and a small log of what happened, such as
-// "Took 64 from the faucet" or "Sent 5". They live in an IndexedDB database of the purse's own, `purse`,
-// which can never be taken for an SDK store (those are `worgl:<server>`).
+// "Took 64 from the faucet", "Sent 5" or "Kept 128 alive". They live in an
+// IndexedDB database of the purse's own, `purse`, which can never be taken
+// for an SDK store (those are `worgl:<server>`).
 // The tokens themselves live only in the SDK's IndexedDbStore, one per
 // server. Every write is strict, so it resolves only once it is on disk.
 
 import { endedToDrop } from './asks.ts';
 import type { AskRecord, LogEntry, MintRecord } from './entries.ts';
+import { type Moved, mergeKept } from './keep.ts';
 
 export type { AskRecord, LogEntry, MintRecord, SavedInfo } from './entries.ts';
 
-/** The database, and the version of its layout. */
+/**
+ * The database, and the version of its layout. 2: the log holds keep-alive's
+ * entries (`kept`, `lost`); 3: the requests made (the store `asks`) and the
+ * log's sends and takes (`sent`, `received`). A purse of an older version
+ * reads an entry it does not know as "Faded": opening at a newer version
+ * closes the records of an older tab still open, so it never shows them.
+ */
 const DATABASE = 'purse';
-const VERSION = 2;
+const VERSION = 3;
 
 /** How many ended requests (taken in full, or cancelled) the purse keeps; open ones it always keeps. */
 export const ASKS_ENDED_KEPT = 50;
 
 /** How many log entries the purse keeps: Holdings shows the last few, History (later) more. */
 const LOG_KEPT = 200;
+/** How far back a run's entry looks for its rotation's: a rotation adds a few entries at most. */
+const KEPT_SCAN = 50;
 
 /** The purse's records in this browser. */
 export class Records {
@@ -144,24 +154,40 @@ export class Records {
       added.onsuccess = () => {
         id = added.result as number;
       };
-      const count = store.count();
-      count.onsuccess = () => {
-        let extra = count.result - LOG_KEPT;
-        if (extra <= 0) {
-          return;
-        }
-        const oldest = store.openCursor();
-        oldest.onsuccess = () => {
-          const cursor = oldest.result;
-          if (cursor !== null && extra > 0) {
-            cursor.delete();
-            extra--;
-            cursor.continue();
-          }
-        };
-      };
+      trim(store);
     });
     return id;
+  }
+
+  /**
+   * Adds keep-alive's entry for a rotation: when the log has one for the same
+   * mint and rotation already (an earlier run of the visit, stopped when the
+   * page was hidden, or another tab's), it takes that one's place with both
+   * runs in it, as the newest entry. `spent` names the notes this run moved
+   * that the purse held before it, so a note the earlier run brought and
+   * this one moved on counts once.
+   */
+  async addKept(entry: Omit<LogEntry, 'id'>, spent: readonly Moved[]): Promise<void> {
+    await this.#run('log', 'readwrite', (store) => {
+      let seen = 0;
+      const cursor = store.openCursor(null, 'prev');
+      cursor.onsuccess = () => {
+        const at = cursor.result;
+        if (at === null || seen >= KEPT_SCAN) {
+          store.add(entry);
+          trim(store);
+          return;
+        }
+        seen += 1;
+        const old = at.value as LogEntry;
+        if (old.kind !== 'kept' || old.mint !== entry.mint || old.round === undefined || old.round !== entry.round) {
+          at.continue();
+          return;
+        }
+        at.delete();
+        store.add(mergeKept(old, entry, spent));
+      };
+    });
   }
 
   /**
@@ -179,4 +205,24 @@ export class Records {
       transaction.onabort = () => reject(transaction.error ?? new DOMException('the transaction was aborted', 'AbortError'));
     });
   }
+}
+
+/** Drops the oldest entries past {@link LOG_KEPT}, in the transaction that added one. */
+function trim(store: IDBObjectStore): void {
+  const count = store.count();
+  count.onsuccess = () => {
+    let extra = count.result - LOG_KEPT;
+    if (extra <= 0) {
+      return;
+    }
+    const oldest = store.openCursor();
+    oldest.onsuccess = () => {
+      const cursor = oldest.result;
+      if (cursor !== null && extra > 0) {
+        cursor.delete();
+        extra--;
+        cursor.continue();
+      }
+    };
+  };
 }

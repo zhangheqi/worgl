@@ -1,7 +1,8 @@
 // What the preview walks share: worgl-server with mints on free ports, a
-// faucet, one address for both behind a proxy the walk can slow, cut or
-// take down, the purse built twice and served under the hosted headers, and
-// the screenshots with the problems they must not show.
+// faucet for each, one address for the server and a faucet behind a proxy
+// the walk can slow, cut or take down, the purse built twice and served
+// under the hosted headers, and the screenshots with the problems they
+// must not show.
 //
 // Used by scripts/preview.mjs (Holdings) and scripts/preview-send.mjs
 // (Receive and Send). Needs the `playwright` package where Node can require
@@ -137,12 +138,15 @@ export function binariesOf() {
 /**
  * Starts a fresh state in `home` with `mints` mints (4 layers of 1024, new
  * notes in the last layer, rotating every `period` seconds), a faucet for
- * the first, and a proxy that serves both at one address, as the
- * playground does. Then builds the purse twice and serves each build.
+ * each, and a proxy that serves the server and the first one's faucet at
+ * one address, as the playground does. Then builds the purse (as hosted,
+ * and with the first mint as the playground, or only those `serve` names)
+ * and serves each build.
  */
-export async function setup({ home, period, perAddress = 10, mints = 1 }) {
+export async function setup({ home, period, perAddress = 10, mints = 1, serve = ['plain', 'playground'] }) {
   const bin = binariesOf();
-  const [serverPort, faucetPort, proxyPort, plainPort, playPort] = await Promise.all([1, 2, 3, 4, 5].map(freePort));
+  const [serverPort, proxyPort, plainPort, playPort] = await Promise.all([1, 2, 3, 4].map(freePort));
+  const faucetPorts = await Promise.all(Array.from({ length: mints }, freePort));
   const server = origin(proxyPort);
 
   step(`${mints === 1 ? 'a mint' : `${mints} mints`} rotating every ${period} s, in ${home}`);
@@ -163,27 +167,29 @@ export async function setup({ home, period, perAddress = 10, mints = 1 }) {
     const issuer = /^mint\s+([0-9a-f]{64})$/m.exec(created)?.[1];
     made.push({ issuer, key: field('mint key'), token: readFileSync(field('admin token'), 'utf8').trim() });
   }
-  const { issuer, key, token } = made[0];
+  const { issuer } = made[0];
   const mintLink = (mint) => `#mint=${mint}&at=${encodeURIComponent(server)}`;
 
   children.push(
     spawn(bin.server, ['serve', '--state', state, '--listen', `127.0.0.1:${serverPort}`], { stdio: ['ignore', 'ignore', 'inherit'] }),
-    spawn(
-      bin.faucet,
-      [
-        '--mint', issuer,
-        '--key', key,
-        '--server', origin(serverPort),
-        '--listen', `127.0.0.1:${faucetPort}`,
-        '--per-address', String(perAddress),
-        '--allow-origin', [plainPort, playPort].map(origin).join(','),
-      ],
-      { stdio: ['ignore', 'ignore', 'inherit'] },
+    ...made.map((each, i) =>
+      spawn(
+        bin.faucet,
+        [
+          '--mint', each.issuer,
+          '--key', each.key,
+          '--server', origin(serverPort),
+          '--listen', `127.0.0.1:${faucetPorts[i]}`,
+          '--per-address', String(perAddress),
+          '--allow-origin', [plainPort, playPort].map(origin).join(','),
+        ],
+        { stdio: ['ignore', 'ignore', 'inherit'] },
+      ),
     ),
   );
 
   // ---------- the proxy, and what the walk can make it do ----------
-  const control = { hold: undefined, holdKeys: undefined, holdInfo: undefined, refuse: undefined, refuseSkip: 0, drop: false, down: false, transfers: 0, faucets: 0, held: 0 };
+  const control = { hold: undefined, holdKeys: undefined, holdInfo: undefined, refuse: undefined, refuseSkip: 0, drop: false, down: false, transfers: 0, faucets: 0, held: 0, faucet: 0 };
   /** The gates requests wait at now, by kind, so that a release opens them. */
   const waiting = { transfer: new Set(), keys: new Set(), info: new Set() };
   const wait = async (kind, held) => {
@@ -259,7 +265,7 @@ export async function setup({ home, period, perAddress = 10, mints = 1 }) {
       outgoing.end(JSON.stringify({ error: code, message }));
       return;
     }
-    const port = pathname === '/v1/faucet' ? faucetPort : serverPort;
+    const port = pathname === '/v1/faucet' ? faucetPorts[control.faucet] : serverPort;
     const dropping = transfer && control.drop;
     const upstream = request({ host: '127.0.0.1', port, method: incoming.method, path: incoming.url, headers: incoming.headers }, (answer) => {
       if (process.env.PREVIEW_DEBUG) {
@@ -297,7 +303,9 @@ export async function setup({ home, period, perAddress = 10, mints = 1 }) {
   proxy.listen(proxyPort, '127.0.0.1');
   servers.push(proxy);
   await up(`${server}/v1/mints/${issuer}/info`);
-  await up(`${origin(faucetPort)}/v1/faucet`);
+  for (const port of faucetPorts) {
+    await up(`${origin(port)}/v1/faucet`);
+  }
 
   const mint = {
     issuer,
@@ -388,6 +396,10 @@ export async function setup({ home, period, perAddress = 10, mints = 1 }) {
       get faucets() {
         return control.faucets;
       },
+      /** Which mint's faucet answers at the proxy's /v1/faucet: the first's until this names another. */
+      faucet(which = issuer) {
+        control.faucet = made.findIndex((each) => each.issuer === which);
+      },
     },
   };
 
@@ -397,7 +409,7 @@ export async function setup({ home, period, perAddress = 10, mints = 1 }) {
   for (const build of [
     { name: 'plain', port: plainPort, playground: '' },
     { name: 'playground', port: playPort, playground: mint.link },
-  ]) {
+  ].filter((each) => serve.includes(each.name))) {
     step(`vite build (${build.name})`);
     const dir = join(home, `dist-${build.name}`);
     run(process.execPath, [vite, 'build', '--outDir', dir, '--emptyOutDir', '--logLevel', 'warn'], {

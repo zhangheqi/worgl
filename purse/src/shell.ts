@@ -9,12 +9,13 @@ import { face, wordmark } from './marks.ts';
 /**
  * The brand: the wordmark in bits and "purse" in the serif italic. A link
  * home once the purse holds a mint; before that there is no home to go to,
- * so it is an image with a name.
+ * so it is an image with a name. `key` keeps its focus when the view is
+ * drawn again: one for the phone's top bar, one for the desktop's.
  */
-export function brand(link: boolean): HTMLElement {
+export function brand(link: boolean, key = 'brand'): HTMLElement {
   const inside = [wordmark(3), h('span', { class: 'purse', 'aria-hidden': 'true' }, 'purse')];
   return link
-    ? h('a', { class: 'brand', href: '#home', 'aria-label': 'Worgl Purse, home' }, ...inside)
+    ? h('a', { class: 'brand', href: '#home', 'aria-label': 'Worgl Purse, home', 'data-fk': key }, ...inside)
     : h('span', { class: 'brand', role: 'img', 'aria-label': 'Worgl Purse' }, ...inside);
 }
 
@@ -32,10 +33,10 @@ export function deskbar(link: boolean, current: Bar = 'first'): HTMLElement {
       : h(
           'div',
           { class: 'acts' },
-          h('a', { class: 'btn', href: '#receive', 'aria-current': current === 'receive' ? 'page' : undefined }, downIcon(), 'Receive'),
-          h('a', { class: 'btn solid', href: '#send', 'aria-current': current === 'send' ? 'page' : undefined }, upIcon(), 'Send'),
+          h('a', { class: 'btn', href: '#receive', 'aria-current': current === 'receive' ? 'page' : undefined, 'data-fk': 'db-receive' }, downIcon(), 'Receive'),
+          h('a', { class: 'btn solid', href: '#send', 'aria-current': current === 'send' ? 'page' : undefined, 'data-fk': 'db-send' }, upIcon(), 'Send'),
         );
-  return h('header', { class: 'db' }, h('div', { class: 'db-in' }, brand(link), acts));
+  return h('header', { class: 'db' }, h('div', { class: 'db-in' }, brand(link, 'brand-d'), acts));
 }
 
 /**
@@ -46,7 +47,7 @@ export function tbSub(title: string, mint: string, name: string): HTMLElement {
   return h(
     'header',
     { class: 'tb' },
-    h('a', { class: 'ib back', href: '#home', 'aria-label': 'Back to the purse' }, backIcon()),
+    h('a', { class: 'ib back', href: '#home', 'aria-label': 'Back to the purse', 'data-fk': 'tb-back' }, backIcon()),
     h('div', { class: 'subhead' }, h('span', { class: 'lab' }, title), h('span', { class: 'rule' }), regIcon()),
     h('span', { class: 'ib face', role: 'img', 'aria-label': `Mint: ${name}` }, face(mint, 4.4, 3.4)),
   );
