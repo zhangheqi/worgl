@@ -4,7 +4,7 @@
 .sheet-head { display: flex; justify-content: space-between; gap: 8px 16px; flex-wrap: wrap; margin-bottom: 10px; }
 .sheet-head .label { font-size: 10.5px; }
 .sheet.frozen { background: repeating-linear-gradient(135deg, transparent 0 7px, var(--rule) 7px 8px), var(--paper-2); }
-.cells { display: grid; grid-template-columns: repeat(24, minmax(0, 1fr)); gap: 4px; }
+.cells { display: grid; grid-template-columns: repeat(var(--cols, 24), minmax(0, 1fr)); gap: 4px; }
 .cells .c { aspect-ratio: 1; display: grid; place-items: center; font-family: var(--f-mono); font-size: 11px; font-stretch: 75%; position: relative; line-height: 1; padding: 0; border: 0; min-width: 0; }
 .c.u::before { content: ""; width: 3px; height: 3px; background: var(--rule-strong); }
 .c.l { background: var(--cobalt); color: var(--on-cobalt); cursor: pointer; }
@@ -35,4 +35,4 @@
 .counters b { font-family: var(--f-serif); font-size: 34px; font-weight: 400; line-height: 1; }
 .formula { border: 1.5px solid var(--ink); padding: 16px 18px; display: flex; flex-direction: column; gap: 6px; font-family: var(--f-mono); font-size: 13px; line-height: 1.7; font-stretch: 87.5%; }
 .formula .k { color: var(--accent-text); font-weight: 600; }
-@media (max-width: 560px) { .cells { grid-template-columns: repeat(12, minmax(0, 1fr)); gap: 3px; } .cells .c { font-size: 10px; } .sheet { padding: 10px 10px 12px; } }
+@media (max-width: 560px) { .cells { grid-template-columns: repeat(var(--cols-narrow, 12), minmax(0, 1fr)); gap: 3px; } .cells .c { font-size: 10px; } .sheet { padding: 10px 10px 12px; } }

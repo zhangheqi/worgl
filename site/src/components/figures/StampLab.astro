@@ -7,10 +7,16 @@ interface Props {
   /** Clicking selects a note to follow instead of transferring it. */
   select?: boolean;
   id?: string;
+  /** Bits in each layer, and the rows they are laid out in (half as wide again on a phone, unless a plate). */
+  bits?: number;
+  rows?: number;
+  /** Lay the layers out as panes side by side, each labelled above and described below. */
+  plate?: boolean;
 }
-const { select = false, id } = Astro.props;
+const { select = false, id, bits = 48, rows = 2, plate = false } = Astro.props;
+const cols = bits / rows;
 ---
-<div class="stamp-lab" data-stamp-lab data-select={select ? '' : undefined} id={id}>
+<div class="stamp-lab" data-stamp-lab data-select={select ? '' : undefined} data-plate={plate ? '' : undefined} data-bits={bits} id={id} style={`--cols: ${cols}; --cols-narrow: ${plate ? cols : cols / 2}`}>
   <div class="sheets" data-part="sheets" aria-label="Four layers of a small mint, oldest first"></div>
   <div class="lab-tip" data-part="tip" role="tooltip" hidden></div>
   <div class="lab-side">

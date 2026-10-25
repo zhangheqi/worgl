@@ -74,8 +74,8 @@ const LIFECYCLE = `${REPO}/blob/main/crates/worgl/examples/lifecycle.rs`;
         </div>
 
         <div class="lab-col" aria-label="A small mint to try the rules on">
-          <p class="label lab-cap"><span>A mint of four layers</span><span>48 bits each</span></p>
-          <StampLab select id="lab" />
+          <p class="label lab-cap"><span>A mint of four layers</span><span class="muted">16 bits each</span></p>
+          <StampLab select plate id="lab" bits={16} rows={4} />
         </div>
       </div>
     </div>
@@ -170,4 +170,34 @@ const LIFECYCLE = `${REPO}/blob/main/crates/worgl/examples/lifecycle.rs`;
       lab.dispatchEvent(new CustomEvent('lab-do', { detail: b.dataset.lab }));
     }));
   }
+
+  // The lab stays in view beside the chapters. A window too short for it, with
+  // the longest thing it says in its message, gets a lab that scrolls on its own.
+  const col = document.querySelector<HTMLElement>('.lab-col');
+  const out = col?.querySelector<HTMLElement>('.readout');
+  const sticky = matchMedia('(min-width: 1001px)');
+  const ghost = Object.assign(document.createElement('p'), {
+    className: 'readout',
+    textContent: 'Refreshed 12 notes: each paid to a fresh key of your own, one layer on. They now die in 2 rotations instead of 1. Layer 1 is full now, so the other 4 stay behind and die at the next rotation.',
+  });
+  ghost.setAttribute('aria-hidden', 'true');
+  ghost.style.cssText = 'position: absolute; visibility: hidden;';
+  let queued = 0;
+  function fit() {
+    queued = 0;
+    if (!col || !out) return;
+    col.classList.remove('scrolls');
+    if (!sticky.matches) return;
+    out.after(ghost);
+    ghost.style.width = `${out.offsetWidth}px`;
+    const tallest = col.offsetHeight + Math.max(0, ghost.offsetHeight - out.offsetHeight);
+    ghost.remove();
+    col.classList.toggle('scrolls', tallest > innerHeight - parseFloat(getComputedStyle(col).top) - 16);
+  }
+  const queue = () => { queued ||= requestAnimationFrame(fit); };
+  addEventListener('resize', queue);
+  sticky.addEventListener('change', queue);
+  addEventListener('load', queue);
+  document.fonts.ready.then(queue);
+  fit();
 </script>
