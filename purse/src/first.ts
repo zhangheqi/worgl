@@ -2,6 +2,8 @@
 // be in, and the way in: the build's playground, a mint link, or a mint's
 // stamp read from its server, with its face and key, before it is added.
 
+import type { MintInfo } from 'worgl';
+
 import { type Child, h } from './dom.ts';
 import { periodWords } from './format.ts';
 import { hostOf, shortKey } from './link.ts';
@@ -9,7 +11,7 @@ import { bits, face, swatch } from './marks.ts';
 import type { About } from './purses.ts';
 import type { MintRecord } from './records.ts';
 import { brand, deskbar } from './shell.ts';
-import { legend } from './words.ts';
+import { legend, rotatesQuickly, visitWords } from './words.ts';
 
 /** What the first run is showing in its cobalt band. */
 export interface FirstState {
@@ -208,7 +210,7 @@ function linkStamp(
       ),
     );
   }
-  return [stamp(link.mint, name, about, false), low(buttons, input)];
+  return [stamp(link.mint, name, about, false), low(buttons, input, about.info)];
 }
 
 /** The build's playground as a stamp: Start with the Playground, or add another mint by link. */
@@ -233,7 +235,7 @@ function playgroundStamp(input: FirstInput, playground: { mint: string; server: 
   const other = state.pasting
     ? pasteRow(input)
     : h('button', { class: 'btn wide', type: 'button', 'data-fk': 'first-addlink', on: { click: actions.openPaste } }, 'Add a mint by link');
-  return [stamp(playground.mint, 'Playground', about, true), low([start, other], input)];
+  return [stamp(playground.mint, 'Playground', about, true), low([start, other], input, about.info)];
 }
 
 /** The solid faucet button. */
@@ -245,19 +247,26 @@ function takeButton(state: FirstState, amount: number, take: () => void): HTMLEl
   );
 }
 
-/** The actions, the error under them and the two notes, pinned low in the band. */
-function low(buttons: Child[], input: FirstInput): HTMLElement {
-  return h('div', { class: 'c-low first-acts' }, ...buttons, errorLine(input.state.error), notes(input.standalone));
+/** The actions, the error under them and the notes, pinned low in the band; `info`, the stamp's mint. */
+function low(buttons: Child[], input: FirstInput, info?: MintInfo): HTMLElement {
+  return h('div', { class: 'c-low first-acts' }, ...buttons, errorLine(input.state.error), notes(input.standalone, info));
 }
 
 const errorLine = (error: string | undefined): HTMLElement | null =>
   error === undefined ? null : h('p', { class: 'err', role: 'alert' }, error);
 
-/** The Home Screen hint, unless the purse is one already, and what clears the purse. */
-function notes(standalone: boolean): HTMLElement {
+/**
+ * How long a visit keeps a quickly rotating mint's tokens, the Home Screen
+ * hint, unless the purse is one already, and what clears the purse.
+ */
+function notes(standalone: boolean, info?: MintInfo): HTMLElement {
+  const period = info === undefined || info.paused ? undefined : info.rotation?.periodSecs;
   return h(
     'div',
     { class: 'first-notes' },
+    period !== undefined && rotatesQuickly(Number(period))
+      ? h('p', { class: 'note-line muted' }, visitWords(Number(period)))
+      : null,
     standalone
       ? null
       : h('p', { class: 'note-line muted' }, 'On iPhone or iPad, add this purse to your Home Screen so Safari keeps it.'),

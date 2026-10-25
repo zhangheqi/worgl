@@ -1,16 +1,27 @@
 // The purse's own records, apart from the tokens: the mints the person
 // added and a small log of what happened, such as "Took 64 from the
-// faucet". They live in an IndexedDB database of the purse's own, `purse`,
-// which can never be taken for an SDK store (those are `worgl:<server>`).
+// faucet" or "Kept 128 alive". They live in an IndexedDB database of the
+// purse's own, `purse`, which can never be taken for an SDK store (those
+// are `worgl:<server>`).
 // The tokens themselves live only in the SDK's IndexedDbStore, one per
 // server. Every write is strict, so it resolves only once it is on disk.
 
-/** The database, and the version of its layout. */
+import type { LastFade } from './holdings.ts';
+import { type Moved, mergeKept } from './keep.ts';
+
+/**
+ * The database, and the version of its layout. 2: the log holds keep-alive's
+ * entries (`kept`, `lost`), which a purse of version 1 reads as "Faded";
+ * opening at 2 closes the records of a version-1 tab still open, so it never
+ * shows them.
+ */
 const DATABASE = 'purse';
-const VERSION = 1;
+const VERSION = 2;
 
 /** How many log entries the purse keeps: Holdings shows the last few, History (later) more. */
 const LOG_KEPT = 200;
+/** How far back a run's entry looks for its rotation's: a rotation adds a few entries at most. */
+const KEPT_SCAN = 50;
 
 /** What the purse last read of a mint's info. */
 export interface SavedInfo {
@@ -20,6 +31,12 @@ export interface SavedInfo {
   paused: boolean;
   /** When the purse read it, by this device's clock. */
   readAt: number;
+  /**
+   * What fades first, and when, as the last read saw it: said when the mint
+   * does not answer the next open. `null` when nothing does (no notes, or no
+   * schedule); missing when no read of this version saved it.
+   */
+  fades?: LastFade | null;
 }
 
 /** A mint the person added. */
@@ -44,14 +61,21 @@ export interface LogEntry {
   id?: number;
   /** When it happened. */
   t: number;
-  /** `faucet`: a note taken from the faucet; `faded`: notes a rotation dropped. */
-  kind: 'faucet' | 'faded';
+  /**
+   * `faucet`: a note taken from the faucet; `faded`: notes a rotation
+   * dropped; `kept`: notes moved a layer on by keep-alive (the amount moved;
+   * the log shows no change); `lost`: a hop the mint applied whose answer
+   * it no longer keeps.
+   */
+  kind: 'faucet' | 'faded' | 'kept' | 'lost';
   /** The mint. */
   mint: string;
-  /** Tokens it brought (faucet) or took away (faded). */
+  /** Tokens it brought (faucet), took away (faded, lost) or moved on (kept). */
   amount: number;
-  /** The serials of the notes it brought, `generation:index`, so a note can say where it came from. */
+  /** The serials of the notes it brought (faucet, kept), `generation:index`, so a note can say where it came from. */
   serials: string[];
+  /** For `kept`: the mint's first layer (its generation) when they moved, so one rotation's runs make one entry. */
+  round?: string;
 }
 
 /** The purse's records in this browser. */
@@ -130,21 +154,37 @@ export class Records {
   async addLog(entry: Omit<LogEntry, 'id'>): Promise<void> {
     await this.#run('log', 'readwrite', (store) => {
       store.add(entry);
-      const count = store.count();
-      count.onsuccess = () => {
-        let extra = count.result - LOG_KEPT;
-        if (extra <= 0) {
+      trim(store);
+    });
+  }
+
+  /**
+   * Adds keep-alive's entry for a rotation: when the log has one for the same
+   * mint and rotation already (an earlier run of the visit, stopped when the
+   * page was hidden, or another tab's), it takes that one's place with both
+   * runs in it, as the newest entry. `spent` names the notes this run moved
+   * that the purse held before it, so a note the earlier run brought and
+   * this one moved on counts once.
+   */
+  async addKept(entry: Omit<LogEntry, 'id'>, spent: readonly Moved[]): Promise<void> {
+    await this.#run('log', 'readwrite', (store) => {
+      let seen = 0;
+      const cursor = store.openCursor(null, 'prev');
+      cursor.onsuccess = () => {
+        const at = cursor.result;
+        if (at === null || seen >= KEPT_SCAN) {
+          store.add(entry);
+          trim(store);
           return;
         }
-        const oldest = store.openCursor();
-        oldest.onsuccess = () => {
-          const cursor = oldest.result;
-          if (cursor !== null && extra > 0) {
-            cursor.delete();
-            extra--;
-            cursor.continue();
-          }
-        };
+        seen += 1;
+        const old = at.value as LogEntry;
+        if (old.kind !== 'kept' || old.mint !== entry.mint || old.round === undefined || old.round !== entry.round) {
+          at.continue();
+          return;
+        }
+        at.delete();
+        store.add(mergeKept(old, entry, spent));
       };
     });
   }
@@ -164,4 +204,24 @@ export class Records {
       transaction.onabort = () => reject(transaction.error ?? new DOMException('the transaction was aborted', 'AbortError'));
     });
   }
+}
+
+/** Drops the oldest entries past {@link LOG_KEPT}, in the transaction that added one. */
+function trim(store: IDBObjectStore): void {
+  const count = store.count();
+  count.onsuccess = () => {
+    let extra = count.result - LOG_KEPT;
+    if (extra <= 0) {
+      return;
+    }
+    const oldest = store.openCursor();
+    oldest.onsuccess = () => {
+      const cursor = oldest.result;
+      if (cursor !== null && extra > 0) {
+        cursor.delete();
+        extra--;
+        cursor.continue();
+      }
+    };
+  };
 }

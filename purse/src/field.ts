@@ -2,7 +2,8 @@
 // the top, under a ruler of the current rotation with a needle for now. The
 // geometry comes from layout.ts; this file turns it into SVG and the label
 // overlay, opens the tips, follows the pointer, moves the needle and slides
-// notes that changed lane.
+// notes that changed lane: a note keep-alive moved a layer on slides from
+// where it was, with a pink thread from there.
 
 import { $, $$, type Child, announce, h, reduced, s } from './dom.ts';
 import { f2, hm } from './format.ts';
@@ -23,6 +24,12 @@ export interface FieldInput {
   opened: Opened;
   /** Notes that just changed, by when: they are pink for six seconds. */
   pink: ReadonlyMap<string, number>;
+  /** Whether the purse can keep these tokens alive now, for the tips' words. */
+  keeps: boolean;
+  /** Layers kept open though nothing is in them: those a keep-alive run passes through, so the field keeps its height. */
+  busy?: ReadonlySet<number>;
+  /** Notes keep-alive just moved a layer on, by when: a thread runs from where each was. */
+  hopped?: ReadonlyMap<string, number>;
   /** Opens or closes a lane's tip. */
   toggleLane: (lane: LaneKey) => void;
   /** Opens or closes a note's tip, from a tap or a click. */
@@ -50,6 +57,12 @@ const firstDrawn = new Map<string, number>();
 
 /** How long pink lasts. */
 const PINK_MS = 6000;
+
+/** How soon after its hop a note's thread is drawn: the slide that goes with it is under a second. */
+const THREAD_MS = 1500;
+
+/** The notes whose thread was drawn: once, on the slide that follows the hop, never again as the lane reflows. */
+const threaded = new Set<string>();
 
 /** The lane a layer's notes and dots are drawn as. */
 const laneKey = (pos: number, layers: number): LaneKey => laneOf(pos, layers);
@@ -102,7 +115,7 @@ function draw(host: HTMLElement, input: FieldInput, target: number | undefined):
   const plan = fieldPlan(width, window.innerHeight, holdings.layers, placed, {
     target,
     fill: true,
-    busy: new Set(placed.map((note) => note.pos)),
+    busy: new Set([...placed.map((note) => note.pos), ...(input.busy ?? [])]),
     ruler: schedule !== undefined,
   });
   const { G, rows, H, rulerH } = plan;
@@ -207,6 +220,8 @@ function draw(host: HTMLElement, input: FieldInput, target: number | undefined):
       'data-id': note.id,
       'data-l': note.pos,
       'data-lane': key,
+      // for tests only: a note on its way a layer on is drawn as any other where it was
+      'data-moving': note.moving ? 'true' : undefined,
       style: { transform: `translate(${f2(box.x)}px,${f2(box.y)}px)` },
     });
     if (schedule !== undefined) {
@@ -335,7 +350,7 @@ function draw(host: HTMLElement, input: FieldInput, target: number | undefined):
           'data-fk': `lane-${key}`,
           'aria-expanded': isOpen ? 'true' : 'false',
           'aria-controls': isOpen ? 'field-tip' : undefined,
-          'aria-label': laneDescription(holdings, key, now),
+          'aria-label': laneDescription(holdings, key, now, input.keeps),
           'aria-keyshortcuts': laneTotal(holdings, key) > 0 ? 'ArrowLeft ArrowRight' : undefined,
           style: { top: `${f2(Math.max(rulerH - 2, mid - 22))}px`, height: '44px' },
           on: {
@@ -369,13 +384,13 @@ function draw(host: HTMLElement, input: FieldInput, target: number | undefined):
       const rowsOfLane = rows.filter((row) => laneKey(row.pos, layers) === opened.lane);
       const open = rowsOfLane.filter((row) => !row.collapsed);
       tipRow = open[open.length - 1] ?? rowsOfLane[rowsOfLane.length - 1];
-      tipEl = tipBox(laneTip(holdings, opened.lane, now), input.close);
+      tipEl = tipBox(laneTip(holdings, opened.lane, now, input.keeps), input.close);
     } else {
       const note = byId.get(opened.note);
       if (note !== undefined) {
         selected = laneKey(note.pos, layers);
         tipRow = rows[laneIndex(note.pos, layers)];
-        tipEl = tipBox(noteTip(holdings, note, input.mintName, now), input.close);
+        tipEl = tipBox(noteTip(holdings, note, input.mintName, now, input.keeps), input.close);
       }
     }
   }
@@ -411,7 +426,7 @@ function draw(host: HTMLElement, input: FieldInput, target: number | undefined):
     $('.f-cap')?.classList.remove('tip-on');
   }
 
-  slide(host, boxes, now);
+  slide(host, svg, boxes, now, width, input.hopped);
 }
 
 /** Notes in the order they came, earliest first; those the log does not know first, by serial. */
@@ -455,8 +470,20 @@ function rulerPaths(frac: number, areaW: number, ry: number): { line: string; ti
 /** Where the "Now" label's centre goes: on the needle, kept clear of the ends. */
 const nowLeft = (frac: number, areaW: number): number => Math.min(areaW - 34, Math.max(52, frac * areaW));
 
-/** FLIP: notes slide from where they were, and a note that just arrived drops in from above. */
-function slide(host: HTMLElement, boxes: Map<string, Box>, now: number): void {
+/**
+ * FLIP: notes slide from where they were, and a note that just arrived
+ * drops in from above. A note keep-alive just moved a layer on gets a pink
+ * thread from its old place to its new, which fades as it lands; with less
+ * motion, notes are placed and no thread is drawn.
+ */
+function slide(
+  host: HTMLElement,
+  svg: SVGSVGElement,
+  boxes: Map<string, Box>,
+  now: number,
+  width: number,
+  hopped: ReadonlyMap<string, number> | undefined,
+): void {
   const moves: [SVGGElement, { x: number; y: number; fresh: boolean }, Box][] = [];
   const still = reduced();
   for (const el of $$<SVGGElement>('.f-note', host)) {
@@ -475,6 +502,22 @@ function slide(host: HTMLElement, boxes: Map<string, Box>, now: number): void {
     }
     if (last !== undefined && (Math.abs(last.x - box.x) > 0.5 || Math.abs(last.y - box.y) > 0.5)) {
       moves.push([el, { ...last, fresh: false }, box]);
+      const at = hopped?.get(id);
+      if (at !== undefined && now - at < THREAD_MS && !threaded.has(id)) {
+        threaded.add(id);
+        const x0 = last.x + box.w + 3;
+        const y0 = last.y + box.h / 2;
+        const x1 = box.x + box.w + 3;
+        const y1 = box.y + box.h / 2;
+        // never past the field's right edge, at 360 px
+        const xm = Math.min(Math.max(x0, x1) + 26, width - 2);
+        svg.append(
+          s('path', {
+            class: 'f-thread',
+            d: `M${f2(x0)} ${f2(y0)}C${f2(xm)} ${f2(y0)} ${f2(xm)} ${f2(y1)} ${f2(x1)} ${f2(y1)}`,
+          }),
+        );
+      }
     } else if (last === undefined && first === undefined && arriving.has(id)) {
       moves.push([el, { x: box.x, y: box.y - 16, fresh: true }, box]);
     }
@@ -505,6 +548,11 @@ function slide(host: HTMLElement, boxes: Map<string, Box>, now: number): void {
       firstDrawn.delete(id);
     }
   }
+  for (const id of threaded) {
+    if (!boxes.has(id)) {
+      threaded.delete(id);
+    }
+  }
   arriving.clear();
 }
 
@@ -515,6 +563,24 @@ const arriving = new Set<string>();
 export function arrive(ids: readonly string[]): void {
   for (const id of ids) {
     arriving.add(id);
+  }
+}
+
+/**
+ * A note moved a layer on by keep-alive: the new note `newId` takes the
+ * place the old one `oldId` was last drawn at, so the next draw slides it
+ * from there rather than dropping it in.
+ */
+export function hop(oldId: string, newId: string): void {
+  const last = lastPos.get(oldId);
+  if (last !== undefined) {
+    lastPos.set(newId, last);
+    lastPos.delete(oldId);
+  }
+  const first = firstDrawn.get(oldId);
+  if (first !== undefined) {
+    firstDrawn.set(newId, first);
+    firstDrawn.delete(oldId);
   }
 }
 
@@ -767,7 +833,7 @@ export function bindPointer(host: HTMLElement): void {
       if (note === undefined) {
         return;
       }
-      const words = noteTip(state.input.holdings, note, state.input.mintName, Date.now());
+      const words = noteTip(state.input.holdings, note, state.input.mintName, Date.now(), state.input.keeps);
       const [first, ...more] = words.lines;
       hover.tip = h(
         'div',
@@ -835,7 +901,7 @@ function stepNote(rows: readonly Row[], lane: LaneKey, by: 1 | -1, input: FieldI
     return;
   }
   input.showNote(id);
-  announce(tipWords(noteTip(holdings, note, input.mintName, Date.now())));
+  announce(tipWords(noteTip(holdings, note, input.mintName, Date.now(), input.keeps)));
 }
 
 /** When a tap or a click last opened or closed a tip in the field: the click that follows is the field's own. */
