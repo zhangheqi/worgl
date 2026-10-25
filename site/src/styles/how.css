@@ -15,9 +15,9 @@
 @media (max-width: 1000px) { .hiw-hero h1, .hiw-hero .lede { grid-column: 1 / -1; } }
 @media (max-width: 760px) { .three { grid-template-columns: 1fr; } .three li { min-height: 0; flex-direction: row; align-items: center; } .three .num { width: 1.6em; flex: none; } }
 
-/* the story: chapters and the diagram */
-.story-grid { display: grid; grid-template-columns: minmax(0, 5fr) minmax(0, 7fr); gap: clamp(32px, 5vw, 72px); align-items: start; }
-.chapters { display: flex; flex-direction: column; gap: clamp(96px, 22vh, 220px); padding-bottom: 12vh; }
+/* the story: chapters on the site's grid, and the lab beside them */
+.story-grid { display: grid; grid-template-columns: repeat(12, minmax(0, 1fr)); column-gap: 24px; align-items: start; }
+.chapters { grid-column: 1 / span 5; display: flex; flex-direction: column; gap: clamp(96px, 22vh, 220px); padding-bottom: 12vh; }
 .chapter { display: flex; flex-direction: column; gap: 18px; scroll-margin-top: 96px; }
 .chapter .sec-head { margin-bottom: 4px; }
 .chapter .h2 { font-size: clamp(40px, 4.4vw, 68px); }
@@ -28,24 +28,75 @@
 .try { align-self: flex-start; }
 .try::before { content: ""; width: 7px; height: 7px; background: var(--pink); }
 
-.lab-col { position: sticky; top: calc(env(safe-area-inset-top, 0px) + 84px); display: flex; flex-direction: column; gap: 12px; }
-.lab-cap { display: flex; justify-content: space-between; gap: 12px; color: var(--muted); }
-.lab-col .lab-side { display: grid; grid-template-columns: minmax(0, 1fr) auto; gap: 12px 20px; align-items: start; margin-top: 2px; }
-.lab-col .controls, .lab-col .readout { grid-column: 1 / -1; }
-.lab-col .readout { min-height: 4.6em; font-size: 15px; }
-.lab-col .counters { grid-column: 1 / -1; }
+/*
+ * The lab is one sheet of stamps in four panes, oldest first, with its counters
+ * in the top margin and its buttons and message along the bottom. Its height is
+ * set by its parts, about 420px, and its top edge sits on the rule of a chapter
+ * scrolled to its heading. A window too short even for that gets .scrolls from
+ * the page script.
+ */
+.lab-col {
+  grid-column: 7 / span 6; position: sticky; top: calc(env(safe-area-inset-top, 0px) + 104px);
+  display: grid; grid-template-columns: minmax(0, 1fr) auto; grid-template-areas: "cap counters" "sheets sheets" "controls controls" "readout readout";
+  background: var(--paper-2); border: 1px solid var(--rule-strong);
+}
+.lab-col.scrolls { max-height: calc(100vh - env(safe-area-inset-top, 0px) - 120px); overflow-y: auto; overscroll-behavior: contain; }
+/* crop marks at the sheet's corners */
+.lab-col::before {
+  content: ""; position: absolute; inset: -17px; pointer-events: none; --m: var(--rule-strong);
+  background:
+    linear-gradient(var(--m), var(--m)) left 0 top 16px / 10px 1px,
+    linear-gradient(var(--m), var(--m)) left 16px top 0 / 1px 10px,
+    linear-gradient(var(--m), var(--m)) right 0 top 16px / 10px 1px,
+    linear-gradient(var(--m), var(--m)) right 16px top 0 / 1px 10px,
+    linear-gradient(var(--m), var(--m)) left 0 bottom 16px / 10px 1px,
+    linear-gradient(var(--m), var(--m)) left 16px bottom 0 / 1px 10px,
+    linear-gradient(var(--m), var(--m)) right 0 bottom 16px / 10px 1px,
+    linear-gradient(var(--m), var(--m)) right 16px bottom 0 / 1px 10px;
+  background-repeat: no-repeat;
+}
+.lab-col.scrolls::before { content: none; }
+.lab-col .lab-side { display: contents; }
+.lab-cap { grid-area: cap; margin: 0; padding: 14px 16px 13px; display: flex; flex-direction: column; gap: 3px; }
+.lab-col .counters { grid-area: counters; align-self: center; padding: 0 16px; gap: 22px; }
+.lab-col .counters div { flex-direction: row; align-items: baseline; gap: 8px; }
+.lab-col .counters b { font-size: 30px; }
+.lab-col .sheets { grid-area: sheets; display: grid; grid-template-columns: repeat(4, minmax(0, 1fr)); gap: 18px; padding: 16px 16px 18px; border-top: 1px solid var(--rule); }
+.lab-col .sheet, .lab-col .sheet.frozen { padding: 0; border: 0; background: none; display: flex; flex-direction: column; gap: 8px; }
+.lab-col .cells { position: relative; padding: 6px; gap: 3px; border: 2px dotted var(--rule-strong); background: var(--paper); transition: box-shadow .35s ease; }
+.lab-col .frozen .cells { background: repeating-linear-gradient(135deg, transparent 0 7px, var(--rule) 7px 8px), var(--paper); }
+/* a transfer moves a note one pane on */
+.lab-col .sheet:not(:last-child) .cells::after { content: ""; position: absolute; right: -14px; top: 50%; width: 6px; height: 6px; border: solid var(--rule-strong); border-width: 1.5px 1.5px 0 0; transform: translateY(-50%) rotate(45deg); }
+.pane-head, .pane-foot { margin: 0; display: flex; font-size: 10.5px; }
+.pane-head { justify-content: space-between; gap: 8px; }
+.pane-foot { flex-direction: column; gap: 2px; }
+.lab-col .controls { grid-area: controls; display: grid; grid-template-columns: repeat(5, minmax(0, 1fr)); gap: 0; border-top: 1px solid var(--rule-strong); }
+.lab-col .controls .btn { min-height: 44px; padding: 0 6px; justify-content: center; border: 0; font-size: 14px; }
+.lab-col .controls .btn + .btn { border-left: 1px solid var(--rule-strong); }
+.lab-col .controls .btn:hover { transform: none; box-shadow: inset 0 -3px 0 var(--pink); }
+.lab-col .readout { grid-area: readout; margin: 0; padding: 13px 16px 15px; min-height: calc(3em + 28px); border-top: 1px solid var(--rule-strong); font-size: 15px; }
 .lab-col .formula { display: none; }
-.lab-col .sheets { gap: 10px; }
-.lab-col .sheet { padding: 10px 12px 12px; transition: box-shadow .35s ease; }
-/* the chapter in view says which layers to look at */
-.stamp-lab[data-focus="layers"] .sheet:nth-child(3),
-.stamp-lab[data-focus="layers"] .sheet:nth-child(4),
-.stamp-lab[data-focus="rotation"] .sheet:nth-child(1),
-.stamp-lab[data-focus="refresh"] .sheet:nth-child(1) { box-shadow: 0 0 0 2px var(--pink); }
+/* the chapter in view says which panes to look at */
+.stamp-lab[data-focus="layers"] .sheet:nth-child(3) .cells,
+.stamp-lab[data-focus="layers"] .sheet:nth-child(4) .cells,
+.stamp-lab[data-focus="rotation"] .sheet:nth-child(1) .cells,
+.stamp-lab[data-focus="refresh"] .sheet:nth-child(1) .cells { box-shadow: 0 0 0 2px var(--pink); }
+/* a narrower window: the lab takes one more column, too close to the text for crop marks */
+@media (max-width: 1179px) {
+  .lab-col { grid-column: 6 / span 7; }
+  .lab-col::before { content: none; }
+}
 @media (max-width: 1000px) {
-  .story-grid { grid-template-columns: minmax(0, 1fr); }
-  .lab-col { position: static; order: -1; }
+  .chapters, .lab-col { grid-column: 1 / -1; }
+  .lab-col { position: static; order: -1; margin-bottom: 72px; }
   .chapters { gap: 72px; padding-bottom: 0; }
+}
+/* a phone: two panes to a row, and the counters under the title */
+@media (max-width: 560px) {
+  .lab-col { grid-template-columns: minmax(0, 1fr); grid-template-areas: "cap" "counters" "sheets" "controls" "readout"; }
+  .lab-col .counters { padding: 0 16px 14px; }
+  .lab-col .sheets { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+  .lab-col .sheet:nth-child(2n) .cells::after { content: none; }
 }
 
 /* privacy */

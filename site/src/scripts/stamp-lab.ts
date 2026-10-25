@@ -9,7 +9,7 @@
  */
 import { isReduced } from './motion';
 
-const N = 4, CAP = 48;
+const N = 4;
 interface Cell { a: number; live: boolean }
 interface Sheet { gen: number; cells: Cell[] }
 
@@ -19,6 +19,9 @@ export function mountStampLab(root: HTMLElement) {
   const cRot = part<HTMLElement>('rotations'), cExp = part<HTMLElement>('expired');
   const tip = part<HTMLElement>('tip');
   const selectMode = root.hasAttribute('data-select');
+  // As a plate the layers are panes side by side, each labelled above and described below.
+  const plate = root.hasAttribute('data-plate');
+  const CAP = Number(root.dataset.bits) || 48;
   let L: Sheet[] = [], gen = 1, rot = 0, expired = 0, busy = false;
   let sel: { gen: number; i: number } | null = null, tipFor: { gen: number; i: number } | null = null, rendering = false;
   const fx = new Map<string, string>();
@@ -64,7 +67,8 @@ export function mountStampLab(root: HTMLElement) {
     sel = selectMode ? { gen: sheet(2).gen, i: 2 } : null;
     fx.clear();
     render();
-    say(selectMode ? 'Four layers, oldest at the top. Click a note to follow it, then use the buttons.' : 'Four layers, oldest at the top. Click a note to transfer it, or use the buttons.');
+    const order = plate ? 'oldest first' : 'oldest at the top';
+    say(selectMode ? `Four layers, ${order}. Click a note to follow it, then use the buttons.` : `Four layers, ${order}. Click a note to transfer it, or use the buttons.`);
   }
   function render(arrive = false) {
     rendering = true;
@@ -80,7 +84,11 @@ export function mountStampLab(root: HTMLElement) {
         }
         else cells += `<span class="c s ${f}"></span>`;
       }
-      return `<div class="${cls}"><div class="sheet-head"><span class="label">Layer ${k} · gen ${layer.gen}</span><span class="label muted">${hopsTxt(k)} · ${diesTxt(k)}</span></div><div class="cells">${cells}</div></div>`;
+      if (plate) {
+        return `<div class="${cls}" data-gen="${layer.gen}"><p class="pane-head label"><span>Layer ${k}</span><span class="muted">gen ${layer.gen}</span></p>` +
+          `<div class="cells">${cells}</div><p class="pane-foot label muted"><span>${k === N - 1 ? 'frozen' : hopsTxt(k)}</span><span>dies in ${k + 1}</span></p></div>`;
+      }
+      return `<div class="${cls}" data-gen="${layer.gen}"><div class="sheet-head"><span class="label">Layer ${k} · gen ${layer.gen}</span><span class="label muted">${hopsTxt(k)} · ${diesTxt(k)}</span></div><div class="cells">${cells}</div></div>`;
     }).join('');
     rendering = false;
     fx.clear();
@@ -158,7 +166,13 @@ export function mountStampLab(root: HTMLElement) {
         if (sel?.gen === d.gen) sel = null;
         expired += v; rot++;
         L.push(nl());
+        const was = new Map(Array.from(host.children, (el) => [(el as HTMLElement).dataset.gen, el.getBoundingClientRect()]));
         render(true);
+        // The layers that stay slide into their new places.
+        if (!isReduced()) for (const el of Array.from(host.children) as HTMLElement[]) {
+          const a = was.get(el.dataset.gen), b = el.getBoundingClientRect();
+          if (a && (a.left !== b.left || a.top !== b.top)) el.animate([{ transform: `translate(${a.left - b.left}px, ${a.top - b.top}px)` }, { transform: 'none' }], { duration: 480, easing: 'cubic-bezier(.2, .8, .2, 1)' });
+        }
         busy = false;
         say(`Rotation ${rot}: generation ${d.gen} dropped. ` +
           (dead.length ? `${dead.length} ${dead.length === 1 ? 'idle note' : 'idle notes'} worth ${v} expired with it.` : 'Nothing was left in it, so nothing expired.') +
