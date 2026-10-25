@@ -22,6 +22,7 @@ import {
   Purse,
   type Refused,
   type RequestOptions,
+  type ScheduledTransfer,
   type Spacing,
   type SubmitOptions,
   type SubmitProgress,
@@ -32,7 +33,7 @@ import { IndexedDbStore } from 'worgl/browser';
 
 import { Current } from './current.ts';
 import { noteId } from './holdings.ts';
-import { type Moving, movingNotes, spentBy, spentKey } from './keep.ts';
+import { type Moving, answersOf, movingNotes, spentBy, spentKey } from './keep.ts';
 import type { KeepPurse } from './keeper.ts';
 import type { MintLink } from './link.ts';
 import { withTransfersLock } from './lock.ts';
@@ -229,8 +230,8 @@ export async function keepServer<R>(
     work({
       planRefresh: (mint) => purse.planRefresh(mint),
       submit: (transfers, options) => purse.submit(transfers, options),
-      settle: async (spacing, options) => {
-        const what = await settling(purse, spacing, options);
+      settle: async (spacing, options, holdBack) => {
+        const what = await settling(purse, holdBack.size === 0 ? 'all' : { holdBack }, spacing, options);
         await settled(what);
         return what.submitted;
       },
@@ -312,24 +313,12 @@ export const SEND_SPACING = { minSecs: 2, maxSecs: 6 } as const;
 /** Whether an error may pass if tried again later: the SDK's own test. */
 export const transient = (error: unknown): boolean => isTransient(error);
 
-/** The serials of the notes held at `mint`, as the purse names them. */
-async function serials(purse: Purse, mint: string): Promise<string[]> {
-  return (await purse.notesAt(mint)).map((note) => noteId(note.serial));
-}
-
 /** A note that came back from a send: its serial, value and layer, and when it can move (Unix seconds by the mint's clock). */
 export interface Came {
   id: string;
   v: number;
   pos: number | undefined;
   spendableAt: bigint | undefined;
-}
-
-/** The notes held at `mint` that `before` did not hold. */
-async function came(purse: Purse, mint: string, before: ReadonlySet<string>): Promise<Came[]> {
-  return (await purse.notesAt(mint))
-    .filter((note) => !before.has(noteId(note.serial)))
-    .map((note) => ({ id: noteId(note.serial), v: Number(note.amount), pos: note.position, spendableAt: note.spendableAt }));
 }
 
 /**
@@ -600,6 +589,8 @@ export interface SettledSend {
   kept: Kept | undefined;
   /** Its transfers refused in this settle. */
   refused: Refused[];
+  /** Its change that came in this settle: the notes of its own transfers' answers that are not the receiver's. */
+  back: Came[];
 }
 
 /** What settling a server came to. */
@@ -607,53 +598,96 @@ export interface Settled {
   submitted: Submitted;
   /** Each payment that was kept before the settle. */
   sends: SettledSend[];
-  /** The notes that came, by mint: the change. */
-  fresh: Map<string, Came[]>;
+}
+
+/** `requests` to submit: the first at once, then each a gap of `spacing` after the one before, at random. */
+function spread(requests: readonly string[], spacing: Spacing): ScheduledTransfer[] {
+  let t = 0;
+  return requests.map((request, i) => {
+    if (i > 0) {
+      t += spacing.minSecs + Math.random() * (spacing.maxSecs - spacing.minSecs);
+    }
+    return { request, afterSecs: t };
+  });
 }
 
 /**
- * Resends what `purse` sent and has not seen answered, `spacing` apart, and
- * tells what each payment came to: for keep-alive's settle, and for "Try
- * again now" on Send.
+ * Resends what `purse` sent and has not seen answered, `spacing` apart:
+ * all of it (keep-alive's settle); all but the transfers that spend notes of
+ * the mints `holdBack` names (keep-alive's settle while Send shows a plan
+ * of one of them); or only its payments' transfers ("Try again now" on
+ * Send, which leaves keep-alive's hops to keep-alive, which logs them).
+ * Tells what each payment came to from the answers to its own transfers,
+ * never from what else changed at the mint meanwhile, such as keep-alive's
+ * hops answered in the same settle.
  */
-async function settling(purse: Purse, spacing: Spacing, options: SubmitOptions): Promise<Settled> {
+async function settling(
+  purse: Purse,
+  which: 'all' | 'sends' | { holdBack: ReadonlySet<string> },
+  spacing: Spacing,
+  options: SubmitOptions,
+): Promise<Settled> {
   const before = kept(purse);
-  const mints = [...new Set(before.map((each) => each.mint))];
-  // what each mint's change is told apart from; a mint that does not answer now leaves only its change's pink unknown
-  const was = new Map(
-    await Promise.all(mints.map(async (mint) => [mint, await serials(purse, mint).then((ids) => new Set(ids), () => undefined)] as const)),
-  );
-  const byTransfer = new Map(before.flatMap((each) => each.transfers.map((transfer) => [transfer, each.id] as const)));
-  const submitted = await purse.settle(spacing, options);
-  const now = new Map(kept(purse).map((each) => [each.id, each]));
-  const fresh = new Map(
-    await Promise.all(
-      mints.map(async (mint) => {
-        const held = was.get(mint);
-        return [mint, held === undefined ? [] : await came(purse, mint, held).catch(() => [])] as const;
-      }),
-    ),
-  );
-  return {
-    submitted,
-    sends: before.map((each) => ({
-      id: each.id,
-      mint: each.mint,
-      kept: now.get(each.id),
-      refused: submitted.refused.filter((refusal) => byTransfer.get(refusal.request) === each.id),
-    })),
-    fresh,
+  // each payment by the notes its transfers spend: told apart by the note, never by the request's text
+  const byNote = new Map<string, string>();
+  for (const made of purse.payments()) {
+    for (const transfer of made.payment.transfers) {
+      for (const spent of spentBy(transfer.request)) {
+        byNote.set(spentKey(spent), idOf(made.request));
+      }
+    }
+  }
+  const paymentOf = (request: string): string | undefined =>
+    spentBy(request)
+      .map((spent) => byNote.get(spentKey(spent)))
+      .find((id) => id !== undefined);
+  // the transfers answered, in order: each answer holds one note per output
+  const answered: string[] = [];
+  const onProgress = (progress: SubmitProgress): void => {
+    if (progress.step === 'answered') {
+      answered.push(progress.transfer.request);
+    }
+    options.onProgress?.(progress);
   };
+  const resent = (request: string): boolean =>
+    which === 'sends' ? paymentOf(request) !== undefined : !spentBy(request).some((spent) => which !== 'all' && which.holdBack.has(spent.mint));
+  const submitted =
+    which === 'all'
+      ? await purse.settle(spacing, { ...options, onProgress })
+      : await purse.submit(spread(purse.outgoing().filter(resent), spacing), { ...options, onProgress });
+  const theirs = new Set(submitted.theirs);
+  const change = new Map<string, string[]>();
+  for (const [i, notes] of answersOf(answered, submitted.notes).entries()) {
+    const id = paymentOf(answered[i] ?? '');
+    if (id !== undefined) {
+      change.set(id, [...(change.get(id) ?? []), ...notes.filter((note) => !theirs.has(note))]);
+    }
+  }
+  const now = new Map(kept(purse).map((each) => [each.id, each]));
+  const sends = await Promise.all(
+    before.map(async (each): Promise<SettledSend> => {
+      const back = change.get(each.id);
+      return {
+        id: each.id,
+        mint: each.mint,
+        kept: now.get(each.id),
+        refused: submitted.refused.filter((refusal) => paymentOf(refusal.request) === each.id),
+        back: back === undefined ? [] : await placed(purse, each.mint, back),
+      };
+    }),
+  );
+  return { submitted, sends };
 }
 
 /**
- * "Try again now" on Send: resends what `server`'s purse has outgoing,
- * waiting for the lock. `undefined` when nothing was outgoing by then.
+ * "Try again now" on Send: resends the transfers of `server`'s payments that
+ * are still outgoing, waiting for the lock; keep-alive's hops stay
+ * keep-alive's. `undefined` when none was outgoing by then.
  */
 export async function retrySettle(server: string, signal: AbortSignal): Promise<Settled | undefined> {
   return locked(() =>
     serverAt(server).purse.change((purse) =>
-      purse.outgoing().length === 0 ? Promise.resolve(undefined) : settling(purse, SEND_SPACING, { signal }),
+      kept(purse).some((each) => each.outgoing) ? settling(purse, 'sends', SEND_SPACING, { signal }) : Promise.resolve(undefined),
     ),
   ).then((settled) => settled ?? undefined);
 }

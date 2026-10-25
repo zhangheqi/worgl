@@ -110,6 +110,10 @@ export interface LogEntry {
   lost?: number;
   /** sent, state lost: the part of `lost` that was for the receiver. */
   lostTheirs?: number;
+  /** sent, state turned: whether the mint turned it away because its newest layer was full (it can go after the rotation). */
+  layerFull?: boolean;
   /** sent: when it was last updated: when its change came. */
   t2?: number;
+  /** sent: when each note of its change came, by serial, for the notes that came before `t2` (a send settled later). */
+  changeAt?: Record<string, number>;
 }

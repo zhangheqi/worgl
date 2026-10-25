@@ -130,6 +130,8 @@ export interface Logged {
   serials: readonly string[];
   /** sent: when its change came. */
   t2?: number | undefined;
+  /** sent: when each note of its change that came before `t2` came. */
+  changeAt?: Readonly<Record<string, number>> | undefined;
 }
 
 /** Where the notes an entry of the log names came from, if it brought any. */
@@ -157,7 +159,7 @@ export function arrivalsOf(
     const at = entry.kind === 'sent' ? (entry.t2 ?? entry.t) : entry.t;
     for (const id of entry.serials) {
       if (!known.has(id)) {
-        known.set(id, { at, source });
+        known.set(id, { at: entry.changeAt?.[id] ?? at, source });
       }
     }
   }
@@ -167,6 +169,27 @@ export function arrivalsOf(
     }
   }
   return known;
+}
+
+/**
+ * A send's entry with the change a settle at `t2` just brought (`fresh`):
+ * the change it had keeps when it came (`changeAt`), so each note's tip
+ * still says when it came.
+ */
+export function withChange(
+  entry: Pick<Logged, 't' | 'serials' | 't2' | 'changeAt'>,
+  fresh: readonly string[],
+  t2: number,
+): { serials: string[]; changeAt?: Record<string, number>; t2: number } {
+  const changeAt: Record<string, number> = { ...entry.changeAt };
+  for (const id of entry.serials) {
+    changeAt[id] ??= entry.t2 ?? entry.t;
+  }
+  return {
+    serials: [...new Set([...entry.serials, ...fresh])],
+    ...(Object.keys(changeAt).length === 0 ? {} : { changeAt }),
+    t2,
+  };
 }
 
 /**

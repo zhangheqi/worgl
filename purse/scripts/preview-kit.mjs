@@ -136,6 +136,25 @@ export function binariesOf() {
 // ---------- the mint, its faucet and the proxy ----------
 
 /**
+ * A schedule of about `period` seconds whose next rotation is more than
+ * `clearMs` off: a mint rotates at whole multiples of its period, so a walk
+ * that rotates by hand meets no rotation of the schedule's, nor keep-alive
+ * moving fading notes because one is near (as it does for Send's plan within
+ * a quarter of an hour of it). Tries the period first, then a few minutes
+ * either side of it.
+ */
+export function clearPeriod(period, clearMs) {
+  for (let step = 0; step < 60; step++) {
+    const tried = period + (step % 2 === 0 ? 1 : -1) * Math.ceil(step / 2) * 300;
+    const next = Math.ceil(Date.now() / 1000 / tried) * tried * 1000;
+    if (next - Date.now() > clearMs) {
+      return tried;
+    }
+  }
+  return period;
+}
+
+/**
  * Starts a fresh state in `home` with `mints` mints (4 layers of 1024, new
  * notes in the last layer, rotating every `period` seconds), a faucet for
  * each, and a proxy that serves the server and the first one's faucet at
@@ -189,7 +208,7 @@ export async function setup({ home, period, perAddress = 10, mints = 1, serve = 
   );
 
   // ---------- the proxy, and what the walk can make it do ----------
-  const control = { hold: undefined, holdKeys: undefined, holdInfo: undefined, refuse: undefined, refuseSkip: 0, drop: false, down: false, transfers: 0, faucets: 0, held: 0, faucet: 0 };
+  const control = { hold: undefined, holdKeys: undefined, holdInfo: undefined, refuse: undefined, refuseSkip: 0, drop: false, down: false, transfers: 0, faucets: 0, held: 0, faucet: 0, lastTransfer: 0 };
   /** The gates requests wait at now, by kind, so that a release opens them. */
   const waiting = { transfer: new Set(), keys: new Set(), info: new Set() };
   const wait = async (kind, held) => {
@@ -221,6 +240,9 @@ export async function setup({ home, period, perAddress = 10, mints = 1, serve = 
     const transfer = incoming.method === 'POST' && pathname === '/v1/transfer';
     const keys = incoming.method === 'GET' && /^\/v1\/mints\/[0-9a-f]+\/keys$/.test(pathname);
     const info = incoming.method === 'GET' && /^\/v1\/mints\/[0-9a-f]+\/info$/.test(pathname);
+    if (transfer) {
+      control.lastTransfer = Date.now();
+    }
     // read the body first, so a held request can still be forwarded whole
     const body = [];
     for await (const chunk of incoming) {
@@ -395,6 +417,17 @@ export async function setup({ home, period, perAddress = 10, mints = 1, serve = 
       },
       get faucets() {
         return control.faucets;
+      },
+      /**
+       * Resolves once no transfer has reached the proxy, nor waits at its
+       * gate, for `ms` from now: a purse's keep-alive sends its hops a few
+       * seconds apart, so none is part way through a run.
+       */
+      async quiet(ms) {
+        const from = Date.now();
+        while (control.held > 0 || Date.now() - Math.max(from, control.lastTransfer) < ms) {
+          await new Promise((resolve) => setTimeout(resolve, 100));
+        }
       },
       /** Which mint's faucet answers at the proxy's /v1/faucet: the first's until this names another. */
       faucet(which = issuer) {

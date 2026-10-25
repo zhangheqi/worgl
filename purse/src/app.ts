@@ -51,6 +51,7 @@ import {
   laneOf,
   laneTotal,
   savedHoldings,
+  withChange,
 } from './holdings.ts';
 import { type Elsewhere, type HomeData, type HomeInput, type KeepShown, homeView, placeholder, renderBack } from './home.ts';
 import type { Moved } from './keep.ts';
@@ -115,10 +116,10 @@ interface HomeState {
 
 /** A keep-alive run, as Holdings shows it. */
 interface KeepState {
-  /** The shown mint's run in this tab: its hops' value, how many are done, of how many. */
+  /** The run in this tab of the mint shown when its pass began: its hops' value, how many are done, of how many. */
   progress: Shown | undefined;
   /** Another tab's run of the shown mint, as it last said, and when. */
-  watching: { amount: number; done: number; total: number; at: number } | undefined;
+  watching: { mint: string; amount: number; done: number; total: number; at: number } | undefined;
   /** The shown mint's hops answered, by the note each spent, until a read shows the note it brought. */
   hops: Map<string, { v: number; generation: bigint; at: number }>;
   /** Notes keep-alive just moved a layer on, by when: their thread, and their place until the run's log entry is in. */
@@ -274,7 +275,7 @@ function qrState(): boolean | undefined {
 
 let observer: ResizeObserver | undefined;
 
-/** The shown mint changed: what was read of the last one is not this one's. */
+/** The shown mint changed: what was read of the last one, and the moves of its notes Holdings follows, are not this one's. */
 function syncShown(): void {
   const mint = shown()?.mint;
   if (mint !== state.home.mint) {
@@ -284,6 +285,10 @@ function syncShown(): void {
     state.home.opened = undefined;
     state.home.drawn = undefined;
     state.home.sideDrawn = undefined;
+    state.keep.hops.clear();
+    state.keep.hopped.clear();
+    state.keep.lanes = new Set();
+    state.keep.lanesSig = undefined;
   }
 }
 
@@ -836,7 +841,7 @@ async function setUsed(mint: string): Promise<void> {
     return;
   }
   try {
-    await records.putMint({ ...record, used: Date.now() });
+    await records.updateMint(mint, { used: Date.now() });
     state.mints = await records.mints();
   } catch {
     // only which mint Holdings shows depends on it: show it here all the same, until the next read
@@ -1121,7 +1126,7 @@ async function readHome(): Promise<void> {
     state.home.error = { words: fades ?? said.words, at: 'read' };
     // the visit's first pass runs all the same: the other mints are kept, and what a closed tab left outgoing is
     // settled while the mints still keep their answers; the keeper asks this mint again each minute after it
-    if (!finishing && !pokedOnOpen) {
+    if (finishing === 0 && !pokedOnOpen) {
       pokedOnOpen = true;
       keeper.poke();
     }
@@ -1149,7 +1154,7 @@ async function readHome(): Promise<void> {
   void keepInfo(record, read.info, firstFade(holdings));
   // fading tokens, or tokens left on their way, call for a pass; and the first read of a visit, to settle what is outgoing
   const calls = keeping.saw(record.mint, read);
-  if (!finishing && (!pokedOnOpen || calls === 'due' || (calls === 'moving' && !keeper.running))) {
+  if (finishing === 0 && (!pokedOnOpen || calls === 'due' || (calls === 'moving' && !keeper.running))) {
     pokedOnOpen = true;
     keeper.poke();
   }
@@ -1252,8 +1257,7 @@ async function keepInfo(record: MintRecord, info: MintInfo, fades: LastFade | nu
     return;
   }
   try {
-    const current = state.mints.find((each) => each.mint === record.mint) ?? record;
-    await state.records.putMint({ ...current, info: saved });
+    await state.records.updateMint(record.mint, { info: saved });
     state.mints = await state.records.mints();
   } catch {
     // only the drawing before the first read depends on it
@@ -1332,8 +1336,8 @@ const HOP_MS = 10_000;
 /** How long a note keep-alive moved keeps its place by its hop, while its run's log entry is on its way. */
 const HOPPED_MS = 10 * 60_000;
 
-/** The pass is reading the shown mint after its work: that read calls for no pass of its own. */
-let finishing = false;
+/** Passes reading the shown mint after their work (a hurried one's read may outlast it): those reads call for no pass of their own. */
+let finishing = 0;
 /** Whether this visit poked the keeper on open, once the first read was drawn, or failed. */
 let pokedOnOpen = false;
 
@@ -1371,15 +1375,24 @@ async function pruneAndLog(loaded: Sdk, server: string, mint: string, read: Read
 /** This tab's sends and settles from Send that hold the lock, or wait for it: a pass gives way to them. */
 let sendsHere = 0;
 
+/** How long after another tab's send asked this tab's pass to end the next pass waits, so that the send takes the lock first. */
+const YIELD_MS = 10_000;
+/** Until when this tab's passes wait for another tab's send. */
+let yieldUntil = 0;
+
 /**
  * A keep-alive pass's lock (lock.ts), if nothing else holds it: false,
- * without running `work`, while another tab does. While a send of this
- * tab's holds it or waits for it, the pass gives way and runs nothing; the
- * send pokes the keeper once it is over.
+ * without running `work`, while another tab does, or while another tab's
+ * send is about to take it. While a send of this tab's holds it or waits for
+ * it, the pass gives way and runs nothing; the send pokes the keeper once it
+ * is over.
  */
 async function passLock(work: () => Promise<void>): Promise<boolean> {
   if (sendsHere > 0) {
     return true;
+  }
+  if (Date.now() < yieldUntil) {
+    return false;
   }
   return (
     (await withTransfersLock(async () => {
@@ -1390,15 +1403,17 @@ async function passLock(work: () => Promise<void>): Promise<boolean> {
 }
 
 /**
- * Runs `work`, a send or a settle the person asked for, holding the lock and
- * waiting for it: the other tabs' passes are asked to stop at their next
- * safe step, and this tab's pass stops first. Keep-alive runs again after.
+ * Runs `work`, a send or a settle the person asked for, which waits for the
+ * lock: the passes running here and in the other tabs are asked to end (each
+ * sends what it has in hand at once, and starts nothing more), and this
+ * tab's has ended before `work` starts. Keep-alive runs again after.
  */
 async function sending<R>(work: () => Promise<R>): Promise<R> {
-  channel?.postMessage({ kind: 'yield' });
-  await keeper.stop();
+  // counted first, so that a pass poked while this tab's ends gives way rather than take the lock before the send
   sendsHere++;
   try {
+    channel?.postMessage({ kind: 'yield' });
+    await keeper.stop();
     return await work();
   } finally {
     sendsHere--;
@@ -1444,6 +1459,7 @@ const keeping: Keeping = new Keeping({
       }
     }
   },
+  showsPlan: sendShowsPlan,
   log: async ({ spent, ...entry }) => {
     // the tokens are safe in the SDK's store by now: a log that cannot be written loses only the entry
     await logEntry(entry, spent).catch(() => undefined);
@@ -1451,7 +1467,10 @@ const keeping: Keeping = new Keeping({
   },
   progress: keepProgress,
   hop: (spent) => {
-    state.keep.hops.set(spent.id, { v: spent.v, generation: spent.generation, at: Date.now() });
+    // the shown mint's: a hop of a mint no longer shown slides nothing
+    if (spent.mint === shown()?.mint) {
+      state.keep.hops.set(spent.id, { v: spent.v, generation: spent.generation, at: Date.now() });
+    }
     tell();
     void refreshHome();
   },
@@ -1462,7 +1481,12 @@ const keeping: Keeping = new Keeping({
     }
   },
   kept: (mint) => channel?.postMessage({ kind: 'kept', mint }),
-  announce: announceHome,
+  announce: (words, mint) => {
+    // a run's words while Holdings shows its mint, which may have changed since the pass began
+    if (shown()?.mint === mint) {
+      announceHome(words);
+    }
+  },
   finish: finishPass,
   reopen,
   now: () => Date.now(),
@@ -1490,27 +1514,25 @@ const keeper: Keeper = new Keeper({
   now: () => Date.now(),
 });
 
-/** Tells the other tabs how the shown mint's run stands here. */
-function postKeeping(mint: string, p: Shown): void {
-  channel?.postMessage({ kind: 'keeping', mint, amount: p.amount, done: p.done, total: p.total });
+/** Tells the other tabs how a run stands here. */
+function postKeeping(p: Shown): void {
+  channel?.postMessage({ kind: 'keeping', mint: p.mint, amount: p.amount, done: p.done, total: p.total });
 }
 
-/** The shown mint's run moved on, or ended: count it in the back row and column, and tell the other tabs. */
+/** The run of the mint shown when the pass began moved on, or ended: count it in the back row and column, and tell the other tabs. */
 function keepProgress(p: Shown | undefined): void {
-  const record = shown();
   const was = state.keep.progress;
   drawBack(() => {
     state.keep.progress = p;
   });
-  if (record === undefined) {
-    return;
-  }
   if (p === undefined) {
     // the run is over here, or stopped: the tabs watching it stop showing it
-    channel?.postMessage({ kind: 'kept', mint: record.mint });
+    if (was !== undefined) {
+      channel?.postMessage({ kind: 'kept', mint: was.mint });
+    }
     return;
   }
-  postKeeping(record.mint, p);
+  postKeeping(p);
   if (p.total > (was?.total ?? 0)) {
     // more hops planned, and saved as outgoing: their notes are moving now, here and in the other tabs
     tell();
@@ -1518,28 +1540,49 @@ function keepProgress(p: Shown | undefined): void {
   }
 }
 
-/** The pass is over: read the shown mint again, then say what was kept of it and the new date to come back by. */
-async function finishPass(kept: number): Promise<void> {
-  finishing = true;
-  try {
-    await refreshHome();
-  } finally {
-    finishing = false;
+/**
+ * The pass is over: read the shown mint again, then say what was kept of
+ * `mint`, the mint shown when the pass began, and the new date to come back
+ * by, while Holdings still shows it. A pass a send hurried does not wait
+ * for that read, so the send has the lock at once; its words follow the
+ * read all the same, since a read from before its last hop landed would
+ * give a date a rotation early.
+ */
+async function finishPass(kept: number, mint: string | undefined, wait: boolean): Promise<void> {
+  const speaks = (): boolean => kept > 0 && mint !== undefined && shown()?.mint === mint;
+  if (!wait && !speaks()) {
+    // the reads after each hop stand
+    return;
   }
-  if (kept > 0) {
-    const holdings = state.home.data?.holdings;
-    const now = Date.now();
-    announceHome(keptWords(kept, holdings === undefined ? undefined : comeBackAt(holdings, now), now));
+  const said = (async () => {
+    finishing++;
+    try {
+      await refreshHome();
+    } finally {
+      finishing--;
+    }
+    if (speaks()) {
+      const holdings = state.home.data?.holdings;
+      const now = Date.now();
+      announceHome(keptWords(kept, holdings === undefined ? undefined : comeBackAt(holdings, now), now));
+    }
+  })();
+  if (wait) {
+    await said;
+  } else {
+    void said.catch(() => undefined);
   }
 }
 
-/** The run Holdings shows: this tab's, or another's it hears of. */
+/** The run Holdings shows: this tab's, or another's it hears of, of the mint it shows. */
 function keepShown(): KeepShown | undefined {
   const { progress, watching } = state.keep;
-  if (progress !== undefined && progress.total > 0) {
-    return { ...progress, watching: false };
+  const mint = shown()?.mint;
+  if (progress !== undefined && progress.total > 0 && progress.mint === mint) {
+    const { amount, done, total, spaced } = progress;
+    return { amount, done, total, spaced, watching: false };
   }
-  if (watching !== undefined && watching.total > 0) {
+  if (watching !== undefined && watching.total > 0 && watching.mint === mint) {
     return { amount: watching.amount, done: watching.done, total: watching.total, spaced: true, watching: true };
   }
   return undefined;
@@ -1598,9 +1641,9 @@ const holdingsOf = (read: Read): Holdings =>
 /**
  * The mint whose tokens go first, when it is not the shown one: the date to
  * come back by is the earliest of every mint the purse keeps, and Holdings
- * shows only the first mint added until the Mints screen comes. A mint this
- * page has not read, since it has not answered yet or does not, counts by
- * what the purse saved of what fades there first.
+ * shows one mint, the one used last, until the Mints screen comes. A mint
+ * this page has not read, since it has not answered yet or does not, counts
+ * by what the purse saved of what fades there first.
  */
 function elsewhere(record: MintRecord, now: number): Elsewhere | undefined {
   let found: Elsewhere | undefined;
@@ -2337,6 +2380,19 @@ async function addFromRequest(): Promise<void> {
   await readForSendStep();
 }
 
+/**
+ * Whether Send shows, or reads for, a plan of `mint`'s notes that is not
+ * signed yet. This tab's keep-alive then leaves that mint alone until its
+ * rotation is near (`waitsForSend`), so that the plan signed is the plan
+ * shown; it runs again once the send is made or Send is left. Another
+ * tab's knows nothing of it: the check under the lock catches what that
+ * one moves.
+ */
+function sendShowsPlan(mint: string): boolean {
+  const s = state.send;
+  return state.route === 'send' && !s.signing && s.req?.mint === mint && (s.step === 'reading' || s.step === 'confirm');
+}
+
 /** Reads what can go for the request, then shows sent already, confirm or not enough ready; its heading focused after the person's step. */
 async function readForSendStep(focus = true): Promise<void> {
   const s = state.send;
@@ -2346,6 +2402,15 @@ async function readForSendStep(focus = true): Promise<void> {
     return;
   }
   s.readError = undefined;
+  // a pass at this server (one on open) may move notes under the plan: it sends what it has in hand at once and ends,
+  // so the read sees them where they land; a pass elsewhere goes on, and this tab's passes after leave the mint alone
+  // (sendShowsPlan)
+  if (keeping.at === record.server) {
+    await keeper.stop();
+    if (state.send !== s) {
+      return;
+    }
+  }
   let fs: ForSend;
   try {
     fs = await (await loadSdk()).readForSend(record.server, req.mint);
@@ -2373,14 +2438,15 @@ async function readForSendStep(focus = true): Promise<void> {
     s.step = 'already';
     s.already = sentBefore(req, before);
     render();
-    if (focus) {
+    if (focus && state.route === 'send') {
       focusH1();
     }
     return;
   }
   applyPlan(s, fs, req);
   render();
-  if (focus) {
+  // left for another screen meanwhile: the step is ready for coming back, and focus stays where the person is
+  if (focus && state.route === 'send') {
     focusH1();
   }
   if (s.step === 'short') {
@@ -2463,9 +2529,23 @@ async function shortFaucet(): Promise<void> {
     return;
   }
   faucet.taking = false;
+  if (state.send !== s || state.route !== 'send') {
+    // left meanwhile: Holdings reads again (its read on arriving may have been before the note was kept) and says what
+    // came, and nothing here takes focus
+    if (state.route === 'home') {
+      void refreshHome();
+    }
+    return;
+  }
   const took = state.home.took;
   // said here, not again on Holdings
   state.home.took = undefined;
+  // read and plan again as on opening the request: Reading, with no Take to press twice, and keep-alive leaves the
+  // mint alone meanwhile (sendShowsPlan)
+  s.step = 'reading';
+  render();
+  // its button is gone: focus goes where adding a mint's does
+  focusH1();
   await readForSendStep();
   const holdings = forSend?.holdings;
   if (took !== undefined && holdings !== undefined) {
@@ -2544,9 +2624,11 @@ function shortFrom(error: unknown, fs: ForSend, req: ReadRequest): ReturnType<ty
 
 /**
  * Send: check again under the lock, pay, then submit each transfer at its
- * time. Keep-alive gives way, here and in the other tabs, so the send has
- * the lock within seconds; its pass runs again once the send's end is
- * drawn, and settles what the send left outgoing.
+ * time. Keep-alive gives way, here and in the other tabs: a pass sends what
+ * it has in hand at once and ends, so the send has the lock once the mint
+ * has answered those, within seconds unless it is slow to answer. The pass
+ * after runs once the send's end is drawn, and settles what the send left
+ * outgoing.
  */
 async function doSend(): Promise<void> {
   const s = state.send;
@@ -2843,6 +2925,7 @@ async function finishRun(s: SendState, result: Sent, spent: readonly string[], r
       serials: back.map((note) => note.id),
       t2,
       ...(logState === 'lost' ? { lost, lostTheirs } : {}),
+      ...(logState === 'turned' ? { layerFull: layerFull(cancelled) } : {}),
     });
   }
   if (went > 0) {
@@ -2889,7 +2972,7 @@ async function finishRun(s: SendState, result: Sent, spent: readonly string[], r
   s.end = {
     amount: A,
     t: entry?.t ?? Date.now(),
-    layerFull: cancelled.some((refusal) => (refusal.error as { code?: unknown } | undefined)?.code === 'layer_full'),
+    layerFull: layerFull(cancelled),
     lost,
     lostTheirs,
     words: kept ? keptRefusalWords(submitted.refused) : undefined,
@@ -3150,7 +3233,6 @@ function openRow(entry: LogEntry): void {
 
 /** What a settle came to, written to each send's log entry (§5.11). */
 async function applySettled(server: string, settled: Settled): Promise<void> {
-  const given = new Set<string>();
   for (const sendOutcome of settled.sends) {
     const entry = state.log.find(
       (each) => each.kind === 'sent' && each.ask === sendOutcome.id && (each.state === 'sending' || each.state === 'waiting'),
@@ -3161,29 +3243,37 @@ async function applySettled(server: string, settled: Settled): Promise<void> {
     const t2 = Date.now();
     const asked = entry.asked ?? entry.amount;
     const dropped = sendOutcome.refused.filter((refusal) => refusal.outcome === 'dropped' && refusal.atStake !== undefined);
+    // the change from this send's own answers in this settle, with what its answers before this one brought
+    const fresh = sendOutcome.back.map((note) => note.id);
     if (sendOutcome.kept?.outgoing === true) {
-      await updateEntry({ ...entry, state: 'waiting' });
+      await updateEntry({ ...entry, state: 'waiting', ...(fresh.length === 0 ? {} : withChange(entry, fresh, t2)) });
+      arrived(fresh, t2);
       const words = sendOutcome.refused.find((refusal) => refusal.outcome === 'kept');
       waitingWords.set(entry.id ?? -1, words === undefined ? undefined : say(words.error, 'settle', { host: hostOf(server) }).words);
     } else if (dropped.length > 0) {
       const { lost, theirs: lostTheirs } = droppedValue(dropped);
-      await updateEntry({ ...entry, state: 'lost', lost, lostTheirs });
+      await updateEntry({ ...entry, state: 'lost', lost, lostTheirs, ...(fresh.length === 0 ? {} : withChange(entry, fresh, t2)) });
+      arrived(fresh, t2);
     } else if (sendOutcome.kept !== undefined && sendOutcome.kept.owed.length > 0) {
-      // the change that came for this sendOutcome's mint; several of one mint at once cannot be told apart
-      const fresh = given.has(sendOutcome.mint) ? [] : (settled.fresh.get(sendOutcome.mint) ?? []);
-      given.add(sendOutcome.mint);
       const partial = entry.transfers !== undefined && sendOutcome.kept.transfers.length < entry.transfers;
-      const serials = fresh.map((note) => note.id);
-      const settledEntry = answeredEntry(entry, sendOutcome.kept, partial ? 'partial' : 'handback', { serials, t2 });
+      const settledEntry = answeredEntry(entry, sendOutcome.kept, partial ? 'partial' : 'handback', withChange(entry, fresh, t2));
       await updateEntry(settledEntry);
-      arrived(serials, t2);
-      announce(settledWords(settledEntry.went ?? asked));
+      arrived(fresh, t2);
+      // the send the waiting view shows says its own end (afterSettle), once
+      if (!(state.send.step === 'waiting' && state.send.end?.entry === entry.id)) {
+        announce(settledWords(settledEntry.went ?? asked));
+      }
     } else if (sendOutcome.refused.length > 0 && sendOutcome.refused.every((refusal) => refusal.outcome === 'cancelled')) {
-      await updateEntry({ ...entry, state: 'turned' });
+      await updateEntry({ ...entry, state: 'turned', layerFull: layerFull(sendOutcome.refused) });
     } else if (sendOutcome.kept === undefined) {
       await updateEntry({ ...entry, state: 'done' });
     }
   }
+}
+
+/** Whether a refusal among `refused` was the mint's newest layer being full: the send can go after its next rotation. */
+function layerFull(refused: readonly { error?: unknown }[]): boolean {
+  return refused.some((refusal) => (refusal.error as { code?: unknown } | undefined)?.code === 'layer_full');
 }
 
 /** The last words of a settle for each waiting entry, by its id. */
@@ -3202,44 +3292,36 @@ function afterSettle(focus: boolean): void {
     }
     return;
   }
-  const entry = entryById(s.end.entry);
+  const end = s.end;
+  const entry = entryById(end.entry);
   if (entry === undefined) {
+    // its entry went from the log: the view stays as it is, with its controls as they now stand
+    if (state.route === 'send') {
+      render();
+    }
     return;
   }
   if (entry.state === 'handback' || entry.state === 'partial') {
-    if (entry.ask !== undefined) {
-      const ask = entry.ask;
-      void (async () => {
-        const each = state.handBacks.find((kept) => kept.kept.id === ask && kept.kept.owed.length > 0);
-        if (each === undefined) {
-          return;
-        }
-        const hb = await handBackOf(each);
-        // a second settle's news of the same send finds it shown already
-        if (state.send !== s || s.step !== 'waiting') {
-          return;
-        }
-        s.hb = { ...hb, t: entry.t };
-        s.again = false;
-        s.step = 'handback';
-        // settled later: the planner was right if pay spent its notes and all of them went
-        const asPlanned = s.end?.asPlanned;
-        s.plan = asPlanned === undefined ? undefined : asPlanned && entry.state === 'handback' ? 'match' : 'differ';
-        if (state.route === 'send') {
-          render();
-          if (focus) {
-            focusH1();
-          }
-          announce(sentWords(hb.amount, false));
-        } else {
-          s.unseen = true;
-          announce(sentWords(hb.amount, true));
-        }
-      })();
+    const each = state.handBacks.find((kept) => kept.kept.id === entry.ask && kept.kept.owed.length > 0);
+    if (each !== undefined) {
+      void wentThrough(s, each, entry.t, focus, entry.state);
     }
   } else if (entry.state === 'lost' || entry.state === 'turned') {
+    // changed in place: Try again now, waiting on its settle, writes to this same end
     s.step = entry.state;
-    s.end = { ...s.end, lost: entry.lost ?? s.end.lost, lostTheirs: entry.lostTheirs ?? s.end.lostTheirs };
+    end.lost = entry.lost ?? end.lost;
+    end.lostTheirs = entry.lostTheirs ?? end.lostTheirs;
+    end.layerFull = entry.layerFull ?? end.layerFull;
+    // what did reach them: its hand-back, as opening the send from Recent offers it
+    const each = state.handBacks.find((kept) => kept.kept.id === entry.ask && kept.kept.owed.length > 0);
+    if (entry.state === 'lost' && each !== undefined) {
+      void handBackOf(each).then((hb) => {
+        if (state.send === s && s.end === end && s.step === 'lost') {
+          end.hb = hb;
+          render();
+        }
+      });
+    }
     if (state.route === 'send') {
       render();
       if (focus) {
@@ -3247,10 +3329,45 @@ function afterSettle(focus: boolean): void {
       }
     }
   } else if (entry.state === 'waiting') {
-    s.end = { ...s.end, words: waitingWords.get(entry.id ?? -1) ?? s.end.words };
+    end.words = waitingWords.get(entry.id ?? -1) ?? end.words;
     if (state.route === 'send') {
       render();
     }
+  }
+}
+
+/**
+ * A waiting send that went through: its view becomes the hand-back, said
+ * here, or, off Send, said and kept for when Send opens. `logged` is what
+ * its log entry says, when it has one.
+ */
+async function wentThrough(
+  s: SendState,
+  each: KeptHandBack,
+  t: number,
+  focus: boolean,
+  logged: 'handback' | 'partial' | undefined,
+): Promise<void> {
+  const hb = await handBackOf(each);
+  // a second settle's news of the same send finds it shown already
+  if (state.send !== s || s.step !== 'waiting') {
+    return;
+  }
+  s.hb = { ...hb, t };
+  s.again = false;
+  s.step = 'handback';
+  // settled later: the planner was right if pay spent its notes and all of them went
+  const asPlanned = s.end?.asPlanned;
+  s.plan = asPlanned === undefined || logged === undefined ? undefined : asPlanned && logged === 'handback' ? 'match' : 'differ';
+  if (state.route === 'send') {
+    render();
+    if (focus) {
+      focusH1();
+    }
+    announce(sentWords(hb.amount, false));
+  } else {
+    s.unseen = true;
+    announce(sentWords(hb.amount, true));
   }
 }
 
@@ -3270,9 +3387,10 @@ async function retryWaiting(): Promise<void> {
   end.words = undefined;
   render();
   let words: string | undefined;
+  let settled: Settled | undefined;
   try {
     const loaded = await loadSdk();
-    const settled = await sending(() => loaded.retrySettle(server, page.signal));
+    settled = await sending(() => loaded.retrySettle(server, page.signal));
     if (settled !== undefined) {
       await applySettled(server, settled);
     }
@@ -3283,16 +3401,67 @@ async function retryWaiting(): Promise<void> {
   await loadHandBacks();
   tell();
   void refreshHome();
-  if (state.send !== s) {
+  if (state.send !== s || s.end === undefined) {
     return;
   }
-  const now = entryById(end.entry);
-  if (now?.state === 'waiting') {
-    end.words = words ?? waitingWords.get(now.id ?? -1) ?? say(new TypeError('no answer'), 'settle', { host: hostOf(server) }).words;
+  // the end shown now, which is this one unless something drew it anew meanwhile
+  s.end.trying = false;
+  const now = entryById(s.end.entry);
+  if (now === undefined && words === undefined && s.req !== undefined && endedUnlogged(s, s.end, s.req.id, settled)) {
+    return;
+  }
+  if (now === undefined || now.state === 'waiting' || now.state === 'sending') {
+    s.end.words = words ?? (now === undefined ? undefined : waitingWords.get(now.id ?? -1)) ?? say(new TypeError('no answer'), 'settle', { host: hostOf(server) }).words;
     render();
     return;
   }
   afterSettle(true);
+}
+
+/**
+ * The end of a send whose log entry was never written, after Try again now:
+ * what this settle refused of it, and what the SDK keeps of its payment,
+ * say what became of it, in the order `applySettled` reads an entry's. True
+ * when the view moved on; false while it is still on its way.
+ */
+function endedUnlogged(s: SendState, end: NonNullable<SendState['end']>, id: string, settled: Settled | undefined): boolean {
+  const payment = state.handBacks.find((each) => each.kept.id === id);
+  if (payment?.kept.outgoing === true) {
+    return false;
+  }
+  const refused = settled?.sends.find((each) => each.id === id)?.refused ?? [];
+  const dropped = refused.filter((refusal) => refusal.outcome === 'dropped' && refusal.atStake !== undefined);
+  if (dropped.length > 0) {
+    const { lost, theirs } = droppedValue(dropped);
+    s.step = 'lost';
+    end.lost = lost;
+    end.lostTheirs = theirs;
+    // what did reach them: its hand-back, as the lost view of a logged send offers it
+    if (payment !== undefined && payment.kept.owed.length > 0) {
+      void handBackOf(payment).then((hb) => {
+        if (state.send === s && s.end === end && s.step === 'lost') {
+          // no entry to date it: the send's own time
+          end.hb = { ...hb, t: end.t };
+          render();
+        }
+      });
+    }
+  } else if (payment !== undefined && payment.kept.owed.length > 0) {
+    void wentThrough(s, payment, end.t, true, undefined);
+    return true;
+  } else if (refused.length > 0 && refused.every((refusal) => refusal.outcome === 'cancelled')) {
+    s.step = 'turned';
+    end.layerFull = layerFull(refused);
+  } else {
+    // no longer kept, and this settle did not see how it ended: as a request sent to before says it
+    s.step = 'already';
+    s.already = { kind: 'gone', t: end.t, amount: end.amount, id };
+  }
+  if (state.route === 'send') {
+    render();
+    focusH1();
+  }
+  return true;
 }
 
 // ---------- Send's input ----------
@@ -3442,29 +3611,35 @@ function keepMessage(data: unknown): KeepMessage | undefined {
 /**
  * Another tab said something: its run moved on (draw it, and watch it), its
  * run is over, it asks how this tab's run stands, it is about to send (this
- * tab's pass stops at its next safe step, so the send has the lock within
- * seconds, and that tab's next pass settles what this one left), or it
- * changed something (read the stores and the records again).
+ * tab's pass ends, sending what it has in hand at once, and the next waits
+ * for that tab's send: see {@link sending}), or it changed something (read
+ * the stores and the records again).
  */
 async function heard(data: unknown): Promise<void> {
   const message = keepMessage(data);
   if (message?.kind === 'yield') {
-    await keeper.stop();
+    yieldUntil = Number.POSITIVE_INFINITY;
+    try {
+      await keeper.stop();
+    } finally {
+      yieldUntil = Date.now() + YIELD_MS;
+    }
+    // this tab tries again once that tab's send and the pass after it are over, whether or not that pass comes
+    keeper.watch();
     return;
   }
   if (message?.kind === 'ask') {
     const progress = state.keep.progress;
-    const record = shown();
-    if (keeper.running && progress !== undefined && record !== undefined) {
-      postKeeping(record.mint, progress);
+    if (keeper.running && progress !== undefined) {
+      postKeeping(progress);
     }
     return;
   }
   if (message?.kind === 'keeping') {
     if (message.mint === shown()?.mint && !keeper.running && message.total > 0) {
-      const { amount, done, total } = message;
+      const { mint, amount, done, total } = message;
       drawBack(() => {
-        state.keep.watching = { amount, done, total, at: Date.now() };
+        state.keep.watching = { mint, amount, done, total, at: Date.now() };
       });
       keeper.watch();
     }
@@ -3488,6 +3663,12 @@ async function heard(data: unknown): Promise<void> {
   }
   syncShown();
   await loadHandBacks();
+  // the send the waiting view shows, settled by that tab's pass: the view moves on as this tab's own settle would
+  const end = state.send.step === 'waiting' ? state.send.end : undefined;
+  const ended = end === undefined ? undefined : entryById(end.entry);
+  if (ended !== undefined && ended.state !== 'sending' && ended.state !== 'waiting') {
+    afterSettle(false);
+  }
   if (state.route === 'home') {
     await refreshHome();
   } else if (state.route === 'first' || (state.route === 'send' && state.send.step === 'scan') || (state.route === 'receive' && state.receive.step === 'ask')) {

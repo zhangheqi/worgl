@@ -23,6 +23,19 @@ export const RUN_MAX_SECS = 120;
 /** The most a settle on open spreads its resends over, inside the mint's receipt of about 128 s. */
 export const SETTLE_MAX_SECS = 60;
 
+/** How near its rotation a mint must be before keep-alive moves its notes while Send shows a plan of them: time enough for a pass after. */
+export const SEND_WAIT_SECS = 900;
+
+/**
+ * Whether a pass leaves a mint alone because Send shows a plan of its notes,
+ * not signed yet: moving them, or landing its outgoing transfers, would make
+ * the plan untrue. Not once the rotation is nearer than {@link SEND_WAIT_SECS},
+ * nor for a mint with no schedule (`left` undefined), since keeping its
+ * tokens alive comes first; Send then says what is ready changed.
+ */
+export const waitsForSend = (shows: boolean, left: number | undefined): boolean =>
+  shows && left !== undefined && left > SEND_WAIT_SECS;
+
 /** Seconds a pass may spread its hops over: the time left before the rotation, less the SDK's margin. */
 export function budgetSecs(leftSecs: number | undefined): number {
   if (leftSecs === undefined) {
@@ -196,6 +209,22 @@ export function spentBy(request: string): Spent[] {
 export function outputsOf(request: string): number {
   const outputs = body(request)?.outputs;
   return Array.isArray(outputs) ? outputs.length : 0;
+}
+
+/**
+ * Each answer's notes, in the order of `answered`: the SDK's
+ * `Submitted.notes` holds one note per output of each transfer answered, in
+ * the order the answers came.
+ */
+export function answersOf(answered: readonly string[], notes: readonly string[]): string[][] {
+  const each: string[][] = [];
+  let at = 0;
+  for (const request of answered) {
+    const n = outputsOf(request);
+    each.push(notes.slice(at, at + n));
+    at += n;
+  }
+  return each;
 }
 
 /** A spent note's key across mints, as `sendInputs` holds them. */

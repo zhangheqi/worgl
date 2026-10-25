@@ -23,14 +23,28 @@ import { deflateRawSync, inflateRawSync } from 'node:zlib';
 
 import qrcode from 'qrcode-generator';
 
-import { chromiumOf, failingRequests, launch, newContext, options, repo, report, setup, shooter, step, stop } from './preview-kit.mjs';
+import {
+  chromiumOf,
+  clearPeriod,
+  failingRequests,
+  launch,
+  newContext,
+  options,
+  repo,
+  report,
+  setup,
+  shooter,
+  step,
+  stop,
+} from './preview-kit.mjs';
 
 const { out } = options(join(repo, 'target/purse-preview/send-shots/'));
 const home = process.env.PREVIEW_HOME ?? join(repo, 'target/purse-preview/send/');
 const chromium = chromiumOf();
 
-// mint A, with the faucet, rotates by hand (its schedule is 8 hours); mint B is held by the camera's purses
-const { mint, builds } = await setup({ home, period: 28_800, perAddress: 1000, mints: 2 });
+// mint A, with the faucet, rotates by hand (its schedule is about 8 hours, with its next rotation well after the walk,
+// which takes about half an hour); mint B is held by the camera's purses
+const { mint, builds } = await setup({ home, period: clearPeriod(28_800, 90 * 60_000), perAddress: 1000, mints: 2 });
 const [A, B] = mint.issuers;
 const play = builds.playground;
 const plain = builds.plain;
@@ -127,6 +141,24 @@ async function start(page) {
   await page.waitForSelector('[data-fk="first-start"]');
   await page.click('[data-fk="first-start"]');
   await page.waitForSelector('.f-note');
+}
+
+/**
+ * Waits until no purse's keep-alive has a transfer at the mint, nor sends
+ * one for 6.5 s (its hops go at most 5 s apart): what the proxy is told to
+ * hold, drop or refuse next then meets the transfer the walk means, not a
+ * hop of another purse's.
+ */
+const quiet = () => mint.proxy.quiet(6500);
+
+/**
+ * Rotates mint A by hand, once no purse's keep-alive is part way through a
+ * run: a rotation between two of its hops would drop the second one's note
+ * before it goes, which the mint then refuses as expired.
+ */
+async function rotate() {
+  await quiet();
+  await mint.rotate();
 }
 
 /** Opens mint A's link again and takes 64 from the faucet, then waits for Holdings to show it. */
@@ -239,7 +271,7 @@ try {
   step('1. funds: S and R start with 64 each, a rotation, and 64 more for S');
   await start(S);
   await start(R);
-  await mint.rotate();
+  await rotate();
   await take(S);
   check((await total(S)) === 128, 'S holds 128');
   await go(S, '#home');
@@ -278,6 +310,7 @@ try {
   await shootAll(S, 'send-confirm');
 
   step('4. S sends 5, the mint slow to answer');
+  await quiet();
   mint.proxy.hold(25_000);
   await S.click('[data-fk="send-go"]');
   await S.waitForSelector('.v-send.is-sending');
@@ -292,6 +325,7 @@ try {
 
   step('5. R takes the hand-back');
   const before = 64;
+  await quiet();
   mint.proxy.holdKeys(25_000);
   await R.goto(take5);
   await R.waitForSelector('.v-take');
@@ -345,7 +379,7 @@ try {
   await shootAll(R, 'receive-request-take-error');
 
   step('9. the other short cases');
-  await mint.rotate();
+  await rotate();
   await take(S);
   // in notes of at most 64: a plain 150 asks for a note of 128, which no note here can make
   const link150 = await ask(R, 150, 64);
@@ -358,7 +392,7 @@ try {
   await shootAll(S, 'send-short-over');
 
   step('10. fragmented: R asks one note of 128');
-  await mint.rotate();
+  await rotate();
   const link128 = await ask(R, 128);
   await open(S, link128, '#slice-short');
   check((await text(S, '.options')).includes('at most 64'), 'the way out asks for notes of at most 64');
@@ -368,6 +402,7 @@ try {
   const link128b = await ask(R, 128, 64, 'receive-smaller');
   await open(S, link128b, '.split.many');
   await shootAll(S, 'send-confirm-two');
+  await quiet();
   mint.proxy.hold(25_000);
   await S.click('[data-fk="send-go"]');
   await S.waitForSelector('[data-fk="send-now"]');
@@ -451,10 +486,11 @@ try {
   step('15. waiting for the mint, then settled');
   await take(S);
   await take(S);
-  await mint.rotate();
+  await rotate();
   const link5w = await ask(R, 5);
   await open(S, link5w, '[data-fk="send-go"]');
   await failingRequests(async () => {
+    await quiet();
     mint.proxy.drop(true);
     await S.click('[data-fk="send-go"]');
     await S.waitForFunction(() => document.querySelector('[data-fk="retry"]')?.textContent?.includes('Try again now') === true, undefined, { timeout: 120_000 });
@@ -470,6 +506,7 @@ try {
   step('16. a tab closed mid-send, settled on the next open');
   const link69 = await ask(R, 69);
   await open(S, link69, '.split.many');
+  await quiet();
   mint.proxy.hold(120_000, 1);
   await S.click('[data-fk="send-go"]');
   // LV7, in the live region, once the first answer is in
@@ -499,6 +536,7 @@ try {
   step('17. the mint unreachable');
   const link5u = await ask(R, 5);
   await failingRequests(async () => {
+    await quiet();
     mint.proxy.down(true);
     await open(S2, link5u, '.v-send .err');
     await shootAll(S2, 'send-unreachable');
@@ -544,7 +582,7 @@ try {
   for (let i = 0; i < 4; i++) {
     await take(S2);
   }
-  await mint.rotate();
+  await rotate();
   const link255 = await ask(R, 255, 64);
   await open(S2, link255, '.split.many');
   await send(S2);
@@ -566,10 +604,11 @@ try {
   step('22. a send the mint turns away, and one lost');
   await take(S2);
   await take(S2);
-  await mint.rotate();
+  await rotate();
   const linkT = await ask(R, 5);
   await open(S2, linkT, '[data-fk="send-go"]');
   await failingRequests(async () => {
+    await quiet();
     mint.proxy.refuse('layer_full');
     await S2.click('[data-fk="send-go"]');
     await S2.waitForFunction(() => document.querySelector('h1')?.textContent?.startsWith('The mint turned this send away') === true, undefined, { timeout: 60_000 });
@@ -581,6 +620,7 @@ try {
   const linkL = await ask(R, 5);
   await open(S2, linkL, '[data-fk="send-go"]');
   await failingRequests(async () => {
+    await quiet();
     mint.proxy.refuse('spent');
     await S2.click('[data-fk="send-go"]');
     await S2.waitForFunction(() => document.querySelector('h1')?.textContent?.startsWith('This send could not be finished') === true, undefined, { timeout: 60_000 });
@@ -597,12 +637,13 @@ try {
   step('23. the reading step, then what is ready changed: another tab of S spent the note');
   await take(S2);
   await take(S2);
-  await mint.rotate();
+  await rotate();
   const linkX1 = await ask(R, 5);
   const linkX2 = await ask(R, 5);
   await go(S2, '#home');
   // Holdings' own read of the mint first, so that the held one is Send's
   await S2.waitForTimeout(1200);
+  await quiet();
   mint.proxy.holdInfo(30_000);
   await S2.goto(linkX1);
   await S2.waitForSelector('.v-send .ticket');
@@ -625,10 +666,11 @@ try {
   step('24. part of a send turned away: the hand-back carries what went');
   await take(S2);
   await take(S2);
-  await mint.rotate();
+  await rotate();
   const link69p = await ask(R, 69);
   await open(S2, link69p, '.split.many');
   await failingRequests(async () => {
+    await quiet();
     mint.proxy.refuse('layer_full', 1);
     await S2.click('[data-fk="send-go"]');
     await S2.waitForSelector('[data-fk="copy-take"]', { timeout: 90_000 });
@@ -649,7 +691,7 @@ try {
 
   step('25. too many small notes for one transfer: U holds one ready 64');
   await take(U);
-  await mint.rotate();
+  await rotate();
   const link15 = await ask(R, 15, 1);
   // on U's own build: R's link names the playground build, whose origin keeps another store
   await open(U, `${plain}/${hashOf(link15)}`, '#slice-short');

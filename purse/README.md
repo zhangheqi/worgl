@@ -82,8 +82,10 @@ While it runs, the phone's back row and the desktop's come-back column
 read "Keeping 128 alive · 1 of 2" with a box for each transfer, the
 notes on their way stay in the fading lane, and each one that lands
 slides one lane on in pink. The screen is kept awake while transfers go
-(Screen Wake Lock), where the browser allows it. Off Holdings a pass
-runs quietly: nothing is spoken, and the screen is not kept awake.
+(Screen Wake Lock), where the browser allows it. Off Holdings a pass's
+run is not spoken and the screen is not kept awake; a send it settles is
+spoken on any screen ("The send of 5 went through"), as the send's own
+end would be.
 
 What it does not do:
 
@@ -100,8 +102,24 @@ What it does not do:
   to hand tokens to.
 - **No switch to turn it off**: the purse says it keeps tokens alive while
   on screen, and does.
-- **It never runs during a send.** A send asks a pass in any tab to stop
-  at its next safe step and waits for it; the next pass runs right after.
+- **It never runs during a send.** A send asks the pass in any tab to
+  end: the pass sends the transfers it has in hand at once rather than a
+  few seconds apart, starts nothing more, and so leaves no hop unsent
+  (one the mint does not answer, and those after it, stay outgoing for the
+  next pass). The send waits for that, which takes seconds unless the mint
+  is slow to answer, since a transfer on its way is answered first, and
+  then for the lock. A pass of another tab's waits ten seconds before it
+  tries again, so the send takes the lock first, and that tab tries again
+  half a minute after; the sending tab's next pass runs once the send is
+  over. While Send shows a request's plan, not yet sent, that tab's
+  keep-alive leaves the mint alone too (a pass at its server ends that way
+  before Send reads, and later ones neither move its notes nor resend what
+  is outgoing that spends them; the other mints' are settled as ever), so
+  that the notes signed are the notes shown. It moves them all the same
+  once the mint's rotation is less than a quarter of an hour off. Another
+  tab's keep-alive knows nothing of the plan and may move them too. Either
+  way, the check under the lock sees it, and Send says that what is ready
+  changed.
 
 When it cannot keep tokens, it says why and when they fade: the mint did
 not answer ("They fade at 16:00 unless the purse reaches it before then.
@@ -161,13 +179,15 @@ faucet on free ports, builds the purse twice (as hosted, and with that mint
 as the playground), serves both under the policy, and walks them in
 Chromium: the first run, takes from the faucet and rotations, until the
 field holds fading, ready and resting tokens and keep-alive has moved the
-first ones on. A second mint that rotates every 8 hours, with a third
-build, is for the keep-alive walk: a run with its transfers held so each
-step can be shot, the landing slide, the result, a page closed in the
-middle of a transfer and the open that settles it, a run in another tab,
-a mint that does not answer its transfers, and one that does not answer
-at all on open; then a purse that holds both mints, the other one's
-tokens going first, and that mint not answering. It writes PNGs of each
+first ones on. Two more mints that rotate every 8 hours, on a server of
+their own with a faucet each, and a third build with the first of them as
+its playground, are for the keep-alive walk: a run with its transfers held
+so each step can be shot, the landing slide, the result, a page closed in
+the middle of a transfer and the open that settles it, a run in another
+tab, a mint that does not answer its transfers, and one that does not
+answer at all on open; then a purse that holds both of those mints, the
+second one's tokens going first while the first is shown, and the second
+not answering. It writes PNGs of each
 view at 360 x 780 and 1280 x 860, light and dark, and of the tips; any
 console error, page error or policy violation fails it. It needs
 `playwright` where Node can require it (`NODE_PATH`); `--out <dir>` says
@@ -178,7 +198,8 @@ the mint by hand instead of waiting.
 plumbing (`scripts/preview-kit.mjs`) and with its own `--out`
 (`target/purse-preview/send-shots/`): two purses in their own browser
 contexts ask, send and take between them, on mints of their own that
-rotate by hand, through every view and state of Receive and Send (the
+rotate by hand (their schedule's next rotation is set well after the walk),
+through every view and state of Receive and Send (the
 camera from a fake video of a request's code, a slow mint, a dropped
 answer, a send turned away, lost or cut short, links that do not read).
 After every view it checks the mint's supply and the camera's
@@ -219,9 +240,12 @@ no server.
   shows the first one's run ("In another tab") instead of starting its
   own, and a tab that hears nothing for 30 seconds tries again. The lock
   is held per pass, not for the tab's life. A send first tells every tab
-  to stop its pass (`keeper.stop()`, which ends it at its next safe step),
-  then waits for the lock; once it is sent, this tab's next pass runs and
-  settles anything the send left for later.
+  to end its pass (`keeper.stop()`, which has the pass send what it has
+  in hand at once and start nothing more), then waits for the lock; once
+  it is sent, this tab's next pass runs and settles anything the send left
+  for later. "Try again now" resends only sends' transfers (those of every
+  send still on its way at that server), and leaves keep-alive's to
+  keep-alive, which logs them.
   Taking from the faucet, asking and taking a hand-back in need no such
   lock, since every change of a store takes the SDK's own lock
   (`worgl:<server URL>`) and reads it again first.
@@ -237,17 +261,20 @@ no server.
   rotation, with the serials of the new notes; a later pass adds to it,
   and a token moved twice counts once), `lost` ("Lost 64": a transfer the
   mint applied whose answer it no longer keeps), `sent` ("Sent 5") and
-  `received` ("Received 20").
+  `received` ("Received 20"). A send still on its way is never trimmed,
+  however old, since its settle writes what it came to there.
 - **Sends and hand-backs.** The SDK keeps each payment and what it owes the
   receiver (`payments()`, `owed`), so a hand-back is never lost: Send shows
   it again from Recent, and the purse never forgets it. A send that ends
   before every note is answered is settled by keep-alive's next pass, on
   open or right after the send (the SDK's `settle`), and its Recent entry
-  then says what it came to.
+  then says what it came to: the change is read from the answers to the
+  send's own transfers, never from what else came to the mint in the same
+  settle, and each note of it keeps the time its own answer came.
 - **Other tabs** hear of each change on the `BroadcastChannel` named
   `purse`, and read the stores again; so does a tab that comes back into
   view. A running pass also posts its progress there (`keeping`, then
-  `kept`), and a send posts `yield`, which stops a pass in every other tab.
+  `kept`), and a send posts `yield`, which ends a pass in every other tab.
 - On the first take the purse asks the browser to keep its storage
   (`navigator.storage.persist()`). Clearing the site's data still empties
   it, and a private window forgets it when it closes.

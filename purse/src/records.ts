@@ -13,11 +13,13 @@ import { type Moved, mergeKept } from './keep.ts';
 export type { AskRecord, LogEntry, MintRecord, SavedInfo } from './entries.ts';
 
 /**
- * The database, and the version of its layout. 2: the log holds keep-alive's
- * entries (`kept`, `lost`); 3: the requests made (the store `asks`) and the
- * log's sends and takes (`sent`, `received`). A purse of an older version
- * reads an entry it does not know as "Faded": opening at a newer version
- * closes the records of an older tab still open, so it never shows them.
+ * The database, and the version of its layout. 1: the mints and the log.
+ * 2: either of two builds made side by side, keep-alive's (the log's `kept`
+ * and `lost` entries) or Receive and Send's (the store `asks`, and the log's
+ * `sent` and `received` entries). 3: both. The upgrade makes each store
+ * that is missing, so it works from any of these. Opening at a newer version
+ * closes the records of an older tab still open, so that tab never reads an
+ * entry it does not know.
  */
 const DATABASE = 'purse';
 const VERSION = 3;
@@ -55,7 +57,7 @@ export class Records {
         if (!database.objectStoreNames.contains('log')) {
           database.createObjectStore('log', { keyPath: 'id', autoIncrement: true });
         }
-        // version 2: the requests made; each store is made only if missing, so the upgrade works from any earlier version
+        // the requests made, since Receive and Send's version 2; each store is made only if missing, so the upgrade works from any earlier version
         if (!database.objectStoreNames.contains('asks')) {
           database.createObjectStore('asks', { keyPath: 'id' });
         }
@@ -87,6 +89,23 @@ export class Records {
   async putMint(record: MintRecord): Promise<void> {
     await this.#run('mints', 'readwrite', (store) => {
       store.put(record);
+    });
+  }
+
+  /**
+   * Changes the fields `patch` names of a mint kept already, reading it in
+   * the same transaction, so that two tabs that each change one field never
+   * put back the other's from a copy read before. A mint not kept is left so.
+   */
+  async updateMint(mint: string, patch: Partial<Omit<MintRecord, 'mint'>>): Promise<void> {
+    await this.#run('mints', 'readwrite', (store) => {
+      const request = store.get(mint);
+      request.onsuccess = () => {
+        const record = request.result as MintRecord | undefined;
+        if (record !== undefined) {
+          store.put({ ...record, ...patch });
+        }
+      };
     });
   }
 
@@ -130,17 +149,23 @@ export class Records {
     });
   }
 
-  /** The last `limit` log entries, newest first. */
+  /** The last `limit` log entries, newest first, and any older send still on its way (see `trim`). */
   async log(limit = LOG_KEPT): Promise<LogEntry[]> {
     const entries: LogEntry[] = [];
+    let seen = 0;
     await this.#run('log', 'readonly', (store) => {
       const request = store.openCursor(null, 'prev');
       request.onsuccess = () => {
         const cursor = request.result;
-        if (cursor !== null && entries.length < limit) {
-          entries.push(cursor.value as LogEntry);
-          cursor.continue();
+        if (cursor === null) {
+          return;
         }
+        const entry = cursor.value as LogEntry;
+        seen += 1;
+        if (seen <= limit || stays(entry)) {
+          entries.push(entry);
+        }
+        cursor.continue();
       };
     });
     return entries;
@@ -207,7 +232,10 @@ export class Records {
   }
 }
 
-/** Drops the oldest entries past {@link LOG_KEPT}, in the transaction that added one. */
+/** Whether an entry stays however old: a send still on its way, whose settle writes what it came to there. */
+const stays = (entry: LogEntry): boolean => entry.kind === 'sent' && (entry.state === 'sending' || entry.state === 'waiting');
+
+/** Drops the oldest entries past {@link LOG_KEPT}, but a send still on its way, in the transaction that added one. */
 function trim(store: IDBObjectStore): void {
   const count = store.count();
   count.onsuccess = () => {
@@ -219,8 +247,10 @@ function trim(store: IDBObjectStore): void {
     oldest.onsuccess = () => {
       const cursor = oldest.result;
       if (cursor !== null && extra > 0) {
-        cursor.delete();
-        extra--;
+        if (!stays(cursor.value as LogEntry)) {
+          cursor.delete();
+          extra--;
+        }
         cursor.continue();
       }
     };
