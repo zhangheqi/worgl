@@ -22,7 +22,7 @@ import {
 import type { Read } from '../src/purses.ts';
 import { when } from '../src/format.ts';
 import { keepStoreWords, keepingStart, lostWords } from '../src/words.ts';
-import { ISSUER, decodeNoteParts, noteText, transfer } from './notes.ts';
+import { ISSUER, OTHER, decodeNoteParts, noteText, transfer } from './notes.ts';
 
 /** Lets every pending promise and microtask run. */
 async function flush(): Promise<void> {
@@ -244,7 +244,7 @@ describe('the keeper', () => {
     assert.equal(p.calls.length, 1, 'nothing runs once the page is going');
   });
 
-  test('stopped for a send, ends the pass at its next safe step, then runs passes as before', async () => {
+  test('stopped for a send, hurries the pass and waits for its end, then runs passes as before', async () => {
     const { keeper, p } = keeperWith();
     keeper.poke();
     await flush();
@@ -257,10 +257,15 @@ describe('the keeper', () => {
       over = true;
     });
     await flush();
-    assert.equal(run?.signal.aborted, false, 'a transfer on its way is answered first');
-    assert.equal(over, false);
+    assert.equal(run?.hurry.aborted, true, 'what the pass has in hand goes at once');
+    assert.equal(run?.signal.aborted, false, 'and nothing is cut short, so no hop is left unsent');
     run?.step('answered');
-    assert.equal(run?.signal.aborted, true);
+    run?.step('sending');
+    run?.step('answered');
+    assert.equal(run?.signal.aborted, false);
+    await flush();
+    assert.equal(over, false, 'the stop waits for the pass to end');
+    p.calls[0]?.end();
     await stopping;
     assert.equal(keeper.running, false, 'the lock is free once the stop resolves');
     await flush();
@@ -269,6 +274,72 @@ describe('the keeper', () => {
     await flush();
     assert.equal(p.calls.length, 2, 'unlike a page that goes, later pokes run');
     assert.equal(p.calls[1]?.run.signal.aborted, false);
+    assert.equal(p.calls[1]?.run.hurry.aborted, false, 'the next pass goes at its own pace');
+  });
+
+  test('hurried for a send, stops at a hop the mint did not answer, but not at one it refused for good', async () => {
+    for (const [outcome, stops] of [
+      ['kept', true],
+      ['dropped', false],
+      ['cancelled', false],
+    ] as const) {
+      const { keeper, p } = keeperWith();
+      keeper.poke();
+      await flush();
+      const run = p.calls[0]?.run;
+      run?.step('sending');
+      void keeper.stop();
+      run?.step('refused', outcome);
+      assert.equal(run?.signal.aborted, stops, outcome);
+    }
+  });
+
+  test('shown again during a stop for a send, still ends the pass', async () => {
+    const { keeper, p, page } = keeperWith();
+    keeper.poke();
+    await flush();
+    const run = p.calls[0]?.run;
+    run?.step('sending');
+    page.hidden = true;
+    keeper.hide();
+    void keeper.stop();
+    page.hidden = false;
+    keeper.show();
+    run?.step('answered');
+    assert.equal(run?.signal.aborted, false, 'shown again: the hide is undone');
+    assert.equal(run?.hurry.aborted, true, 'the send’s stop is not');
+  });
+
+  test('a pass poked while the stop for a send waits gives way to the send, and the send pokes after', async () => {
+    const page = { sending: 0 };
+    // as the page's passLock: a send of this tab's, counted before it stops the keeper, has the pass run nothing
+    const { keeper, p } = keeperWith({
+      lock: async (work) => {
+        if (page.sending > 0) {
+          return true;
+        }
+        await work();
+        return true;
+      },
+    });
+    keeper.poke();
+    await flush();
+    const run = p.calls[0]?.run;
+    run?.step('sending');
+    page.sending += 1;
+    const stopping = keeper.stop();
+    // the minute's poke, or the page shown again
+    keeper.poke();
+    keeper.show();
+    run?.step('answered');
+    p.calls[0]?.end();
+    await stopping;
+    await flush();
+    assert.equal(p.calls.length, 1, 'the pass after it ran nothing');
+    page.sending -= 1;
+    keeper.poke();
+    await flush();
+    assert.equal(p.calls.length, 2);
   });
 
   test('stopped with no pass running, resolves at once', async () => {
@@ -478,17 +549,21 @@ class FakePurse implements KeepPurse {
     const spent = decodeNoteParts(request);
     return { notes: spent.map((note) => noteText({ generation: note.generation + 1n, index: 100 + note.index, amount: note.amount })) };
   };
-  /** Stops the submit once this many transfers were answered, as a hidden page would. */
+  /** Stops the submit once this many transfers were answered, as a hidden page would, or hurries it, as a send would. */
   stopAfter: { count: number; controller: AbortController } | undefined;
+  /** For each transfer sent, whether it went at once (`sendNow` had aborted). */
+  readonly sentNow: boolean[] = [];
 
   constructor(notes: HeldNote[]) {
     this.notes = notes;
   }
 
-  async settle(spacing: Spacing, options: SubmitOptions): Promise<Submitted> {
+  async settle(spacing: Spacing, options: SubmitOptions, holdBack: ReadonlySet<string> = new Set()): Promise<Submitted> {
     this.calls.push(`settle ${spacing.minSecs}-${spacing.maxSecs}`);
     return this.#send(
-      this.outgoing.map((request) => ({ request, afterSecs: 0 })),
+      this.outgoing
+        .filter((request) => !decodeNoteParts(request).some((note) => holdBack.has(note.issuer)))
+        .map((request) => ({ request, afterSecs: 0 })),
       options,
     );
   }
@@ -526,7 +601,10 @@ class FakePurse implements KeepPurse {
         tell('unsent', each, index);
         continue;
       }
-      tell('waiting', each, index);
+      if (options.sendNow?.aborted !== true) {
+        tell('waiting', each, index);
+      }
+      this.sentNow.push(options.sendNow?.aborted === true);
       tell('sending', each, index);
       const answer = this.answer(each.request);
       if ('notes' in answer) {
@@ -559,6 +637,7 @@ function passWith(purse: FakePurse, more: Partial<KeepingDeps> = {}) {
   const hops: string[] = [];
   const kept: string[] = [];
   const finished: number[] = [];
+  const reads: boolean[] = [];
   let reopened = 0;
   const read = async (): Promise<Read> => ({
     info: mintInfo(),
@@ -585,8 +664,9 @@ function passWith(purse: FakePurse, more: Partial<KeepingDeps> = {}) {
     troubled: () => undefined,
     kept: (mint) => kept.push(mint),
     announce: (words) => said.push(words),
-    finish: async (n) => {
+    finish: async (n, _mint, again) => {
       finished.push(n);
+      reads.push(again);
     },
     reopen: () => {
       reopened += 1;
@@ -596,9 +676,10 @@ function passWith(purse: FakePurse, more: Partial<KeepingDeps> = {}) {
     ...more,
   });
   const controller = new AbortController();
+  const hurry = new AbortController();
   const steps: string[] = [];
-  const run: Run = { signal: controller.signal, step: (step) => steps.push(step) };
-  return { keeping, run, controller, logged, said, shown, hops, kept, finished, steps, reopened: () => reopened };
+  const run: Run = { signal: controller.signal, hurry: hurry.signal, step: (step) => steps.push(step) };
+  return { keeping, run, controller, hurry, logged, said, shown, hops, kept, finished, reads, steps, reopened: () => reopened };
 }
 
 describe('a pass', () => {
@@ -629,7 +710,7 @@ describe('a pass', () => {
     assert.deepEqual(t.kept, [ISSUER]);
     assert.deepEqual(t.finished, [128]);
     assert.equal(t.said[0], keepingStart(64, 1, true));
-    assert.deepEqual(t.shown.at(-2), { amount: 128, done: 2, total: 2, spaced: true });
+    assert.deepEqual(t.shown.at(-2), { mint: ISSUER, amount: 128, done: 2, total: 2, spaced: true });
     assert.equal(t.shown.at(-1), undefined, 'the run is over');
     assert.equal(end.trouble, false);
     assert.equal(end.nextMs, Number(NEXT) * 1000);
@@ -753,6 +834,30 @@ describe('a pass', () => {
     assert.equal(t.keeping.trouble.size, 0);
   });
 
+  test('hurried for a send, sends the hops in hand at once, plans nothing more, logs what it kept, and asks for a pass after', async () => {
+    const purse = new FakePurse([held(1, 64n, 0), held(2, 32n, 0), held(3, 16n, 0)]);
+    const t = passWith(purse);
+    purse.stopAfter = { count: 1, controller: t.hurry };
+    const end = await t.keeping.pass(t.run);
+    assert.deepEqual(purse.calls, ['plan', 'submit 1 3 5']);
+    assert.deepEqual(purse.sentNow, [false, true, true], 'the first at its time, the rest at once');
+    assert.equal(purse.outgoing.length, 0, 'no hop left unsent');
+    assert.deepEqual(t.logged.map((entry) => [entry.kind, entry.amount]), [['kept', 112]]);
+    assert.deepEqual(t.finished, [112], 'what was kept is said');
+    assert.deepEqual(t.reads, [false], 'and the lock goes to the send without a read');
+    assert.equal(t.keeping.at, undefined, 'at no server once over');
+    assert.equal(end.again, false, 'its mint was planned');
+    // hurried in the settle: the fading notes wait for the pass after the send
+    const left = held(4, 8n, 0);
+    const second = new FakePurse([held(1, 64n, 0)]);
+    second.outgoing.push(transfer([textOf(left)]));
+    const u = passWith(second);
+    second.stopAfter = { count: 1, controller: u.hurry };
+    const after = await u.keeping.pass(u.run);
+    assert.deepEqual(second.calls, ['settle 2-5']);
+    assert.equal(after.again, true, 'one more pass for the mint it did not plan');
+  });
+
   test('moves on, in the same pass, a note a resend brought into the first layer, and counts its tokens once', async () => {
     // a hop sent before the rotation, its answer lost: its note's layer is gone now, and the answer lands in the first
     const before = held(1, 64n, 0);
@@ -779,7 +884,7 @@ describe('a pass', () => {
       [['kept', 64, ['8:201'], [{ id: '6:1', v: 64 }]]],
     );
     assert.deepEqual(t.finished, [64]);
-    assert.deepEqual(t.shown.at(-2), { amount: 64, done: 2, total: 2, spaced: true });
+    assert.deepEqual(t.shown.at(-2), { mint: ISSUER, amount: 64, done: 2, total: 2, spaced: true });
     assert.equal(end.again, false);
   });
 
@@ -815,8 +920,8 @@ describe('a pass', () => {
         : new FakePurse([]).answer(request);
     const t = passWith(purse);
     await t.keeping.pass(t.run);
-    assert.deepEqual(t.shown[0], { amount: 64, done: 0, total: 1, spaced: true });
-    assert.deepEqual(t.shown.at(-2), { amount: 64, done: 1, total: 1, spaced: true });
+    assert.deepEqual(t.shown[0], { mint: ISSUER, amount: 64, done: 0, total: 1, spaced: true });
+    assert.deepEqual(t.shown.at(-2), { mint: ISSUER, amount: 64, done: 1, total: 1, spaced: true });
     assert.deepEqual(
       t.logged.map((entry) => [entry.kind, entry.amount]),
       [
@@ -883,5 +988,40 @@ describe('a pass', () => {
     assert.deepEqual(t.logged, []);
     assert.deepEqual(t.shown, []);
     assert.deepEqual(t.hops, []);
+  });
+
+  test('leaves a mint alone while Send shows a plan of its notes, until its rotation is near', async () => {
+    const left = held(3, 16n, 0);
+    const purse = new FakePurse([held(1, 64n, 0), held(2, 32n, 2)]);
+    // a hop an earlier pass left unsent: landing it would change the plan too
+    purse.outgoing.push(transfer([textOf(left)]));
+    const t = passWith(purse, { showsPlan: (mint) => mint === ISSUER });
+    const end = await t.keeping.pass(t.run);
+    assert.deepEqual(purse.calls, [], 'nothing settled, nothing planned');
+    assert.equal(purse.outgoing.length, 1);
+    assert.deepEqual(t.logged, []);
+    assert.equal(end.trouble, true, 'tries again in a minute');
+    assert.equal(end.again, false, 'not at once');
+    assert.equal(t.keeping.canKeep(ISSUER, false), true, 'no trouble words');
+    // ten minutes before the rotation, keeping the tokens alive comes first
+    const near = passWith(purse, { showsPlan: () => true, now: () => (Number(NEXT) - 600) * 1000 });
+    await near.keeping.pass(near.run);
+    assert.deepEqual(purse.calls, ['settle 2-5', 'plan', 'submit 1']);
+    assert.equal(purse.outgoing.length, 0);
+  });
+
+  test('while Send shows a plan of one mint, still settles what the other mints of its server have outgoing', async () => {
+    const mine = held(1, 16n, 0);
+    const other = { ...held(2, 8n, 0), serial: { generation: OLDEST, index: 2 } };
+    const otherText = noteText({ issuer: OTHER, generation: OLDEST, index: 2, amount: 8n });
+    const purse = new FakePurse([held(3, 64n, 2)]);
+    purse.outgoing.push(transfer([textOf(mine)]), transfer([otherText]));
+    const servers = [{ server: SERVER, mints: [{ mint: ISSUER, host: '127.0.0.1:9' }, { mint: OTHER, host: '127.0.0.1:9' }] }];
+    const t = passWith(purse, { servers: () => servers, showsPlan: (mint) => mint === ISSUER });
+    await t.keeping.pass(t.run);
+    assert.deepEqual(purse.calls, ['settle 2-5']);
+    assert.equal(purse.outgoing.length, 1, 'the plan mint’s hop waits with the plan');
+    assert.deepEqual(decodeNoteParts(purse.outgoing[0] ?? '').map((note) => note.issuer), [ISSUER]);
+    assert.equal(other.serial.index, 2);
   });
 });

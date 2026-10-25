@@ -82,6 +82,13 @@ em { font-style: italic; }
 .tb .sp { flex: 1; }
 .brand { display: inline-flex; align-items: flex-end; gap: 7px; color: var(--sq); text-decoration: none; min-height: 44px; padding-block: 8px; }
 .brand .purse { font-family: var(--f-serif); font-style: italic; font-size: 27px; line-height: 1; color: var(--ink); transform: translateY(-3px); letter-spacing: -.005em; }
+.ib { width: 44px; height: 44px; display: inline-grid; place-items: center; flex: none; color: var(--ink); text-decoration: none; }
+.ib:hover { background: var(--hover); }
+.ib.face { color: var(--sq); }
+.ib.bx { border: 1.5px solid currentColor; }
+.subhead { display: flex; align-items: center; gap: 10px; flex: 1; min-width: 0; padding-left: 2px; }
+.subhead .rule { flex: 1; height: 1px; background: currentColor; opacity: .25; }
+.reg { width: 14px; height: 14px; flex: none; opacity: .7; }
 /* desktop bar */
 .db { display: none; }
 /* ---------- buttons ---------- */
@@ -95,6 +102,13 @@ em { font-style: italic; }
 .btn[disabled], .btn[aria-disabled="true"] { opacity: .55; cursor: default; }
 .btn.wide { width: 100%; }
 .btn.sm { min-height: 44px; font-size: 15px; padding: 0 14px; }
+/* inputs */
+.fld { display: flex; flex-direction: column; gap: 6px; }
+.fld label { color: var(--muted); }
+.band-c .fld label { color: var(--on-cobalt-muted); }
+.btn-row { display: flex; gap: 12px; }
+.btn-row > .btn { flex: 1 1 0; min-width: 0; }
+.tbtn { min-height: 44px; display: inline-flex; align-items: center; gap: 8px; font-weight: 600; font-size: 15px; text-decoration: underline; text-decoration-thickness: 1px; text-underline-offset: .24em; }
 .inp { width: 100%; min-height: 52px; border: 1.5px solid currentColor; background: transparent; padding: 0 14px; font-size: 16px; border-radius: 0; color: inherit; }
 .inp::placeholder { color: var(--muted); opacity: 1; }
 .band-c .inp::placeholder { color: var(--on-cobalt-muted); }
@@ -110,6 +124,7 @@ em { font-style: italic; }
 .total b { --total-size: clamp(92px, 29vw, 118px); font-family: var(--f-serif); font-weight: 400; font-size: min(var(--total-size), calc(100cqi / (var(--digits, 3) * .44))); line-height: .84; letter-spacing: -.035em; font-variant-numeric: lining-nums; }
 .total i { font-family: var(--f-serif); font-size: 31px; line-height: 1; letter-spacing: -.005em; }
 .chip { position: relative; z-index: 5; align-self: flex-start; margin-top: 14px; font-family: var(--f-mono); font-size: 13px; font-weight: 600; font-stretch: 87.5%; letter-spacing: .04em; padding: 4px 7px 3px; line-height: 1.15; color: var(--ink); background: var(--paper); box-shadow: inset 0 0 0 1.5px var(--ink); }
+.has-pm .chip { outline: 5px solid var(--paper); outline-offset: 0; }
 .chip.live { animation: chip 6s ease forwards; }
 @keyframes chip { 0%, 33% { background: var(--pink); color: var(--on-pink); box-shadow: inset 0 0 0 1.5px var(--pink); } 100% { background: var(--paper); color: var(--ink); box-shadow: inset 0 0 0 1.5px var(--ink); } }
 .sentence { font-family: var(--f-serif); font-size: clamp(19px, 5.4vw, 21px); line-height: 1.22; letter-spacing: -.003em; margin-top: 10px; text-wrap: pretty; }
@@ -158,10 +173,34 @@ em { font-style: italic; }
   .v-home .home-acts { margin-top: 12px; }
 }
 .home-acts { margin-top: 20px; }
+/* postmark (received) */
+.v-home .band-p { overflow-x: clip; }
+.pm-wrap { position: absolute; right: -8px; top: -6px; width: 178px; z-index: 4; pointer-events: none; color: var(--accent-text); opacity: .3; }
+.pm-wrap.live { animation: pmDecay 6s ease forwards; animation-delay: var(--pd, 0s); }
+@keyframes pmDecay { 0%, 33% { color: var(--pink); opacity: 1; } 100% { color: var(--accent-text); opacity: .3; } }
+.postmark { display: block; width: 100%; height: auto; overflow: visible; transform: rotate(-9deg); }
+.postmark .ring, .postmark .waves, .postmark .bars { fill: none; stroke: currentColor; }
+.pm-wrap.bare .waves { display: none; }
+.postmark .ring { stroke-width: 1.5; }
+.postmark .ring.thin { stroke-width: 1.2; }
+.postmark .waves { stroke-width: 1.5; stroke-linecap: round; }
+.postmark .bars { stroke-width: 1.4; }
+.postmark .bits, .postmark .word { fill: currentColor; }
+.postmark text { fill: currentColor; font-family: var(--f-mono); font-stretch: 87.5%; font-weight: 700; }
+.postmark .big { font-size: 46px; letter-spacing: -.01em; }
+.postmark .small { font-size: 18px; letter-spacing: .04em; font-weight: 600; }
+.pm-wrap.live .ring:not(.thin) { animation: inkRing 6s ease forwards; animation-delay: var(--pd, 0s); }
+.pm-wrap.live .waves { animation: inkWave 6s ease forwards; animation-delay: var(--pd, 0s); }
+@keyframes inkRing { 0%, 33% { stroke-width: 3.6; } 100% { stroke-width: 1.5; } }
+@keyframes inkWave { 0%, 33% { stroke-width: 3; } 100% { stroke-width: 1.5; } }
+.press .postmark { animation: press .5s cubic-bezier(.3, 1.4, .5, 1) both; }
+@keyframes press { 0% { opacity: 0; transform: rotate(-4deg) scale(1.06); } 24% { opacity: 1; transform: rotate(-9deg) scale(1); } 100% { opacity: 1; transform: rotate(-9deg) scale(1); } }
 /* ---------- the field ---------- */
 .field-wrap { position: relative; margin-top: 10px; }
 .field { position: relative; user-select: none; -webkit-user-select: none; }
+.slice { margin-top: 14px; }
 .f-rot { color: var(--muted); }
+#slice-confirm, #slice-send, #slice-short { margin-top: 28px; }
 .field svg { overflow: visible; }
 .f-dots { fill: var(--dot); }
 .f-perf { fill: var(--perf); }
@@ -186,6 +225,7 @@ em { font-style: italic; }
 .f-note.pink .rs { animation: pinkRs 6s ease forwards; animation-delay: var(--pd, 0s); }
 @keyframes pinkRd { 0%, 40% { fill: var(--pink); } 100% { fill: var(--sq); } }
 @keyframes pinkRs { 0%, 40% { fill: var(--pink); stroke: var(--pink); } 100% { fill: var(--paper); stroke: var(--sq); } }
+.f-note.ghost .rd, .f-note.ghost .rs { fill: none; stroke: var(--ink); stroke-width: 1; stroke-dasharray: 1.4 1.3; opacity: .55; animation: none; }
 .f-note.hov .rd, .f-note.hov .rs { stroke: var(--ink); stroke-width: 1.2; }
 .field[data-sel] .f-note, .field[data-sel] .f-lane { opacity: .26; }
 .f-labs { position: absolute; inset: 0; pointer-events: none; }
@@ -206,6 +246,11 @@ em { font-style: italic; }
 .f-lab.dim .lab, .f-lab.dim b { color: var(--muted); }
 .f-lab.dim b { font-size: 17px; }
 .f-lab.static { position: absolute; right: 0; transform: translateY(-50%); }
+.f-tag { position: absolute; transform: translate(0, -100%); font-family: var(--f-mono); font-size: 11px; letter-spacing: .06em; text-transform: uppercase; font-stretch: 87.5%; font-weight: 600; white-space: nowrap; background: var(--ink); color: var(--paper); padding: 2px 6px 2px; line-height: 1.25; pointer-events: none; }
+.f-tag.pink { background: var(--pink); color: var(--on-pink); }
+.f-tag.out { background: transparent; color: var(--ink); box-shadow: inset 0 0 0 1px var(--ink); }
+.f-tag.r { transform: translate(-100%, -100%); }
+.f-tag.below { transform: translate(0, 4px); }
 .tip-slot:empty { display: none; }
 .tip-slot { margin-top: 12px; }
 .tip-slot .f-tip { position: relative; max-width: none; }
@@ -235,7 +280,33 @@ em { font-style: italic; }
     radial-gradient(circle, var(--bite) 4.2px, transparent 4.8px) 0 100% / 14px 10px repeat-x,
     radial-gradient(circle, var(--bite) 4.2px, transparent 4.8px) 0 0 / 10px 14px repeat-y,
     radial-gradient(circle, var(--bite) 4.2px, transparent 4.8px) 100% 0 / 10px 14px repeat-y; }
+.sample:focus-visible { outline: 2px solid var(--on-cobalt); outline-offset: 7px; box-shadow: none; }
 .band-c :focus-visible:not(.sample) { outline: 2px solid var(--on-cobalt); outline-offset: 3px; box-shadow: none; }
+.qstamp { padding: 14px 14px 12px; align-self: center; display: flex; flex-direction: column; align-items: center; gap: 10px; max-width: 100%; }
+.qstamp .lab { color: var(--muted-print); font-size: 11px; }
+.qr { max-width: 100%; height: auto; }
+.qr-bg { fill: var(--print); }
+.ticket .qr-bg { fill: var(--print-2); }
+.qr-fg { fill: var(--ink-print); }
+.qr-wrap { line-height: 0; width: 100%; display: flex; justify-content: center; }
+.linkrow { display: flex; align-items: center; gap: 8px; margin-top: 18px; min-height: 48px; border-top: 1px solid var(--rule-cobalt); border-bottom: 1px solid var(--rule-cobalt); }
+.band-req { padding-block: 22px 18px; }
+.band-req .linkrow { margin-top: 12px; }
+.linkrow code { flex: 1; min-width: 0; font-family: var(--f-mono); font-size: 12px; font-stretch: 87.5%; letter-spacing: .02em; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; color: var(--on-cobalt); user-select: all; -webkit-user-select: all; }
+.linkrow .ib { color: var(--on-cobalt); margin-right: -8px; }
+.linkrow .ib:hover { background: var(--hover-cobalt); }
+.ib.did { width: auto; padding: 0 10px; gap: 6px; display: inline-flex; align-items: center; }
+.ib.did .lab { font-size: 11px; font-weight: 600; }
+
+/* ticket stub */
+.ticket { --bite: var(--paper); position: relative; display: grid; grid-template-columns: auto 1fr; background: var(--print-2); color: var(--ink-print); margin-top: 6px; }
+.ticket::before { content: ""; position: absolute; top: 0; bottom: 0; right: -5px; width: 10px; pointer-events: none; background: radial-gradient(circle, var(--paper) 4.2px, transparent 4.8px) 0 0 / 10px 14px repeat-y; }
+.ticket .stub { padding: 10px; border-right: 1.5px dashed var(--rule-print); line-height: 0; }
+.ticket .stub svg { width: 76px; height: 76px; }
+.ticket .tk { padding: 10px 22px 10px 14px; display: flex; flex-direction: column; justify-content: center; gap: 3px; min-width: 0; }
+.ticket .tk .lab { color: var(--muted-print); font-size: 11px; }
+.ticket .tk b { font-family: var(--f-serif); font-weight: 400; font-size: 30px; line-height: 1; letter-spacing: -.01em; }
+.ticket .tk .who { display: flex; align-items: center; gap: 6px; color: var(--ink-print); }
 /* first run */
 .mstamp { padding: 14px 16px 12px; display: grid; grid-template-columns: 1fr auto; gap: 6px 14px; }
 .mstamp .who { display: flex; align-items: center; gap: 8px; color: var(--cobalt); }
@@ -251,6 +322,54 @@ em { font-style: italic; }
 .legend3 li b { font-weight: 600; font-size: 15px; }
 .legend3 li span { color: var(--muted); }
 .legend3 svg { overflow: visible; }
+
+/* receive */
+.amount { display: flex; align-items: flex-end; gap: 8px; margin: 4px 0 0; padding-bottom: 8px; border-bottom: 1.5px solid var(--ink); }
+.amount input { width: calc(var(--len, 2) * .46em + .06em); max-width: calc(100% - 90px); min-width: .5em; flex: none; border: 0; background: transparent; font-family: var(--f-serif); font-size: clamp(84px, 27vw, 108px); line-height: .9; letter-spacing: -.03em; padding: 0; color: var(--ink); height: 1em; border-radius: 0; caret-color: var(--pink); }
+.amount input:focus-visible { outline: 2px solid var(--focus-in); outline-offset: 3px; box-shadow: 0 0 0 7px var(--focus-out); }
+.amount:focus-within { border-bottom-color: var(--ink); box-shadow: 0 1px 0 var(--ink); }
+.amount i { font-family: var(--f-serif); font-size: 31px; line-height: 1; padding-bottom: 10px; }
+.amount b { font-family: var(--f-serif); font-weight: 400; font-size: clamp(84px, 27vw, 108px); line-height: .9; letter-spacing: -.03em; }
+.ask-row { display: grid; grid-template-columns: 1fr auto; align-items: end; gap: 0 12px; margin-top: 8px; padding-bottom: 6px; border-bottom: 1.5px solid var(--ink); }
+.ask-row h1 { display: flex; flex-direction: column; gap: 4px; }
+.h-lab { display: block; margin-top: 10px; }
+.ask-amt { display: flex; align-items: baseline; gap: 8px; }
+.ask-amt b { font-family: var(--f-serif); font-weight: 400; font-size: 76px; line-height: .9; letter-spacing: -.03em; }
+.ask-amt i { font-family: var(--f-serif); font-size: 28px; }
+.ask-row .tbtn { margin-bottom: 2px; }
+.pair { display: grid; grid-template-columns: 1fr; gap: 10px; }
+.pair .btn { min-height: 52px; }
+.pair .btn[aria-pressed="true"] { background: var(--hover-cobalt); }
+.scanner.on-c { background-image: radial-gradient(circle, var(--rule-cobalt) .8px, transparent 1.1px); background-size: 8px 8px; color: var(--on-cobalt); }
+.steps3 { display: flex; flex-direction: column; border-top: 1px solid var(--rule-cobalt); }
+.steps3 li { display: grid; grid-template-columns: 34px 1fr; gap: 8px; padding: 12px 0; border-bottom: 1px solid var(--rule-cobalt); font-size: 15px; line-height: 1.42; }
+.steps3 li i { font-family: var(--f-serif); font-size: 24px; line-height: .9; }
+.steps3 li span { color: var(--on-cobalt-muted); }
+.steps3 li b { color: var(--on-cobalt); font-weight: 600; }
+.scan-area { flex: 1 0 210px; container-type: size; display: grid; place-items: center; margin-top: 18px; }
+.scanner { position: relative; width: min(100cqw, 100cqh, 360px); aspect-ratio: 1; display: grid; place-items: center; text-align: center; padding: 22px; background: radial-gradient(circle, var(--dot) .8px, transparent 1.1px) 0 0 / 8px 8px; }
+.scanner.sm { width: min(100%, 236px); margin: 14px auto 0; }
+.scanner .corners { position: absolute; left: 0; top: 0; width: 100%; height: 100%; pointer-events: none; }
+.scanner p { max-width: 17em; font-size: 15px; line-height: 1.45; background: var(--paper); padding: 10px 12px; }
+.scanner.on-c p { background: var(--cobalt); color: var(--on-cobalt); }
+.v-scan .band-p { display: flex; flex-direction: column; }
+.v-scan .band-p > .wrap { flex: 1 0 auto; display: flex; flex-direction: column; }
+.slice-foot { margin-top: auto; padding-top: 18px; }
+/* Receive (Ask): the paper holds Ask and the slice at their own height, so the slice still closes the paper on
+   the seam, and the cobalt "How it goes" takes what the screen has left. On phones and tall tablets its three
+   steps share that height row by row; on wide, short screens they stand side by side (below). */
+.v-recv-ask .band-p, .v-recv-ask .band-p > .wrap { flex: none; }
+.v-recv-ask .band-c, .v-recv-ask .band-c > .wrap { flex: 1 0 auto; display: flex; flex-direction: column; }
+@media (max-width: 559px), (max-width: 1099px) and (min-height: 960px) {
+  .v-recv-ask .band-c .c-mid { flex: 1 0 auto; display: flex; flex-direction: column; margin-block: 0; }
+  .v-recv-ask .steps3 { flex: 1 0 auto; }
+  .v-recv-ask .steps3 li { flex: 1 0 auto; align-content: center; }
+}
+@media (max-width: 559px) and (min-height: 800px) {
+  .v-recv-ask .slice-foot { padding-top: 24px; }
+  .v-recv-ask .steps3 li { grid-template-columns: 52px 1fr; align-items: center; }
+  .v-recv-ask .steps3 li i { font-size: clamp(40px, 5.4vh, 54px); line-height: .8; }
+}
 .flow .band-p { flex: none; }
 .flow .band-c { flex: 1 0 auto; display: flex; flex-direction: column; }
 .flow .band-c > .wrap { flex: 1 0 auto; display: flex; flex-direction: column; }
@@ -258,26 +377,134 @@ em { font-style: italic; }
 .c-low { margin-top: auto; }
 .c-mid ~ .c-low { margin-top: 0; }
 .first-acts { display: flex; flex-direction: column; gap: 10px; padding-top: 20px; }
+/* Confirm: where the screen has room (fitPre), the time it takes is drawn large, as Sending will count it down
+   (one note: that it goes at once); where it has none, one line under the buttons says it */
+.pre { padding-bottom: 26px; }
+.pre.off { display: none; }
+.pre .count { margin-top: 10px; }
+.pre .count > b { font-size: var(--pre-f, 96px); }
+.pre.off ~ .c-low { margin-top: auto; }
+.pre .count > b i { font-size: 34px; }
+.pre:not(.off) ~ .c-low .pre-alt { display: none; }
 @media (min-width: 560px) {
+  .v-recv-ask .slice-foot { margin-top: 0; padding-top: 30px; }
   /* first run on wider screens: the headline and the Playground stamp take the room */
   .v-first .h1 { font-size: clamp(52px, min(8vw, 8.2vh), 80px); }
   .v-first .mstamp { padding: 20px 22px 16px; gap: 8px 18px; }
   .v-first .mstamp .denom { font-size: 84px; }
   .v-first .mstamp .denom i { font-size: 30px; }
   .v-first .mstamp .bits svg { width: 118px; height: auto; }
+  /* with room to spare, the three steps stand side by side under large numerals */
+  .v-recv-ask .steps3 { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 0 28px; margin-top: 16px !important; }
+  .v-recv-ask .steps3 li { grid-template-columns: 1fr; align-content: start; gap: 12px; padding: 16px 0 18px; }
+  .v-recv-ask .steps3 li i { font-size: clamp(48px, 7vh, 72px); line-height: .8; }
+  .v-recv-ask .steps3 li b { display: block; margin-bottom: 2px; }
 }
+/* tall tablets: the flows are sized to the height they have, not to a phone. Ask for is drawn larger and the
+   three steps become rows of a large index; Send's headlines, the lines beside its large figures, and the
+   first run's headline, key and Playground stamp grow */
 @media (min-width: 560px) and (max-width: 1099px) and (min-height: 960px) {
+  .v-send .count p { font-size: 17px; }
+  .v-send .options { margin-top: 18px; }
+  .v-send .options li { grid-template-columns: 84px 1fr; gap: 0 20px; padding: 20px 0 22px; }
+  .v-send .options li > i { font-size: clamp(56px, 6.5vh, 84px); line-height: .78; }
+  .v-send .options li p { font-size: 18px; line-height: 1.38; }
+  .v-send .options li p small { font-size: 15.5px; margin-top: 4px; }
+  .v-send.is-sending .count { margin-block: auto; }
+  .v-send.is-sending .tr-wrap { margin-top: 0; }
   .v-first .h1 { font-size: clamp(52px, min(10vw, 6.6vh), 84px); }
   .v-first .legend3 li { grid-template-columns: 70px 1fr; padding: 13px 0; }
   .v-first .legend3 li p { font-size: 16px; }
   .v-first .legend3 li b { font-size: 16.5px; }
   .v-first .legend3 svg { width: 60px; height: 17.5px; }
+  .v-recv-ask .amount input, .v-recv-ask .amount b { font-size: clamp(108px, 13vh, 168px); }
+  .v-recv-ask .amount i { font-size: 40px; padding-bottom: 14px; }
+  .v-recv-ask .h-lab { margin-top: 18px; }
+  .v-recv-ask .steps3 { display: flex; margin-top: 18px !important; }
+  .v-recv-ask .steps3 li { grid-template-columns: minmax(0, 1fr) minmax(0, 2.3fr); gap: 0 24px; align-items: start; align-content: center; padding: 22px 0 24px; font-size: 16.5px; line-height: 1.45; }
+  .v-recv-ask .steps3 li i { font-size: clamp(88px, 10.5vh, 150px); line-height: .74; }
+  .v-recv-ask .steps3 li b { display: block; font-family: var(--f-serif); font-weight: 400; font-size: 36px; line-height: 1; letter-spacing: -.01em; margin-bottom: 10px; }
+  .v-send.flow .h1 { font-size: clamp(52px, min(8vw, 6.4vh), 80px); }
   .v-first .mstamp { padding: 24px 26px 18px; gap: 10px 22px; }
   .v-first .mstamp .denom { font-size: clamp(96px, 12.5vh, 160px); }
   .v-first .mstamp .denom i { font-size: 38px; margin-left: 8px; }
   .v-first .mstamp .bits svg { width: clamp(150px, 16.5vh, 206px); }
   .v-first .mstamp .foot { padding-top: 12px; margin-top: 10px; }
 }
+.slice-cap { margin-top: 8px; font-size: 14px; line-height: 1.4; color: var(--muted); }
+.slice-cap b { color: var(--ink); font-weight: 600; }
+
+/* send */
+.split { display: grid; grid-template-columns: auto 38px auto 30px auto; align-items: start; justify-content: start; gap: 0 6px; margin-top: 18px; padding-top: 14px; border-top: 1px solid var(--rule-strong); }
+.split > div { display: flex; flex-direction: column; gap: 6px; }
+.split b { font-family: var(--f-serif); font-weight: 400; font-size: 58px; line-height: .82; letter-spacing: -.03em; }
+.split .op { font-family: var(--f-serif); font-size: 34px; line-height: 1; color: var(--muted); padding-top: 8px; text-align: center; }
+.split .lab { font-size: 11px; color: var(--muted); }
+.explain { font-size: 15px; line-height: 1.45; color: var(--muted); margin-top: 12px; }
+.explain b { color: var(--ink); font-weight: 600; }
+.after { margin-top: 10px; font-size: 15.5px; line-height: 1.4; font-weight: 600; }
+.stages { display: flex; flex-direction: column; margin-top: 18px; }
+.stages li { display: grid; grid-template-columns: 24px 1fr; align-items: center; min-height: 46px; border-top: 1px solid var(--rule); font-size: 15.5px; line-height: 1.3; padding: 6px 0; }
+.stages li:last-child { border-bottom: 1px solid var(--rule); }
+.stages li i { width: 10px; height: 10px; border: 1.5px solid var(--ink); }
+.stages li.done i { background: var(--sq); border-color: var(--sq); }
+.stages li.now i { background: var(--sq); border-color: var(--sq); box-shadow: 0 0 0 4px var(--paper), 0 0 0 5px var(--rule-strong); }
+.stages li.todo { color: var(--muted); }
+.stages li small { display: block; font-size: 13.5px; color: var(--muted); }
+.count { display: flex; align-items: flex-end; gap: 14px; }
+.count > b { font-family: var(--f-serif); font-weight: 400; font-size: 128px; line-height: .8; letter-spacing: -.03em; font-variant-numeric: tabular-nums; min-width: .6em; }
+.v-send.is-sending .count > b { font-size: clamp(128px, 22vh, 200px); }
+.count > b i { font-size: 38px; letter-spacing: 0; margin-left: 4px; }
+.count p { font-size: 15px; line-height: 1.4; padding-bottom: 4px; }
+/* one note is one transfer, sent at once: where a countdown would stand, the phrase says so, with its line
+   beside it or, in a narrow column, under it */
+.count.once { flex-wrap: wrap; row-gap: 12px; }
+.count.once > b { white-space: nowrap; flex: none; }
+.count.once > p { flex: 1 1 10em; }
+.v-send.is-sending .count.once > b { font-size: min(clamp(110px, 20vh, 200px), calc((min(100vw, 560px) - 32px) / 2.6)); }
+@media (max-height: 959px) { .v-send.is-sending .count.once > b { font-size: min(clamp(60px, 16vh, 200px), calc((min(100vw, 560px) - 32px) / 2.6)); } }
+@media (min-width: 1100px) { .v-send.is-sending .count.once > b { font-size: clamp(110px, 20vh, 200px); } }
+@media (min-width: 1100px) and (max-height: 767px) { .v-send.is-sending .count.once > b { font-size: clamp(90px, 13vh, 150px); } }
+@media (min-width: 560px) and (max-width: 1099px) and (min-height: 960px) { .v-send.is-sending .count > b { font-size: clamp(200px, 23vh, 280px); } }
+.tear { position: relative; height: 44px; margin-top: 18px; }
+.tear svg { position: absolute; left: 0; top: 0; width: 100%; height: 44px; overflow: visible; }
+.tear .t-c { fill: var(--cobalt); }
+.tear .t-hole { fill: var(--paper); }
+.tear .t-pt { fill: var(--pink); }
+.tear .t-pl { stroke: var(--pink); stroke-width: 2; }
+.band-p.tearing { padding-bottom: 0; display: flex; flex-direction: column; }
+.band-p.tearing > .wrap { flex: 1 0 auto; }
+.band-c.tearing { padding-block: 16px 22px; overflow: hidden; }
+.v-send.is-sending .band-p { flex: none; }
+.v-send.is-sending .band-c { flex: 1 0 auto; display: flex; flex-direction: column; }
+.v-send.is-sending .band-c > .wrap { flex: 1 0 auto; display: flex; flex-direction: column; gap: 22px; }
+.trule { position: relative; height: 13px; }
+.trule::before { content: ""; position: absolute; left: 0; right: 0; top: 6px; height: 1px; background: var(--rule-cobalt); }
+.trule i { position: absolute; left: 0; top: 5.5px; height: 2px; background: var(--on-cobalt); }
+.trule b { position: absolute; top: 0; width: 2px; height: 13px; margin-left: -1px; background: var(--on-cobalt); }
+.tr-wrap { margin-top: auto; }
+.trule-labs { display: flex; justify-content: space-between; color: var(--on-cobalt-muted); margin-top: 8px; }
+.band-c.tearing::before { display: none; }
+.tear-ends { display: flex; justify-content: space-between; color: var(--on-cobalt-muted); margin-top: 10px; }
+.changed { display: flex; align-items: center; gap: 10px; margin-top: 14px; font-size: 15px; line-height: 1.35; }
+.changed .sw { width: 10px; height: 10px; flex: none; background: var(--pink); }
+.changed .sw.live { animation: newsw 6s ease forwards; }
+@keyframes newsw { 0%, 40% { background: var(--pink); } 100% { background: transparent; box-shadow: inset 0 0 0 1.5px var(--ink); } }
+.changed .sw.cold { background: transparent; box-shadow: inset 0 0 0 1.5px var(--ink); }
+.options { display: flex; flex-direction: column; margin-top: 14px; border-top: 1px solid var(--rule-cobalt); }
+.options li { display: grid; grid-template-columns: 34px 1fr; gap: 8px; padding: 8px 0; border-bottom: 1px solid var(--rule-cobalt); }
+.options li > i { font-family: var(--f-serif); font-size: 26px; line-height: .95; }
+.options li p { font-size: 15.5px; line-height: 1.4; }
+.options li p small { display: block; font-size: 14px; color: var(--on-cobalt-muted); margin-top: 2px; }
+.options .btn { margin-top: 8px; }
+.msg-preview { font-size: 14px; line-height: 1.45; color: var(--on-cobalt-muted); margin-top: 8px; font-style: italic; }
+.samples { display: grid; grid-template-columns: repeat(3, 1fr); gap: 10px; margin-top: 10px; }
+.sample { --bite: var(--cobalt); position: relative; display: flex; flex-direction: column; align-items: flex-start; gap: 4px; min-height: 76px; padding: 10px 12px; background: var(--print); color: var(--ink-print); text-align: left; }
+.sample b { font-family: var(--f-serif); font-weight: 400; font-size: 34px; line-height: .9; letter-spacing: -.02em; }
+.sample .lab { font-size: 11px; color: var(--muted-print); }
+.sample:hover { background: var(--print-2); }
+.or { display: flex; align-items: center; gap: 12px; margin: 18px 0 8px; color: var(--on-cobalt-muted); }
+.or::before, .or::after { content: ""; flex: 1; height: 1px; background: var(--rule-cobalt); }
 .paste-row { display: flex; gap: 10px; margin-top: 8px; }
 .paste-row .inp { flex: 1; min-width: 0; }
 /* ---------- views at width ---------- */
@@ -289,7 +516,10 @@ em { font-style: italic; }
   .tb { display: none; }
   .db { display: block; border-bottom: 1px solid var(--rule); background-color: var(--paper); background-image: var(--grain, none); background-size: 180px; }
   .db-in { display: flex; align-items: center; gap: 36px; min-height: 80px; max-width: 1440px; margin-inline: auto; padding-left: max(60px, env(safe-area-inset-left, 0px)); padding-right: max(76px, env(safe-area-inset-right, 0px)); }
+  .db .acts { margin-left: auto; display: flex; gap: 10px; }
+  .db .acts .btn { min-height: 52px; min-width: 132px; }
   .v-sub .band-p { padding-block: 36px 22px; }
+  .v-sub .band-p.tearing { padding-bottom: 0; }
   .v-home .wrap { max-width: 1440px; padding-left: max(60px, env(safe-area-inset-left, 0px)); padding-right: max(60px, env(safe-area-inset-right, 0px)); }
   .v-home .band-p { padding-block: 22px 24px; }
   .v-home .hero { display: grid; grid-template-columns: minmax(0, 1fr) minmax(0, 560px); gap: 56px; align-items: end; }
@@ -299,6 +529,7 @@ em { font-style: italic; }
   .v-home .sentence { font-size: 31px; line-height: 1.2; margin-top: 0; }
   .v-home .field-wrap { margin-top: 16px; }
   .v-home .f-cap { margin-top: 10px; }
+  .v-home .pm-wrap { right: auto; left: var(--pm-x, 420px); top: var(--pm-y, -22px); width: var(--pm-w, 332px); }
   .v-home .hero-l { position: relative; }
   .v-home .band-c { padding-block: 30px 34px; }
   .home-cols { display: grid; grid-template-columns: minmax(0, 1fr) minmax(0, 1.25fr) minmax(0, 1fr); gap: 56px; align-items: start; }
@@ -334,6 +565,7 @@ em { font-style: italic; }
    without scrolling while the field keeps its 13 px squares */
 @media (min-width: 1100px) and (max-height: 899px) {
   .db-in { min-height: 64px; }
+  .db .acts .btn { min-height: 48px; }
   .v-home .band-p { padding-block: 12px 14px; }
   .v-home .total b { --total-size: min(176px, 17.5vh); }
   .v-home .total i { font-size: min(44px, 4.6vh); }
@@ -350,6 +582,7 @@ em { font-style: italic; }
   .v-home .cb-act .btn { min-height: 48px; }
   .v-sub .band-p { padding-block: 28px 20px; }
   .v-sub .band-c { padding-block: 26px 26px; }
+  .v-send.is-sending .count > b { font-size: clamp(110px, 18vh, 200px); }
   .v-first .h1 { font-size: 60px; }
   .v-first .mstamp { padding: 14px 16px 12px; }
   .v-first .mstamp .denom { font-size: 60px; }
@@ -376,11 +609,49 @@ em { font-style: italic; }
   .v-home .band-c { padding-block: 16px 18px; }
   .v-home .cb-date { font-size: 40px; }
   .v-home .col-back .note-line { margin: 6px 0 10px; }
+  .v-send.is-sending .count > b { font-size: clamp(90px, 13vh, 150px); }
+}
+/* Send and Receive on phones under 800 px tall: the countdown, its gaps and the rows round a code tighten, so
+   the rule, Copy link and Done stay on screen (fitQR shrinks the code for what is left) */
+@media (max-width: 1099px) and (max-height: 799px) {
+  .v-send.is-sending .count > b { font-size: clamp(88px, 12vh, 200px); }
+  .v-send.is-sending .band-c > .wrap { gap: 14px; }
+  .v-send.is-sending .band-c.tearing { padding-block: 10px 12px; }
+  .v-send.is-sending .stages { margin-top: 12px; }
+  .v-send.is-sending .stages li { min-height: 42px; padding-block: 4px; }
+  .v-send .band-c, .v-recv .band-req { padding-block: 22px 16px; }
+  .qstamp { padding: 12px 12px 10px; gap: 8px; }
+  .linkrow, .band-req .linkrow { margin-top: 10px; }
+  .hb-acts { margin-top: 12px; }
+  .hb-again { margin-top: 8px; }
+  .cancel-low { margin-top: 6px; }
+}
+/* desktops under 900 px tall: a dense hand-back's code keeps 2 px a module, and its buttons stay on screen */
+@media (min-width: 1100px) and (max-height: 899px) {
+  .qstamp { padding: 12px 14px 10px; gap: 8px; }
+  .hb-acts { margin-top: 12px; }
+  .hb-again { margin-top: 8px; }
+}
+/* Send on phones under 700 px tall (iPhone SE): a tighter stub, headline and split keep Send on screen */
+@media (max-width: 1099px) and (max-height: 699px) {
+  .v-send .ticket .stub { padding: 8px; }
+  .v-send .ticket .stub svg { width: 58px; height: 58px; }
+  .v-send .ticket .tk b { font-size: 26px; }
+  .v-send .h1 { font-size: 36px; margin-top: 12px !important; }
+  #slice-confirm, #slice-send, #slice-short { margin-top: 22px; }
+  .split { margin-top: 12px; padding-top: 10px; }
+  .split b { font-size: 50px; }
+  .explain { margin-top: 8px; }
+  .v-send .band-c { padding-block: 20px 14px; }
+  .v-send.is-sending .count > b { font-size: 96px; }
+  .v-send.is-sending .count.once > b { font-size: 60px; }
+  .stages li { min-height: 42px; }
 }
 /* ---------- motion ---------- */
 @media (prefers-reduced-motion: reduce) {
   *, *::before, *::after { animation-duration: 1ms !important; animation-delay: 0s !important; animation-iteration-count: 1 !important; transition-duration: 1ms !important; }
   .lo-drift { animation: none !important; }
+  .press .postmark { animation: none !important; opacity: 1; }
 }
 /* ---------- the purse's own rules ---------- */
 /* the lane a tip is about stays lit, by its key, so any number of layers works */
@@ -431,3 +702,113 @@ em { font-style: italic; }
 .v-first .intro-lab { margin-top: 12px; }
 .v-first .h1 { margin-top: 10px; }
 .v-first .band-p .body { margin-top: 12px; }
+/* ---------- step 2: receive and send ---------- */
+/* the prototype's inline margins on flow screens (L1665-1819), one class each */
+.mt-8 { margin-top: 8px; }
+.mt-10 { margin-top: 10px; }
+.mt-12 { margin-top: 12px; }
+.mt-14 { margin-top: 14px; }
+.mt-16 { margin-top: 16px; }
+.mt-18 { margin-top: 18px; }
+/* the back arrow sits on the column's edge (L1132) */
+.tb .back { margin-left: -12px; }
+/* Ask's hint, error and button (L1665-1667) */
+.ask-hint { margin-top: 12px; }
+.flow-err { margin-top: 8px; }
+.ask-go { margin-top: 18px; }
+/* How it goes (L1673) */
+.steps3 { margin-top: 12px; }
+/* Request (L1687-1694) */
+.recv-made { margin-top: 10px; }
+.band-req > .wrap { display: flex; flex-direction: column; }
+.band-req .pair { margin-top: 12px; }
+.take-form { margin-top: 14px; }
+/* the ticket's mint name prints in the ticket's ink (L1703) */
+.ticket .tk .who .lab { color: var(--ink-print); }
+/* Scan: the viewfinder in the paper's ink (L1719) */
+.v-scan .scanner { color: var(--ink); }
+/* Not enough ready: its Cancel, centred and low, and its buttons (L1730, L1749, L1758) */
+.short-low { display: flex; justify-content: center; padding-top: 8px; }
+.tbtn.on-c { color: var(--on-cobalt); }
+.options .btn.take { margin-top: 10px; }
+.options .btn.copy { margin-top: 0; }
+/* Confirm from several notes (L1766) */
+.split.many { grid-template-columns: auto 48px auto; }
+.split.many b { font-size: 46px; }
+.split.many .op { padding-top: 3px; }
+/* the bold line beside a count (L1772-1773, L1804-1805) */
+.count p b { font-weight: 600; }
+/* seconds keep their lower case (L1806) */
+.trule-labs .s { text-transform: none; }
+/* Hand-back (L1816-1819) */
+.hb-mid { display: flex; flex-direction: column; }
+.hb-acts { margin-top: 16px; }
+.hb-again { margin-top: 10px; }
+/* a code that could not be drawn (L1483) */
+.qr-none { aspect-ratio: 1; display: grid; place-items: center; padding: 20px; text-align: center; font-size: 14px; line-height: 1.4; }
+/* the outline round a chosen note (L2099) */
+.f-mark { fill: none; stroke: var(--ink); stroke-width: 1.5; }
+/* the face in a flow's top bar is a mark, not a link, until Mints exists */
+span.ib.face { cursor: default; }
+span.ib.face:hover { background: none; }
+/* the request's code with too much in it: a word under it, or in its place */
+.qr-note { max-width: 22em; font-size: 13px; line-height: 1.4; text-align: center; color: var(--muted-print); }
+.qstamp > .qr-none { aspect-ratio: auto; min-height: 160px; width: min(267px, 100%); color: var(--ink-print); }
+/* the camera inside the viewfinder: the corners and the words stay over it */
+.scanner .cam { position: absolute; inset: 0; width: 100%; height: 100%; object-fit: cover; }
+.scanner .corners { z-index: 1; } /* already position: absolute (prototype L401) */
+.scanner p, .scanner .btn { position: relative; z-index: 1; }
+.scanner .stack { position: relative; z-index: 1; display: flex; flex-direction: column; align-items: center; gap: 12px; }
+.scanner.live p { align-self: end; }
+.cam-toggle { margin-top: 8px; }
+.band-c .cam-toggle { color: var(--on-cobalt); }
+/* Ask in smaller notes */
+.smaller { margin-top: 12px; }
+.sel { position: relative; }
+.sel select { appearance: none; -webkit-appearance: none; padding-right: 42px; cursor: pointer; }
+.sel::after { content: ""; position: absolute; right: 18px; top: 50%; width: 8px; height: 8px; border-right: 1.5px solid currentColor; border-bottom: 1.5px solid currentColor; transform: translateY(-70%) rotate(45deg); pointer-events: none; }
+/* open requests, above How it goes */
+.asks { margin-bottom: 22px; }
+.asks .col-h { display: flex; align-items: center; min-height: 44px; border-bottom: 1px solid var(--rule-cobalt); }
+/* a Recent or open-request row that opens something: the row is the button */
+.act.go { width: 100%; text-align: left; color: inherit; cursor: pointer; background: transparent; }
+.act.go:hover { background: var(--hover-cobalt); }
+.act.go span small { margin-left: 4px; }
+/* Cancel this request, and its question */
+.cancel-low { display: flex; justify-content: center; margin-top: 10px; }
+.cancel-ask { margin-top: 14px; padding-top: 12px; border-top: 1px solid var(--rule-cobalt); }
+.cancel-ask p { font-size: 15px; line-height: 1.45; color: var(--on-cobalt); }
+.cancel-ask .btn-row { margin-top: 12px; }
+/* Send the rest now, on the cobalt under the count */
+.send-now { flex-direction: column; align-items: flex-start; gap: 2px; text-align: left; }
+.send-now small { font-size: 13.5px; font-weight: 400; text-decoration: none; color: var(--on-cobalt-muted); }
+/* Fix: a decoration on the button runs through every line in it, so the underline goes on its first line alone */
+.tbtn.send-now { text-decoration: none; }
+.send-now > span { text-decoration: underline; text-decoration-thickness: 1px; text-underline-offset: .24em; }
+/* the desktop bar's button for the screen shown */
+.db .acts .btn[aria-current="page"] { background: var(--hover); }
+.db .acts .btn.solid[aria-current="page"] { background: var(--cobalt-deep); border-color: var(--cobalt-deep); }
+/* Holdings on the phone: Receive and Send under the faucet button of an empty purse */
+.home-acts > .btn + .btn-row, .home-acts > .err + .btn-row { margin-top: 10px; }
+/* the take step's buttons */
+.v-take .btn-row { margin-top: 22px; }
+/* the request's code, while the purse draws it: the room it will take */
+.qr-wait { width: 267px; max-width: 100%; aspect-ratio: 1; }
+/* Fix: a tag under the field at its right end grows leftwards, as one above it does (in the prototype .below came after .r and undid it) */
+.f-tag.below.r { transform: translate(-100%, 4px); }
+/* a stamp's label that wraps at 360 px stays centred under its code */
+.qstamp > .lab { text-align: center; }
+/* Fix: two buttons whose words do not fit side by side stack, each the column's width, rather than spill past
+   their edges ("Back to the purse" beside "Show the hand-back" at 360 px); side by side they share the row */
+.btn-row { flex-wrap: wrap; }
+.btn-row > .btn { min-width: max-content; }
+/* Fix: the viewfinder's words and its button stay inside its corners, however small it is */
+.scanner .stack { max-width: 100%; min-width: 0; }
+.scanner .stack > p { max-width: min(17em, 100%); }
+.scanner .stack .btn { max-width: 100%; white-space: normal; text-align: center; line-height: 1.25; }
+/* Send's viewfinder leaves room under it for "Turn off the camera" (44 px and its 8 px margin) */
+.scan-area.live { grid-template-rows: minmax(0, 1fr) auto; }
+.scan-area.live .scanner { width: min(100cqw, 100cqh - 52px, 360px); }
+/* a flow step with only buttons in its cobalt: the paper takes the height, the cobalt is their strip */
+.flow.low .band-p { flex: 1 0 auto; }
+.flow.low .band-c { flex: none; }

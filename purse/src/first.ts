@@ -113,8 +113,8 @@ function cobaltBand(input: FirstInput): HTMLElement {
   return h('section', { class: 'band-c' }, h('div', { class: 'wrap' }, ...parts));
 }
 
-/** While the purse reads a mint from its server. */
-const waiting = (server: string): HTMLElement =>
+/** While the purse reads a mint from its server: also Send's, for a mint a request names. */
+export const waiting = (server: string): HTMLElement =>
   h('p', { class: 'note-line muted stamp-wait c-mid', role: 'status' }, `Reading the mint at ${hostOf(server)}…`);
 
 /** The way in without a stamp: the paste row, always open, in the middle of the band. */
@@ -177,7 +177,23 @@ function linkStamp(
   const name = held?.name ?? (input.playground?.mint === link.mint ? 'Playground' : hostOf(link.server));
   const faucet = about.faucet;
   const buttons: Child[] = [];
-  const home = h('a', { class: 'btn solid wide', href: '#home', 'data-fk': 'first-home' }, 'Open the purse');
+  // Holdings shows the mint last used: for a mint held already, `add` marks it used, then opens Holdings
+  const open = (solid: boolean): HTMLElement =>
+    h(
+      'a',
+      {
+        class: solid ? 'btn solid wide' : 'btn wide',
+        href: '#home',
+        'data-fk': 'first-home',
+        on: {
+          click: (event: Event) => {
+            event.preventDefault();
+            actions.add();
+          },
+        },
+      },
+      'Open the purse',
+    );
   if (held !== undefined && held.server !== link.server) {
     // the purse never moves a mint it holds to another server on a link's word
     buttons.push(
@@ -186,13 +202,15 @@ function linkStamp(
         { class: 'note-line' },
         `This purse holds this mint at ${hostOf(held.server)} already, and keeps it there. The link names ${hostOf(link.server)}.`,
       ),
-      home,
+      open(true),
     );
   } else if (held !== undefined && faucet === undefined) {
-    buttons.push(home);
+    buttons.push(open(true));
   } else if (faucet !== undefined) {
     buttons.push(takeButton(state, Number(faucet.amount), actions.take));
-    if (held === undefined) {
+    if (held !== undefined) {
+      buttons.push(open(false));
+    } else {
       buttons.push(
         h(
           'button',
@@ -283,7 +301,7 @@ function notes(standalone: boolean, info?: MintInfo): HTMLElement {
  * as a denomination, and the faucet's limit. Without: its face large, and
  * its rotation.
  */
-function stamp(key: string, name: string, about: About, playground: boolean): HTMLElement {
+export function stamp(key: string, name: string, about: About, playground: boolean): HTMLElement {
   const faucet = about.faucet;
   const rotation = about.info.paused ? undefined : about.info.rotation;
   const schedule = about.info.paused

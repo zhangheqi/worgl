@@ -5,6 +5,8 @@ import type { HeldNote, MintInfo, ScheduledTransfer } from 'worgl';
 
 import {
   RUN_MAX_SECS,
+  SEND_WAIT_SECS,
+  answersOf,
   boxes,
   broughtBy,
   budgetSecs,
@@ -25,6 +27,7 @@ import {
   spentBy,
   spentKey,
   stepOf,
+  waitsForSend,
 } from '../src/keep.ts';
 import { rng } from '../src/rng.ts';
 import { ISSUER, OTHER, noteText, transfer } from './notes.ts';
@@ -45,6 +48,15 @@ describe('the budget', () => {
     for (const [left, budget] of cases) {
       assert.equal(budgetSecs(left), budget, String(left));
     }
+  });
+
+  test('waits for Send’s plan only while the rotation is more than a quarter of an hour off', () => {
+    assert.equal(SEND_WAIT_SECS, 900);
+    assert.equal(waitsForSend(true, 28_800), true);
+    assert.equal(waitsForSend(true, 901), true);
+    assert.equal(waitsForSend(true, 900), false);
+    assert.equal(waitsForSend(true, undefined), false, 'a mint with no schedule');
+    assert.equal(waitsForSend(false, 28_800), false);
   });
 
   test('is the mint’s clock that counts', () => {
@@ -166,6 +178,15 @@ describe('what a transfer spends', () => {
     ]);
     assert.equal(spentKey(spent[1] as (typeof spent)[number]), `${ISSUER}/9:3`);
     assert.equal(outputsOf(transfer([a, b], 3)), 3);
+  });
+
+  test('splits a submit’s notes into each answer’s, by the outputs of the transfers answered, in order', () => {
+    const a = noteText({ index: 1 });
+    const b = noteText({ index: 2 });
+    // a send's transfer (two outputs: theirs and the change), a hop, a send's of three
+    const answered = [transfer([a], 2), transfer([b]), transfer([a], 3)];
+    assert.deepEqual(answersOf(answered, ['t1', 'c1', 'h', 't2', 't3', 'c3']), [['t1', 'c1'], ['h'], ['t2', 't3', 'c3']]);
+    assert.deepEqual(answersOf([], []), []);
   });
 
   test('is nothing for what does not read', () => {

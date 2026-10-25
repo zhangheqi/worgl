@@ -25,8 +25,8 @@ export interface Note {
   readyAt: number | undefined;
   /** When it came into the purse, from the purse's own log, if the log has it. */
   arrivedAt: number | undefined;
-  /** Where it came from, if the log knows: a faucet, or keep-alive, which moved it a layer on. */
-  source: 'faucet' | 'kept' | undefined;
+  /** Where it came from, if the log knows: a faucet, keep-alive (which moved it a layer on), a hand-back taken in, or the change of a send. */
+  source: Source | undefined;
   /** On its way a layer on in a refresh transfer the mint has not answered yet: drawn where it was. */
   moving: boolean;
 }
@@ -113,26 +113,37 @@ export function comeBackAt(holdings: Holdings, now: number): number | undefined 
 export const noteId = (serial: { generation: bigint; index: number }): string =>
   `${serial.generation}:${serial.index}`;
 
+/** Where a note came from, as the purse's log knows it. */
+export type Source = 'faucet' | 'kept' | 'received' | 'change';
+
 /** What the purse's own log knows of a note: when it came, and from where. */
 export interface Arrival {
   at: number;
-  source: 'faucet' | 'kept';
+  source: Source;
 }
 
 /** An entry of the purse's log (records.ts `LogEntry`, which needs IndexedDB to load), as far as arrivals read it. */
 export interface Logged {
   t: number;
-  kind: 'faucet' | 'faded' | 'kept' | 'lost';
+  kind: 'faucet' | 'faded' | 'kept' | 'lost' | 'sent' | 'received';
   mint: string;
   serials: readonly string[];
+  /** sent: when its change came. */
+  t2?: number | undefined;
+  /** sent: when each note of its change that came before `t2` came. */
+  changeAt?: Readonly<Record<string, number>> | undefined;
 }
+
+/** Where the notes an entry of the log names came from, if it brought any. */
+const SOURCES: Partial<Record<Logged['kind'], Source>> = { faucet: 'faucet', kept: 'kept', received: 'received', sent: 'change' };
 
 /**
  * What the purse's log knows of each note of `mint`: when it came, and from
- * where, a faucet or keep-alive. The log is newest first, so a note's latest
- * entry wins. A note keep-alive just moved (`hopped`, by when) counts from
- * its hop until its run's entry is written, so it keeps its place in the
- * field.
+ * where, a faucet, keep-alive, a hand-back or a send's change (which comes
+ * when its answer does, not at pay). The log is newest first, so a note's
+ * latest entry wins. A note keep-alive just moved (`hopped`, by when)
+ * counts from its hop until its run's entry is written, so it keeps its
+ * place in the field.
  */
 export function arrivalsOf(
   log: readonly Logged[],
@@ -141,11 +152,14 @@ export function arrivalsOf(
 ): Map<string, Arrival> {
   const known = new Map<string, Arrival>();
   for (const entry of log) {
-    if (entry.mint === mint && (entry.kind === 'faucet' || entry.kind === 'kept')) {
-      for (const id of entry.serials) {
-        if (!known.has(id)) {
-          known.set(id, { at: entry.t, source: entry.kind });
-        }
+    const source = SOURCES[entry.kind];
+    if (entry.mint !== mint || source === undefined) {
+      continue;
+    }
+    const at = entry.kind === 'sent' ? (entry.t2 ?? entry.t) : entry.t;
+    for (const id of entry.serials) {
+      if (!known.has(id)) {
+        known.set(id, { at: entry.changeAt?.[id] ?? at, source });
       }
     }
   }
@@ -155,6 +169,27 @@ export function arrivalsOf(
     }
   }
   return known;
+}
+
+/**
+ * A send's entry with the change a settle at `t2` just brought (`fresh`):
+ * the change it had keeps when it came (`changeAt`), so each note's tip
+ * still says when it came.
+ */
+export function withChange(
+  entry: Pick<Logged, 't' | 'serials' | 't2' | 'changeAt'>,
+  fresh: readonly string[],
+  t2: number,
+): { serials: string[]; changeAt?: Record<string, number>; t2: number } {
+  const changeAt: Record<string, number> = { ...entry.changeAt };
+  for (const id of entry.serials) {
+    changeAt[id] ??= entry.t2 ?? entry.t;
+  }
+  return {
+    serials: [...new Set([...entry.serials, ...fresh])],
+    ...(Object.keys(changeAt).length === 0 ? {} : { changeAt }),
+    t2,
+  };
 }
 
 /**

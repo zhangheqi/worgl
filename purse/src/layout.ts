@@ -163,6 +163,13 @@ export interface PlanOptions {
   busy?: ReadonlySet<number> | undefined;
   /** Draw the ruler. */
   ruler?: boolean;
+  /**
+   * Whether lanes may shrink (see {@link shrinks}); `false` keeps every lane
+   * four rows tall and open, as the flows' slices of the field are drawn.
+   */
+  shrink?: boolean;
+  /** The least gap between the bands of a lane: a slice opens its bands so a tag fits between them. */
+  bandGap?: number;
 }
 
 /**
@@ -279,19 +286,24 @@ export function fieldPlan(
   o: PlanOptions = {},
 ): Plan {
   const B = geomBase(width, vh);
+  const geom = (p: number, pad: number): Geometry => {
+    const g = geomAt(B, p, pad);
+    return o.bandGap === undefined || o.bandGap <= g.bandGap ? g : { ...g, bandGap: o.bandGap };
+  };
   // the lanes, by index: each row keeps its first layer as its `pos`
   const count = laneCount(layers);
   const lanes = Array.from({ length: count }, (_, i) => i);
   const lists = lanes.map((lane) => laneNotes(notes, lane, layers));
   const busy = o.busy === undefined ? undefined : new Set([...o.busy].map((layer) => laneIndex(layer, layers)));
   const listOf = (lane: number): Placed[] => lists[lane] ?? [];
-  const isCollapsed = (lane: number): boolean => listOf(lane).length === 0 && shrinks(lane, count);
+  const shrinking = (lane: number): boolean => o.shrink !== false && shrinks(lane, count);
+  const isCollapsed = (lane: number): boolean => listOf(lane).length === 0 && shrinking(lane);
   const bandsAt = (G: Geometry, lane: number): number => Math.max(laneLayout(listOf(lane), G).bands, 1);
   const laneRows = (list: readonly Placed[], G: Geometry): number =>
     list.length > 0 ? Math.max(...list.map((note) => shape(note.v).h)) : G.R;
   const blockH = (G: Geometry, lane: number, full: boolean): number => {
     const b = bandsAt(G, lane);
-    const bh = !full && b === 1 && shrinks(lane, count) ? (laneRows(listOf(lane), G) - 1) * G.p + G.s : G.bh;
+    const bh = !full && b === 1 && shrinking(lane) ? (laneRows(listOf(lane), G) - 1) * G.p + G.s : G.bh;
     return b * bh + (b - 1) * G.bandGap;
   };
   const rulerH = o.ruler === false ? 0 : B.rulerH;
@@ -309,7 +321,7 @@ export function fieldPlan(
     );
   // the pitch shrinks (never below its floor) only to keep every lane on one band; past that, lanes wrap
   let p0 = B.p0;
-  const fits = (p: number): boolean => lanes.every((lane) => laneLayout(listOf(lane), geomAt(B, p, 0)).bands <= 1);
+  const fits = (p: number): boolean => lanes.every((lane) => laneLayout(listOf(lane), geom(p, 0)).bands <= 1);
   if (!fits(p0)) {
     for (let q = f2(p0 - 0.1); q >= B.pMin - 1e-9; q = f2(q - 0.1)) {
       if (fits(q)) {
@@ -318,14 +330,14 @@ export function fieldPlan(
       }
     }
   }
-  let G = geomAt(B, p0, B.pad0);
+  let G = geom(p0, B.pad0);
   let T = 0;
   if (o.target !== undefined) {
     const target = o.target;
     const base = lanes.map((lane) => bandsAt(G, lane));
     let p = p0;
     for (let q = B.pMax; q > p0; q--) {
-      const g = geomAt(B, q, B.padMin);
+      const g = geom(q, B.padMin);
       if (lanes.every((lane, i) => bandsAt(g, lane) <= (base[i] ?? 1)) && height(g, true) <= target) {
         p = q;
         break;
@@ -333,21 +345,21 @@ export function fieldPlan(
     }
     // tablet widths: when padding alone cannot take up the slack, larger squares may wrap onto extra
     // bands, decided for every lane open, so the squares keep their size whichever lanes are collapsed
-    if (B.mid && (target - height(geomAt(B, p, 0), true)) / (2 * lanes.length) > B.padMax) {
+    if (B.mid && (target - height(geom(p, 0), true)) / (2 * lanes.length) > B.padMax) {
       for (let q = B.pMax; q > p; q--) {
-        if (height(geomAt(B, q, B.pad0), true) <= target) {
+        if (height(geom(q, B.pad0), true) <= target) {
           p = q;
           break;
         }
       }
     }
-    G = geomAt(B, p, 0);
+    G = geom(p, 0);
     const open = lanes.filter((lane) => !isCollapsed(lane));
     // the main field has one height for its busiest state: never less than that at the least padding,
     // and the whole target when the screen has room; the open lanes take up the rest
-    T = o.fill === true ? Math.max(target, height(geomAt(B, p, B.padMin), busy ?? true)) : target;
+    T = o.fill === true ? Math.max(target, height(geom(p, B.padMin), busy ?? true)) : target;
     const padF = open.length > 0 ? (T - height(G, false)) / (2 * open.length) : B.pad0;
-    G = geomAt(B, p, f2(Math.max(B.padMin, o.fill === true ? padF : Math.min(B.padMax, padF))));
+    G = geom(p, f2(Math.max(B.padMin, o.fill === true ? padF : Math.min(B.padMax, padF))));
   }
   const rows: Row[] = [];
   let y = rulerH;
@@ -356,7 +368,7 @@ export function fieldPlan(
     const list = listOf(lane);
     const L = laneLayout(list, G);
     const bands = Math.max(L.bands, 1);
-    const nr = bands === 1 && shrinks(lane, count) ? laneRows(list, G) : G.R;
+    const nr = bands === 1 && shrinking(lane) ? laneRows(list, G) : G.R;
     const bh = bands * ((nr - 1) * G.p + G.s) + (bands - 1) * G.bandGap;
     const h = collapsed ? G.collapsed : bh + 2 * G.pad;
     rows.push({ pos: laneLayer(lane, layers), top: y, h, collapsed, by: y + (h - bh) / 2, blockH: bh, bands, nr, at: L.at, list });

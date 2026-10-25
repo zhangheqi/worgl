@@ -1,12 +1,13 @@
 # Headers for Cloudflare Pages. Every response: a policy that runs only the
 # purse's own scripts (and its wasm), loads only its own styles, fonts and
 # images, talks to its own origin and to mints over https, and requires
-# Trusted Types, so no string from a mint or a link can become markup.
+# Trusted Types, so no string from a mint or a link can become markup. It may
+# use the camera, for scanning a request or a hand-back on this origin only.
 /*
   Content-Security-Policy: default-src 'none'; script-src 'self' 'wasm-unsafe-eval'; style-src 'self'; img-src 'self'; font-src 'self'; connect-src 'self' https:; base-uri 'none'; form-action 'none'; frame-ancestors 'none'; require-trusted-types-for 'script'; trusted-types 'none'
   Cross-Origin-Opener-Policy: same-origin
   Cross-Origin-Resource-Policy: same-origin
-  Permissions-Policy: camera=(), microphone=(), geolocation=(), usb=()
+  Permissions-Policy: camera=(self), microphone=(), geolocation=(), usb=()
   Referrer-Policy: no-referrer
   Strict-Transport-Security: max-age=31536000
   X-Content-Type-Options: nosniff

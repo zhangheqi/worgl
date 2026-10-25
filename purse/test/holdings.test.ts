@@ -13,6 +13,7 @@ import {
   lanePositions,
   laneTotal,
   savedHoldings,
+  withChange,
 } from '../src/holdings.ts';
 
 const MINT = 'ab'.repeat(32);
@@ -187,6 +188,21 @@ describe('where a note came from', () => {
     // the log's entry wins over the hop
     assert.deepEqual(known.get('7:1'), { at: 3000, source: 'kept' });
     assert.equal(arrivalsOf(log, OTHER, new Map()).get('7:3')?.source, 'faucet');
+  });
+
+  test('for a send’s change, is when each answer brought it, though a settle answered the rest later', () => {
+    // sent at 1000; its first answer brought 9:1 at 1200; a settle at 5000 answered the rest, with 9:2
+    const sent = { t: 1000, kind: 'sent' as const, mint: MINT, serials: ['9:1'], t2: 1200 };
+    const settled = { ...sent, ...withChange(sent, ['9:2'], 5000) };
+    assert.deepEqual(settled.serials, ['9:1', '9:2']);
+    assert.equal(settled.t2, 5000);
+    const known = arrivalsOf([settled], MINT, new Map());
+    assert.deepEqual(known.get('9:1'), { at: 1200, source: 'change' });
+    assert.deepEqual(known.get('9:2'), { at: 5000, source: 'change' });
+    // a second settle keeps both earlier times, and a send whose first answers brought none keeps no times
+    const again = { ...settled, ...withChange(settled, ['9:3'], 7000) };
+    assert.deepEqual(again.changeAt, { '9:1': 1200, '9:2': 5000 });
+    assert.equal(withChange({ t: 1000, serials: [] }, ['9:4'], 5000).changeAt, undefined);
   });
 });
 

@@ -166,6 +166,40 @@ describe('the field', () => {
     }
   });
 
+  test('drawn as a slice keeps every lane open and four rows tall', () => {
+    const notes = fading();
+    const plan = fieldPlan(328, 800, 4, notes, { ruler: false, shrink: false });
+    assert.deepEqual(plan.rows.map((row) => row.collapsed), [false, false, false, false]);
+    assert.deepEqual(plan.rows.map((row) => row.nr), [4, 4, 4, 4]);
+    const heights = plan.rows.map((row) => row.h);
+    assert.ok(heights.every((each) => each === heights[0]), `lanes ${heights.join(', ')} px tall`);
+    // the same notes on Holdings: the empty lane collapses and the fading one opens only to its tallest note
+    const home = fieldPlan(328, 800, 4, notes, { ruler: false });
+    assert.equal(home.rows[1]?.collapsed, true);
+    assert.equal(home.rows[0]?.nr, 2);
+  });
+
+  test('drawn as a slice opens its bands for a tag between them, and places the notes the same', () => {
+    // the Ready lane of a two-lane slice at 360 px, wrapped onto two bands
+    const notes = [note(64, 0), note(8, 0), note(32, 0), note(1, 0), note(1, 0), note(4, 0), note(64, 0)];
+    const plain = fieldPlan(328, 780, 2, notes, { ruler: false, shrink: false });
+    const open = fieldPlan(328, 780, 2, notes, { ruler: false, shrink: false, bandGap: 28 });
+    assert.equal(plain.rows[0]?.bands, 2);
+    assert.ok(plain.G.bandGap < 28);
+    assert.equal(open.G.bandGap, 28);
+    assert.equal(open.H - plain.H, 28 - plain.G.bandGap);
+    const before = placeNotes(plain);
+    // the first band stays where it was; the second moves down by what the gap grew
+    for (const [id, box] of placeNotes(open)) {
+      const was = before.get(id);
+      const second: boolean = (was?.y ?? 0) > (plain.rows[0]?.by ?? 0) + 0.5;
+      assert.equal(box.x, was?.x, id);
+      assert.equal(Math.round((box.y - (was?.y ?? 0)) * 100) / 100, second ? 28 - plain.G.bandGap : 0, id);
+    }
+    // a gap smaller than the slice's own changes nothing
+    assert.deepEqual(fieldPlan(328, 780, 2, notes, { ruler: false, shrink: false, bandGap: 2 }).G, plain.G);
+  });
+
   test('has a lane for every layer of the mint', () => {
     const plan = fieldPlan(328, 800, 6, [note(8, 5), note(4, 2)], {});
     assert.equal(plan.rows.length, 6);

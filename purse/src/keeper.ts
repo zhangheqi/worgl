@@ -18,6 +18,7 @@ import { type Holdings, type LastFade, fadedAt, holdingsFrom, noteId } from './h
 import {
   type Moved,
   SETTLE_MAX_SECS,
+  answersOf,
   type Spent,
   broughtBy,
   budgetSecs,
@@ -26,13 +27,13 @@ import {
   hopOf,
   keptOf,
   leftSecs,
-  outputsOf,
   respace,
   spaced,
   spacedPlan,
   spacingFor,
   spentBy,
   spentKey,
+  waitsForSend,
 } from './keep.ts';
 import type { Read } from './purses.ts';
 import {
@@ -50,18 +51,27 @@ import {
 
 // ---------- the keeper: when a pass runs ----------
 
-/** What a pass is given: the signal that stops it, and where it reports each step of its transfers. */
+/** What a pass is given: the signals that stop it and hurry it, and where it reports each step of its transfers. */
 export interface Run {
   signal: AbortSignal;
-  /** Each progress step of every transfer the pass submits, so that the keeper knows when one is on its way. */
-  step: (step: SubmitProgress['step']) => void;
+  /**
+   * Aborts when a send asks the pass to end ({@link Keeper.stop}): the
+   * transfers in hand go at once, as the SDK's `sendNow` sends them, and
+   * nothing more starts, so no hop is left unsent.
+   */
+  hurry: AbortSignal;
+  /**
+   * Each progress step of every transfer the pass submits, with a refusal's
+   * outcome, so that the keeper knows when one is on its way.
+   */
+  step: (step: SubmitProgress['step'], outcome?: Refused['outcome']) => void;
 }
 
 /** How a pass ended, which decides when the next runs. */
 export interface PassEnd {
   /** The soonest next rotation of the mints it knows, by this device's clock. */
   nextMs: number | undefined;
-  /** Work is left over (a mint that did not answer, a transient refusal, a store problem): try again in a minute. */
+  /** Work is left over (a mint that did not answer, a transient refusal, a store problem, a mint left for Send): try again in a minute. */
   trouble: boolean;
   /** The store changed under a change, once: one more pass after a second. */
   soon: boolean;
@@ -125,6 +135,8 @@ export class Keeper {
   /** The page is going away: nothing runs until it is shown again. */
   #left = false;
   #controller: AbortController | undefined;
+  /** Aborted by {@link stop}: the pass running now sends what it has in hand at once and ends. */
+  #hurry: AbortController | undefined;
   /** The pass running now, until it is over: what {@link stop} waits for. */
   #pass: Promise<void> | undefined;
   /** A transfer is on its way: hiding then waits for its answer. */
@@ -159,7 +171,11 @@ export class Keeper {
     this.#pass = this.#run();
   }
 
-  /** The page is visible again: the run goes on, the screen stays awake again, and a pass settles what an abort left. */
+  /**
+   * The page is visible again: the run goes on, the screen stays awake
+   * again, and a pass settles what an abort left. A pass a send asked to end
+   * ends all the same.
+   */
   show(): void {
     this.#left = false;
     this.#stopSoon = false;
@@ -179,16 +195,20 @@ export class Keeper {
   }
 
   /**
-   * Stops the pass running now at its next safe step, as hiding does, and
-   * resolves once it is over and the lock `purse:transfers` is free: for a
-   * send, which takes that lock next. The pass's unsent hops stay outgoing,
-   * and the next pass settles them. Pokes made before the stop give no pass
-   * after it; later ones, and the timer it sets, run passes as before.
+   * Ends the pass running now for a send, which takes the lock
+   * `purse:transfers` next, and resolves once the pass is over and the lock
+   * is free. The pass sends the transfers it has in hand at once rather than
+   * spaced (one on its way is answered first), starts nothing more, and so
+   * leaves no hop unsent; once the mint does not answer one, it stops there,
+   * and the rest stay outgoing for the next pass. Hiding the page meanwhile
+   * stops it as hiding does, and showing it again does not undo this. Pokes
+   * made before the stop give no pass after it; later ones, and the timer it
+   * sets, run passes as before.
    */
   async stop(): Promise<void> {
     this.#again = false;
     const pass = this.#pass;
-    this.#halt();
+    this.#hurry?.abort();
     await pass;
   }
 
@@ -227,7 +247,9 @@ export class Keeper {
     this.#again = false;
     this.#deps.clearTimeout(this.#timer);
     const controller = new AbortController();
+    const hurry = new AbortController();
     this.#controller = controller;
+    this.#hurry = hurry;
     this.#inFlight = false;
     this.#stopSoon = false;
     this.#moving = false;
@@ -236,7 +258,11 @@ export class Keeper {
     let ran = true;
     try {
       ran = await this.#deps.lock(async () => {
-        end = await this.#deps.pass({ signal: controller.signal, step: (step) => this.#step(step, controller) });
+        end = await this.#deps.pass({
+          signal: controller.signal,
+          hurry: hurry.signal,
+          step: (step, outcome) => this.#step(step, outcome, controller, hurry.signal),
+        });
       });
     } catch {
       // as above
@@ -244,6 +270,7 @@ export class Keeper {
     await this.#asleep();
     this.#running = false;
     this.#controller = undefined;
+    this.#hurry = undefined;
     if (!ran) {
       this.#again = false;
       this.#deps.busy?.();
@@ -278,7 +305,7 @@ export class Keeper {
     }
   }
 
-  #step(step: SubmitProgress['step'], controller: AbortController): void {
+  #step(step: SubmitProgress['step'], outcome: Refused['outcome'] | undefined, controller: AbortController, hurry: AbortSignal): void {
     if (step === 'waiting' || step === 'sending') {
       void this.#awake();
     }
@@ -286,7 +313,8 @@ export class Keeper {
       this.#inFlight = true;
     } else if (step === 'answered' || step === 'refused') {
       this.#inFlight = false;
-      if (this.#stopSoon) {
+      // hidden meanwhile; or hurried for a send, and the mint did not answer: the rest would each wait out its retries
+      if (this.#stopSoon || (hurry.aborted && step === 'refused' && outcome === 'kept')) {
         controller.abort();
       }
     }
@@ -351,7 +379,8 @@ export interface KeptServer {
 
 /** The SDK purse, as far as a pass uses it. */
 export interface KeepPurse {
-  settle(spacing: Spacing, options: SubmitOptions): Promise<Submitted>;
+  /** Resends what is outgoing, but the transfers that spend notes of the mints `holdBack` names, which stay outgoing. */
+  settle(spacing: Spacing, options: SubmitOptions, holdBack: ReadonlySet<string>): Promise<Submitted>;
   planRefresh(mint: string): Promise<ScheduledTransfer[]>;
   submit(transfers: ScheduledTransfer[], options: SubmitOptions): Promise<Submitted>;
 }
@@ -369,8 +398,10 @@ export interface Trouble {
   paused?: boolean;
 }
 
-/** The shown mint's hops in this pass, for the back row: their value, how many are done, and whether they go a few seconds apart. */
+/** The shown mint's hops in this pass, for the back row: the mint, their value, how many are done, and whether they go a few seconds apart. */
 export interface Shown {
+  /** The mint Holdings showed when the pass began, whose hops these are. */
+  mint: string;
   amount: number;
   done: number;
   total: number;
@@ -405,6 +436,8 @@ export interface KeepingDeps {
   outgoing(server: string): Promise<{ outgoing: string[]; sendInputs: Set<string> }>;
   /** Runs `work` on the server's SDK purse as one change, so the purse is not opened again in the middle. */
   keepServer<R>(server: string, work: (purse: KeepPurse) => Promise<R>): Promise<R>;
+  /** Whether Send shows a plan of this mint's notes, not signed yet: the pass then leaves the mint alone (see `waitsForSend`). */
+  showsPlan?(mint: string): boolean;
   /** Adds an entry to the log and tells the other tabs; never rejects. */
   log(entry: KeptEntry): Promise<void>;
   /** The shown mint's run moved on, or ended (`undefined`). */
@@ -415,10 +448,15 @@ export interface KeepingDeps {
   troubled(): void;
   /** A mint's work in this pass is done: the tabs watching stop showing its run. */
   kept(mint: string): void;
-  /** Says words in the live region. */
-  announce(words: string): void;
-  /** The pass is over: read the shown mint again, and say what was kept of it (0 for nothing). */
-  finish(kept: number): Promise<void>;
+  /** Says words of `mint`'s run in the live region, while Holdings shows that mint. */
+  announce(words: string, mint: string): void;
+  /**
+   * The pass is over: read the shown mint again, then say what was kept of
+   * `mint`, the mint shown when it began (0 for nothing). It waits for that
+   * read when `wait`; not when a send hurried the pass, so the lock goes to
+   * the send at once and the words follow the read.
+   */
+  finish(kept: number, mint: string | undefined, wait: boolean): Promise<void>;
   /** Has each server's SDK purse read its store again. */
   reopen(): void;
   now(): number;
@@ -457,7 +495,7 @@ interface PassState {
   started: boolean;
   /** The value of the shown mint's tokens kept. */
   kept: number;
-  /** The mints the pass planned a refresh for. */
+  /** The mints the pass planned a refresh for, or left for Send: no second pass for them at once. */
   planned: Set<string>;
   /** The mints that got new trouble this pass. */
   troubled: Set<string>;
@@ -469,6 +507,9 @@ interface PassState {
 
 /** Whether `error` is the reason `signal` aborted with: a call the stop cut short. */
 const stopped = (signal: AbortSignal, error: unknown): boolean => signal.aborted && error === signal.reason;
+
+/** Whether the pass is to start nothing more: it is stopped, or a send hurries it. */
+const halted = (run: Run): boolean => run.signal.aborted || run.hurry.aborted;
 
 /** A mint's holdings from a read, for the words. */
 const holdingsOf = (read: Read): Holdings =>
@@ -485,9 +526,16 @@ export class Keeping {
   readonly #visit = new Set<string>();
   /** The last pass met a store that changed under it. */
   #changed = false;
+  /** The server the pass running now is at. */
+  #at: string | undefined;
 
   constructor(deps: KeepingDeps) {
     this.#deps = deps;
+  }
+
+  /** The server a pass is at now, if one runs: Send waits for it only when it is the request's. */
+  get at(): string | undefined {
+    return this.#at;
   }
 
   /**
@@ -515,6 +563,13 @@ export class Keeping {
     this.#visit.clear();
   }
 
+  /** Whether Send shows a plan of `mint`'s notes and its rotation is not near: a pass leaves it alone, and tries again in a minute. */
+  #waits(mint: string): boolean {
+    const known = this.#seen.get(mint);
+    const left = known === undefined ? undefined : leftSecs(known.read.info, known.read.skew, this.#deps.now());
+    return waitsForSend(this.#deps.showsPlan?.(mint) === true, left);
+  }
+
   /** Whether the purse can keep this mint's tokens alive now: it is not paused, and nothing stands in the way. */
   canKeep(mint: string, paused: boolean): boolean {
     return !paused && !this.trouble.has(mint);
@@ -526,7 +581,7 @@ export class Keeping {
       run,
       end: { nextMs: undefined, trouble: false, soon: false, again: false },
       shown: this.#deps.shown(),
-      progress: { amount: 0, done: 0, total: 0, spaced: true },
+      progress: { mint: this.#deps.shown() ?? '', amount: 0, done: 0, total: 0, spaced: true },
       counted: new Set(),
       brought: new Set(),
       answered: new Set(),
@@ -539,12 +594,14 @@ export class Keeping {
     };
     try {
       for (const server of this.#deps.servers()) {
-        if (run.signal.aborted) {
+        if (halted(run)) {
           break;
         }
+        this.#at = server.server;
         await this.#server(server, state);
       }
     } finally {
+      this.#at = undefined;
       if (state.progress.total > 0) {
         this.#deps.progress(undefined);
       }
@@ -559,8 +616,10 @@ export class Keeping {
     state.end.nextMs = nexts.length === 0 ? undefined : Math.min(...nexts);
     state.end.trouble ||= [...this.trouble.values()].some((trouble) => trouble.kind !== 'blocked');
     if (!run.signal.aborted) {
-      await this.#deps.finish(state.kept);
-      // the read after the work found fading notes this pass did not plan for (a rotation came meanwhile): one more pass
+      // hurried, the lock goes to the send at once: the words follow a read that the pass does not wait for
+      await this.#deps.finish(state.kept, state.shown, !run.hurry.aborted);
+      // the read after the work found fading notes this pass did not plan for (a rotation came meanwhile, or a send
+      // hurried it): one more pass
       state.end.again = [...this.#seen].some(
         ([mint, { read }]) => !state.planned.has(mint) && !this.trouble.has(mint) && due(this.#dueInput(mint, read)),
       );
@@ -570,9 +629,9 @@ export class Keeping {
 
   /** Steps 1 to 6 for one server. */
   async #server({ server, mints }: KeptServer, state: PassState): Promise<void> {
-    const { signal } = state.run;
+    const { run } = state;
     let reached = await this.#readAll(server, mints, state, false);
-    if (signal.aborted) {
+    if (halted(run)) {
       return;
     }
     let out: { outgoing: string[]; sendInputs: Set<string> };
@@ -586,34 +645,46 @@ export class Keeping {
     // what was outgoing before planning: settled here, never sent twice in one pass
     const before = new Set(out.outgoing.flatMap((request) => spentBy(request).map(spentKey)));
     let going = true;
+    // Send shows a plan of a mint here: what lands from its outgoing transfers could change it too, so those wait with
+    // it, until its rotation is near; the other mints' are settled as ever
+    const waiting = new Set(mints.flatMap(({ mint }) => (this.#waits(mint) ? [mint] : [])));
+    if (waiting.size > 0) {
+      state.end.trouble = true;
+    }
+    const settled = out.outgoing.filter((request) => !spentBy(request).some((spent) => waiting.has(spent.mint)));
     // 3. settle what is outgoing first: the mint keeps a receipt only about 128 s
     const live = mints.some(({ mint }) => this.#seen.get(mint)?.read.info.paused === false);
-    if (out.outgoing.length > 0 && live) {
+    if (settled.length > 0 && live && !halted(run)) {
       const lefts = mints.flatMap(({ mint }) => {
         const read = this.#seen.get(mint)?.read;
         const left = read === undefined ? undefined : leftSecs(read.info, read.skew, this.#deps.now());
         return left === undefined ? [] : [left];
       });
       const budget = budgetSecs(lefts.length === 0 ? undefined : Math.min(...lefts));
-      const spacing = spacingFor(out.outgoing.length, Math.min(budget, SETTLE_MAX_SECS));
-      this.#count(out.outgoing, out.sendInputs, state, spaced(spacing));
+      const spacing = spacingFor(settled.length, Math.min(budget, SETTLE_MAX_SECS));
+      this.#count(settled, out.sendInputs, state, spaced(spacing));
       going = await this.#keep(server, mints, undefined, out.sendInputs, answered, state, (purse, options) =>
-        purse.settle(spacing, options),
+        purse.settle(spacing, options, waiting),
       );
       // an answer the mint kept from before a rotation lands in what is now the first layer: read again, so it moves on too
-      if (going && !signal.aborted) {
+      if (going && !halted(run)) {
         reached = await this.#readAll(server, mints, state, true);
       }
     }
     // 4 and 5. plan each due mint's refresh, spread its hops over the visit, and send them
     for (const [mint, read] of reached) {
-      if (!going || signal.aborted) {
+      if (!going || halted(run)) {
         break;
       }
       if (!due(this.#dueInput(mint, read))) {
         continue;
       }
       state.planned.add(mint);
+      // asked again here: Send may have opened a plan of this mint since the pass reached the server
+      if (this.#waits(mint)) {
+        state.end.trouble = true;
+        continue;
+      }
       const budget = budgetSecs(leftSecs(read.info, read.skew, this.#deps.now()));
       going = await this.#keep(server, mints, mint, out.sendInputs, answered, state, async (purse, options) => {
         const plan = await purse.planRefresh(mint);
@@ -659,7 +730,7 @@ export class Keeping {
       });
       this.#deps.kept(mint);
     }
-    if (!going || signal.aborted) {
+    if (!going || halted(run)) {
       return;
     }
     // what moved sits a layer on now: read those mints again, so their words and their date to come back by are of now
@@ -689,7 +760,7 @@ export class Keeping {
   async #readAll(server: string, mints: readonly KeptMint[], state: PassState, force: boolean): Promise<Map<string, Read>> {
     const reached = new Map<string, Read>();
     for (const { mint, host } of mints) {
-      if (state.run.signal.aborted) {
+      if (halted(state.run)) {
         break;
       }
       const now = this.#deps.now();
@@ -816,7 +887,7 @@ export class Keeping {
     const mine: Answered[] = [];
     const refusals: Promise<void>[] = [];
     const onProgress = (progress: SubmitProgress): void => {
-      run.step(progress.step);
+      run.step(progress.step, progress.refusal?.outcome);
       const request = progress.transfer.request;
       const hop = hopOf(request, sendInputs);
       const shown = hop !== undefined && hop.mint === state.shown;
@@ -842,12 +913,12 @@ export class Keeping {
         refusals.push(this.#refused(hop, progress.refusal, mints, state));
       } else if ((progress.step === 'waiting' || progress.step === 'sending') && counted && !state.started) {
         state.started = true;
-        this.#deps.announce(keepingStart(state.progress.amount, state.progress.total, state.progress.spaced));
+        this.#deps.announce(keepingStart(state.progress.amount, state.progress.total, state.progress.spaced), state.progress.mint);
       }
     };
     let submitted: Submitted | undefined;
     try {
-      submitted = await this.#deps.keepServer(server, (purse) => work(purse, { onProgress, signal: run.signal }));
+      submitted = await this.#deps.keepServer(server, (purse) => work(purse, { onProgress, signal: run.signal, sendNow: run.hurry }));
     } catch (error) {
       await Promise.all(refusals);
       if (stopped(run.signal, error)) {
@@ -864,13 +935,7 @@ export class Keeping {
     }
     await Promise.all(refusals);
     if (submitted !== undefined) {
-      const notes: string[][] = [];
-      let at = 0;
-      for (const request of order) {
-        const n = outputsOf(request);
-        notes.push(submitted.notes.slice(at, at + n));
-        at += n;
-      }
+      const notes = answersOf(order, submitted.notes);
       for (const each of mine) {
         each.notes = notes[each.slot] ?? [];
         each.brought = broughtBy([each.hop], each.notes)[0];
@@ -907,7 +972,7 @@ export class Keeping {
         const amount = refusal.atStake === undefined ? hop.v : Number(refusal.atStake);
         await this.#deps.log({ t: now, kind: 'lost', mint, amount, serials: [] });
         if (mint === state.shown) {
-          this.#deps.announce(lostWords(amount, 1));
+          this.#deps.announce(lostWords(amount, 1), mint);
         }
       } else {
         // its layer went before the hop landed, or after an answer was lost: either way the tokens went with it

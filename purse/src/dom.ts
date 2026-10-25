@@ -20,6 +20,15 @@ export type Listeners = { [K in keyof HTMLElementEventMap]?: (event: HTMLElement
 
 const SVG = 'http://www.w3.org/2000/svg';
 
+/** The children that are drawn: nodes and text, numbers as text, and nothing for what is left out. */
+const drawn = (children: readonly Child[]): (Node | string)[] =>
+  children.filter((child): child is Node | string | number => child !== null && child !== undefined && child !== false).map((child) => (typeof child === 'number' ? String(child) : child));
+
+/** Puts `children` in place of what `el` holds: for the parts of a view redrawn in place. */
+export function put(el: Element, ...children: Child[]): void {
+  el.replaceChildren(...drawn(children));
+}
+
 function apply(el: Element & ElementCSSInlineStyle, props: Props | undefined, children: Child[]): void {
   for (const [name, value] of Object.entries(props ?? {})) {
     if (name === 'style') {
@@ -36,7 +45,7 @@ function apply(el: Element & ElementCSSInlineStyle, props: Props | undefined, ch
       el.setAttribute(name, String(value));
     }
   }
-  el.append(...children.filter((child): child is Node | string | number => child !== null && child !== undefined && child !== false).map((child) => (typeof child === 'number' ? String(child) : child)));
+  el.append(...drawn(children));
 }
 
 /** An HTML element. */

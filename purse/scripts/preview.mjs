@@ -5,16 +5,17 @@
 // Chromium: the first run, a take from the faucet, rotations and more
 // takes, until keep-alive moves the first fading note on. Then it writes
 // PNGs of each view at 360 x 780 and 1280 x 860, light and dark, and of a
-// note's tip open.
+// note's tip open. Receive and Send have a walk of their own,
+// scripts/preview-send.mjs, with its own --out.
 //
-// A second mint on the same server, rotating every 8 hours, with its own
-// faucet and a third build that has it as its playground, is for the
+// Two more mints on a server of their own, rotating every 8 hours, with a
+// faucet each and a build that has the first as its playground, are for the
 // keep-alive walk: a run with its transfers held, so each step can be
 // shot; a run whose page closes mid-transfer, and the open that settles
 // it; a run in another tab; a mint that does not answer its transfers, and
 // one that does not answer at all on open. Then a purse that holds both
-// mints, the first one's tokens going first while the second is shown, and
-// the first one not answering.
+// mints, the second one's tokens going first while the first is shown, and
+// the second one not answering.
 //
 //   node scripts/preview.mjs [--quick] [--out <dir>]
 //
@@ -24,218 +25,69 @@
 // own while the purse is on screen, as it would for a person, and the keep
 // walk waits for the purse to recover from the mint that did not answer.
 // Any page error, console error or policy violation fails the walk, as
-// does a 360 px shot that scrolls sideways. Needs the `playwright` package where
-// Node can require it (NODE_PATH) and a Chromium it can launch
-// (PREVIEW_CHROMIUM names one). Cargo builds worgl-server and worgl-faucet
-// into CARGO_TARGET_DIR (or target/), unless WORGL_SERVER_BINARY and
-// WORGL_FAUCET_BINARY name them. Its mint lives in target/purse-preview/
-// (PREVIEW_HOME), made afresh each run; PREVIEW_PERIOD sets the mint's
-// rotation in seconds (120, or 28800 with --quick).
+// does a 360 px shot that scrolls sideways. What it needs is in
+// scripts/preview-kit.mjs. Its mints live in holdings/ and keep/ under
+// target/purse-preview/ (PREVIEW_HOME), made afresh each run;
+// PREVIEW_PERIOD sets the first mint's rotation in seconds (120, or 28800
+// with --quick).
 
-import { execFileSync, spawn, spawnSync } from 'node:child_process';
-import { mkdirSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
-import { createServer, request } from 'node:http';
-import { createRequire } from 'node:module';
 import { join } from 'node:path';
-import { fileURLToPath } from 'node:url';
 
-const purse = fileURLToPath(new URL('..', import.meta.url));
-const repo = join(purse, '..');
-const args = process.argv.slice(2);
-const quick = args.includes('--quick');
-const outAt = args.indexOf('--out');
-const out = outAt >= 0 && args[outAt + 1] !== undefined ? args[outAt + 1] : join(repo, 'target/purse-preview/shots/');
+import { THEMES, chromiumOf, failingRequests, launch, newContext, options, repo, report, setup, shooter, step, stop } from './preview-kit.mjs';
+
+const { quick, out } = options(join(repo, 'target/purse-preview/shots/'));
 const home = process.env.PREVIEW_HOME ?? join(repo, 'target/purse-preview/');
 const PERIOD = Number(process.env.PREVIEW_PERIOD ?? (quick ? 28_800 : 120));
-const SIZES = { m360: { width: 360, height: 780 }, d1280: { width: 1280, height: 860 } };
-const THEMES = ['light', 'dark'];
+const chromium = chromiumOf();
 
-let chromium;
-try {
-  ({ chromium } = createRequire(import.meta.url)('playwright'));
-} catch {
-  console.error('preview: cannot require playwright; put it on NODE_PATH');
-  process.exit(1);
-}
+const { mint, builds } = await setup({ home: join(home, 'holdings'), period: PERIOD });
+const link = mint.link;
+const rotate = () => mint.rotate();
+const nextRotation = () => mint.nextRotation();
+const plain = builds.plain;
+const play = builds.playground;
 
-// ---------- the mint and its faucet ----------
-
-const binaries = (() => {
-  const server = process.env.WORGL_SERVER_BINARY;
-  const faucet = process.env.WORGL_FAUCET_BINARY;
-  if (server !== undefined && faucet !== undefined) {
-    return { server, faucet };
-  }
-  step('cargo build worgl-server worgl-faucet');
-  run('cargo', ['build', '--package', 'worgl-server', '--package', 'worgl-faucet', '--locked'], { cwd: repo });
-  const target = process.env.CARGO_TARGET_DIR ?? join(repo, 'target');
-  return { server: join(target, 'debug/worgl-server'), faucet: join(target, 'debug/worgl-faucet') };
-})();
-
-const children = [];
-const servers = [];
-const stop = () => {
-  for (const server of servers) {
-    server.close();
-  }
-  for (const child of children) {
-    child.kill('SIGTERM');
-  }
-};
-process.on('SIGINT', () => {
-  stop();
-  process.exit(130);
-});
-
-const ports = await Promise.all([1, 2, 3, 4, 5, 6, 7, 8].map(freePort));
-const [serverPort, faucetPort, proxyPort, plainPort, playPort, keepFaucetPort, keepProxyPort, keepPort] = ports;
-const origin = (port) => `http://127.0.0.1:${port}`;
-const mintServer = origin(proxyPort);
-const keepServer = origin(keepProxyPort);
-/** The keep walk's mint: a long period, so only rotations by hand move it while the walk runs. */
+/** The keep walk's mints: a long period, so only rotations by hand move them while the walk runs. */
 const KEEP_PERIOD = 28_800;
-
-step(`a mint rotating every ${PERIOD} s, and one every ${KEEP_PERIOD} s for keep-alive, in ${home}`);
-rmSync(home, { recursive: true, force: true });
-mkdirSync(home, { recursive: true });
-const state = join(home, 'state');
-execFileSync(binaries.server, ['init', '--state', state], { stdio: 'ignore' });
-// new notes land in the last layer, where they rest until the next rotation
-writeFileSync(join(home, 'policy.json'), JSON.stringify({ mint_layer: 3 }));
-
-/** Creates a mint on the state, before the server serves it: its issuer, admin token and mint authority key. */
-function createMint(period) {
-  const created = execFileSync(
-    binaries.server,
-    ['create-mint', '--state', state, '--layers', '4', '--layer-size', '1024', '--policy', join(home, 'policy.json'), '--rotate-every', String(period)],
-    { encoding: 'utf8' },
-  );
-  const field = (name) => new RegExp(`^${name}\\s+(\\S+)`, 'm').exec(created)?.[1];
-  return {
-    issuer: /^mint\s+([0-9a-f]{64})$/m.exec(created)?.[1],
-    token: readFileSync(field('admin token'), 'utf8').trim(),
-    key: field('mint key'),
-  };
-}
-
-const main = createMint(PERIOD);
-const kept = createMint(KEEP_PERIOD);
-const issuer = main.issuer;
-const link = `#mint=${issuer}&at=${encodeURIComponent(mintServer)}`;
-const keepLink = `#mint=${kept.issuer}&at=${encodeURIComponent(keepServer)}`;
-/** The first mint at the keep mint's address, so the keep build can add it as a second mint. */
-const otherLink = `#mint=${issuer}&at=${encodeURIComponent(keepServer)}`;
-
-/** A faucet for `mint`, answering pages from `origins`. */
-const faucet = (mint, port, origins) =>
-  spawn(
-    binaries.faucet,
-    [
-      '--mint', mint.issuer,
-      '--key', mint.key,
-      '--server', origin(serverPort),
-      '--listen', `127.0.0.1:${port}`,
-      '--allow-origin', origins.map(origin).join(','),
-    ],
-    { stdio: ['ignore', 'ignore', 'inherit'] },
-  );
-
-children.push(
-  spawn(binaries.server, ['serve', '--state', state, '--listen', `127.0.0.1:${serverPort}`], { stdio: ['ignore', 'ignore', 'inherit'] }),
-  // the keep build takes from it too, through the keep mint's address (faucetFor)
-  faucet(main, faucetPort, [plainPort, playPort, keepPort]),
-  faucet(kept, keepFaucetPort, [keepPort]),
-);
-
-/** The faucet each proxy sends /v1/faucet to, by the proxy's port: the walk points the keep mint's at the first mint's faucet for a take. */
-const faucetFor = new Map();
-/** One address for the mint's server and its faucet, as the playground's proxy serves them: the faucet at /v1/faucet. */
-const proxy = (port, faucetAt) => {
-  faucetFor.set(port, faucetAt);
-  return createServer((incoming, outgoing) => {
-    const { pathname } = new URL(incoming.url ?? '/', 'http://proxy');
-    const upstream = request(
-      { host: '127.0.0.1', port: pathname === '/v1/faucet' ? faucetFor.get(port) : serverPort, method: incoming.method, path: incoming.url, headers: incoming.headers },
-      (answer) => {
-        outgoing.writeHead(answer.statusCode ?? 502, answer.headers);
-        answer.pipe(outgoing);
-      },
-    );
-    upstream.on('error', () => {
-      outgoing.writeHead(502);
-      outgoing.end();
-    });
-    incoming.pipe(upstream);
-  }).listen(port, '127.0.0.1');
-};
-servers.push(proxy(proxyPort, faucetPort), proxy(keepProxyPort, keepFaucetPort));
-await up(`${mintServer}/v1/mints/${issuer}/info`);
-await up(`${keepServer}/v1/mints/${kept.issuer}/info`);
-await up(`${origin(faucetPort)}/v1/faucet`);
-await up(`${origin(keepFaucetPort)}/v1/faucet`);
-
-/** Rotates a mint now, as its schedule would. */
-async function rotateMint(mint) {
-  const answer = await fetch(`${origin(serverPort)}/v1/mints/${mint.issuer}/rotate`, {
-    method: 'POST',
-    headers: { authorization: `Bearer ${mint.token}` },
-  });
-  if (!answer.ok) {
-    throw new Error(`rotate: ${answer.status} ${await answer.text()}`);
-  }
-}
-const rotate = () => rotateMint(main);
-const rotateKeep = () => rotateMint(kept);
-
-// ---------- the purse, built and served twice ----------
-
-const vite = join(purse, 'node_modules/vite/bin/vite.js');
-const builds = [
-  { name: 'plain', port: plainPort, playground: '', mint: mintServer },
-  { name: 'playground', port: playPort, playground: link, mint: mintServer },
-  { name: 'keep', port: keepPort, playground: keepLink, mint: keepServer },
-];
-for (const build of builds) {
-  step(`vite build (${build.name})`);
-  const dir = join(home, `dist-${build.name}`);
-  run(process.execPath, [vite, 'build', '--outDir', dir, '--emptyOutDir', '--logLevel', 'warn'], {
-    cwd: purse,
-    env: { ...process.env, VITE_PLAYGROUND_LINK: build.playground },
-  });
-  children.push(
-    spawn(process.execPath, [vite, 'preview', '--outDir', dir, '--host', '127.0.0.1', '--port', String(build.port), '--strictPort'], {
-      cwd: purse,
-      env: { ...process.env, PURSE_DEV_MINT: build.mint },
-      stdio: 'ignore',
-    }),
-  );
-  await up(`${origin(build.port)}/`);
-}
+const keeps = await setup({ home: join(home, 'keep'), period: KEEP_PERIOD, mints: 2, serve: ['playground'] });
+const keepMint = keeps.mint;
+const keepLink = keepMint.link;
+const keepBuild = keeps.builds.playground;
+/** The keep server's second mint, so the keep build can add it as a second mint. */
+const other = keepMint.issuers[1];
+const otherLink = keepMint.mintLink(other);
+/** The keep server as the purse names it. */
+const keepHost = new URL(keepMint.server).host;
 
 // ---------- the walk ----------
 
-mkdirSync(out, { recursive: true });
-const shots = [];
+const kit = shooter(out);
+const { shots, size } = kit;
 const problems = [];
-/** While set, the browser's own line for a transfer the walk cut off on purpose is no problem. */
-let cutting = false;
-const browser = await chromium.launch(process.env.PREVIEW_CHROMIUM ? { executablePath: process.env.PREVIEW_CHROMIUM } : {});
+/** A shot of `page` as it is, which must not scroll sideways. */
+async function shoot(page, name, theme, view) {
+  await kit.shoot(page, name, theme, view);
+  await sideways(page, `${name}-${theme}-${view}.png`);
+}
+/** Shots at every size and theme. */
+const shootAll = (page, view) => kit.shootAll(page, view, (each, name, theme) => sideways(each, `${name}-${theme}-${view}.png`));
+const browser = await launch(chromium);
 try {
-  const context = await newContext();
-  const page = await newPage(context);
+  const context = await newContext(browser, problems, 'holdings');
+  const page = await context.newPage();
 
   step('the first run, as hosted: the paste row');
-  await page.goto(`${origin(plainPort)}/`);
+  await page.goto(`${plain}/`);
   await page.waitForSelector('.paste-row');
   await shootAll(page, 'first-paste');
 
   step('the first run on a mint link: its stamp');
-  await page.goto(`${origin(plainPort)}/${link}`);
+  await page.goto(`${plain}/${link}`);
   await page.waitForSelector('.mstamp');
   await shootAll(page, 'first-link');
 
   step('the first run with the mint as the build’s playground');
-  await page.goto(`${origin(playPort)}/`);
+  await page.goto(`${play}/`);
   await page.waitForSelector('[data-fk="first-start"]');
   await shootAll(page, 'first');
 
@@ -309,27 +161,11 @@ try {
   stop();
 }
 
-console.log(`\n${shots.length} screenshots in ${out}`);
-for (const shot of shots) {
-  console.log(`  ${shot}`);
-}
-if (problems.length > 0) {
-  console.error(`\n${problems.length} problems:`);
-  for (const problem of problems) {
-    console.error(`  ${problem}`);
-  }
-  process.exit(1);
-}
-process.exit(0);
+process.exit(report(out, shots, problems));
 
 // ---------- helpers ----------
 
-/** When the mint rotates next on its schedule: at whole multiples of its period. */
-function nextRotation() {
-  return Math.ceil(Date.now() / 1000 / PERIOD) * PERIOD * 1000;
-}
-
-/** Opens the mint link again and takes from the faucet once more, then waits for Holdings. */
+/** Opens a mint link again (the first mint's unless `at` names another) and takes from the faucet once more, then waits for Holdings. */
 async function takeAgain(page, at = link) {
   const before = await page.$$eval('.f-note', (notes) => notes.length);
   await page.evaluate((hash) => {
@@ -341,52 +177,12 @@ async function takeAgain(page, at = link) {
   await page.waitForTimeout(800);
 }
 
-async function size(page, name, theme) {
-  await page.setViewportSize(SIZES[name]);
-  await page.emulateMedia({ colorScheme: theme });
-  // the field redraws 120 ms after a resize; the fonts are in by then
-  await page.evaluate(() => document.fonts.ready);
-  await page.waitForTimeout(450);
-}
-
-async function shoot(page, name, theme, view) {
-  const file = `${name}-${theme}-${view}.png`;
-  // a phone page never scrolls sideways
+/** A phone page never scrolls sideways, nor a desktop one. */
+async function sideways(page, file) {
   const wide = await page.evaluate(() => document.documentElement.scrollWidth - window.innerWidth);
   if (wide > 0) {
     problems.push(`${file}: the page is ${wide} px wider than the screen`);
   }
-  await page.screenshot({ path: join(out, file), fullPage: true });
-  shots.push(file);
-}
-
-/** A context as the walks use it: a phone in light, touch, and the policy's refusals reported as errors. */
-async function newContext() {
-  const context = await browser.newContext({ viewport: SIZES.m360, deviceScaleFactor: 2, hasTouch: true, colorScheme: 'light' });
-  // what the hosted policy refuses shows up here, as does any error
-  await context.addInitScript(() => {
-    document.addEventListener('securitypolicyviolation', (event) => {
-      console.error(`policy: ${event.violatedDirective} refused ${event.blockedURI}`);
-    });
-  });
-  return context;
-}
-
-/** A page whose errors are the walk's problems. */
-async function newPage(context) {
-  const page = await context.newPage();
-  page.on('pageerror', (error) => problems.push(`page error: ${error.message}`));
-  page.on('console', (message) => {
-    if (message.type() !== 'error') {
-      return;
-    }
-    // a transfer the walk cut off on purpose: the browser says it failed to load, as it should
-    if (cutting && /^Failed to load resource: net::ERR_CONNECTION_(RESET|REFUSED)/.test(message.text())) {
-      return;
-    }
-    problems.push(`console: ${message.text()}`);
-  });
-  return page;
 }
 
 /** Waits until `ready()` holds, or fails after `ms`. */
@@ -459,7 +255,7 @@ function totalOf(page) {
 
 /** Opens the keep build's Holdings, a fresh open. */
 async function openKeep(page) {
-  await page.goto(`${origin(keepPort)}/#home`);
+  await page.goto(`${keepBuild}/#home`);
   await page.waitForSelector('.f-note');
 }
 
@@ -471,16 +267,17 @@ async function openKeep(page) {
  * about:blank, so each part starts as a fresh open.
  */
 async function keepWalk() {
-  const next = Math.ceil(Date.now() / 1000 / KEEP_PERIOD) * KEEP_PERIOD * 1000;
+  const rotateKeep = () => keepMint.rotate();
+  const next = keepMint.nextRotation();
   if (next - Date.now() < 10 * 60_000) {
-    step(`waiting ${Math.ceil((next - Date.now()) / 1000)} s for the keep mint's own rotation to pass`);
+    step(`waiting ${Math.ceil((next - Date.now()) / 1000)} s for the keep mints' own rotation to pass`);
     await new Promise((resolve) => setTimeout(resolve, next - Date.now() + 5000));
   }
-  const context = await newContext();
-  let page = await newPage(context);
+  const context = await newContext(browser, problems, 'keep');
+  let page = await context.newPage();
 
   step('keep-alive: two notes of 64 taken, two rotations by hand, a third taken, one more rotation');
-  await page.goto(`${origin(keepPort)}/`);
+  await page.goto(`${keepBuild}/`);
   await page.waitForSelector('[data-fk="first-start"]');
   await page.click('[data-fk="first-start"]');
   await page.waitForSelector('.f-note');
@@ -553,24 +350,24 @@ async function keepWalk() {
   step('a page closed mid-transfer: the mint applies it and its answer is lost');
   await page.goto('about:blank');
   await rotateKeep();
-  let cut = false;
-  cutting = true;
-  await page.route('**/v1/transfer', async (route) => {
-    if (cut) {
-      await route.abort('connectionreset').catch(() => undefined);
-      return;
-    }
-    cut = true;
-    await route.fetch();
-    await route.abort('connectionreset');
+  await failingRequests(async () => {
+    let cut = false;
+    await page.route('**/v1/transfer', async (route) => {
+      if (cut) {
+        await route.abort('connectionreset').catch(() => undefined);
+        return;
+      }
+      cut = true;
+      await route.fetch();
+      await route.abort('connectionreset');
+    });
+    await page.goto(`${keepBuild}/#home`);
+    await until(() => cut, 30_000, 'the first transfer');
+    await page.close();
   });
-  await page.goto(`${origin(keepPort)}/#home`);
-  await until(() => cut, 30_000, 'the first transfer');
-  await page.close();
-  cutting = false;
 
   step('the next open settles both: one resent for its answer, one never sent');
-  page = await newPage(context);
+  page = await context.newPage();
   held = await holdTransfers(page);
   await openKeep(page);
   await page.waitForSelector('.back-row .ka-steps');
@@ -595,78 +392,77 @@ async function keepWalk() {
   await openKeep(page);
   await page.waitForSelector('.back-row .ka-steps');
   await held.arrived(1);
-  const other = await newPage(context);
-  await openKeep(other);
-  await other.waitForFunction(() => document.querySelector('.back-row')?.textContent?.includes('In another tab') === true, undefined, {
+  const second = await context.newPage();
+  await openKeep(second);
+  await second.waitForFunction(() => document.querySelector('.back-row')?.textContent?.includes('In another tab') === true, undefined, {
     timeout: 15_000,
   });
-  await shoot(other, 'm360', 'light', 'othertab');
-  await size(other, 'd1280', 'light');
-  await other.waitForSelector('.col-back .ka-steps');
-  await shoot(other, 'd1280', 'light', 'othertab');
+  await shoot(second, 'm360', 'light', 'othertab');
+  await size(second, 'd1280', 'light');
+  await second.waitForSelector('.col-back .ka-steps');
+  await shoot(second, 'd1280', 'light', 'othertab');
   held.releaseAll();
   await until(async () => (await live(page)).startsWith('Kept'), 40_000, 'the run in the first tab');
   await held.stop();
-  await other.close();
+  await second.close();
 
   step('a mint that does not answer: every transfer refused on the way');
   await page.goto('about:blank');
   await rotateKeep();
-  cutting = true;
-  await page.route('**/v1/transfer', (route) => route.abort('connectionrefused'));
-  await openKeep(page);
-  await page.waitForSelector('.home-err', { timeout: 60_000 });
-  await page.waitForSelector('.ka-steps', { state: 'detached', timeout: 90_000 });
-  const words = await page.$eval('.home-err', (p) => p.textContent ?? '');
-  if (!words.startsWith(`The mint at 127.0.0.1:${keepProxyPort} did not answer, so `) || !words.endsWith('The purse asks again each minute while it is on screen.')) {
-    problems.push(`unreachable: the error says ${JSON.stringify(words)}`);
-  }
-  const row = await page.$eval('.back-row', (el) => el.textContent ?? '');
-  if (!row.startsWith('First tokens fade at ')) {
-    problems.push(`unreachable: the row says ${JSON.stringify(row)}`);
-  }
-  for (const [name, theme] of [['m360', 'light'], ['m360', 'dark'], ['d1280', 'light']]) {
-    await size(page, name, theme);
-    await shoot(page, name, theme, 'unreachable');
-  }
-  await size(page, 'm360', 'light');
+  await failingRequests(async () => {
+    await page.route('**/v1/transfer', (route) => route.abort('connectionrefused'));
+    await openKeep(page);
+    await page.waitForSelector('.home-err', { timeout: 60_000 });
+    await page.waitForSelector('.ka-steps', { state: 'detached', timeout: 90_000 });
+    const words = await page.$eval('.home-err', (p) => p.textContent ?? '');
+    if (!words.startsWith(`The mint at ${keepHost} did not answer, so `) || !words.endsWith('The purse asks again each minute while it is on screen.')) {
+      problems.push(`unreachable: the error says ${JSON.stringify(words)}`);
+    }
+    const row = await page.$eval('.back-row', (el) => el.textContent ?? '');
+    if (!row.startsWith('First tokens fade at ')) {
+      problems.push(`unreachable: the row says ${JSON.stringify(row)}`);
+    }
+    for (const [name, theme] of [['m360', 'light'], ['m360', 'dark'], ['d1280', 'light']]) {
+      await size(page, name, theme);
+      await shoot(page, name, theme, 'unreachable');
+    }
+    await size(page, 'm360', 'light');
+    await page.unroute('**/v1/transfer');
+  });
   if (!quick) {
     step('the mint answers again: the purse tries again within a minute');
-    await page.unroute('**/v1/transfer');
-    cutting = false;
     await until(async () => (await live(page)).startsWith('Kept'), 75_000, 'the retry');
     await page.waitForSelector('.home-err', { state: 'detached', timeout: 10_000 });
     // the last hop's slide and thread run out (0.9 s and 2 s); its pink stays for 6 s
     await page.waitForTimeout(2500);
     await shoot(page, 'm360', 'light', 'recovered');
   }
-  await page.unroute('**/v1/transfer');
 
   step('the mint does not answer on open: the lanes and the date from what the purse saved');
   await page.goto('about:blank');
-  cutting = true;
-  await page.route(`**/v1/mints/${kept.issuer}/**`, refuse);
-  await page.goto(`${origin(keepPort)}/#home`);
-  await page.waitForSelector('.home-err', { timeout: 60_000 });
-  // the keeper's pass has failed too: its words, from what the purse saved, stand in for the read's
-  await page.waitForTimeout(1500);
-  const down = await page.$eval('.home-err', (p) => p.textContent ?? '');
-  if (!down.startsWith(`The mint at 127.0.0.1:${keepProxyPort} did not answer. As the purse last saw them, `)) {
-    problems.push(`down: the error says ${JSON.stringify(down)}`);
-  }
-  // the row says the same time, from the same saved fade
-  const downRow = await page.$eval('.back-row', (el) => el.textContent ?? '');
-  const downAt = /fade at (.+?) unless/.exec(down)?.[1];
-  if (downAt === undefined || downRow !== `First tokens fade at ${downAt}`) {
-    problems.push(`down: the row says ${JSON.stringify(downRow)}`);
-  }
-  for (const [name, theme] of [['m360', 'light'], ['m360', 'dark'], ['d1280', 'light']]) {
-    await size(page, name, theme);
-    await shoot(page, name, theme, 'down');
-  }
-  await size(page, 'm360', 'light');
-  await page.unroute(`**/v1/mints/${kept.issuer}/**`, refuse);
-  cutting = false;
+  await failingRequests(async () => {
+    await page.route(`**/v1/mints/${keepMint.issuer}/**`, refuse);
+    await page.goto(`${keepBuild}/#home`);
+    await page.waitForSelector('.home-err', { timeout: 60_000 });
+    // the keeper's pass has failed too: its words, from what the purse saved, stand in for the read's
+    await page.waitForTimeout(1500);
+    const down = await page.$eval('.home-err', (p) => p.textContent ?? '');
+    if (!down.startsWith(`The mint at ${keepHost} did not answer. As the purse last saw them, `)) {
+      problems.push(`down: the error says ${JSON.stringify(down)}`);
+    }
+    // the row says the same time, from the same saved fade
+    const downRow = await page.$eval('.back-row', (el) => el.textContent ?? '');
+    const downAt = /fade at (.+?) unless/.exec(down)?.[1];
+    if (downAt === undefined || downRow !== `First tokens fade at ${downAt}`) {
+      problems.push(`down: the row says ${JSON.stringify(downRow)}`);
+    }
+    for (const [name, theme] of [['m360', 'light'], ['m360', 'dark'], ['d1280', 'light']]) {
+      await size(page, name, theme);
+      await shoot(page, name, theme, 'down');
+    }
+    await size(page, 'm360', 'light');
+    await page.unroute(`**/v1/mints/${keepMint.issuer}/**`, refuse);
+  });
   await context.close();
 
   await elsewhereWalk();
@@ -678,47 +474,49 @@ function refuse(route) {
 }
 
 /**
- * A purse that holds two mints, the keep mint shown: the first mint's
+ * A purse that holds two mints, the keep mint shown: the second mint's
  * tokens go first, so the date to come back by is theirs and names them;
- * then, on a fresh open, the first mint does not answer, and the date and
+ * then, on a fresh open, the second mint does not answer, and the date and
  * the words come from what the purse saved of it.
  */
 async function elsewhereWalk() {
-  // what this walk does to the first mint must fall in one rotation of its schedule
-  const next = nextRotation();
-  if (next - Date.now() < (quick ? 10 * 60_000 : 100_000)) {
-    step(`waiting ${Math.ceil((next - Date.now()) / 1000)} s for the first mint's own rotation to pass`);
+  // what this walk does to the second mint must fall in one rotation of its schedule
+  const next = keepMint.nextRotation();
+  if (next - Date.now() < 10 * 60_000) {
+    step(`waiting ${Math.ceil((next - Date.now()) / 1000)} s for the second mint's own rotation to pass`);
     await new Promise((resolve) => setTimeout(resolve, next - Date.now() + 2000));
   }
-  const context = await newContext();
-  const page = await newPage(context);
+  const context = await newContext(browser, problems, 'elsewhere');
+  const page = await context.newPage();
 
-  step('two mints: the keep mint taken from first, then the first mint at the same address');
-  await page.goto(`${origin(keepPort)}/`);
+  step('two mints: the keep mint taken from, then the second mint at the same address, then the keep mint again');
+  await page.goto(`${keepBuild}/`);
   await page.waitForSelector('[data-fk="first-start"]');
   await page.click('[data-fk="first-start"]');
   await page.waitForSelector('.f-note');
-  faucetFor.set(keepProxyPort, faucetPort);
+  keepMint.proxy.faucet(other);
   try {
     await page.evaluate((hash) => {
       location.hash = hash;
     }, otherLink);
     await page.waitForSelector('[data-fk="first-take"]');
     await page.click('[data-fk="first-take"]');
-    // the take is kept before Holdings opens, on the keep mint, the first added
+    // Holdings opens on the mint just taken from, with its one note
     await page.waitForSelector('.v-home .f-note');
     await page.waitForTimeout(1500);
   } finally {
-    faucetFor.set(keepProxyPort, keepFaucetPort);
+    keepMint.proxy.faucet();
   }
+  // Holdings shows the mint used last: the keep mint, taken from again
+  await takeAgain(page, keepLink);
 
-  step('the first mint rotated twice by hand: its tokens go before the keep mint’s');
+  step('the second mint rotated twice by hand: its tokens go before the keep mint’s');
   await page.goto('about:blank');
-  await rotate();
-  await rotate();
+  await keepMint.rotate(other);
+  await keepMint.rotate(other);
   await openKeep(page);
   const elsewhereRow = () => page.$eval('.back-row', (el) => el.textContent ?? '');
-  await until(async () => (await elsewhereRow()).includes(`For your tokens at 127.0.0.1:${keepProxyPort}`), 20_000, 'the row naming the other mint');
+  await until(async () => (await elsewhereRow()).includes(`For your tokens at ${keepHost}`), 20_000, 'the row naming the other mint');
   // the keeper's pass reads the other mint, and the view draws its date from that read
   await page.waitForTimeout(3000);
   if (!(await elsewhereRow()).startsWith('Open again before ')) {
@@ -733,34 +531,25 @@ async function elsewhereWalk() {
 
   step('the other mint does not answer on a fresh open: its date and words from what the purse saved');
   await page.goto('about:blank');
-  cutting = true;
-  await page.route(`**/v1/mints/${issuer}/**`, refuse);
-  await openKeep(page);
-  await page.waitForSelector('.home-err', { timeout: 60_000 });
-  const words = await page.$eval('.home-err', (p) => p.textContent ?? '');
-  if (!words.startsWith(`The mint at 127.0.0.1:${keepProxyPort} did not answer. As the purse last saw them, 64 tokens fade at `)) {
-    problems.push(`elsewhere-down: the error says ${JSON.stringify(words)}`);
-  }
-  const row = await elsewhereRow();
-  if (!row.startsWith('First tokens fade at ') || !row.includes(`For your tokens at 127.0.0.1:${keepProxyPort}`)) {
-    problems.push(`elsewhere-down: the row says ${JSON.stringify(row)}`);
-  }
-  for (const [name, theme] of [['m360', 'light'], ['d1280', 'light']]) {
-    await size(page, name, theme);
-    await shoot(page, name, theme, 'elsewhere-down');
-  }
-  await page.unroute(`**/v1/mints/${issuer}/**`, refuse);
-  cutting = false;
-  await context.close();
-}
-
-async function shootAll(page, view) {
-  for (const name of Object.keys(SIZES)) {
-    for (const theme of THEMES) {
-      await size(page, name, theme);
-      await shoot(page, name, theme, view);
+  await failingRequests(async () => {
+    await page.route(`**/v1/mints/${other}/**`, refuse);
+    await openKeep(page);
+    await page.waitForSelector('.home-err', { timeout: 60_000 });
+    const words = await page.$eval('.home-err', (p) => p.textContent ?? '');
+    if (!words.startsWith(`The mint at ${keepHost} did not answer. As the purse last saw them, 64 tokens fade at `)) {
+      problems.push(`elsewhere-down: the error says ${JSON.stringify(words)}`);
     }
-  }
+    const row = await elsewhereRow();
+    if (!row.startsWith('First tokens fade at ') || !row.includes(`For your tokens at ${keepHost}`)) {
+      problems.push(`elsewhere-down: the row says ${JSON.stringify(row)}`);
+    }
+    for (const [name, theme] of [['m360', 'light'], ['d1280', 'light']]) {
+      await size(page, name, theme);
+      await shoot(page, name, theme, 'elsewhere-down');
+    }
+    await page.unroute(`**/v1/mints/${other}/**`, refuse);
+  });
+  await context.close();
 }
 
 /** The middle of a note's squares in `lane`, in the page. */
@@ -785,42 +574,4 @@ async function hoverNote(page, lane) {
   await page.mouse.move(x, y);
   await page.waitForSelector('.f-tip.hover');
   await page.waitForTimeout(300);
-}
-
-function freePort() {
-  return new Promise((resolve, reject) => {
-    const probe = createServer();
-    probe.on('error', reject);
-    probe.listen(0, '127.0.0.1', () => {
-      const { port } = probe.address();
-      probe.close(() => resolve(port));
-    });
-  });
-}
-
-/** Waits until `url` answers 200. */
-async function up(url) {
-  for (let i = 0; i < 200; i++) {
-    try {
-      if ((await fetch(url)).ok) {
-        return;
-      }
-    } catch {
-      // not yet
-    }
-    await new Promise((resolve) => setTimeout(resolve, 100));
-  }
-  throw new Error(`${url} did not come up`);
-}
-
-function run(command, argv, options) {
-  const result = spawnSync(command, argv, { stdio: 'inherit', ...options });
-  if (result.status !== 0) {
-    stop();
-    throw new Error(`${command} ${argv.join(' ')} exited with ${result.status}`);
-  }
-}
-
-function step(words) {
-  console.log(`preview: ${words}`);
 }

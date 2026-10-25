@@ -43,7 +43,7 @@ export const LANE_NAME: Record<LaneKey, string> = { fade: 'Fading', ready: 'Read
 const STATE: Record<LaneKey, string> = { fade: 'fading', ready: 'ready', rest: 'resting' };
 
 /** When the `k`th rotation from now comes, in words; a mint with no schedule has no time to name. */
-function rotationWords(holdings: Holdings, k: number, now: number): string {
+export function rotationWords(holdings: Holdings, k: number, now: number): string {
   const t = rotation(holdings, k);
   if (t !== undefined) {
     return when(t, now);
@@ -59,26 +59,43 @@ function fadesAt(holdings: Holdings, note: Note, now: number): string {
 /** The lowest layer any note sits in. */
 const lowest = (notes: readonly Note[]): number => Math.min(...notes.map((note) => note.pos));
 
+/** Tokens just taken in from a hand-back, and the lane they landed in, while Holdings says so. */
+export interface Received {
+  amount: number;
+  lane: LaneKey;
+}
+
+/** The end of a lane's clause while it holds tokens just taken in. */
+export const justTook = (amount: number): string => `, including the ${amount} you just took`;
+
 /**
  * The sentence under the total: `69 are ready; 123 rest until 16:00.
- * Nothing fades before Thu 08:00.`
+ * Nothing fades before Thu 08:00.` While tokens just taken in show, the
+ * clause of the lane they landed in ends `, including the 5 you just took`.
  */
-export function sentence(holdings: Holdings, now: number, keepsAlive = KEEPS_ALIVE): Segment[] {
+export function sentence(
+  holdings: Holdings,
+  now: number,
+  keepsAlive = KEEPS_ALIVE,
+  received?: Received,
+): Segment[] {
   if (holdings.notes.length === 0) {
-    return ['This purse is empty.'];
+    // a send's change counts in the total from the moment it is signed, before the mint has made its notes
+    return holdings.total > 0 ? [`Nothing is held this moment: ${holdings.total} is on its way back from the mint.`] : ['This purse is empty.'];
   }
   const ready = laneTotal(holdings, 'ready');
   const resting = laneTotal(holdings, 'rest');
   const fading = laneTotal(holdings, 'fade');
   const next = rotationWords(holdings, 0, now);
   const out: Segment[] = [];
+  const took = (lane: LaneKey): string => (received !== undefined && received.lane === lane ? justTook(received.amount) : '');
   if (ready > 0) {
-    out.push({ n: ready, lane: 'ready' }, ready === 1 ? ' is ready' : ' are ready');
+    out.push({ n: ready, lane: 'ready' }, `${ready === 1 ? ' is ready' : ' are ready'}${took('ready')}`);
   } else {
     out.push('Nothing is ready');
   }
   if (resting > 0) {
-    out.push('; ', { n: resting, lane: 'rest' }, `${resting === 1 ? ' rests' : ' rest'} until ${next}`);
+    out.push('; ', { n: resting, lane: 'rest' }, `${resting === 1 ? ' rests' : ' rest'} until ${next}${took('rest')}`);
   }
   if (fading > 0) {
     const at = resting > 0 ? 'then' : `at ${next}`;
@@ -310,10 +327,17 @@ export function noteTip(
 ): Tip {
   const lane = laneOf(note.pos, holdings.layers);
   const lines: string[] = [];
-  if (note.source === 'faucet' && note.arrivedAt !== undefined) {
-    lines.push(`From the ${mintName} faucet at ${when(note.arrivedAt, now)}.`);
-  } else if (note.source === 'kept' && note.arrivedAt !== undefined) {
-    lines.push(`Kept alive at ${when(note.arrivedAt, now)}.`);
+  if (note.arrivedAt !== undefined) {
+    const at = when(note.arrivedAt, now);
+    if (note.source === 'faucet') {
+      lines.push(`From the ${mintName} faucet at ${at}.`);
+    } else if (note.source === 'kept') {
+      lines.push(`Kept alive at ${at}.`);
+    } else if (note.source === 'received') {
+      lines.push(`Received at ${at}.`);
+    } else if (note.source === 'change') {
+      lines.push(`Change from your send at ${at}.`);
+    }
   }
   if (note.moving) {
     // on its way: the tip says it fades only when the purse cannot move it now (the mint did not answer, or is paused)

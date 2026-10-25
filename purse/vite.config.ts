@@ -21,16 +21,23 @@ const FIRST_FONTS = [
 ];
 
 /**
- * The Content-Security-Policy that public/_headers gives the hosted purse,
- * with the dev mint added to connect-src, so that a preview runs under it.
+ * The headers that public/_headers gives the hosted purse, so that a preview
+ * runs under them: its Content-Security-Policy, with the dev mint added to
+ * connect-src, and its Permissions-Policy, so that a wrong `camera=` shows.
  */
-function previewPolicy(): string {
+function previewHeaders(): Record<string, string> {
   const headers = readFileSync(new URL('public/_headers', import.meta.url), 'utf8');
-  const policy = /^\s+Content-Security-Policy:\s*(.+)$/m.exec(headers)?.[1];
-  if (policy === undefined) {
-    throw new Error('public/_headers sets no Content-Security-Policy');
-  }
-  return policy.replace(/connect-src ([^;]*)/, `connect-src $1 ${DEV_MINT}`);
+  const header = (name: string): string => {
+    const value = new RegExp(`^\\s+${name}:\\s*(.+)$`, 'm').exec(headers)?.[1];
+    if (value === undefined) {
+      throw new Error(`public/_headers sets no ${name}`);
+    }
+    return value;
+  };
+  return {
+    'Content-Security-Policy': header('Content-Security-Policy').replace(/connect-src ([^;]*)/, `connect-src $1 ${DEV_MINT}`),
+    'Permissions-Policy': header('Permissions-Policy'),
+  };
 }
 
 /** Adds a `<link rel="preload">` for each of {@link FIRST_FONTS}, by the name the build gave it. */
@@ -70,6 +77,6 @@ export default defineConfig({
     fs: { allow: [searchForWorkspaceRoot(process.cwd()), sdk] },
   },
   preview: {
-    headers: { 'Content-Security-Policy': previewPolicy() },
+    headers: previewHeaders(),
   },
 });

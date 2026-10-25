@@ -430,7 +430,7 @@ function draw(host: HTMLElement, input: FieldInput, target: number | undefined):
 }
 
 /** Notes in the order they came, earliest first; those the log does not know first, by serial. */
-function order(notes: readonly Note[]): Placed[] {
+export function order(notes: readonly Note[]): Placed[] {
   const serial = (id: string): [number, number] => {
     const [generation, index] = id.split(':').map(Number);
     return [generation ?? 0, index ?? 0];
@@ -607,7 +607,7 @@ function tipBox(tip: Tip, close: () => void): HTMLElement {
 }
 
 /** A fading note comes apart into loose bits in the darkest ink; the right-hand bits first. */
-function dissolve(box: Box, plan: Plan): SVGElement[] {
+export function dissolve(box: Box, plan: Plan): SVGElement[] {
   const { G } = plan;
   const v = box.note.v;
   const { w, h: rowsOf } = shape(v);

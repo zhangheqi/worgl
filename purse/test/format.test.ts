@@ -7,8 +7,10 @@ import {
   f2,
   hm,
   listWords,
+  notesShort,
   notesWords,
   periodWords,
+  plusJoin,
   shortDay,
   toks,
   when,
@@ -78,6 +80,25 @@ describe('numbers and words', () => {
     assert.equal(notesWords([4, 1]), 'notes of 4 and 1');
     assert.equal(notesWords([64, 64, 64, 8]), 'three notes of 64 and one of 8');
     assert.equal(notesWords([64, 64]), 'two notes of 64');
+    // a request lists its notes in any order; the words name the largest first
+    assert.equal(notesWords([1, 64, 4]), 'notes of 64, 4 and 1');
+    assert.equal(notesWords([8, 64, 64]), 'two notes of 64 and one of 8');
+  });
+
+  test('name a request’s notes short: the values alone when each differs, else grouped', () => {
+    assert.equal(notesShort([16, 4]), '16 and 4');
+    // in any order, the largest first
+    assert.equal(notesShort([1, 64, 4]), '64, 4 and 1');
+    assert.equal(notesShort([64, 64]), 'two notes of 64');
+    assert.equal(notesShort([64, 64, 32, 64, 16, 8, 4, 2, 1]), 'three notes of 64, one of 32, one of 16, one of 8, one of 4, one of 2 and one of 1');
+    assert.equal(notesShort([5]), 'one note of 5');
+  });
+
+  test('join a slice’s notes with plus signs, in the order given', () => {
+    assert.equal(plusJoin([16, 4]), '16 + 4');
+    assert.equal(plusJoin([4, 64, 1]), '4 + 64 + 1');
+    assert.equal(plusJoin([8]), '8');
+    assert.equal(plusJoin([]), '');
   });
 
   test('write a change with a plus or a minus sign', () => {
