@@ -37,6 +37,21 @@ export interface MintRecord {
   info: SavedInfo | undefined;
   /** When the person last used it: added, took from its faucet, asked, sent or took in. Holdings shows the latest. */
   used?: number;
+  /** What the last backup holds of it: the newest this purse saved, or restored from when that is newer. */
+  backup?: LastBackup;
+}
+
+/**
+ * What a backup holds of a mint: the notes it held then. A note that moves
+ * after that (a send, a hand-back, keep-alive) is spent, and the notes it
+ * becomes are paid to keys the backup never saw, so it covers only the
+ * notes held now that it names.
+ */
+export interface LastBackup {
+  /** When it was saved: for a file restored, when the file says it last changed. */
+  t: number;
+  /** The serials of its notes of this mint, `generation:index`. */
+  ids: string[];
 }
 
 /** A request this purse made: the SDK keeps its keys; this keeps what Receive shows and lists. */
@@ -76,14 +91,21 @@ export interface LogEntry {
    * dropped; `kept`: notes moved a layer on by keep-alive (the amount moved;
    * the log shows no change); `lost`: a hop the mint applied whose answer
    * it no longer keeps; `sent`: a send to someone's request; `received`: a
-   * hand-back taken in.
+   * hand-back taken in; `backup`: a backup saved (the amount it holds; the
+   * log shows no change); `restored`: a backup restored; `checked`: notes
+   * a restore brought, asked about at the mint (the amount it found spent).
    */
-  kind: 'faucet' | 'faded' | 'kept' | 'lost' | 'sent' | 'received';
+  kind: 'faucet' | 'faded' | 'kept' | 'lost' | 'sent' | 'received' | 'backup' | 'restored' | 'checked';
   /** The mint. */
   mint: string;
   /**
    * Tokens it brought (faucet, received), moved on (kept) or took away
-   * (faded, lost, sent: what went, or what was asked until that is known).
+   * (faded, lost, sent: what went, or what was asked until that is known;
+   * checked: the notes the mint said were spent; lost: what was expected of
+   * the transfer). backup: what it holds of the mint. restored: what it
+   * changed the total by, with what it brought that had faded already,
+   * which a `faded` entry takes away after it; or, with `turnedBack`, what
+   * a send it brought would have paid.
    */
   amount: number;
   /**
@@ -92,18 +114,28 @@ export interface LogEntry {
    * send, its change.
    */
   serials: string[];
-  /** faucet, received, kept: the values of the notes in `serials`, in their order, where the entry was written with them. */
+  /**
+   * faucet, received, kept, restored: the values of the notes in `serials`,
+   * in their order, where the entry was written with them. backup: the
+   * values of the notes it holds; checked: of those the mint said are live.
+   */
   values?: number[];
-  /** faded: the values of the notes that faded, where they were read. */
+  /**
+   * faded: the values of the notes that faded, where they were read.
+   * checked: of the notes the mint said were spent. restored: of the notes
+   * held before that the backup had spent, which the purse dropped.
+   */
   gone?: number[];
   /**
    * faded: how far `t` can be trusted: missing when it is the mint's
    * scheduled rotation; `after` when that fell before the notes came (a mint
    * rotated by hand), so `t` is when the last of them came and they faded
-   * some time after; `by` when there was no schedule to go by, so `t` is
+   * some time after; `restored` when they came with a restore, after the
+   * rotation that took them, so they faded in the backup and `t` is just
+   * after the restore; `by` when there was no schedule to go by, so `t` is
    * when the purse saw them gone.
    */
-  fadeAt?: 'after' | 'by';
+  fadeAt?: 'after' | 'by' | 'restored';
   /** kept: the mint's first layer (its generation) when they moved, so one rotation's runs make one entry. */
   round?: string;
   /** sent, received: the request's id. */
@@ -116,8 +148,20 @@ export interface LogEntry {
   asked?: number;
   /** sent: the value that went, once known; undefined after a cancelled transfer found by a later settle (SDK lacks 4). */
   went?: number;
-  /** sent: transfers made. */
+  /** sent: transfers made. restored: the transfers it brought that the mint had not been seen to answer, which the purse sends again. */
   transfers?: number;
+  /** backup: when it was sealed, which may be before the entry was logged (a download said saved later). restored: when the backup was sealed, where its file says. */
+  saved?: number;
+  /** restored: the notes its transfers spend, which came with it: a fade of one is placed after it. */
+  moved?: string[];
+  /**
+   * restored: written for a send the restore brought, not for the restore:
+   * how many of its transfers the mint turned away, whose notes came back
+   * (`serials`), with what they would have paid (`amount`).
+   */
+  turnedBack?: number;
+  /** lost: of a send a restore brought, which this purse never made: its change, which the mint no longer kept. */
+  brought?: true;
   /** sent: serials of the notes spent. */
   spent?: string[];
   /** sent: the values of the notes spent, in the order of `spent`, where the entry was written with them. */

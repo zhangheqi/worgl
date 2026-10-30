@@ -328,6 +328,22 @@ describe('when a mint is due', () => {
     assert.equal(dueInput(notes, 0, info, 5n).blocked, true);
     assert.equal(dueInput(notes, 0, info, 4n).blocked, false);
   });
+
+  test('leaves out a fading note a restore brought until the mint is asked about it', () => {
+    const at = (index: number, state: HeldNote['state']): HeldNote => ({
+      serial: { generation: 5n, index },
+      amount: 1n,
+      state,
+      position: 0,
+      spendableAt: undefined,
+      expiresAt: undefined,
+    });
+    const info = { oldest: 5n, paused: false } as MintInfo;
+    const notes = [at(1, 'expiring'), at(2, 'expiring')];
+    assert.equal(dueInput(notes, 0, info, undefined, new Set(['5:1'])).fading, 1);
+    // only unchecked notes fade: nothing to plan
+    assert.equal(due(dueInput(notes, 0, info, undefined, new Set(['5:1', '5:2']))), false);
+  });
 });
 
 describe('the run’s count', () => {

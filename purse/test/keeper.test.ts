@@ -648,6 +648,7 @@ function passWith(purse: FakePurse, more: Partial<KeepingDeps> = {}) {
     moving: purse.outgoing.flatMap((request) =>
       decodeNoteParts(request).map((note) => ({ id: `${note.generation}:${note.index}`, v: Number(note.amount), generation: note.generation })),
     ),
+    unchecked: new Set(),
   });
   const keeping = new Keeping({
     servers: () => [{ server: SERVER, mints: [{ mint: ISSUER, host: '127.0.0.1:9' }] }],
@@ -777,7 +778,7 @@ describe('a pass', () => {
     assert.equal(t.keeping.canKeep(ISSUER, false), false);
     assert.equal(end.trouble, false, 'a full layer waits for the rotation, not a minute');
     // the same layer: not due
-    const read = { info: mintInfo(), skew: 0, notes: [...purse.notes], total: 5n, firstExpiry: undefined, moving: [] };
+    const read = { info: mintInfo(), skew: 0, notes: [...purse.notes], total: 5n, firstExpiry: undefined, moving: [], unchecked: new Set<string>() };
     assert.equal(t.keeping.saw(ISSUER, read), undefined);
     // the mint rotated: due again
     assert.equal(t.keeping.saw(ISSUER, { ...read, info: mintInfo({ oldest: OLDEST + 1n }) }), 'due');
@@ -894,7 +895,7 @@ describe('a pass', () => {
     const t = passWith(purse, {
       finish: async () => {
         // a rotation came during the pass: the read after it finds the note in the first layer
-        t.keeping.saw(ISSUER, { info: mintInfo(), skew: 0, notes: [held(1, 64n, 0)], total: 64n, firstExpiry: undefined, moving: [] });
+        t.keeping.saw(ISSUER, { info: mintInfo(), skew: 0, notes: [held(1, 64n, 0)], total: 64n, firstExpiry: undefined, moving: [], unchecked: new Set() });
       },
     });
     const end = await t.keeping.pass(t.run);
@@ -903,7 +904,7 @@ describe('a pass', () => {
     const second = new FakePurse([held(1, 64n, 0)]);
     const u = passWith(second, {
       finish: async () => {
-        u.keeping.saw(ISSUER, { info: mintInfo(), skew: 0, notes: [held(1, 64n, 0)], total: 64n, firstExpiry: undefined, moving: [] });
+        u.keeping.saw(ISSUER, { info: mintInfo(), skew: 0, notes: [held(1, 64n, 0)], total: 64n, firstExpiry: undefined, moving: [], unchecked: new Set() });
       },
     });
     assert.equal((await u.keeping.pass(u.run)).again, false);
@@ -960,7 +961,7 @@ describe('a pass', () => {
       if (down) {
         throw new TypeError('Failed to fetch');
       }
-      return { info: mintInfo(), skew: 0, notes: [...purse.notes], total: 64n, firstExpiry: NEXT + 28_800n, moving: [] };
+      return { info: mintInfo(), skew: 0, notes: [...purse.notes], total: 64n, firstExpiry: NEXT + 28_800n, moving: [], unchecked: new Set() };
     };
     const t = passWith(purse, { read });
     await t.keeping.pass(t.run);

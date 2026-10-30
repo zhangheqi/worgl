@@ -219,6 +219,22 @@ describe('where a note came from', () => {
     assert.deepEqual(again.changeAt, { '9:1': 1200, '9:2': 5000 });
     assert.equal(withChange({ t: 1000, serials: [] }, ['9:4'], 5000).changeAt, undefined);
   });
+
+  test('for a note a backup brought, is the restore, so a fade of it is never placed before it came', () => {
+    const restored = { t: 6000, kind: 'restored' as const, mint: MINT, serials: ['5:1'] };
+    const known = arrivalsOf([restored], MINT, new Map());
+    assert.deepEqual(known.get('5:1'), { at: 6000, source: 'restored' });
+    assert.equal(fadedAfter(2000, ['5:1'], known, 9000), 6001);
+    // a backup saved or checked brings no note
+    assert.equal(arrivalsOf([{ t: 6000, kind: 'backup' as const, mint: MINT, serials: ['5:2'] }], MINT, new Map()).size, 0);
+  });
+
+  test('for a note a transfer from a backup spends, is the restore too, so a settle that finds it faded places the fade after', () => {
+    const restored = { t: 6000, kind: 'restored' as const, mint: MINT, serials: ['5:1'], moved: ['4:7'] };
+    const known = arrivalsOf([restored], MINT, new Map());
+    assert.deepEqual(known.get('4:7'), { at: 6000, source: 'restored' });
+    assert.equal(fadedAfter(2000, ['4:7'], known, 9000), 6001);
+  });
 });
 
 describe('holdings as the purse saved them', () => {

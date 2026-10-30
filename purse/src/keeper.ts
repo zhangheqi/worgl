@@ -815,7 +815,7 @@ export class Keeping {
 
   #dueInput(mint: string, read: Read): ReturnType<typeof dueInput> {
     const trouble = this.trouble.get(mint);
-    return dueInput(read.notes, read.moving.length, read.info, trouble?.kind === 'blocked' ? trouble.oldest : undefined);
+    return dueInput(read.notes, read.moving.length, read.info, trouble?.kind === 'blocked' ? trouble.oldest : undefined, read.unchecked);
   }
 
   /** Clears what a read shows is over: a block once the mint rotated, a pause the read now names, a read that failed. */

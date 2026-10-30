@@ -14,11 +14,14 @@ export function effectOf(entry: LogEntry): number | undefined {
   switch (entry.kind) {
     case 'faucet':
     case 'received':
+    case 'restored':
       return entry.amount;
     case 'faded':
     case 'lost':
-      return -entry.amount;
+    case 'checked':
+      return less(entry.amount);
     case 'kept':
+    case 'backup':
       return 0;
     case 'sent':
       break;

@@ -16,13 +16,14 @@ export type { AskRecord, LogEntry, MintRecord, SavedInfo } from './entries.ts';
  * The database, and the version of its layout. 1: the mints and the log.
  * 2: either of two builds made side by side, keep-alive's (the log's `kept`
  * and `lost` entries) or Receive and Send's (the store `asks`, and the log's
- * `sent` and `received` entries). 3: both. The upgrade makes each store
- * that is missing, so it works from any of these. Opening at a newer version
- * closes the records of an older tab still open, so that tab never reads an
- * entry it does not know.
+ * `sent` and `received` entries). 3: both. 4: Backup's entries (`backup`,
+ * `restored`, `checked`) and a mint's last backup. The upgrade makes each
+ * store that is missing, so it works from any of these. Opening at a newer
+ * version closes the records of an older tab still open, so that tab never
+ * reads an entry it does not know.
  */
 const DATABASE = 'purse';
-const VERSION = 3;
+const VERSION = 4;
 
 /** How many ended requests (taken in full, or cancelled) the purse keeps; open ones it always keeps. */
 export const ASKS_ENDED_KEPT = 50;

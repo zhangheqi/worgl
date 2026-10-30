@@ -46,8 +46,8 @@ export function recentRow(entry: LogEntry, kept: boolean, now: number): RecentRo
   const delta = effectOf(entry);
   const plain = (title: string): RecentRow => ({ title, small: undefined, delta, opens: undefined, label: undefined });
   if (entry.kind !== 'sent' && entry.kind !== 'received') {
-    // a take from the faucet, a fade and keep-alive's entries: words.ts says them
-    return plain(recentTitle({ kind: entry.kind, amount: entry.amount }));
+    // a take from the faucet, a fade, keep-alive's entries and a backup's: words.ts says them
+    return plain(recentTitle({ kind: entry.kind, amount: entry.amount, live: entry.values?.reduce((sum, v) => sum + v, 0) }));
   }
   if (entry.kind === 'received') {
     return plain(`Received ${entry.amount}`);

@@ -372,10 +372,22 @@ export interface DueInput {
 /** Whether a pass plans a refresh for this mint now. Settling what is outgoing needs no such check. */
 export const due = (m: DueInput): boolean => !m.paused && !m.blocked && m.fading > 0;
 
-/** A mint's {@link DueInput} from what the SDK reports, and whether a refusal blocks its first layer now. */
-export function dueInput(notes: readonly HeldNote[], moving: number, info: MintInfo, blockedAt: bigint | undefined): DueInput {
+/**
+ * A mint's {@link DueInput} from what the SDK reports, and whether a
+ * refusal blocks its first layer now. A note a restore brought that the
+ * mint has not been asked about (`unchecked`, by id) is not fading for
+ * this: it moves once the mint says it is live, so it alone calls for no
+ * plan, which would only be taken back.
+ */
+export function dueInput(
+  notes: readonly HeldNote[],
+  moving: number,
+  info: MintInfo,
+  blockedAt: bigint | undefined,
+  unchecked: ReadonlySet<string> = new Set(),
+): DueInput {
   return {
-    fading: notes.filter((note) => note.state === 'expiring').length,
+    fading: notes.filter((note) => note.state === 'expiring' && !unchecked.has(`${note.serial.generation}:${note.serial.index}`)).length,
     moving,
     paused: info.paused,
     blocked: blockedAt !== undefined && blockedAt === info.oldest,

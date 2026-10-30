@@ -27,7 +27,11 @@ export type Doing =
   /** Taking in a hand-back. */
   | 'accept'
   /** Sending again what a send kept for later. */
-  | 'settle';
+  | 'settle'
+  /** Sealing a backup, or saving its file. */
+  | 'backup'
+  /** Opening a backup, or restoring from it. */
+  | 'restore';
 
 /** What the words may name. */
 export interface Context {
@@ -57,6 +61,13 @@ export function linkWords(problem: LinkProblem): string {
   return 'Paste the whole mint link, starting with https://';
 }
 
+/** The words when the purse's own code did not load (its parts are fetched once the shell has painted): no mint was asked anything. */
+export const LOAD_WORDS = 'The purse could not load all of itself. Check the connection, then reload the page.';
+
+/** The words when a send stopped because the mint did not answer about a note a restore brought, which it might have spent. */
+export const UNCHECKED_WORDS =
+  'The mint did not answer about a note this purse brought back from a backup, which this send might have spent, so nothing was sent. Try again in a moment.';
+
 /** The words when the server answers, but not with the mint the link names. */
 export const notListed = (host: string): string => `The server at ${host} does not list the mint this link names.`;
 
@@ -78,6 +89,10 @@ function noAnswer(host: string, doing: Doing): string {
       return `${first} Taking in needs its keys. The hand-back keeps until its tokens fade, so try again later.`;
     case 'settle':
       return `${first} This purse tries again the next time it opens; you can also try now.`;
+    case 'backup':
+      return `${first} Nothing was saved; try again in a moment.`;
+    case 'restore':
+      return `${first} Nothing of it was restored; try again when it answers.`;
     default:
       return `${first} Check the link, or try again later.`;
   }
@@ -121,6 +136,20 @@ export function say(error: unknown, doing: Doing, context: Context): Said {
     if (doing === 'send' && code === 'policy') {
       return { words: 'This mint’s rules refuse this send as it stands. Ask them for a new request.' };
     }
+    if (doing === 'restore') {
+      // what opening a backup refuses: the passphrase, or the file
+      switch (code) {
+        case 'wrong_passphrase':
+          return { words: 'That passphrase does not open this backup, or the file has changed since it was saved. Check the passphrase and try again.' };
+        case 'not_sealed':
+          return { words: 'This is not a purse backup. Choose the file the purse saved, ending in .worgl.' };
+        case 'unknown_version':
+        case 'unknown_format':
+          return { words: 'A newer version of the purse saved this backup. Reload the page to update the purse, then try again.' };
+        case 'damaged':
+          return { words: 'Part of this backup does not read, so it cannot be opened. Try another copy of the file.' };
+      }
+    }
     switch (code) {
       case 'store_blocked':
         return { words: 'The purse is open in another tab with an older version. Close its other tabs, then try again.' };
@@ -134,6 +163,12 @@ export function say(error: unknown, doing: Doing, context: Context): Said {
           : { words: `The answer from ${host} is not a mint’s.` };
       case 'no_layers':
         return { words: `The mint at ${host} lists no layers, so it cannot hold tokens.` };
+      case 'empty_passphrase':
+        return { words: 'Type the passphrase first.' };
+      case 'out_of_memory':
+        return { words: 'This device ran short of memory for the backup’s lock. Close other tabs or apps, then try again.' };
+      case 'no_randomness':
+        return { words: 'This browser gave the purse no randomness to seal with. Nothing was saved.' };
       case 'bad_signature':
       case 'unknown_generation':
       case 'wrong_issuer':
@@ -167,6 +202,9 @@ export function say(error: unknown, doing: Doing, context: Context): Said {
       return { words: 'This faucet does not hand out notes to this purse.', noFaucet: true };
     }
     if (code === 'unknown_mint' || (doing === 'read' && status === 404)) {
+      if (doing === 'restore') {
+        return { words: `The server at ${host} does not list a mint the backup holds, so nothing of it was restored.` };
+      }
       return { words: doing === 'open' ? `The server at ${host} no longer lists this mint.` : notListed(host) };
     }
     if (code === 'paused') {

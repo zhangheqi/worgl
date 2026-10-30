@@ -227,7 +227,7 @@ function askView(input: ReceiveInput): HTMLElement {
         h(
           'div',
           { class: 'wrap' },
-          tbSub('Receive', bar.mint, bar.name),
+          tbSub('Receive', bar),
           form,
           h(
             'div',
@@ -402,7 +402,7 @@ function requestView(input: ReceiveInput, ask: AskRecord): HTMLElement {
         h(
           'div',
           { class: 'wrap' },
-          tbSub('Receive', bar.mint, bar.name),
+          tbSub('Receive', bar),
           h(
             'div',
             { class: 'ask-row' },
@@ -648,7 +648,7 @@ function takeView(input: ReceiveInput, take: NonNullable<ReceiveState['take']>):
         h(
           'div',
           { class: 'wrap' },
-          tbSub('Receive', bar.mint, bar.name),
+          tbSub('Receive', bar),
           // what it carries, once its link is read: a link that did not read carries nothing to name
           take.link === undefined ? null : h('p', { class: 'lab muted mt-10' }, handBackLabel(amount, take.name)),
           h(

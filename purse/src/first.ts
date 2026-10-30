@@ -293,6 +293,13 @@ function notes(standalone: boolean, info?: MintInfo): HTMLElement {
       { class: 'note-line muted' },
       'Clearing this site’s data empties the purse, and a private window forgets it when it closes.',
     ),
+    h(
+      'p',
+      { class: 'note-line muted' },
+      'Have a backup file? ',
+      h('a', { class: 'to-restore', href: '#backup', 'data-fk': 'first-restore' }, 'Restore it'),
+      '.',
+    ),
   );
 }
 

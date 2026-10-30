@@ -561,6 +561,7 @@ describe('what keep-alive promises', () => {
     const came = at(21, 14, 2);
     assert.equal(noteTip(h, note(4, 3, { arrivedAt: came, source: 'received' }), 'Playground', NOW).lines[0], 'Received at 14:02.');
     assert.equal(noteTip(h, note(4, 3, { arrivedAt: came, source: 'change' }), 'Playground', NOW).lines[0], 'Change from your send at 14:02.');
+    assert.equal(noteTip(h, note(4, 3, { arrivedAt: came, source: 'restored' }), 'Playground', NOW).lines[0], 'Restored from a backup at 14:02.');
     assert.equal(noteTip(h, note(4, 3, { arrivedAt: came, source: 'faucet' }), 'Playground', NOW).lines[0], 'From the Playground faucet at 14:02.');
   });
 });

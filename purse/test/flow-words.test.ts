@@ -408,6 +408,18 @@ describe('Recent', () => {
     assert.deepEqual(row(sent({ state: 'lost', asked: 20, went: 16, lost: 8, lostTheirs: 4 })), ['Sent 16 of 20', ' · 8 lost', -24, 'lost']);
   });
 
+  test('names a backup saved, a restore and the checks of what it brought', () => {
+    const plain = (kind: LogEntry['kind'], amount: number, values?: number[]): (string | number | undefined)[] => {
+      const r = keep(recentRow({ id: 2, t: NOW, kind, mint: sent({}).mint, amount, serials: [], ...(values === undefined ? {} : { values }) }, false, NOW));
+      return [r.title, r.small, r.delta, r.opens];
+    };
+    assert.deepEqual(plain('backup', 64), ['Saved a backup', undefined, 0, undefined]);
+    assert.deepEqual(plain('restored', 52), ['Restored 52', undefined, 52, undefined]);
+    assert.deepEqual(plain('restored', 0), ['Restored a backup', undefined, 0, undefined]);
+    assert.deepEqual(plain('checked', 12, [32]), ['Dropped 12 already spent', undefined, -12, undefined]);
+    assert.deepEqual(plain('checked', 0, [32, 16]), ['Checked 48 restored', undefined, 0, undefined]);
+  });
+
   test('tells assistive tech what a row opens', () => {
     assert.equal(recentRow(sent({ state: 'handback', went: 5 }), true, NOW).label, 'Sent 5 at 14:02. Show the hand-back again');
     assert.equal(recentRow(sent({ state: 'waiting' }), true, NOW).label, 'Sent 5 at 14:02. Waiting for the mint');

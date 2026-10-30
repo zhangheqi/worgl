@@ -1,18 +1,33 @@
-// The app: its state, its five routes, what the person's actions do, what
+// The app: its state, its six routes, what the person's actions do, what
 // keeps Holdings current while it is open, and keep-alive's wiring: when
 // the keeper runs, what other tabs hear of it, and how a run shows. The
-// views (first.ts, home.ts, receive.ts, send.ts, history.ts) and the field (field.ts)
-// are drawn from the state on every change; the SDK is reached only through
-// purses.ts, which is loaded once the shell has painted.
+// views (first.ts, home.ts, receive.ts, send.ts, history.ts, backup.ts) and
+// the field (field.ts) are drawn from the state on every change; the SDK is
+// reached only through purses.ts, which is loaded once the shell has painted.
 
 import type { FaucetInfo, MintInfo } from 'worgl';
 
 import { parseAmount } from './amount.ts';
 import { askAfterTake, newestOpen, openAsks } from './asks.ts';
+import { type BackupInput, type BackupState, backupView, blankBackup } from './backup.ts';
 import { type Camera, cameraWords, startCamera, stopCamera } from './camera.ts';
+import {
+  FILE_TYPE,
+  type PlannedMint,
+  type RestoredAt,
+  fileName,
+  fileProblem,
+  fileWords,
+  passProblem,
+  passWords,
+  pendingWords,
+  restorePlan,
+  restoredWords,
+  savedWords,
+} from './cover.ts';
 import { $, announce, reduced } from './dom.ts';
 import { effectOf } from './effect.ts';
-import { type Said, linkWords, notCancelled, notRecorded, say, transient } from './errors.ts';
+import { LOAD_WORDS, type Said, UNCHECKED_WORDS, linkWords, notCancelled, notRecorded, say, transient } from './errors.ts';
 import {
   type FieldInput,
   type Opened,
@@ -60,10 +75,10 @@ import { type HistoryInput, historyView } from './history.ts';
 import { type Elsewhere, type HomeData, type HomeInput, type KeepShown, homeView, placeholder, renderBack } from './home.ts';
 import type { Moved } from './keep.ts';
 import { Keeper, type KeptServer, Keeping, type Shown } from './keeper.ts';
-import { withTransfersLock } from './lock.ts';
+import { withChecksLock, withTransfersLock } from './lock.ts';
 import { type MintLink, hostOf, isMintHash, mintHash, parseMintLink } from './link.ts';
 import { type AskLink, type TakeLink, decode, encodeAsk, encodeTake, linkFor } from './links.ts';
-import { holdersOf, readNote, valueOf } from './notes.ts';
+import { holdersOf, readNote, sentTo, serialsSpent, valueOf } from './notes.ts';
 import {
   type Denoms,
   type Planned,
@@ -76,7 +91,7 @@ import {
   withRefused,
 } from './plan.ts';
 import { placePostmark } from './postmark.ts';
-import type { About, Came, ForSend, Kept, Read, ReadRequest, Sent, Settled } from './purses.ts';
+import type { About, Came, CheckResult, ForSend, Holds, Kept, Read, ReadRequest, RestoredMint, Sent, Settled, SettledSend, Stopped } from './purses.ts';
 import { loadQr, qrReady } from './qr.ts';
 import { type ReceiveInput, type ReceiveState, atMostFor, blankReceive, mountReceive, receiveView, refreshAsk } from './receive.ts';
 import { type AskRecord, type LogEntry, type MintRecord, Records, type SavedInfo } from './records.ts';
@@ -98,8 +113,8 @@ import { keptWords, rotatedWords, rotationWords, tookWords, unreachableFor } fro
 
 type Sdk = typeof import('./purses.ts');
 
-/** The five views. */
-type Route = 'first' | 'home' | 'receive' | 'send' | 'history';
+/** The six views. */
+type Route = 'first' | 'home' | 'receive' | 'send' | 'history' | 'backup';
 
 /** What Holdings shows and what it is doing. */
 interface HomeState {
@@ -204,6 +219,9 @@ const state = {
     /** What History last drew, so a read that finds nothing new draws nothing. */
     drawn: undefined as string | undefined,
   },
+  backup: blankBackup() as BackupState,
+  /** What Backup last drew, so a read that finds nothing new draws nothing. */
+  backupDrawn: undefined as string | undefined,
   /** Each mint's denominations, once its info is read: Receive's sizes of note. */
   policies: new Map<string, Denoms>(),
   /** Each request's link, by its id, once encoded; and the requests whose link could not be written here. */
@@ -358,10 +376,19 @@ function render(): void {
   } else if (state.route === 'history' && record !== undefined) {
     view = historyView(historyInput(record));
     state.history.drawn = historySignature(Date.now());
+  } else if (state.route === 'backup') {
+    view = backupView(backupInput());
+    state.backupDrawn = backupSignature();
+    // an error is announced when it is first drawn, not again on each redraw of the checks
+    const b = state.backup;
+    b.alerted = new Set([b.saveError, b.restoreError, b.readError].filter((words) => words !== undefined));
   } else {
     view = firstView(firstInput());
   }
   app.replaceChildren(view);
+  if (state.route === 'backup') {
+    mountBackup();
+  }
   document.documentElement.dataset['view'] = state.route;
   // the camera runs only while a viewfinder shows
   if (state.camera.kind !== 'idle' && app.querySelector('.scanner') === null) {
@@ -513,7 +540,18 @@ function historySignature(now: number): string {
     heldTotal(mint),
     state.log
       .filter((entry) => entry.mint === mint)
-      .map((entry) => [entry.id, entry.t, entry.amount, entry.state, entry.went, entry.back, entry.lost, entry.serials.length]),
+      .map((entry) => [
+        entry.id,
+        entry.t,
+        entry.amount,
+        entry.state,
+        entry.went,
+        entry.back,
+        entry.lost,
+        entry.serials.length,
+        entry.values?.length,
+        entry.gone?.length,
+      ]),
     [...keptIds()],
     state.mints.some((record) => record.mint === mint && state.handBacksFrom.has(record.server)),
     state.asks.map((ask) => [ask.id, ask.state, ask.got]),
@@ -645,8 +683,11 @@ function closeTip(refocus: boolean): void {
 const flowOpen = (route: Route): boolean =>
   (route === 'send' && (state.send.step !== 'scan' || state.send.error !== undefined)) || (route === 'receive' && state.receive.step === 'take');
 
-/** The view a hash asks for: Holdings, Receive or Send once the purse holds a mint, else the first run. */
+/** The view a hash asks for: Holdings, Receive or Send once the purse holds a mint, else the first run; Backup always, to restore. */
 function routeFor(hash: string): Route {
+  if (hash === '#backup') {
+    return 'backup';
+  }
   if (hash === '#first' || shown() === undefined) {
     return 'first';
   }
@@ -714,8 +755,21 @@ function setRoute(route: Route, options: { focus?: boolean; hash?: string; keep?
       openingSend();
     }
   }
-  const next: Route = route !== 'first' && shown() === undefined && !flowOpen(route) ? 'first' : route;
+  const next: Route = route !== 'first' && route !== 'backup' && shown() === undefined && !flowOpen(route) ? 'first' : route;
   const changed = next !== state.route;
+  if (changed && state.route === 'backup') {
+    // a passphrase typed and left is never kept past the screen it was typed on
+    clearPass();
+  }
+  if (changed && next === 'backup') {
+    const b = state.backup;
+    // a save or restore still on its way keeps the state it writes its end to, and one that ended away shows once; anything else starts afresh
+    if (b.saving || b.restoring || b.unseen) {
+      b.unseen = false;
+    } else {
+      state.backup = { ...blankBackup(), held: b.held, checking: b.checking, persisted: b.persisted, pending: b.pending };
+    }
+  }
   if (changed && next === 'home') {
     state.first = blankFirst();
   }
@@ -755,6 +809,9 @@ function setRoute(route: Route, options: { focus?: boolean; hash?: string; keep?
       // the flows show what the shown mint holds, and History works back from it: read it, if it is not yet
       void refreshHome();
     }
+  }
+  if (next === 'backup') {
+    void readBackup();
   }
   const record = shown();
   if (next === 'receive' && record !== undefined) {
@@ -1195,6 +1252,9 @@ function redrawIfChanged(): void {
     }
   } else if (state.route === 'home' && seen !== state.home.drawn) {
     render();
+  } else if (state.route === 'backup') {
+    // what is held changed under it, as after a keep-alive hop: read again, as Holdings would be
+    void readBackup();
   } else if (
     ((state.route === 'send' && state.send.step === 'scan') || (state.route === 'receive' && state.receive.step === 'ask')) &&
     seen !== state.home.sideDrawn
@@ -1482,13 +1542,11 @@ async function pruneAndLog(loaded: Sdk, server: string, mint: string, read: Read
   const { lost, layers } = await loaded.prune(server, mint);
   if (lost > 0n) {
     const now = Date.now();
-    const came = arrivals(mint);
     // one entry for each layer that went, at its own rotation; one for all, seen gone by now, when they do not add up
     const fades = layers.length > 0 ? layers : [{ generation: undefined, ids: [], values: undefined }];
     for (const layer of fades) {
       const scheduled = layer.generation === undefined ? undefined : fadedAt(layer.generation, read.info, read.skew, now);
-      const t = fadedAfter(scheduled ?? now, layer.ids, came, now);
-      const fadeAt = scheduled === undefined ? 'by' : t === scheduled ? undefined : 'after';
+      const { t, fadeAt } = fadePlaced(scheduled, layer.ids, mint, now);
       await logEntry({
         t,
         kind: 'faded',
@@ -1502,6 +1560,27 @@ async function pruneAndLog(loaded: Sdk, server: string, mint: string, read: Read
     tell();
   }
   return loaded.read(server, mint);
+}
+
+/**
+ * When to log a fade of the notes `ids` of `mint`, which the mint's
+ * schedule puts at `scheduled` (`undefined` when there is none to go by),
+ * and how far that time can be trusted (entries.ts `fadeAt`): never before
+ * the notes came, as far as the log knows. Notes a restore brought after
+ * their layer had gone faded in the backup, before it was restored.
+ */
+function fadePlaced(scheduled: number | undefined, ids: readonly string[], mint: string, now: number): { t: number; fadeAt: LogEntry['fadeAt'] } {
+  const came = arrivals(mint);
+  const t = fadedAfter(scheduled ?? now, ids, came, now);
+  if (t === scheduled) {
+    return { t, fadeAt: undefined };
+  }
+  // the notes' last arrival, which put the fade after the rotation that took them
+  const last = ids.map((id) => came.get(id)).reduce<Arrival | undefined>((a, b) => (b !== undefined && (a === undefined || b.at > a.at) ? b : a), undefined);
+  if (scheduled !== undefined && last?.source === 'restored') {
+    return { t, fadeAt: 'restored' };
+  }
+  return { t, fadeAt: scheduled === undefined ? 'by' : 'after' };
 }
 
 /** This tab's sends and settles from Send that hold the lock, or wait for it: a pass gives way to them. */
@@ -1616,8 +1695,9 @@ const keeping: Keeping = new Keeping({
   showsPlan: sendShowsPlan,
   log: async ({ spent, ids, ...entry }) => {
     // a fade, never before the notes it took came
-    const t = ids === undefined ? entry.t : fadedAfter(entry.t, ids, arrivals(entry.mint), Date.now());
-    const fadeAt = t === entry.t ? entry.fadeAt : 'after';
+    const placed = ids === undefined ? undefined : fadePlaced(entry.fadeAt === 'by' ? undefined : entry.t, ids, entry.mint, Date.now());
+    const t = placed?.t ?? entry.t;
+    const fadeAt = placed === undefined ? entry.fadeAt : placed.fadeAt;
     // the tokens are safe in the SDK's store by now: a log that cannot be written loses only the entry
     await logEntry({ ...entry, t, ...(fadeAt === undefined ? {} : { fadeAt }) }, spent).catch(() => undefined);
     tell();
@@ -2816,7 +2896,9 @@ async function sendTo(s: SendState, record: MintRecord, req: ReadRequest, ask: A
   const host = hostOf(record.server);
   const sendNow = new AbortController();
   let spent: string[] = [];
-  let result: Sent | { stopped: 'changed' | 'short' | 'already' };
+  let result: Sent | { stopped: Stopped };
+  // the send's checks of restored notes, logged as one run
+  const checks: CheckRun = new Map();
   try {
     result = await (await loadSdk()).send(record.server, ask.json, {
       check: (fresh) => {
@@ -2833,6 +2915,7 @@ async function sendTo(s: SendState, record: MintRecord, req: ReadRequest, ask: A
         }
         return 'go';
       },
+      checked: (results) => logChecked(checks, results),
       signed: async (made) => {
         spent = made.spent;
         const t = Date.now();
@@ -2916,10 +2999,14 @@ async function sendTo(s: SendState, record: MintRecord, req: ReadRequest, ask: A
       void loadSendFaucet(s, record);
     } else if (result.stopped === 'changed') {
       s.changed = true;
+    } else if (result.stopped === 'unchecked') {
+      s.sendError = UNCHECKED_WORDS;
     }
     if (state.route === 'send' && state.send === s) {
       render();
-      focusH1();
+      if (result.stopped !== 'unchecked') {
+        focusH1();
+      }
     }
     return;
   }
@@ -3414,6 +3501,7 @@ async function applySettled(server: string, settled: Settled): Promise<void> {
       (each) => each.kind === 'sent' && each.ask === sendOutcome.id && (each.state === 'sending' || each.state === 'waiting'),
     );
     if (entry === undefined) {
+      await settledUnlogged(sendOutcome);
       continue;
     }
     const t2 = Date.now();
@@ -3456,6 +3544,33 @@ async function applySettled(server: string, settled: Settled): Promise<void> {
     } else if (kept === undefined) {
       await updateEntry({ ...now, state: 'done' });
     }
+  }
+}
+
+/**
+ * What a settle did to a payment no send entry follows: one a restore
+ * brought, which this purse never made. The restore's entry counted its
+ * transfers' change; one the mint dropped takes that change away, and one
+ * it turned away brings its note back, and with it what it would have
+ * paid. Each is logged, so History's Held column still adds up; one
+ * answered changes nothing, as its change was counted.
+ */
+async function settledUnlogged(outcome: SettledSend): Promise<void> {
+  const t = Date.now();
+  const dropped = outcome.refused.filter((refusal) => refusal.outcome === 'dropped');
+  const lost = sum(dropped.map((refusal) => Number(refusal.atStake ?? 0n)));
+  if (lost > 0) {
+    await logEntry({ t, kind: 'lost', mint: outcome.mint, amount: lost, serials: [], brought: true }).catch(() => undefined);
+  }
+  const turned = outcome.refused.filter((refusal) => refusal.outcome === 'cancelled').map((refusal) => refusal.request);
+  const back = sentTo(turned, outcome.holders)?.theirs ?? 0;
+  if (back > 0) {
+    await logEntry({ t, kind: 'restored', mint: outcome.mint, amount: back, serials: serialsSpent(turned), turnedBack: turned.length }).catch(
+      () => undefined,
+    );
+  }
+  if (lost > 0 || back > 0) {
+    tell();
   }
 }
 
@@ -3778,6 +3893,765 @@ const sendActions: SendInput['actions'] = {
   retrySettle: () => void retryWaiting(),
 };
 
+// ---------- Backup ----------
+
+/**
+ * The passphrases typed on Backup: kept here, never in the state the view
+ * draws from, and put back as their fields' values after each draw, so a
+ * passphrase is never an attribute in the page. Cleared once used, and on
+ * leaving Backup.
+ */
+const pass = { first: '', again: '', open: '' };
+
+function clearPass(): void {
+  pass.first = '';
+  pass.again = '';
+  pass.open = '';
+}
+
+function backupInput(): BackupInput {
+  return {
+    state: state.backup,
+    records: state.mints,
+    standalone: state.standalone,
+    now: Date.now(),
+    actions: {
+      passChanged: (which, value) => {
+        pass[which] = value;
+      },
+      save: () => void saveBackup(),
+      kept: () => void keptDownload(),
+      again: () => {
+        const pending = state.backup.pending;
+        if (pending !== undefined) {
+          download(pending.sealed, pending.name);
+        }
+      },
+      chooseFile: () => $<HTMLInputElement>('#bk-file')?.click(),
+      fileChosen: (file) => void chooseBackup(file),
+      restore: () => void restoreBackup(),
+    },
+  };
+}
+
+/**
+ * Error words a press just set: an alert again even where the same words
+ * show already, since the person asked again. A redraw alone (a read, a
+ * check) draws them as a plain line.
+ */
+function anew(b: BackupState, words: string): string {
+  const alerted = new Set(b.alerted);
+  alerted.delete(words);
+  b.alerted = alerted;
+  return words;
+}
+
+/** Puts the typed passphrases back in their fields after a draw: as the fields' values, never as attributes. */
+function mountBackup(): void {
+  for (const [id, which] of [
+    ['bk-p1', 'first'],
+    ['bk-p2', 'again'],
+    ['bk-open', 'open'],
+  ] as const) {
+    const field = $<HTMLInputElement>(`#${id}`);
+    if (field !== null && field.value !== pass[which]) {
+      field.value = pass[which];
+    }
+  }
+}
+
+/** What Backup shows that can change between reads: each mint's last backup, what is held, the checks, the day. */
+function backupSignature(): string {
+  const b = state.backup;
+  return JSON.stringify([
+    state.mints.map((record) => [record.mint, record.name, record.unit, record.backup?.t, record.backup?.ids]),
+    [...b.held].map(([mint, held]) => [mint, held.total, held.notes.map((note) => [note.id, note.v])]),
+    b.readError,
+    b.persisted,
+    b.checking,
+    new Date().toDateString(),
+  ]);
+}
+
+/** Draws Backup again if what it shows changed. */
+function redrawBackup(): void {
+  if (state.route === 'backup' && backupSignature() !== state.backupDrawn) {
+    render();
+  }
+}
+
+/** Backup's read on its way, and whether another is asked for after it. */
+let backupReading: Promise<void> | undefined;
+let backupReadAgain = false;
+
+/**
+ * Reads what the purse holds of each mint, for what the last backup covers,
+ * and whether this browser keeps the purse. Calls while a read runs ask for
+ * one more after it, not one each.
+ */
+function readBackup(): Promise<void> {
+  if (backupReading !== undefined) {
+    backupReadAgain = true;
+    return backupReading;
+  }
+  backupReading = (async () => {
+    try {
+      do {
+        backupReadAgain = false;
+        await readHeld();
+      } while (backupReadAgain);
+    } finally {
+      backupReading = undefined;
+    }
+  })();
+  return backupReading;
+}
+
+async function readHeld(): Promise<void> {
+  void persisted().then((kept) => {
+    state.backup.persisted = kept;
+    redrawBackup();
+  });
+  const records = state.mints;
+  if (records.length === 0) {
+    return;
+  }
+  let loaded: Sdk;
+  try {
+    loaded = await loadSdk();
+  } catch {
+    state.backup.readError = LOAD_WORDS;
+    redrawBackup();
+    return;
+  }
+  const held = new Map(state.backup.held);
+  let words: string | undefined;
+  await Promise.all(
+    records.map(async (record) => {
+      try {
+        held.set(record.mint, await loaded.heldAt(record.server, record.mint));
+      } catch (error) {
+        words ??= say(error, 'open', { host: hostOf(record.server) }).words;
+      }
+    }),
+  );
+  state.backup.held = held;
+  state.backup.readError = words;
+  redrawBackup();
+}
+
+/** Whether the browser has agreed to keep the purse's data; `undefined` where it cannot say. */
+async function persisted(): Promise<boolean | undefined> {
+  try {
+    return (await navigator.storage?.persisted?.()) ?? undefined;
+  } catch {
+    return undefined;
+  }
+}
+
+/** Once what was just drawn has painted: a busy label shows before the key's derivation holds the thread. */
+const nextPaint = (): Promise<void> =>
+  Promise.race([new Promise<void>((resolve) => requestAnimationFrame(() => requestAnimationFrame(() => resolve()))), sleep(120)]);
+
+/** The save dialog of browsers that have one: the file is written where the person chose. */
+type SavePicker = (options: { suggestedName: string; types: { description: string; accept: Record<string, string[]> }[] }) => Promise<FileSystemFileHandle>;
+
+/** Saves `text` as a download named `name`: where the browser has no save dialog. */
+function download(text: string, name: string): void {
+  const url = URL.createObjectURL(new Blob([text], { type: FILE_TYPE }));
+  const link = document.createElement('a');
+  link.href = url;
+  link.download = name;
+  link.hidden = true;
+  document.body.append(link);
+  link.click();
+  link.remove();
+  // the download has its bytes once it starts; the address is let go a minute on
+  setTimeout(() => URL.revokeObjectURL(url), 60_000);
+}
+
+/** Whether the save dialog is open: a second press while it is does nothing. */
+let picking = false;
+
+/**
+ * Save backup: the passphrase twice, the place to save (where the browser
+ * asks), then the seal, then the file. A file written where the person
+ * chose is the last backup at once; a download only once they say it is
+ * there (`keptDownload`).
+ */
+async function saveBackup(): Promise<void> {
+  const b = state.backup;
+  if (b.saving || picking || b.pending !== undefined || state.mints.length === 0) {
+    return;
+  }
+  b.saved = undefined;
+  const problem = passProblem(pass.first, pass.again);
+  if (problem !== undefined) {
+    b.saveError = anew(b, passWords(problem));
+    render();
+    focusKey(problem === 'short' ? 'bk-p1' : 'bk-p2');
+    return;
+  }
+  // what was typed when Save was pressed is what seals, whatever the fields hold by then
+  const passphrase = pass.first;
+  const t = Date.now();
+  const name = fileName(t);
+  // the dialog first, while the press still counts as the person's: the seal takes a moment
+  let handle: FileSystemFileHandle | undefined;
+  const picker = (window as Window & { showSaveFilePicker?: SavePicker }).showSaveFilePicker;
+  if (typeof picker === 'function') {
+    picking = true;
+    try {
+      handle = await picker.call(window, { suggestedName: name, types: [{ description: 'Purse backup', accept: { [FILE_TYPE]: ['.worgl'] } }] });
+    } catch (error) {
+      if (error instanceof DOMException && error.name === 'AbortError') {
+        // the person closed the dialog: nothing was saved, and nothing needs saying
+        return;
+      }
+      // the dialog is refused here (a policy, a frame): the file downloads instead
+    } finally {
+      picking = false;
+    }
+  }
+  b.saving = true;
+  b.saveError = undefined;
+  render();
+  await nextPaint();
+  const listed = state.mints.map((record) => ({ mint: record.mint, server: record.server, name: record.name, unit: record.unit }));
+  let loaded: Sdk | undefined;
+  try {
+    loaded = await loadSdk();
+    const { sealed, holds } = await loaded.seal(passphrase, listed, t);
+    if (handle === undefined) {
+      download(sealed, name);
+      clearPass();
+      b.pending = { name, t, sealed, holds, mints: listed.map((each) => each.mint) };
+    } else {
+      const writable = await handle.createWritable();
+      await writable.write(sealed);
+      await writable.close();
+      clearPass();
+      await keepBackup(t, holds, new Set(listed.map((each) => each.mint)));
+      b.saved = savedOf(t, holds);
+    }
+  } catch (error) {
+    b.saveError = loaded === undefined ? LOAD_WORDS : say(error, 'backup', { host: hostOf(state.mints[0]?.server ?? '') }).words;
+  }
+  b.saving = false;
+  if (state.route !== 'backup' || state.backup !== b) {
+    // the person has gone elsewhere: what it came to shows when they come back
+    b.unseen = true;
+    return;
+  }
+  render();
+  if (b.pending !== undefined) {
+    focusKey('bk-kept');
+    announce(pendingWords(b.pending.name));
+  } else {
+    focusKey('bk-save');
+  }
+  if (b.saved !== undefined) {
+    announce(b.saved);
+    // what it covers is what is held now
+    void readBackup();
+  }
+}
+
+/** A downloaded backup the person says is with their files: from now it is the last backup. */
+async function keptDownload(): Promise<void> {
+  const b = state.backup;
+  const pending = b.pending;
+  if (pending === undefined) {
+    return;
+  }
+  b.pending = undefined;
+  await keepBackup(pending.t, pending.holds, new Set(pending.mints));
+  b.saved = savedOf(pending.t, pending.holds);
+  if (state.route !== 'backup' || state.backup !== b) {
+    return;
+  }
+  render();
+  focusKey('bk-save');
+  announce(b.saved);
+  void readBackup();
+}
+
+/** What a save at `t` holds, in words. */
+const savedOf = (t: number, holds: ReadonlyMap<string, Holds>): string =>
+  savedWords(
+    state.mints.map((record) => ({ name: record.name, unit: record.unit, amount: sum(holds.get(record.mint)?.values ?? []) })),
+    t,
+  );
+
+/**
+ * Keeps what a backup saved at `t` holds of each mint it lists (`mints`),
+ * for what it covers, and logs it. A mint added since is not in it, and
+ * one whose record holds a newer backup (another tab's, or a restore's,
+ * while a download waited to be said saved) keeps that one.
+ */
+async function keepBackup(t: number, holds: ReadonlyMap<string, Holds>, mints: ReadonlySet<string>): Promise<void> {
+  const records = state.records;
+  if (records === undefined) {
+    return;
+  }
+  const now = await records.mints().catch(() => state.mints);
+  const logged = Date.now();
+  for (const record of now) {
+    if (!mints.has(record.mint)) {
+      continue;
+    }
+    const at = holds.get(record.mint) ?? { ids: [], values: [] };
+    try {
+      if (record.backup === undefined || record.backup.t <= t || record.backup.t > logged) {
+        await records.updateMint(record.mint, { backup: { t, ids: at.ids } });
+      }
+    } catch {
+      // the file is saved; only what Backup says it covers depends on this
+    }
+    // logged when it is written, as every entry is, with when it was sealed beside: an entry dated before others logged
+    // already would sit among them in History, and the Held column would be off between them
+    await logEntry({ t: logged, kind: 'backup', mint: record.mint, amount: sum(at.values), serials: [], values: at.values, saved: t }).catch(
+      () => undefined,
+    );
+  }
+  try {
+    state.mints = await records.mints();
+  } catch {
+    // keep what was read last
+  }
+  tell();
+}
+
+/** A file chosen to restore from: read and looked at before any passphrase is asked for. */
+async function chooseBackup(file: File | undefined): Promise<void> {
+  const b = state.backup;
+  // the same file chosen again would fire no change: the chooser starts empty each time
+  const chooser = $<HTMLInputElement>('#bk-file');
+  if (chooser !== null) {
+    chooser.value = '';
+  }
+  if (file === undefined || b.restoring) {
+    return;
+  }
+  b.restoreError = undefined;
+  b.restored = undefined;
+  let problem = fileProblem(file.size, undefined);
+  let text: string | undefined;
+  if (problem === undefined) {
+    try {
+      text = await file.text();
+      problem = fileProblem(file.size, text);
+    } catch {
+      problem = 'not_sealed';
+    }
+  }
+  if (problem !== undefined || text === undefined) {
+    b.file = undefined;
+    b.restoreError = anew(b, fileWords(problem ?? 'not_sealed'));
+    render();
+    focusKey('bk-restore');
+    return;
+  }
+  b.file = { name: file.name, text, t: file.lastModified > 0 ? file.lastModified : Date.now() };
+  pass.open = '';
+  render();
+  focusKey('bk-open');
+}
+
+/**
+ * Restore: opens the file with its passphrase, reads each mint new here
+ * from its server as a link's would be, then restores each server's mints
+ * under the purse's lock. What came of it is logged before the lock goes;
+ * then keep-alive settles what it brought outgoing and drops what faded,
+ * and the mint is asked about each note it brought.
+ */
+async function restoreBackup(): Promise<void> {
+  const b = state.backup;
+  const file = b.file;
+  if (file === undefined || b.restoring) {
+    return;
+  }
+  // what was typed when Restore was pressed is what opens it
+  const passphrase = pass.open;
+  if (passphrase === '') {
+    b.restoreError = anew(b, 'Type the passphrase it was saved with.');
+    render();
+    focusKey('bk-open');
+    return;
+  }
+  b.restoring = true;
+  b.restoreError = undefined;
+  b.restored = undefined;
+  render();
+  await nextPaint();
+  let loaded: Sdk | undefined;
+  let opened: Awaited<ReturnType<Sdk['openBackup']>>;
+  try {
+    loaded = await loadSdk();
+    opened = await loaded.openBackup(file.text, passphrase);
+  } catch (error) {
+    b.restoring = false;
+    b.restoreError = loaded === undefined ? LOAD_WORDS : say(error, 'restore', { host: '' }).words;
+    if (state.route === 'backup' && state.backup === b) {
+      render();
+      focusKey('bk-open');
+    } else {
+      b.unseen = true;
+    }
+    return;
+  }
+  pass.open = '';
+  const plan = restorePlan(opened.mints, state.mints);
+  const errors: string[] = [];
+  const failed = (error: unknown, server: string): void => {
+    const words = say(error, 'restore', { host: hostOf(server) }).words;
+    if (!errors.includes(words)) {
+      errors.push(words);
+    }
+  };
+  // a mint new here is read from its server first: one whose server does not list it, or does not answer, is left out
+  const about = new Map<string, About>();
+  const ready: PlannedMint[] = [];
+  for (const each of plan.mints) {
+    if (each.known) {
+      ready.push(each);
+      continue;
+    }
+    try {
+      about.set(each.mint, await loaded.readMint({ mint: each.mint, server: each.server }));
+      ready.push(each);
+    } catch (error) {
+      failed(error, each.server);
+    }
+  }
+  const byServer = new Map<string, PlannedMint[]>();
+  for (const each of ready) {
+    byServer.set(each.server, [...(byServer.get(each.server) ?? []), each]);
+  }
+  const at: RestoredAt[] = [];
+  for (const [server, mints] of byServer) {
+    try {
+      const what = await loaded.restoreAt(
+        server,
+        opened.backup,
+        mints.map((each) => each.mint),
+        (what) => keepRestored(what, mints, about, file.t, opened.holds),
+      );
+      for (const each of what) {
+        const record = state.mints.find((one) => one.mint === each.mint);
+        at.push({
+          name: record?.name ?? hostOf(server),
+          unit: record?.unit ?? 'tokens',
+          brought: each.brought.filter((note) => !note.expired).map((note) => note.v),
+          faded: each.brought.filter((note) => note.expired).map((note) => note.v),
+          dropped: each.dropped.map((note) => note.v),
+          transfers: each.transfers,
+        });
+      }
+    } catch (error) {
+      failed(error, server);
+    }
+  }
+  b.restoring = false;
+  b.file = errors.length > 0 && at.length === 0 ? file : undefined;
+  b.restored = restoredWords(at, plan.unplaced.length);
+  b.restoreError = errors.length === 0 ? undefined : errors.join(' ');
+  if (at.length > 0) {
+    tell();
+    // keep-alive settles what it brought outgoing and drops what had faded; the mint is asked about each note it brought
+    keeper.poke();
+    void runChecks();
+  }
+  void readBackup();
+  if (state.route !== 'backup' || state.backup !== b) {
+    // the person has gone elsewhere: what it came to shows when they come back, and their focus stays where it is
+    b.unseen = true;
+    return;
+  }
+  render();
+  announce([...b.restored, ...errors].join(' '));
+  focusH1();
+}
+
+/**
+ * Keeps what a restore came to, under the purse's lock: a mint new here,
+ * named by its server as a link's would be; the file as the last
+ * backup of each mint, when the file says when it was sealed and that is
+ * after the one recorded here (a file that does not say counts only where
+ * none is); and an entry for each mint it changed, before any fade of what
+ * it brought. Other tabs hear of it before the lock goes.
+ */
+async function keepRestored(
+  what: readonly RestoredMint[],
+  planned: readonly PlannedMint[],
+  about: ReadonlyMap<string, About>,
+  fileTime: number,
+  holds: ReadonlyMap<string, Holds>,
+): Promise<void> {
+  const records = state.records;
+  if (records === undefined) {
+    return;
+  }
+  const t = Date.now();
+  for (const each of what) {
+    const plan = planned.find((one) => one.mint === each.mint);
+    const record = state.mints.find((one) => one.mint === each.mint);
+    // a time to come (a fast clock where it was sealed or copied, or a file made up) is taken as now: kept as it is, it
+    // would read as newer than every save of the purse's own until that time came
+    const saved = plan?.saved === undefined ? undefined : Math.min(plan.saved, t);
+    const backup = { t: Math.min(saved ?? fileTime, t), ids: holds.get(each.mint)?.ids ?? [] };
+    try {
+      if (record === undefined && plan !== undefined) {
+        const link = { mint: each.mint, server: plan.server };
+        const info = about.get(each.mint)?.info;
+        await records.putMint({
+          mint: each.mint,
+          server: plan.server,
+          name: isPlayground(link) ? 'Playground' : hostOf(plan.server),
+          unit: 'tokens',
+          added: t,
+          info: info === undefined ? undefined : savedInfo(info, null),
+          used: t,
+          backup,
+        });
+      } else if (record !== undefined && (record.backup === undefined || (saved !== undefined && record.backup.t < saved))) {
+        await records.updateMint(each.mint, { backup });
+      }
+    } catch {
+      // the tokens are kept by the SDK; only the mint's name, or what Backup says it covers, depends on this
+    }
+    const faded = sum(each.brought.filter((note) => note.expired).map((note) => note.v));
+    if (each.brought.length > 0 || each.dropped.length > 0 || each.transfers > 0 || each.delta !== 0) {
+      await logEntry({
+        t,
+        kind: 'restored',
+        mint: each.mint,
+        // what had faded counts in nothing yet: the fade logged after it takes it away again
+        amount: each.delta + faded,
+        serials: each.brought.map((note) => note.id),
+        values: each.brought.map((note) => note.v),
+        ...(each.dropped.length === 0 ? {} : { gone: each.dropped.map((note) => note.v) }),
+        ...(each.transfers === 0 ? {} : { transfers: each.transfers }),
+        ...(each.moved.length === 0 ? {} : { moved: each.moved }),
+        ...(saved === undefined ? {} : { saved }),
+      }).catch(() => undefined);
+    }
+  }
+  try {
+    state.mints = await records.mints();
+  } catch {
+    // keep what was read last
+  }
+  syncShown();
+  tell();
+}
+
+// ---------- checking restored notes ----------
+
+/** The checks running in this tab, if they are, and whether a restore since asks for another run after it. */
+let checking: Promise<void> | undefined;
+let checkAgain = false;
+
+/** How far apart the mint is asked about restored notes: a few seconds at random, as a send's transfers go, so it sees no batch. */
+const CHECK_GAP = { minSecs: 2, maxSecs: 6 };
+
+const checkGap = (): Promise<void> => sleep((CHECK_GAP.minSecs + Math.random() * (CHECK_GAP.maxSecs - CHECK_GAP.minSecs)) * 1000);
+
+/**
+ * Asks the mint about each note a restore brought, one at a time and a few
+ * seconds apart, in one tab of the purse. Called while a run is on its way,
+ * it asks for another once that one ends, which finds what a restore
+ * brought meanwhile.
+ */
+function runChecks(): Promise<void> {
+  if (checking !== undefined) {
+    checkAgain = true;
+    return checking;
+  }
+  checking = (async () => {
+    try {
+      do {
+        checkAgain = false;
+        await checkAll();
+      } while (checkAgain && !page.signal.aborted);
+    } finally {
+      checking = undefined;
+    }
+  })();
+  return checking;
+}
+
+async function checkAll(): Promise<void> {
+  if (state.mints.length === 0) {
+    return;
+  }
+  let loaded: Sdk;
+  try {
+    loaded = await loadSdk();
+  } catch {
+    return;
+  }
+  await withChecksLock(async () => {
+    const servers = [...new Set(state.mints.map((record) => record.server))];
+    // how many there are to ask about, at every server: the line counts them all, not one server's
+    const counted = new Map<string, number>();
+    for (const server of servers) {
+      counted.set(server, await loaded.uncheckedAt(server).catch(() => 0));
+    }
+    const left = [...counted.values()].reduce((all, n) => all + n, 0);
+    if (left === 0) {
+      return;
+    }
+    // the notes the mint did not answer for: asked again on the next open, not in this run
+    const skip = new Set<string>();
+    const run: CheckRun = new Map();
+    const c = { left, done: 0, live: 0, spent: 0, faded: 0, unanswered: 0 };
+    let asked = false;
+    state.backup.checking = { ...c };
+    redrawBackup();
+    for (const server of servers) {
+      let answered = 0;
+      for (;;) {
+        if (page.signal.aborted) {
+          return;
+        }
+        if (asked) {
+          await checkGap();
+        }
+        let step: Awaited<ReturnType<Sdk['checkNext']>>;
+        try {
+          // under the purse's lock, and logged before it goes: no send, pass or restore sees a note dropped unlogged
+          step = await loaded.checkNext(server, skip, (result) => logChecked(run, [result]));
+        } catch {
+          // the store or the mint's info refused: what was counted here and not asked is said as not answered, and the
+          // next open asks again
+          const rest = Math.max((counted.get(server) ?? 0) - answered, 0);
+          c.unanswered += rest;
+          c.done += rest;
+          c.left = Math.max(c.left - rest, 0);
+          break;
+        }
+        if (step === 'busy') {
+          // a send, a keep-alive pass or a restore holds the purse: asked once it is done
+          asked = true;
+          continue;
+        }
+        if (step === undefined) {
+          break;
+        }
+        asked = true;
+        answered++;
+        const { result } = step;
+        if (result.outcome === 'unanswered') {
+          skip.add(`${result.mint}/${result.id}`);
+          c.unanswered++;
+        } else if (result.outcome === 'live') {
+          c.live += result.v;
+        } else if (result.outcome === 'spent') {
+          c.spent += result.v;
+        } else if (result.outcome === 'expired') {
+          c.faded += result.v;
+        }
+        c.done++;
+        c.left = Math.max(c.left - 1, 0);
+        state.backup.checking = { ...c };
+        if (result.outcome === 'spent' || result.outcome === 'expired') {
+          heldChanged();
+        }
+        redrawBackup();
+        if (step.left === 0) {
+          break;
+        }
+      }
+    }
+    // the last server's last answer: the line says what the run came to. What else was counted, a send asked about
+    // first, or it faded before it was asked; a run that asked nothing says nothing
+    state.backup.checking = c.done > 0 ? { ...c, left: 0 } : undefined;
+    redrawBackup();
+    // the notes the mint said are live can move now
+    keeper.poke();
+  });
+}
+
+/** What is held changed under the view, as when a check dropped a restored note: the view that shows it reads it again. */
+function heldChanged(): void {
+  if (state.route === 'home' || state.route === 'history') {
+    void refreshHome();
+  } else if (state.route === 'backup') {
+    void readBackup();
+  }
+}
+
+/** A run of checks' entries in the log: one `checked` entry for each mint, added at its first answer and updated with each after. */
+type CheckRun = Map<string, LogEntry>;
+
+/**
+ * Logs what the mint said of restored notes: live and spent in the run's
+ * entry for their mint, so History's Held column counts what was dropped;
+ * a note whose layer had gone as a fade, at its rotation where the mint's
+ * schedule says, and never before the note came.
+ */
+async function logChecked(run: CheckRun, results: readonly CheckResult[]): Promise<void> {
+  for (const result of results) {
+    const { mint, v } = result;
+    if (result.outcome === 'unanswered' || result.outcome === 'gone') {
+      continue;
+    }
+    if (result.outcome === 'expired') {
+      const record = state.mints.find((each) => each.mint === mint);
+      let scheduled: number | undefined;
+      try {
+        const read = record === undefined ? undefined : await (await loadSdk()).read(record.server, mint);
+        scheduled = read === undefined ? undefined : fadedAt(result.generation, read.info, read.skew, Date.now());
+      } catch {
+        // no schedule to go by: the fade is placed when the purse saw it gone
+      }
+      const { t, fadeAt } = fadePlaced(scheduled, [result.id], mint, Date.now());
+      await logEntry({ t, kind: 'faded', mint, amount: v, serials: [], gone: [v], ...(fadeAt === undefined ? {} : { fadeAt }) }).catch(
+        () => undefined,
+      );
+      continue;
+    }
+    const spent = result.outcome === 'spent';
+    const before = run.get(mint);
+    // the run's entry moves on to this answer's time, unless anything of the mint was logged since (a keep-alive round
+    // and a backup saved change nothing held, but they have a Held number too): moved past it, the drops it holds would
+    // sit after that row in History, which would show them as not yet made
+    const since = before !== undefined && state.log.some((each) => each.mint === mint && each.id !== before.id && each.t > before.t);
+    if (since && !spent && before?.id !== undefined) {
+      // a live answer changes nothing held: it joins the run's entry where that stands
+      const next: LogEntry = { ...before, values: [...(before.values ?? []), v] };
+      run.set(mint, next);
+      await updateEntry(next);
+      continue;
+    }
+    if (before === undefined || before.id === undefined || since) {
+      const entry: Omit<LogEntry, 'id'> = {
+        t: Date.now(),
+        kind: 'checked',
+        mint,
+        amount: spent ? v : 0,
+        serials: [],
+        values: spent ? [] : [v],
+        gone: spent ? [v] : [],
+      };
+      const id = await logEntry(entry).catch(() => undefined);
+      run.set(mint, id === undefined ? entry : { ...entry, id });
+    } else {
+      const next: LogEntry = {
+        ...before,
+        t: Math.max(before.t, Date.now()),
+        amount: before.amount + (spent ? v : 0),
+        values: spent ? (before.values ?? []) : [...(before.values ?? []), v],
+        gone: spent ? [...(before.gone ?? []), v] : (before.gone ?? []),
+      };
+      run.set(mint, next);
+      await updateEntry(next);
+    }
+  }
+  tell();
+}
+
 // ---------- other tabs ----------
 
 const channel = typeof BroadcastChannel === 'function' ? new BroadcastChannel('purse') : undefined;
@@ -3897,7 +4771,11 @@ async function heard(data: unknown): Promise<void> {
   } else if (state.route === 'first' || (state.route === 'send' && state.send.step === 'scan') || (state.route === 'receive' && state.receive.step === 'ask')) {
     render();
     void refreshHome();
+  } else if (state.route === 'backup') {
+    await readBackup();
   }
+  // a restore in that tab brought notes the mint has not been asked about: this tab asks, unless that one is
+  void runChecks();
 }
 
 // ---------- start ----------
@@ -4020,9 +4898,12 @@ function listen(): void {
     keeping.forget();
     if (state.route === 'home' || state.route === 'receive' || state.route === 'send' || state.route === 'history') {
       void refreshHome();
+    } else if (state.route === 'backup') {
+      void readBackup();
     }
     // on every route: what is held is kept, and what an abort left outgoing, a pass's or a send's, is settled
     keeper.show();
+    void runChecks();
   });
   window.addEventListener('pagehide', () => {
     // the only thing that cuts a send short: what is on its way stays outgoing, settled on the next open; keep-alive stops at once
@@ -4070,6 +4951,9 @@ function listen(): void {
       void refreshHome();
     } else {
       keeper.poke();
+      if (state.route === 'backup') {
+        void readBackup();
+      }
     }
   }, 60_000);
 }
@@ -4121,6 +5005,8 @@ export async function start(): Promise<void> {
         }
         // the hand-backs kept show at once; the keeper's first pass settles what a closed tab left outgoing
         await loadHandBacks();
+        // what a restore brought and a closed tab left unasked
+        void runChecks();
       },
       () => undefined,
     );
