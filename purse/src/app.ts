@@ -1,7 +1,7 @@
-// The app: its state, its four routes, what the person's actions do, what
+// The app: its state, its five routes, what the person's actions do, what
 // keeps Holdings current while it is open, and keep-alive's wiring: when
 // the keeper runs, what other tabs hear of it, and how a run shows. The
-// views (first.ts, home.ts, receive.ts, send.ts) and the field (field.ts)
+// views (first.ts, home.ts, receive.ts, send.ts, history.ts) and the field (field.ts)
 // are drawn from the state on every change; the SDK is reached only through
 // purses.ts, which is loaded once the shell has painted.
 
@@ -11,6 +11,7 @@ import { parseAmount } from './amount.ts';
 import { askAfterTake, newestOpen, openAsks } from './asks.ts';
 import { type Camera, cameraWords, startCamera, stopCamera } from './camera.ts';
 import { $, announce, reduced } from './dom.ts';
+import { effectOf } from './effect.ts';
 import { type Said, linkWords, notCancelled, notRecorded, say, transient } from './errors.ts';
 import {
   type FieldInput,
@@ -35,6 +36,7 @@ import {
   receivedWords,
   sentWords,
   serverNote,
+  partLostWords,
   settledWords,
   takeEndWords,
 } from './flow-words.ts';
@@ -45,6 +47,7 @@ import {
   type LastFade,
   arrivalsOf,
   comeBackAt,
+  fadedAfter,
   fadedAt,
   firstFade,
   holdingsFrom,
@@ -53,6 +56,7 @@ import {
   savedHoldings,
   withChange,
 } from './holdings.ts';
+import { type HistoryInput, historyView } from './history.ts';
 import { type Elsewhere, type HomeData, type HomeInput, type KeepShown, homeView, placeholder, renderBack } from './home.ts';
 import type { Moved } from './keep.ts';
 import { Keeper, type KeptServer, Keeping, type Shown } from './keeper.ts';
@@ -60,7 +64,17 @@ import { withTransfersLock } from './lock.ts';
 import { type MintLink, hostOf, isMintHash, mintHash, parseMintLink } from './link.ts';
 import { type AskLink, type TakeLink, decode, encodeAsk, encodeTake, linkFor } from './links.ts';
 import { holdersOf, readNote, valueOf } from './notes.ts';
-import { type Denoms, type Planned, type Policy, type Spendable, droppedValue, plan, shortCase, shown as shownPlan } from './plan.ts';
+import {
+  type Denoms,
+  type Planned,
+  type Policy,
+  type Spendable,
+  droppedValue,
+  plan,
+  shortCase,
+  shown as shownPlan,
+  withRefused,
+} from './plan.ts';
 import { placePostmark } from './postmark.ts';
 import type { About, Came, ForSend, Kept, Read, ReadRequest, Sent, Settled } from './purses.ts';
 import { loadQr, qrReady } from './qr.ts';
@@ -84,14 +98,16 @@ import { keptWords, rotatedWords, rotationWords, tookWords, unreachableFor } fro
 
 type Sdk = typeof import('./purses.ts');
 
-/** The four views. */
-type Route = 'first' | 'home' | 'receive' | 'send';
+/** The five views. */
+type Route = 'first' | 'home' | 'receive' | 'send' | 'history';
 
 /** What Holdings shows and what it is doing. */
 interface HomeState {
   /** The mint `data` is of: the one shown when it was read. */
   mint: string | undefined;
   data: HomeData | undefined;
+  /** What the log said of the mint (`logOf`) when the read `data` came from began. */
+  logAt: string | undefined;
   /** The mint's rotations so far at the last read, to tell when it rotates while the purse is open. */
   oldest: bigint | undefined;
   error: { words: string; at: 'read' | 'take' } | undefined;
@@ -157,6 +173,8 @@ const state = {
   asks: [] as AskRecord[],
   /** Every payment kept with owed notes or still on its way, across servers, newest first. */
   handBacks: [] as KeptHandBack[],
+  /** The servers whose payments `handBacks` holds, once read: until then History cannot say whether a hand-back is kept. */
+  handBacksFrom: new Set<string>(),
   /** The build's playground, when the build names one. */
   playground: undefined as MintLink | undefined,
   standalone: false,
@@ -164,6 +182,7 @@ const state = {
   home: {
     mint: undefined,
     data: undefined,
+    logAt: undefined,
     oldest: undefined,
     error: undefined,
     opened: undefined,
@@ -179,6 +198,12 @@ const state = {
   } as HomeState,
   receive: blankReceive() as ReceiveState,
   send: blankSend() as SendState,
+  history: {
+    /** The row that is open, by its key (history.ts `rowKey`). */
+    open: undefined as string | undefined,
+    /** What History last drew, so a read that finds nothing new draws nothing. */
+    drawn: undefined as string | undefined,
+  },
   /** Each mint's denominations, once its info is read: Receive's sizes of note. */
   policies: new Map<string, Denoms>(),
   /** Each request's link, by its id, once encoded; and the requests whose link could not be written here. */
@@ -292,6 +317,9 @@ function syncShown(): void {
   }
 }
 
+/** On History drawn again, where focus goes from `key` when it is not drawn: a row's button for Send to its row, a row to the heading. */
+const historyNear = (key: string): string[] => (key.startsWith('go-') ? [`h-${key.slice(3)}`, 'h1'] : key.startsWith('h-') ? ['h1'] : []);
+
 /** Draws the current view, keeping focus, a text field's selection and the scroll where they were. */
 function render(): void {
   const app = document.getElementById('app');
@@ -301,9 +329,17 @@ function render(): void {
   syncShown();
   const active = document.activeElement;
   const key = active instanceof HTMLElement || active instanceof SVGElement ? active.dataset['fk'] : undefined;
-  // on Holdings drawn again, where focus goes when what had it is not drawn: a number whose notes all moved, a tip that closed
-  const again = state.route === 'home' && document.documentElement.dataset['view'] === 'home';
-  const near = key === undefined || !again ? [] : nearKeys(key, active);
+  // drawn again, where focus goes when what had it is not drawn: on Holdings a number whose notes all moved, a tip that
+  // closed; on History a row's button for Send once its send has moved on, or a row gone from the log
+  const drawn = document.documentElement.dataset['view'];
+  const near =
+    key === undefined
+      ? []
+      : state.route === 'home' && drawn === 'home'
+        ? nearKeys(key, active)
+        : state.route === 'history' && drawn === 'history'
+          ? historyNear(key)
+          : [];
   const selection =
     active instanceof HTMLInputElement ? ([active.selectionStart, active.selectionEnd] as const) : undefined;
   const y = window.scrollY;
@@ -319,6 +355,9 @@ function render(): void {
   } else if (state.route === 'send') {
     send = sendInput();
     view = sendView(send);
+  } else if (state.route === 'history' && record !== undefined) {
+    view = historyView(historyInput(record));
+    state.history.drawn = historySignature(Date.now());
   } else {
     view = firstView(firstInput());
   }
@@ -430,6 +469,56 @@ function homeInput(record: MintRecord): HomeInput {
     toggleLane,
     openRow,
   };
+}
+
+function historyInput(record: MintRecord): HistoryInput {
+  return {
+    record,
+    log: state.log,
+    total: heldTotal(record.mint),
+    asks: state.asks,
+    kept: keptIds(),
+    keptRead: state.handBacksFrom.has(record.server),
+    host: hostOf(record.server),
+    open: state.history.open,
+    now: Date.now(),
+    toggle: (key) => {
+      state.history.open = state.history.open === key ? undefined : key;
+      render();
+    },
+    openRow,
+  };
+}
+
+/**
+ * What the purse holds of `mint` as the last read of it said, for History's
+ * Held column: only while none of the mint's entries came to the log or
+ * changed after that read began, since the column works back from it
+ * through every one of them.
+ */
+function heldTotal(mint: string | undefined): number | undefined {
+  return mint !== undefined && state.home.mint === mint && state.home.logAt === logOf(mint) ? state.home.data?.holdings.total : undefined;
+}
+
+/** What the log says of `mint`, as far as History's numbers go: its entries and what each changed. */
+function logOf(mint: string): string {
+  return JSON.stringify(state.log.filter((entry) => entry.mint === mint).map((entry) => [entry.id, entry.t, effectOf(entry)]));
+}
+
+/** What History shows that can change between reads: the total, the mint's entries, the hand-backs kept, the requests and the day. */
+function historySignature(now: number): string {
+  const mint = shown()?.mint;
+  return JSON.stringify([
+    mint,
+    heldTotal(mint),
+    state.log
+      .filter((entry) => entry.mint === mint)
+      .map((entry) => [entry.id, entry.t, entry.amount, entry.state, entry.went, entry.back, entry.lost, entry.serials.length]),
+    [...keptIds()],
+    state.mints.some((record) => record.mint === mint && state.handBacksFrom.has(record.server)),
+    state.asks.map((ask) => [ask.id, ask.state, ask.got]),
+    new Date(now).toDateString(),
+  ]);
 }
 
 function fieldInput(record: MintRecord): FieldInput {
@@ -567,6 +656,9 @@ function routeFor(hash: string): Route {
   if (hash === '#send') {
     return 'send';
   }
+  if (hash === '#history') {
+    return 'history';
+  }
   return 'home';
 }
 
@@ -600,7 +692,7 @@ function openingSend(): void {
     state.send = s;
     return;
   }
-  if (s.step === 'handback' && s.unseen) {
+  if ((s.step === 'handback' || (s.step === 'lost' && s.end?.hb !== undefined)) && s.unseen) {
     s.unseen = false;
     state.send = s;
     return;
@@ -631,6 +723,9 @@ function setRoute(route: Route, options: { focus?: boolean; hash?: string; keep?
     // the received postmark shows until the person leaves Holdings
     state.home.received = undefined;
   }
+  if (changed && next === 'history') {
+    state.history.open = undefined;
+  }
   if (changed) {
     state.scanError = undefined;
     // the camera is for the view that started it: leaving the route turns it off, though the next view has a viewfinder too
@@ -656,8 +751,8 @@ function setRoute(route: Route, options: { focus?: boolean; hash?: string; keep?
     void refreshHome();
   } else {
     clearTimeout(rotationTimer);
-    if (next === 'receive' || next === 'send') {
-      // the flows show what the shown mint holds: read it, if it is not yet
+    if (next === 'receive' || next === 'send' || next === 'history') {
+      // the flows show what the shown mint holds, and History works back from it: read it, if it is not yet
       void refreshHome();
     }
   }
@@ -933,11 +1028,11 @@ function arrived(ids: readonly string[], t: number): void {
 async function takeInto(link: MintLink): Promise<void> {
   const loaded = await loadSdk();
   keepStorage();
-  const { value, serials } = await loaded.take(link.server, link.mint);
+  const { value, serials, values } = await loaded.take(link.server, link.mint);
   const t = Date.now();
   const amount = Number(value);
   // the note is kept by now: a log that cannot be written loses only the entry
-  await logEntry({ t, kind: 'faucet', mint: link.mint, amount, serials }).catch(() => undefined);
+  await logEntry({ t, kind: 'faucet', mint: link.mint, amount, serials, values }).catch(() => undefined);
   await setUsed(link.mint);
   state.home.delta = { v: amount, t };
   arrived(serials, t);
@@ -994,7 +1089,19 @@ async function logEntry(entry: Omit<LogEntry, 'id'>, spent?: readonly Moved[]): 
     id = await records.addLog(entry);
   }
   state.log = await records.log();
+  historyChanged();
   return id;
+}
+
+/**
+ * The log changed under History: it is drawn again once the shown mint is
+ * read again, since its Held column works back from what is held now, and
+ * every entry is written after the change it records.
+ */
+function historyChanged(): void {
+  if (state.route === 'history') {
+    void refreshHome();
+  }
 }
 
 /** Saves what changed of a log entry, and reads the log back. */
@@ -1006,6 +1113,7 @@ async function updateEntry(entry: LogEntry): Promise<void> {
   try {
     await records.updateLog(entry);
     state.log = await records.log();
+    historyChanged();
   } catch {
     // the payment is kept by the SDK; only Recent's row depends on it
   }
@@ -1078,10 +1186,14 @@ function askFaucet(record: MintRecord): Promise<void> {
   return asking;
 }
 
-/** Draws again where what the shown mint holds shows, when that changed: Holdings, Send's scan and Receive's ask. */
+/** Draws again where what the shown mint holds shows, when that changed: Holdings, Send's scan, Receive's ask and History. */
 function redrawIfChanged(): void {
   const seen = shownSignature(Date.now());
-  if (state.route === 'home' && seen !== state.home.drawn) {
+  if (state.route === 'history') {
+    if (historySignature(Date.now()) !== state.history.drawn) {
+      render();
+    }
+  } else if (state.route === 'home' && seen !== state.home.drawn) {
     render();
   } else if (
     ((state.route === 'send' && state.send.step === 'scan') || (state.route === 'receive' && state.receive.step === 'ask')) &&
@@ -1115,6 +1227,9 @@ async function readHome(): Promise<void> {
     return;
   }
   let read: Read;
+  // an entry of this mint logged or changed after this, a fade the read drops among them, leaves History's Held column
+  // blank until the next read
+  const logAt = logOf(record.mint);
   try {
     read = await readPruned(record.server, record.mint);
   } catch (error) {
@@ -1144,6 +1259,7 @@ async function readHome(): Promise<void> {
   const rotated = state.home.oldest !== undefined && read.info.oldest > state.home.oldest;
   state.home.oldest = read.info.oldest;
   state.home.data = { holdings, faucet: state.home.data?.faucet };
+  state.home.logAt = logAt;
   if (state.home.error?.at === 'read') {
     state.home.error = undefined;
   }
@@ -1363,10 +1479,26 @@ async function readPruned(server: string, mint: string): Promise<Read> {
 
 /** Drops the notes whose layer the mint dropped, logs "Faded N", and reads again: for Holdings' reads and the keeper's alike. */
 async function pruneAndLog(loaded: Sdk, server: string, mint: string, read: Read): Promise<Read> {
-  const { lost, generation } = await loaded.prune(server, mint);
-  if (lost > 0n && generation !== undefined) {
-    const t = fadedAt(generation, read.info, read.skew, Date.now());
-    await logEntry({ t, kind: 'faded', mint, amount: Number(lost), serials: [] }).catch(() => undefined);
+  const { lost, layers } = await loaded.prune(server, mint);
+  if (lost > 0n) {
+    const now = Date.now();
+    const came = arrivals(mint);
+    // one entry for each layer that went, at its own rotation; one for all, seen gone by now, when they do not add up
+    const fades = layers.length > 0 ? layers : [{ generation: undefined, ids: [], values: undefined }];
+    for (const layer of fades) {
+      const scheduled = layer.generation === undefined ? undefined : fadedAt(layer.generation, read.info, read.skew, now);
+      const t = fadedAfter(scheduled ?? now, layer.ids, came, now);
+      const fadeAt = scheduled === undefined ? 'by' : t === scheduled ? undefined : 'after';
+      await logEntry({
+        t,
+        kind: 'faded',
+        mint,
+        amount: layer.values === undefined ? Number(lost) : sum(layer.values),
+        serials: [],
+        ...(layer.values === undefined ? {} : { gone: layer.values }),
+        ...(fadeAt === undefined ? {} : { fadeAt }),
+      }).catch(() => undefined);
+    }
     tell();
   }
   return loaded.read(server, mint);
@@ -1482,9 +1614,12 @@ const keeping: Keeping = new Keeping({
     }
   },
   showsPlan: sendShowsPlan,
-  log: async ({ spent, ...entry }) => {
+  log: async ({ spent, ids, ...entry }) => {
+    // a fade, never before the notes it took came
+    const t = ids === undefined ? entry.t : fadedAfter(entry.t, ids, arrivals(entry.mint), Date.now());
+    const fadeAt = t === entry.t ? entry.fadeAt : 'after';
     // the tokens are safe in the SDK's store by now: a log that cannot be written loses only the entry
-    await logEntry(entry, spent).catch(() => undefined);
+    await logEntry({ ...entry, t, ...(fadeAt === undefined ? {} : { fadeAt }) }, spent).catch(() => undefined);
     tell();
   },
   progress: keepProgress,
@@ -2168,7 +2303,7 @@ async function takeLink(given: TakeLink, via: 'link' | 'paste' | 'camera', focus
   // the request whose keys these notes are paid to, if it is this purse's
   const ask = state.asks.find((each) => each.mint === link.mint && holdersOf(each.json).some((holder) => holders.has(holder)));
   const askId = ask?.id ?? (holders.has(link.ask) ? link.ask : undefined);
-  let took: { value: number; serials: string[] };
+  let took: { value: number; serials: string[]; values: number[] };
   let loaded: Sdk | undefined;
   try {
     loaded = await loadSdk();
@@ -2201,7 +2336,15 @@ async function takeLink(given: TakeLink, via: 'link' | 'paste' | 'camera', focus
       // taken in all the same: the request may show as open until the next write
     }
   }
-  await logEntry({ t, kind: 'received', mint: link.mint, amount: took.value, ...(askId === undefined ? {} : { ask: askId }), serials: took.serials }).catch(() => undefined);
+  await logEntry({
+    t,
+    kind: 'received',
+    mint: link.mint,
+    amount: took.value,
+    ...(askId === undefined ? {} : { ask: askId }),
+    serials: took.serials,
+    values: took.values,
+  }).catch(() => undefined);
   await setUsed(link.mint);
   state.home.delta = { v: took.value, t };
   arrived(took.serials, t);
@@ -2704,6 +2847,7 @@ async function sendTo(s: SendState, record: MintRecord, req: ReadRequest, ask: A
           state: 'sending',
           transfers: made.transfers,
           spent: made.spent,
+          ...(made.spentValues === undefined ? {} : { spentValues: made.spentValues }),
           serials: [],
         }).catch(() => undefined);
         await setUsed(req.mint);
@@ -2946,7 +3090,8 @@ async function finishRun(s: SendState, result: Sent, spent: readonly string[], r
       back: backValue,
       serials: back.map((note) => note.id),
       t2,
-      ...(logState === 'lost' ? { lost, lostTheirs } : {}),
+      // what was dropped or turned away, even while the rest waits: History's Held column counts it
+      ...withRefused(entry, submitted.refused),
       ...(logState === 'turned' ? { layerFull: layerFull(cancelled) } : {}),
     });
   }
@@ -3054,11 +3199,13 @@ async function loadHandBacks(): Promise<void> {
     return;
   }
   const out: KeptHandBack[] = [];
+  const from = new Set<string>();
   for (const server of new Set(state.mints.map((record) => record.server))) {
     try {
       for (const kept of await loaded.handBacks(server)) {
         out.push({ server, kept, entry: state.log.find((entry) => entry.kind === 'sent' && entry.ask === kept.id) });
       }
+      from.add(server);
     } catch {
       // that server's store did not open: its hand-backs show once it does
     }
@@ -3066,8 +3213,12 @@ async function loadHandBacks(): Promise<void> {
   out.sort((a, b) => (b.entry?.t ?? -1) - (a.entry?.t ?? -1));
   const was = JSON.stringify(state.handBacks.map((each) => [each.kept.id, each.kept.owed.length, each.kept.outgoing]));
   state.handBacks = out;
+  state.handBacksFrom = from;
   const moved = await reconcile(loaded);
-  if (moved || was !== JSON.stringify(out.map((each) => [each.kept.id, each.kept.owed.length, each.kept.outgoing]))) {
+  if (state.route === 'history') {
+    // its rows say which hand-backs are kept: drawn again when that, or an entry reconcile moved, changed what it shows
+    redrawIfChanged();
+  } else if (moved || was !== JSON.stringify(out.map((each) => [each.kept.id, each.kept.owed.length, each.kept.outgoing]))) {
     if (state.route === 'home' || (state.route === 'send' && state.send.step === 'scan')) {
       render();
     }
@@ -3091,8 +3242,9 @@ async function reconcile(loaded: Sdk): Promise<boolean> {
     const kept = state.handBacks.find((each) => each.kept.id === entry.ask);
     if (kept !== undefined && !kept.kept.outgoing && kept.kept.owed.length > 0) {
       const partial = entry.transfers !== undefined && kept.kept.transfers.length < entry.transfers;
+      const now = blindTo(entry, kept.kept) ? { ...entry, blind: true } : entry;
       // nothing is outgoing, so its kept transfers were all answered: they say what went and what came back
-      await updateEntry(answeredEntry(entry, kept.kept, partial ? 'partial' : 'handback'));
+      await updateEntry(answeredEntry(now, kept.kept, (entry.dropped ?? 0) > 0 ? 'lost' : partial ? 'partial' : 'handback'));
       moved = true;
     } else if (kept === undefined) {
       gone.push(entry);
@@ -3109,7 +3261,9 @@ async function reconcile(loaded: Sdk): Promise<boolean> {
       ids.set(server, await loaded.sendsKept(server).catch(() => undefined));
     }
     if (ids.get(server)?.has(entry.ask) === false) {
-      await updateEntry({ ...entry, state: 'done' });
+      // one still sending when its page closed: what its transfers came to, the purse never saw
+      const blind = entry.state === 'sending' || blindTo(entry, undefined);
+      await updateEntry({ ...entry, state: (entry.dropped ?? 0) > 0 ? 'lost' : 'done', ...(blind ? { blind: true } : {}) });
       moved = true;
     }
   }
@@ -3118,15 +3272,15 @@ async function reconcile(loaded: Sdk): Promise<boolean> {
 
 /**
  * A sent entry once its transfers are answered: its state, and what went and
- * came back as the kept transfers say (the request's amount when they do
- * not read, or nothing for a part of it).
+ * came back as the kept transfers say (when they do not read, the request's
+ * amount less what the mint dropped of it, or nothing for a part of it).
  */
-function answeredEntry(entry: LogEntry, kept: Kept, state: 'handback' | 'partial', more: Partial<LogEntry> = {}): LogEntry {
+function answeredEntry(entry: LogEntry, kept: Kept, state: 'handback' | 'partial' | 'lost', more: Partial<LogEntry> = {}): LogEntry {
   const { went: _went, back: _back, ...rest } = entry;
   void _went;
   void _back;
   const asked = entry.asked ?? entry.amount;
-  const went = kept.went ?? (state === 'handback' ? asked : undefined);
+  const went = kept.went ?? (state === 'handback' ? asked - (entry.lostTheirs ?? 0) : undefined);
   return {
     ...rest,
     state,
@@ -3264,33 +3418,59 @@ async function applySettled(server: string, settled: Settled): Promise<void> {
     }
     const t2 = Date.now();
     const asked = entry.asked ?? entry.amount;
-    const dropped = sendOutcome.refused.filter((refusal) => refusal.outcome === 'dropped' && refusal.atStake !== undefined);
+    const kept = sendOutcome.kept;
+    // what this settle dropped or turned away, added to what the send's earlier submits and settles did
+    const known = { ...entry, ...withRefused(entry, sendOutcome.refused) };
+    const now = { ...known, ...(blindTo(known, kept) ? { blind: true } : {}) };
     // the change from this send's own answers in this settle, with what its answers before this one brought
     const fresh = sendOutcome.back.map((note) => note.id);
-    if (sendOutcome.kept?.outgoing === true) {
-      await updateEntry({ ...entry, state: 'waiting', ...(fresh.length === 0 ? {} : withChange(entry, fresh, t2)) });
+    const change = fresh.length === 0 ? {} : withChange(entry, fresh, t2);
+    const answered = kept !== undefined && kept.owed.length > 0;
+    // the send the waiting view shows says its own end (afterSettle), once
+    const told = state.send.step === 'waiting' && state.send.end?.entry === entry.id;
+    if (kept?.outgoing === true) {
+      await updateEntry({ ...now, state: 'waiting', ...change });
       arrived(fresh, t2);
       const words = sendOutcome.refused.find((refusal) => refusal.outcome === 'kept');
       waitingWords.set(entry.id ?? -1, words === undefined ? undefined : say(words.error, 'settle', { host: hostOf(server) }).words);
-    } else if (dropped.length > 0) {
-      const { lost, theirs: lostTheirs } = droppedValue(dropped);
-      await updateEntry({ ...entry, state: 'lost', lost, lostTheirs, ...(fresh.length === 0 ? {} : withChange(entry, fresh, t2)) });
+    } else if ((now.dropped ?? 0) > 0) {
+      // the mint dropped one of its transfers, in this settle or before: lost, with what its answered ones gave them
+      const lostEntry = answered ? answeredEntry(now, kept, 'lost', withChange(entry, fresh, t2)) : { ...now, state: 'lost' as const, ...change };
+      await updateEntry(lostEntry);
       arrived(fresh, t2);
-    } else if (sendOutcome.kept !== undefined && sendOutcome.kept.owed.length > 0) {
-      const partial = entry.transfers !== undefined && sendOutcome.kept.transfers.length < entry.transfers;
-      const settledEntry = answeredEntry(entry, sendOutcome.kept, partial ? 'partial' : 'handback', withChange(entry, fresh, t2));
+      if (answered && !told) {
+        announce(partLostWords(lostEntry.went, asked));
+      }
+    } else if (answered) {
+      const partial = entry.transfers !== undefined && kept.transfers.length < entry.transfers;
+      const settledEntry = answeredEntry(now, kept, partial ? 'partial' : 'handback', withChange(entry, fresh, t2));
       await updateEntry(settledEntry);
       arrived(fresh, t2);
-      // the send the waiting view shows says its own end (afterSettle), once
-      if (!(state.send.step === 'waiting' && state.send.end?.entry === entry.id)) {
+      if (!told) {
         announce(settledWords(settledEntry.went ?? asked));
       }
     } else if (sendOutcome.refused.length > 0 && sendOutcome.refused.every((refusal) => refusal.outcome === 'cancelled')) {
-      await updateEntry({ ...entry, state: 'turned', layerFull: layerFull(sendOutcome.refused) });
-    } else if (sendOutcome.kept === undefined) {
-      await updateEntry({ ...entry, state: 'done' });
+      // every transfer it still had was turned away: all of it, or the rest of a send part of which went before
+      const whole = entry.transfers === undefined || (now.turnedAway ?? 0) >= entry.transfers;
+      await updateEntry(whole ? { ...now, state: 'turned', layerFull: layerFull(sendOutcome.refused) } : { ...now, state: 'partial' });
+    } else if (kept === undefined) {
+      await updateEntry({ ...now, state: 'done' });
     }
   }
+}
+
+/**
+ * Whether the purse cannot tell what some of a send's transfers came to:
+ * the store keeps fewer of them (`kept`, none once its payment is gone)
+ * than it made, past those the log saw dropped or turned away. So it is when
+ * the page closed before its first submit's end was written, or when what
+ * the store owed the receiver faded before a settle named the rest.
+ */
+function blindTo(entry: LogEntry, kept: Kept | undefined): boolean {
+  if (entry.transfers === undefined) {
+    return false;
+  }
+  return (kept?.transfers.length ?? 0) + (entry.dropped ?? 0) + (entry.turnedAway ?? 0) < entry.transfers;
 }
 
 /** Whether a refusal among `refused` was the mint's newest layer being full: the send can go after its next rotation. */
@@ -3311,6 +3491,8 @@ function afterSettle(focus: boolean): void {
   if (s.step !== 'waiting' || s.end === undefined) {
     if (state.route === 'home') {
       render();
+    } else if (state.route === 'history') {
+      redrawIfChanged();
     }
     return;
   }
@@ -3340,6 +3522,11 @@ function afterSettle(focus: boolean): void {
       void handBackOf(each).then((hb) => {
         if (state.send === s && s.end === end && s.step === 'lost') {
           end.hb = hb;
+          if (state.route !== 'send') {
+            // off Send: said, and kept for when Send opens, as a send that went through is
+            s.unseen = true;
+            announce(partLostWords(entry.went, end.amount));
+          }
           render();
         }
       });
@@ -3705,7 +3892,7 @@ async function heard(data: unknown): Promise<void> {
   if (ended !== undefined && ended.state !== 'sending' && ended.state !== 'waiting') {
     afterSettle(false);
   }
-  if (state.route === 'home') {
+  if (state.route === 'home' || state.route === 'history') {
     await refreshHome();
   } else if (state.route === 'first' || (state.route === 'send' && state.send.step === 'scan') || (state.route === 'receive' && state.receive.step === 'ask')) {
     render();
@@ -3831,7 +4018,7 @@ function listen(): void {
     // another tab may have changed the store meanwhile
     reopen();
     keeping.forget();
-    if (state.route === 'home' || state.route === 'receive' || state.route === 'send') {
+    if (state.route === 'home' || state.route === 'receive' || state.route === 'send' || state.route === 'history') {
       void refreshHome();
     }
     // on every route: what is held is kept, and what an abort left outgoing, a pass's or a send's, is settled
@@ -3852,7 +4039,7 @@ function listen(): void {
     page = new AbortController();
     reopen();
     keeping.forget();
-    if (state.route === 'home') {
+    if (state.route === 'home' || state.route === 'history') {
       void refreshHome();
     }
     keeper.show();

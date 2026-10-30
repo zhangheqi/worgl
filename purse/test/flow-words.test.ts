@@ -33,6 +33,7 @@ import {
   notesLabel,
   nothingBack,
   alreadyBody,
+  partLostWords,
   partialBody,
   partialLine,
   plainText,
@@ -370,6 +371,12 @@ describe('Send', () => {
       keep(lostBody(5, 64)),
       'The mint says the note this send spent is gone, and it no longer keeps the answer. The 5 for them and your change are lost: 64 in all.',
     );
+    // part went: said off Send, where its hand-back is
+    assert.equal(
+      keep(partLostWords(16, 20)),
+      '16 of the send of 20 went through, and the mint no longer kept the answer for some of it. Its hand-back is on Send.',
+    );
+    assert.match(partLostWords(undefined, 20), /^Part of the send of 20 went through/);
   });
 });
 
@@ -394,8 +401,11 @@ describe('Recent', () => {
     assert.deepEqual(row(sent({ state: 'partial', asked: 128, went: 64 }), false), ['Sent 64', undefined, -64, undefined]);
     assert.deepEqual(row(sent({ state: 'partial', asked: 128 }), false), ['Sent part of 128', undefined, undefined, undefined]);
     assert.deepEqual(row(sent({ state: 'done', went: 5 })), ['Sent 5', undefined, -5, undefined]);
-    assert.deepEqual(row(sent({ state: 'turned' })), ['Turned away: 5', undefined, undefined, undefined]);
-    assert.deepEqual(row(sent({ state: 'lost', lost: 64 })), ['Lost 64 on a send of 5', undefined, -64, 'lost']);
+    // turned away: its note came back, and nothing changed
+    assert.deepEqual(row(sent({ state: 'turned' })), ['Turned away: 5', undefined, 0, undefined]);
+    assert.deepEqual(row(sent({ state: 'lost', lost: 64, lostTheirs: 5 })), ['Lost 64 on a send of 5', undefined, -64, 'lost']);
+    // part of it went: what went, and the change counts it with what was lost, as History's Held column does
+    assert.deepEqual(row(sent({ state: 'lost', asked: 20, went: 16, lost: 8, lostTheirs: 4 })), ['Sent 16 of 20', ' · 8 lost', -24, 'lost']);
   });
 
   test('tells assistive tech what a row opens', () => {

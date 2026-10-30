@@ -271,34 +271,51 @@ class FaucetFor extends Client {
 
 /**
  * Takes a note of `mint` from the faucet at its server and keeps it.
- * Resolves to its value and the serials of the notes that came, for the
- * log. Refused with a `FaucetChanged` when the faucet hands out another
- * mint's notes now.
+ * Resolves to its value and the serials and values of the notes that came,
+ * for the log. Refused with a `FaucetChanged` when the faucet hands out
+ * another mint's notes now.
  */
-export async function take(server: string, mint: string): Promise<{ value: bigint; serials: string[] }> {
+export async function take(server: string, mint: string): Promise<{ value: bigint; serials: string[]; values: number[] }> {
   return serverAt(server).purse.change(async (purse) => {
     const before = new Set((await purse.notesAt(mint)).map((note) => noteId(note.serial)));
     const { value } = await purse.takeFromFaucet(new FaucetFor(server, mint));
     // the take read the store, so notes another tab kept meanwhile are new here too: the faucet's is one note of `value`
     const fresh = (await purse.notesAt(mint)).filter((note) => !before.has(noteId(note.serial)));
     const taken = fresh.filter((note) => note.amount === value).slice(-1);
-    return { value, serials: (taken.length > 0 ? taken : fresh).map((note) => noteId(note.serial)) };
+    const came = taken.length > 0 ? taken : fresh;
+    return { value, serials: came.map((note) => noteId(note.serial)), values: came.map((note) => Number(note.amount)) };
   });
+}
+
+/** The notes of one layer the mint dropped, as a prune found them. */
+export interface Faded {
+  generation: bigint;
+  ids: string[];
+  values: number[];
 }
 
 /**
  * Drops the notes whose layer the mint dropped, when there are any, and
- * resolves to the value lost and the generation of the newest of them.
+ * resolves to the value lost and, when that is what those notes held, the
+ * notes of each layer that went, oldest first: one rotation each.
  */
-export async function prune(server: string, mint: string): Promise<{ lost: bigint; generation: bigint | undefined }> {
+export async function prune(server: string, mint: string): Promise<{ lost: bigint; layers: Faded[] }> {
   return serverAt(server).purse.change(async (purse) => {
     const expired = (await purse.notesAt(mint)).filter((note) => note.state === 'expired');
     if (expired.length === 0) {
-      return { lost: 0n, generation: undefined };
+      return { lost: 0n, layers: [] };
     }
     const lost = await purse.prune(mint);
-    const generation = expired.reduce((top, note) => (note.serial.generation > top ? note.serial.generation : top), 0n);
-    return { lost, generation };
+    const sum = expired.reduce((total, note) => total + note.amount, 0n);
+    const layers = new Map<bigint, Faded>();
+    for (const note of expired) {
+      const generation = note.serial.generation;
+      const layer = layers.get(generation) ?? { generation, ids: [], values: [] };
+      layer.ids.push(noteId(note.serial));
+      layer.values.push(Number(note.amount));
+      layers.set(generation, layer);
+    }
+    return { lost, layers: sum === lost ? [...layers.values()].sort((a, b) => (a.generation < b.generation ? -1 : 1)) : [] };
   });
 }
 
@@ -477,7 +494,7 @@ export interface SendHooks {
   /** Under the lock, before anything is signed: plan again from what is held now. */
   check: (fresh: Read) => 'go' | 'changed' | 'short' | 'already';
   /** Once `pay` signed and saved: its transfers, their times and the notes spent. */
-  signed: (made: { transfers: number; afterSecs: number[]; spent: string[] }) => Promise<void>;
+  signed: (made: { transfers: number; afterSecs: number[]; spent: string[]; spentValues: number[] | undefined }) => Promise<void>;
   /** Each transfer's progress: called synchronously, so it must return fast. */
   progress: (progress: SubmitProgress) => void;
   /** Aborted by "Send the rest now". */
@@ -525,10 +542,14 @@ export async function send(server: string, json: string, hooks: SendHooks): Prom
       const made = await purse.pay(request, SEND_SPACING);
       // the notes it spends, from the transfers themselves: no read of the mint before the log has it
       const spent = serialsSpent(made.transfers.map((transfer) => transfer.request));
+      // their values, from the read the plan was checked on, for the log; none when one of them was not in it
+      const amounts = new Map(fresh.notes.map((note) => [noteId(note.serial), Number(note.amount)]));
+      const spentValues = spent.map((id) => amounts.get(id));
       await hooks.signed({
         transfers: made.transfers.length,
         afterSecs: made.transfers.map((transfer) => transfer.afterSecs),
         spent,
+        spentValues: spentValues.every((v) => v !== undefined) ? spentValues : undefined,
       });
       const submitted = await purse.submit(made.transfers, {
         onProgress: hooks.progress,
@@ -555,11 +576,16 @@ export async function send(server: string, json: string, hooks: SendHooks): Prom
  * serials of its notes the purse holds now. Once `accept` has kept them,
  * nothing more asks the mint: the serials come from the notes themselves.
  */
-export async function acceptHandBack(server: string, mint: string, notes: string[]): Promise<{ value: number; serials: string[] }> {
+export async function acceptHandBack(
+  server: string,
+  mint: string,
+  notes: string[],
+): Promise<{ value: number; serials: string[]; values: number[] }> {
   return serverAt(server).purse.change(async (purse) => {
     const value = await purse.accept(notes);
     const held = new Set(purse.notes());
-    return { value: Number(value), serials: notes.filter((note) => held.has(note)).flatMap((note) => readNote(note)?.id ?? []) };
+    const came = notes.filter((note) => held.has(note)).flatMap((note) => readNote(note) ?? []);
+    return { value: Number(value), serials: came.map((note) => note.id), values: came.map((note) => note.amount) };
   });
 }
 

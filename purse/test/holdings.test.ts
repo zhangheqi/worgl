@@ -6,6 +6,7 @@ import type { HeldNote, MintInfo } from 'worgl';
 import {
   arrivalsOf,
   comeBackAt,
+  fadedAfter,
   fadedAt,
   firstFade,
   holdingsFrom,
@@ -156,8 +157,22 @@ describe('a faded note', () => {
     assert.equal(fadedAt(4n, info(), 0, now), Number(NEXT - PERIOD) * 1000);
     assert.equal(fadedAt(2n, info(), 0, now), Number(NEXT - 3n * PERIOD) * 1000);
     assert.equal(fadedAt(4n, info(), 2, now), (Number(NEXT - PERIOD) - 2) * 1000);
-    assert.equal(fadedAt(4n, info({ rotation: undefined }), 0, now), now);
-    assert.equal(fadedAt(5n, info(), 0, now), now);
+    // no schedule to go by, or one that puts it still to come: only that it went by now is known
+    assert.equal(fadedAt(4n, info({ rotation: undefined }), 0, now), undefined);
+    assert.equal(fadedAt(5n, info(), 0, now), undefined);
+    assert.equal(fadedAt(4n, info(), 0, (Number(NEXT - PERIOD) - 1) * 1000), undefined);
+  });
+
+  test('never before the notes it took came', () => {
+    const came = new Map([
+      ['4:1', { at: 5_000, source: 'kept' as const }],
+      ['4:2', { at: 7_000, source: 'faucet' as const }],
+    ]);
+    // a mint rotated by hand: the schedule's guess falls before the notes came
+    assert.equal(fadedAfter(1_000, ['4:1', '4:2'], came, 9_000), 7_001);
+    assert.equal(fadedAfter(8_000, ['4:1', '4:2'], came, 9_000), 8_000);
+    assert.equal(fadedAfter(1_000, ['4:9'], came, 9_000), 1_000);
+    assert.equal(fadedAfter(1_000, ['4:2'], came, 7_000), 7_000);
   });
 });
 

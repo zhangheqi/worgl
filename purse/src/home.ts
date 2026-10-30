@@ -13,6 +13,7 @@ import type { FaucetInfo } from 'worgl';
 import { type Child, h } from './dom.ts';
 import { recentRow } from './flow-words.ts';
 import { f2, hm, periodWords, shortDay, change } from './format.ts';
+import { arrowIcon } from './icons.ts';
 import type { Holdings, LaneKey } from './holdings.ts';
 import { type Progress, boxes } from './keep.ts';
 import { shortKey } from './link.ts';
@@ -47,7 +48,8 @@ export interface HomeData {
 
 /** How long the change chip stays, and how long it and a new entry are pink. */
 const CHIP_MS = 60 * 60_000;
-const PINK_MS = 6000;
+/** How long what just changed stays pink: Recent's and History's dot, and the chip. */
+export const PINK_MS = 6000;
 
 /** A keep-alive run of the shown mint's tokens, as the come-back row and column count it. */
 export interface KeepShown extends Progress {
@@ -307,7 +309,12 @@ function cobaltBand(input: HomeInput): HTMLElement {
         h(
           'div',
           { class: 'col-recent' },
-          h('div', { class: 'recent-h col-h' }, h('h2', { class: 'lab' }, 'Recent')),
+          h(
+            'div',
+            { class: 'recent-h col-h' },
+            h('h2', { class: 'lab' }, 'Recent'),
+            h('a', { class: 'lab to-hist', href: '#history', 'data-fk': 'to-history' }, 'History', arrowIcon()),
+          ),
           h('div', { class: 'phone-only recent-p' }, ...recent(input, 3, 'p')),
           h('div', { class: 'desk-only' }, ...recent(input, 4, 'd')),
         ),
@@ -417,7 +424,11 @@ function recent(input: HomeInput, n: number, where: 'p' | 'd'): HTMLElement[] {
     const parts: Child[] = [
       h('time', { datetime: new Date(entry.t).toISOString() }, shortDay(entry.t, now)),
       h('span', {}, age >= 0 && age < PINK_MS ? newDot(age) : null, row.title, row.small === undefined ? null : h('small', {}, row.small)),
-      row.delta === undefined || row.delta === 0 ? h('b', { class: 'n', 'aria-label': 'no change' }, '—') : h('b', {}, change(row.delta)),
+      row.delta === undefined
+        ? h('b', { class: 'n', 'aria-label': 'change not known' }, '?')
+        : row.delta === 0
+          ? h('b', { class: 'n', 'aria-label': 'no change' }, '—')
+          : h('b', {}, change(row.delta)),
     ];
     if (row.opens === undefined) {
       return h('div', { class: 'act' }, ...parts);
@@ -441,7 +452,7 @@ function recent(input: HomeInput, n: number, where: 'p' | 'd'): HTMLElement[] {
  * is taken out once done: a row hidden on a short screen and shown again
  * would start its animation over, pink on an entry that is no longer new.
  */
-function newDot(age: number): HTMLElement {
+export function newDot(age: number): HTMLElement {
   const dot = h('i', { class: 'new', 'aria-hidden': 'true', style: { animationDelay: `${f2(-age / 1000)}s` } });
   setTimeout(() => dot.remove(), PINK_MS - age);
   return dot;

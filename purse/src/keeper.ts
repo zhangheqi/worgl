@@ -416,6 +416,14 @@ export interface KeptEntry {
   amount: number;
   /** The new notes' serials, for `kept`. */
   serials: string[];
+  /** For `kept`: the new notes' values, in the order of `serials`. */
+  values?: number[];
+  /** For `faded`: the values of the notes that faded. */
+  gone?: number[];
+  /** For `faded`: the notes that faded, so the purse never puts the fade before they came. */
+  ids?: string[];
+  /** For `faded`: how far `t` can be trusted (entries.ts `LogEntry.fadeAt`). */
+  fadeAt?: 'after' | 'by';
   /** For `kept`: the mint's first layer when they moved, so that the runs of one rotation make one entry. */
   round?: string;
   /** For `kept`: the notes the run moved that the purse held before it, so a merged entry counts each once. */
@@ -714,7 +722,7 @@ export class Keeping {
       byMint.set(each.hop.mint, [...(byMint.get(each.hop.mint) ?? []), each]);
     }
     for (const [mint, hops] of byMint) {
-      const { amount, serials, spent } = keptOf(hops);
+      const { amount, serials, values, spent } = keptOf(hops);
       if (mint === state.shown) {
         state.kept += amount;
       }
@@ -725,6 +733,7 @@ export class Keeping {
         mint,
         amount,
         serials,
+        values,
         ...(round === undefined ? {} : { round: String(round) }),
         spent,
       });
@@ -976,8 +985,17 @@ export class Keeping {
         }
       } else {
         // its layer went before the hop landed, or after an answer was lost: either way the tokens went with it
-        const t = read === undefined ? now : fadedAt(hop.generation, read.info, read.skew, now);
-        await this.#deps.log({ t, kind: 'faded', mint, amount: hop.v, serials: [] });
+        const scheduled = read === undefined ? undefined : fadedAt(hop.generation, read.info, read.skew, now);
+        await this.#deps.log({
+          t: scheduled ?? now,
+          kind: 'faded',
+          mint,
+          amount: hop.v,
+          serials: [],
+          gone: [hop.v],
+          ids: [hop.id],
+          ...(scheduled === undefined ? { fadeAt: 'by' as const } : {}),
+        });
       }
       return;
     }

@@ -13,6 +13,7 @@ import {
   shortCase,
   shown,
   split,
+  withRefused,
 } from '../src/plan.ts';
 
 const POWERS: Denoms = { kind: 'powers' };
@@ -238,5 +239,20 @@ describe('a send the mint dropped', () => {
   test('counts only the change of a transfer that does not read', () => {
     assert.deepEqual(droppedValue([{ request: '{', atStake: 3n }]), { lost: 3, theirs: 0 });
     assert.deepEqual(droppedValue([{ request: JSON.stringify({ outputs: [{ amount: 'x' }] }), atStake: 3n }]), { lost: 3, theirs: 0 });
+  });
+
+  test('keeps what each submit and settle dropped or turned away, and nothing of what it kept', () => {
+    const first = withRefused({}, [
+      { request: transfer(4, 60), atStake: 60n, outcome: 'dropped' },
+      { request: transfer(4), atStake: undefined, outcome: 'kept' },
+    ]);
+    assert.deepEqual(first, { lost: 64, lostTheirs: 4, dropped: 1 });
+    const later = withRefused(first, [
+      { request: transfer(8, 56), atStake: 56n, outcome: 'dropped' },
+      { request: transfer(4), atStake: undefined, outcome: 'cancelled' },
+    ]);
+    assert.deepEqual(later, { lost: 128, lostTheirs: 12, dropped: 2, turnedAway: 1 });
+    // a dropped transfer the purse did not stand to lose by is no loss of its
+    assert.deepEqual(withRefused({}, [{ request: transfer(4), atStake: undefined, outcome: 'dropped' }]), {});
   });
 });
