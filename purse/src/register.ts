@@ -202,6 +202,16 @@ export function rowWords(entry: LogEntry, ctx: RowContext): RowWords {
       return { ...base, sub: keptSub(entry), detail: keptDetail(entry) };
     case 'faded': {
       const as = asWords(entry.gone);
+      if (entry.fadeAt === 'restored') {
+        const one = entry.amount === 1 || entry.gone?.length === 1;
+        return {
+          ...base,
+          sub: as === undefined ? 'From a backup' : `${as} · from a backup`,
+          detail: [
+            `${cap(notesOr(entry.gone, entry.amount))} came back with a backup, but the mint had dropped ${one ? 'its' : 'their'} layer while the backup was kept, so ${one ? 'it' : 'they'} had faded before ${one ? 'it' : 'they'} came.`,
+          ],
+        };
+      }
       return {
         ...base,
         sub: as === undefined ? 'In the first layer' : `${as} · in the first layer`,
@@ -212,6 +222,15 @@ export function rowWords(entry: LogEntry, ctx: RowContext): RowWords {
       };
     }
     case 'lost':
+      if (entry.brought === true) {
+        return {
+          ...base,
+          sub: 'A send from a backup',
+          detail: [
+            'A backup brought a send whose transfer the mint had not been seen to answer, and the purse sent it again. The mint had applied it before, or its note had been spent elsewhere, and kept no answer, so the change it held for this purse is lost.',
+          ],
+        };
+      }
       return {
         ...base,
         sub: 'A keep-alive transfer',
@@ -221,7 +240,94 @@ export function rowWords(entry: LogEntry, ctx: RowContext): RowWords {
       };
     case 'sent':
       return { ...base, ...sentWords(entry, ctx) };
+    case 'backup': {
+      // sealed when Save was pressed; a download is logged once said saved, which may be later
+      const sealed = whenSaved(entry.saved ?? entry.t, entry.t);
+      return {
+        ...base,
+        sub: entry.amount > 0 ? `Encrypted file · holds ${entry.amount}` : 'Encrypted file',
+        detail: [
+          entry.amount > 0
+            ? `A backup holds the notes as they were ${sealed}: here, ${notesOr(entry.values, entry.amount)}, sealed with your passphrase.`
+            : `A backup holds the purse as it was ${sealed}, sealed with your passphrase. It held nothing of this mint.`,
+          'Notes that move after that get new keys, and the backup no longer covers them.',
+        ],
+      };
+    }
+    case 'restored':
+      return { ...base, sub: restoredSub(entry), detail: restoredDetail(entry, ctx) };
+    case 'checked':
+      return { ...base, sub: checkedSub(entry), detail: checkedDetail(entry) };
   }
+}
+
+const sumOf = (values: readonly number[] | undefined): number => (values ?? []).reduce((sum, v) => sum + v, 0);
+const them = (values: readonly number[] | undefined, amount: number): string => (values?.length === 1 || amount === 1 ? 'it' : 'them');
+
+function restoredSub(entry: LogEntry): string {
+  if (entry.turnedBack !== undefined) {
+    return 'A send from a backup, turned away';
+  }
+  const as = asWords(entry.values);
+  return as === undefined ? 'From a backup' : `${as} · from a backup`;
+}
+
+function restoredDetail(entry: LogEntry, ctx: RowContext): string[] {
+  if (entry.turnedBack !== undefined) {
+    const one = entry.turnedBack === 1;
+    return [
+      `A backup brought a send the mint had not been seen to answer, and the purse sent it again. The mint turned ${one ? 'its transfer' : 'its transfers'} away, so ${one ? 'the note it spent is' : 'the notes they spent are'} back here, with the ${entry.amount} ${one ? 'it' : 'they'} would have paid.`,
+    ];
+  }
+  const from = entry.saved === undefined ? 'a backup' : `a backup saved ${whenSaved(entry.saved, ctx.now)}`;
+  const brought = entry.values ?? [];
+  const lines = [
+    brought.length > 0
+      ? `${cap(notesWords(brought))} from ${from}, which this purse did not hold.`
+      : `Nothing of this mint from ${from} was new to this purse.`,
+  ];
+  const gone = entry.gone ?? [];
+  if (gone.length > 0) {
+    lines.push(`The backup had spent ${notesWords(gone)} this purse still held, so the purse dropped ${them(gone, sumOf(gone))}.`);
+  }
+  const n = entry.transfers ?? 0;
+  if (n > 0) {
+    lines.push(
+      `It also brought ${n === 1 ? 'a transfer' : `${word(n)} transfers`} the mint had not been seen to answer, which the purse sends again.`,
+    );
+  }
+  if (brought.length > 0) {
+    lines.push('The purse asks the mint about each note it brought, and drops those spent since the backup.');
+  }
+  return lines;
+}
+
+/** When a backup was saved: `at 09:15` today, else `on Tue 20 Oct`. */
+const whenSaved = (t: number, now: number): string =>
+  new Date(t).toDateString() === new Date(now).toDateString() ? `at ${hm(t)}` : `on ${sinceWords(t, now)}`;
+
+/** What the title leaves out: who said so, and what stays when some were dropped. */
+function checkedSub(entry: LogEntry): string {
+  const live = sumOf(entry.values);
+  if (entry.amount === 0) {
+    return 'Live, the mint says';
+  }
+  return live > 0 ? `Checked with the mint · ${live} live` : 'Checked with the mint';
+}
+
+function checkedDetail(entry: LogEntry): string[] {
+  const live = entry.values ?? [];
+  const lines: string[] = [];
+  if (entry.amount > 0) {
+    const one = entry.gone?.length === 1 || entry.amount === 1;
+    lines.push(
+      `The mint says ${notesOr(entry.gone, entry.amount)} from the backup ${one ? 'was' : 'were'} spent after it was saved, by this purse or a copy of it, so the purse dropped ${them(entry.gone, entry.amount)}.`,
+    );
+  }
+  if (live.length > 0) {
+    lines.push(`The mint says ${notesWords(live)} from the backup ${live.length === 1 ? 'is' : 'are'} live, so ${live.length === 1 ? 'it moves' : 'they move'} like any other.`);
+  }
+  return lines;
 }
 
 /** When a fade's time is the rotation's (`at`), a bound after it came, or a time the purse saw it gone by (entries.ts `fadeAt`). */
@@ -229,6 +335,7 @@ const FADE_AT: Record<NonNullable<LogEntry['fadeAt']> | 'at', (time: string) => 
   at: (time) => ` at ${time}`,
   after: (time) => `, some time after ${time}`,
   by: (time) => `, at ${time} or before`,
+  restored: (time) => `, before ${time}`,
 };
 
 /** How many notes an entry brought or moved, as its values or serials say. */

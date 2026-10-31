@@ -20,7 +20,7 @@ export function brand(link: boolean, key = 'brand'): HTMLElement {
 }
 
 /** Where the desktop bar is drawn: the first run (the brand alone), or one of the views it leads to. */
-export type Bar = 'first' | 'home' | 'receive' | 'send' | 'history';
+export type Bar = 'first' | 'home' | 'receive' | 'send' | 'history' | 'backup';
 
 /**
  * The desktop bar, from 1100 px: the brand, and past the first run the
@@ -37,6 +37,7 @@ export function deskbar(link: boolean, current: Bar = 'first'): HTMLElement {
     { 'aria-label': 'Purse sections' },
     h('a', { href: '#home', 'aria-current': page('home'), 'data-fk': 'db-home' }, 'Purse'),
     h('a', { href: '#history', 'aria-current': page('history'), 'data-fk': 'db-history' }, 'History'),
+    h('a', { href: '#backup', 'aria-current': page('backup'), 'data-fk': 'db-backup' }, 'Backup'),
   );
   const acts = h(
     'div',
@@ -49,14 +50,20 @@ export function deskbar(link: boolean, current: Bar = 'first'): HTMLElement {
 
 /**
  * A flow's top bar on the phone: back to the purse, the flow's name on a
- * rule, and the mint's face, a mark until the Mints screen comes.
+ * rule, and the mint's face, a mark until the Mints screen comes. Backup,
+ * which covers every mint, shows no face; with no mint yet, there is no
+ * purse to go back to.
  */
-export function tbSub(title: string, mint: string, name: string): HTMLElement {
+export function tbSub(title: string, mint?: { mint: string; name: string }, back = true): HTMLElement {
   return h(
     'header',
     { class: 'tb' },
-    h('a', { class: 'ib back', href: '#home', 'aria-label': 'Back to the purse', 'data-fk': 'tb-back' }, backIcon()),
+    back
+      ? h('a', { class: 'ib back', href: '#home', 'aria-label': 'Back to the purse', 'data-fk': 'tb-back' }, backIcon())
+      : h('a', { class: 'ib back', href: '#first', 'aria-label': 'Back to the start', 'data-fk': 'tb-back' }, backIcon()),
     h('div', { class: 'subhead' }, h('span', { class: 'lab' }, title), h('span', { class: 'rule' }), regIcon()),
-    h('span', { class: 'ib face', role: 'img', 'aria-label': `Mint: ${name}` }, face(mint, 4.4, 3.4)),
+    mint === undefined
+      ? h('span', { class: 'ib face', 'aria-hidden': 'true' })
+      : h('span', { class: 'ib face', role: 'img', 'aria-label': `Mint: ${mint.name}` }, face(mint.mint, 4.4, 3.4)),
   );
 }

@@ -19,6 +19,7 @@
     "screenshots": "node scripts/preview.mjs",
     "screenshots:send": "node scripts/preview-send.mjs",
     "screenshots:history": "node scripts/preview-history.mjs",
+    "screenshots:backup": "node scripts/preview-backup.mjs",
     "plan-check": "node scripts/plan-check.mjs"
   },
   "dependencies": {

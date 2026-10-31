@@ -64,3 +64,6 @@ export const regIcon = (): SVGSVGElement => icon(14, 1, [['circle', 7, 7, 4.2], 
 
 /** An arrow out of a tray: share (Derived, in the same make as copy and paste). */
 export const shareIcon = (): SVGSVGElement => icon(20, 1.5, [['path', 'M10 2.5v10M6 6.5l4-4 4 4'], ['path', 'M4.5 9.5v8h11v-8']], { square: true });
+
+/** A sheet with a folded corner: a file. */
+export const fileIcon = (): SVGSVGElement => icon(20, 1.5, [['path', 'M4 2.5h8l4 4v11H4z'], ['path', 'M12 2.5v4h4']]);

@@ -57,8 +57,17 @@ This version is the shell, Holdings, keep-alive, Receive, Send and History:
   since the oldest entry kept, and that the register is kept in this
   browser alone. Holdings' Recent leads there, and so does the desktop bar.
 
-Not yet: Backup, the Mints screen (Holdings shows the mint used last), a
-menu on the phone, and a service worker.
+- **Backup** (`#backup`): what the last backup covers of what the purse
+  holds, under "Keep a copy": each note held, largest first, solid when the
+  backup names it and dashed when it moved or came since, and "Your last
+  backup covers 128 of 187 tokens". Below it a new backup is saved as an
+  encrypted file, and a file is restored. Holdings' Backup link on the
+  phone carries a mark while the last backup covers less than half of what
+  is held, and the desktop's mint panel has a Backup row. With no mint yet
+  it is the first run's way to restore ("Have a backup file? Restore it").
+
+Not yet: the Mints screen (Holdings shows the mint used last), a menu on
+the phone, and a service worker.
 
 ## History
 
@@ -97,6 +106,85 @@ row can say "As 4 + 1": a take's and keep-alive's in `values`, beside
 their serials; a fade's in `gone`; a send's spent notes in `spentValues`,
 from the read its plan was checked on. An entry written before says the
 tokens instead.
+
+## Backup
+
+A backup is the SDK's `Purse.backup`: every note of every mint the purse
+holds, with its secret key, and the mint list (each mint's server, and the
+name and unit the purse gave it), sealed with a passphrase of 8 characters
+or more, typed twice (Argon2id over 64 MiB, then XChaCha20-Poly1305: the
+`worgl` command line's purse file, which it opens too). Each mint's entry
+also keeps when it was sealed (`saved`), which a restore takes as that
+backup's time: a file's own date is only when that copy was made. A
+passphrase is composed (Unicode NFC) before it is counted, compared and
+sealed, so an accented letter typed as one character or as a letter and a
+mark seals alike; opening tries it composed, then as typed, then
+decomposed, for a file sealed elsewhere.
+
+Where the browser has a save dialog (`showSaveFilePicker`) it asks where
+first, while the press still counts, and a second press while the dialog
+is open does nothing; the file written there is the last backup at once.
+Elsewhere the file downloads, named `worgl-purse-2026-10-30-1413.worgl`,
+and a download says nothing back (the browser may ask first, or be told
+no), so it counts as a backup only once the person presses "It is saved";
+until then Save waits, and "Download again" sends the same file. The
+passphrases are kept in the app, not in the state the view is drawn from,
+and put back into their fields after each draw, so they are never in the
+page's markup; what was typed when Save or Restore was pressed is what
+seals or opens, and they are forgotten once used and on leaving Backup. A
+save or restore that ends while the person is elsewhere keeps what it came
+to for their next visit to Backup, and moves no focus.
+
+A backup covers exactly the notes held now whose serials it names: a note
+that moves (a send, keep-alive) gets a new key, and the backup no longer
+brings it back. So each mint's record keeps the time and the serials of the
+notes held both before and after the seal (`backup`), what Backup draws
+and Holdings' Backup row say are those still held, and History gets "Saved
+a backup", which changes nothing.
+
+Restoring merges (the SDK's `Purse.restore`). The file is checked before
+any passphrase is asked for (not empty, at most 8 MiB, a sealed purse
+file); a wrong passphrase, or a file changed since, is refused with one
+message. A mint the purse has goes to its own server; a new one goes to
+the server the file names, only if a link could name it (https, or http on
+the machine itself), and is read there first and named by that server, as
+a link's mint would be (the name and unit a file gives are never taken: a
+file can come from anyone); a
+mint at no such server is left out, and the purse says to add it by its
+link and restore again. Each server's mints are restored holding
+`purse:transfers`, and what came of it is logged before the lock goes:
+"Restored 192" (the notes it brought, which this purse did not hold), with
+the notes the backup had spent that this purse still held dropped, and its
+outgoing transfers brought along for keep-alive to settle. A note that had
+faded meanwhile is dropped by the next pass and logged as a fade "from a
+backup", after the restore. A send it brought that the mint turns away
+comes back as "Restored", and one whose answer the mint no longer keeps is
+"Lost", as keep-alive's are.
+
+A restored note comes in unchecked: a copy of the purse may have spent it
+since. The purse asks the mint about each, one at a time and two to six
+seconds apart, from one tab (the Web Lock `purse:checks`, taken with
+`ifAvailable`), on Backup and on any route, now and on each open until
+every one is answered. Each question is asked holding `purse:transfers`
+(with `ifAvailable`: when a send or keep-alive holds it, the check waits a
+gap and asks again), and its answer is logged before the lock goes, so
+History's Held column steps with each drop. A spent note is dropped and the
+mint's answers go in one entry per mint and run: "Dropped 64 already
+spent", or "Checked 128 restored" when none was. Once anything else of the
+mint is logged after it, a note found spent starts a new entry, and one
+found live joins the earlier entry where it stands, so no drop is dated
+past a row that came after it. For the same reason "Saved a backup" is
+logged when it is written, with when it was sealed beside it (a download
+said saved later), and a restored file's time is never taken as later
+than the restore. Until it is answered, keep-alive
+leaves a restored note where it is (a hop it planned for one is cancelled),
+and a send first asks about its mint's unchecked notes as the store keeps
+them, since the SDK picks the notes a send spends: it logs each answer as
+it comes, and sends nothing if the mint did not answer for one.
+
+Below that, Backup says whether the browser agreed to keep the purse's
+data (`navigator.storage.persisted()`), and, outside an installed purse,
+that Safari keeps it only once added to the Home Screen.
 
 ## Keep-alive
 
@@ -215,11 +303,12 @@ under the hosted Content-Security-Policy, with the local mint allowed.
 | `npm run build` | the site, in `dist/` |
 | `npm run preview` | `dist/` on 127.0.0.1:4173, under the policy in `public/_headers` |
 | `npm run check` | `tsc` over the app, and over the tests and scripts |
-| `npm test` | `node --test` over the pure logic in `test/`: mint links, request and hand-back links, deflate, QR codes, words, times, amounts, the planner, open requests, notes and transfers, the field's geometry, errors, which SDK purse is current, keep-alive's spacing and decoding, the keeper's passes with stand-ins, the grain |
+| `npm test` | `node --test` over the pure logic in `test/`: mint links, request and hand-back links, deflate, QR codes, words, times, amounts, the planner, open requests, notes and transfers, the field's geometry, errors, which SDK purse is current, keep-alive's spacing and decoding, the keeper's passes with stand-ins, History's register, Backup's words and arithmetic, the grain |
 | `npm run mint` | the local mint and faucet (`scripts/dev-mint.mjs`) |
 | `npm run screenshots` | `scripts/preview.mjs`: the first run and Holdings, below |
 | `npm run screenshots:send` | `scripts/preview-send.mjs`: Receive and Send between two purses, below |
 | `npm run screenshots:history` | `scripts/preview-history.mjs`: History, from the entries of real sends, takes, keep-alive and a fade |
+| `npm run screenshots:backup` | `scripts/preview-backup.mjs`: Backup: a save, a send after it, a restore in a new browser and the checks |
 | `npm run plan-check` | `scripts/plan-check.mjs`: the planner's choice of notes, checked against the SDK's own `pay` on a local mint |
 | `npm run grain` | draws `public/grain-*.png` again (`scripts/grain.ts`) |
 
@@ -266,6 +355,16 @@ received row open, into `target/purse-preview/history-shots/` unless
 every row has a number, that each is the one after it and its change, and
 that the oldest is its own change, as each purse began empty.
 
+`scripts/preview-backup.mjs` saves a backup in one purse (after a short
+passphrase and two that differ are refused), sends from one of its notes so
+the backup covers less, then restores the file in a new browser from the
+first run: a wrong passphrase first, then the right one, and the mint's
+checks drop the note that was spent. The first purse restores the file too,
+and nothing in it is new. It shoots Holdings, Backup at each step and both
+Histories with the new rows open into `target/purse-preview/backup-shots/`
+unless `--out` says, checks the Held column as the History walk does, and
+fails on a passphrase anywhere in the page's markup.
+
 ## Camera
 
 Send and Receive can read a code with the camera, and only on "Turn on the
@@ -292,8 +391,8 @@ no server.
   per server. After another tab changed a store, the purse opens a new
   `Purse` on it, but never while a change of the current one runs, since
   that change saves what it kept (`src/current.ts`).
-- **One lock for every transfer.** A keep-alive pass, a send and "Try
-  again now" each hold the Web Lock `purse:transfers` (`src/lock.ts`), so
+- **One lock for every transfer.** A keep-alive pass, a send, "Try
+  again now" and a restore each hold the Web Lock `purse:transfers` (`src/lock.ts`), so
   no two of them, in this tab or another, run at once. A pass takes it
   with `ifAvailable` and never steals it: a second tab finds it taken and
   shows the first one's run ("In another tab") instead of starting its
@@ -309,10 +408,10 @@ no server.
   lock, since every change of a store takes the SDK's own lock
   (`worgl:<server URL>`) and reads it again first.
 - **Its own records** are in an IndexedDB database named `purse`, at
-  version 3 (a tab on an older version closes its records when a newer one
+  version 4 (a tab on an older version closes its records when a newer one
   opens): the mints added (key, server, name, the info last read, when last
-  used, and when and how much fades first as last read, so a fresh open
-  with the mint down can still say it), the requests made (what Receive
+  used, when and how much fades first as last read, so a fresh open
+  with the mint down can still say it, and what the last backup named), the requests made (what Receive
   shows and lists; the SDK keeps their keys; open ones are never dropped,
   and of the ended ones the newest 50 stay), and a log of up to 200
   entries, every write strict: `faucet` ("Took 64 from the faucet"),
@@ -320,8 +419,9 @@ no server.
   rotation, with the serials and values of the new notes; a later pass adds to it,
   and a token moved twice counts once), `lost` ("Lost 64": a transfer the
   mint applied whose answer it no longer keeps), `sent` ("Sent 5", or "Sent
-  16 of 20 · 8 lost" when the mint dropped part of it) and
-  `received` ("Received 20"). A send still on its way is never trimmed,
+  16 of 20 · 8 lost" when the mint dropped part of it),
+  `received` ("Received 20"), `backup` ("Saved a backup"), `restored`
+  ("Restored 192") and `checked` ("Dropped 64 already spent"). A send still on its way is never trimmed,
   however old, since its settle writes what it came to there.
 - **Sends and hand-backs.** The SDK keeps each payment and what it owes the
   receiver (`payments()`, `owed`), so a hand-back is never lost: Send shows
@@ -363,9 +463,10 @@ A faucet answers the hosted purse only when it names its origin:
 | `src/app.ts` | state, routes, actions, what keeps Holdings current, and keep-alive's wiring (the lock, the channel, the wake lock) |
 | `src/keep.ts` | keep-alive's pure logic: the time budget and spacing, which note a transfer spends, moving and kept notes, when a mint is due, the step count and boxes |
 | `src/keeper.ts` | keep-alive's runner: when passes run and stop (`Keeper`), and one pass over a server (`Keeping`), every browser and SDK dependency injected |
-| `src/lock.ts` | the one Web Lock that keep-alive passes, sends and settles take |
-| `src/first.ts`, `src/home.ts`, `src/receive.ts`, `src/send.ts`, `src/history.ts`, `src/shell.ts` | the views, and the bars and brand they share |
+| `src/lock.ts` | the one Web Lock that keep-alive passes, sends, settles and restores take, and the one the checks of restored notes take |
+| `src/first.ts`, `src/home.ts`, `src/receive.ts`, `src/send.ts`, `src/history.ts`, `src/backup.ts`, `src/shell.ts` | the views, and the bars and brand they share |
 | `src/register.ts` | History's register: the rows by day, what was held after each, and what each row says |
+| `src/cover.ts` | Backup's words and arithmetic: the passphrase, the file, what a backup covers, where a restore puts each mint, and what a restore and the checks came to |
 | `src/flow.ts`, `src/flow-words.ts`, `src/slice.ts`, `src/postmark.ts`, `src/icons.ts` | what Receive and Send draw: the stamps, codes, ticket and scanner, their words, the slice of the field a send takes from, the postmark of what came in |
 | `src/plan.ts`, `src/amount.ts`, `src/asks.ts`, `src/entries.ts` | which notes a send takes, the amount typed, the open requests, and the log's sends and receipts |
 | `src/links.ts`, `src/deflate.ts`, `src/qr.ts`, `src/camera.ts` | request and hand-back links, their deflate, the QR codes, and the camera |

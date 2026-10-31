@@ -13,6 +13,7 @@ import type { FaucetInfo } from 'worgl';
 import { type Child, h } from './dom.ts';
 import { recentRow } from './flow-words.ts';
 import { f2, hm, periodWords, shortDay, change } from './format.ts';
+import { type Cover, coverOf, coverRow, wantsBackup } from './cover.ts';
 import { arrowIcon } from './icons.ts';
 import type { Holdings, LaneKey } from './holdings.ts';
 import { type Progress, boxes } from './keep.ts';
@@ -140,7 +141,7 @@ function paperBand(input: HomeInput): HTMLElement {
     h(
       'div',
       { class: 'wrap' },
-      h('header', { class: 'tb' }, brand(true)),
+      h('header', { class: 'tb' }, brand(true), h('span', { class: 'sp' }), backupLink(input)),
       h(
         'div',
         { class: `hero${input.received !== undefined ? ' has-pm' : ''}` },
@@ -497,7 +498,57 @@ function mintColumn(input: HomeInput): HTMLElement {
         face(record.mint, 7, 5.6),
         h('div', {}, h('h3', {}, ...breakable(record.name)), h('p', { class: 'note-line muted' }, ...rotates)),
       ),
-      h('dl', {}, h('dt', {}, 'Key'), h('dd', {}, h('code', {}, shortKey(record.mint)))),
+      h(
+        'dl',
+        {},
+        h('dt', {}, 'Key'),
+        h('dd', {}, h('code', {}, shortKey(record.mint))),
+        h('dt', {}, 'Backup'),
+        h('dd', {}, h('a', { class: 'to-bk', href: '#backup', 'data-fk': 'to-backup-d' }, backupRow(input))),
+      ),
     ),
+  );
+}
+
+/** What the last backup covers of what is held now, once read. */
+const coverNow = (input: HomeInput): Cover | undefined => {
+  const holdings = input.data?.holdings;
+  // a note on its way in a keep-alive hop is spent, and the backup no longer covers it: Backup's own read leaves it out too
+  return holdings === undefined || input.record.backup === undefined
+    ? undefined
+    : coverOf(
+        holdings.notes.filter((note) => !note.moving),
+        input.record.backup.ids,
+        holdings.total,
+      );
+};
+
+/** The mint column's Backup row: what the last backup covers and when, or that there is none. */
+function backupRow(input: HomeInput): string {
+  return coverRow(coverNow(input), input.record.backup?.t, input.now);
+}
+
+/**
+ * Backup's way in on the phone, at the right of the top bar: marked when a
+ * backup is wanted, the purse holding tokens of which the last one covers
+ * under half (or there is none).
+ */
+function backupLink(input: HomeInput): HTMLElement {
+  const holdings = input.data?.holdings;
+  const wanted = holdings !== undefined && wantsBackup(coverNow(input) ?? { covered: 0, total: holdings.total });
+  return h(
+    'a',
+    {
+      class: `lab tb-bk phone-only${wanted ? ' wanted' : ''}`,
+      href: '#backup',
+      'data-fk': 'to-backup',
+      'aria-label': !wanted
+        ? undefined
+        : input.record.backup === undefined
+          ? `Backup: there is no backup of ${input.record.name} yet`
+          : 'Backup: your last backup covers under half of what the purse holds',
+    },
+    wanted ? h('i', { class: 'bk-mark', 'aria-hidden': 'true' }) : null,
+    'Backup',
   );
 }

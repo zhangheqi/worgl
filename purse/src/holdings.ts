@@ -114,7 +114,7 @@ export const noteId = (serial: { generation: bigint; index: number }): string =>
   `${serial.generation}:${serial.index}`;
 
 /** Where a note came from, as the purse's log knows it. */
-export type Source = 'faucet' | 'kept' | 'received' | 'change';
+export type Source = 'faucet' | 'kept' | 'received' | 'change' | 'restored';
 
 /** What the purse's own log knows of a note: when it came, and from where. */
 export interface Arrival {
@@ -125,25 +125,34 @@ export interface Arrival {
 /** An entry of the purse's log (records.ts `LogEntry`, which needs IndexedDB to load), as far as arrivals read it. */
 export interface Logged {
   t: number;
-  kind: 'faucet' | 'faded' | 'kept' | 'lost' | 'sent' | 'received';
+  kind: 'faucet' | 'faded' | 'kept' | 'lost' | 'sent' | 'received' | 'backup' | 'restored' | 'checked';
   mint: string;
   serials: readonly string[];
   /** sent: when its change came. */
   t2?: number | undefined;
   /** sent: when each note of its change that came before `t2` came. */
   changeAt?: Readonly<Record<string, number>> | undefined;
+  /** restored: the notes its transfers spend, which came with it. */
+  moved?: readonly string[] | undefined;
 }
 
 /** Where the notes an entry of the log names came from, if it brought any. */
-const SOURCES: Partial<Record<Logged['kind'], Source>> = { faucet: 'faucet', kept: 'kept', received: 'received', sent: 'change' };
+const SOURCES: Partial<Record<Logged['kind'], Source>> = {
+  faucet: 'faucet',
+  kept: 'kept',
+  received: 'received',
+  sent: 'change',
+  restored: 'restored',
+};
 
 /**
  * What the purse's log knows of each note of `mint`: when it came, and from
- * where, a faucet, keep-alive, a hand-back or a send's change (which comes
- * when its answer does, not at pay). The log is newest first, so a note's
- * latest entry wins. A note keep-alive just moved (`hopped`, by when)
- * counts from its hop until its run's entry is written, so it keeps its
- * place in the field.
+ * where, a faucet, keep-alive, a hand-back, a send's change (which comes
+ * when its answer does, not at pay) or a backup restored (with the notes
+ * its transfers spend, which a settle may find faded). The log is newest
+ * first, so a note's latest entry wins. A note keep-alive just moved
+ * (`hopped`, by when) counts from its hop until its run's entry is
+ * written, so it keeps its place in the field.
  */
 export function arrivalsOf(
   log: readonly Logged[],
@@ -157,7 +166,7 @@ export function arrivalsOf(
       continue;
     }
     const at = entry.kind === 'sent' ? (entry.t2 ?? entry.t) : entry.t;
-    for (const id of entry.serials) {
+    for (const id of [...entry.serials, ...(entry.moved ?? [])]) {
       if (!known.has(id)) {
         known.set(id, { at: entry.changeAt?.[id] ?? at, source });
       }

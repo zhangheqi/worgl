@@ -337,6 +337,8 @@ export function noteTip(
       lines.push(`Received at ${at}.`);
     } else if (note.source === 'change') {
       lines.push(`Change from your send at ${at}.`);
+    } else if (note.source === 'restored') {
+      lines.push(`Restored from a backup at ${at}.`);
     }
   }
   if (note.moving) {
@@ -580,8 +582,10 @@ export const rotatesQuickly = (periodSecs: number): boolean => periodSecs < 14_4
 
 /** What Recent says of an entry of the purse's log (records.ts `LogEntry`, which needs IndexedDB to load). */
 export interface RecentEntry {
-  kind: 'faucet' | 'faded' | 'kept' | 'lost';
+  kind: 'faucet' | 'faded' | 'kept' | 'lost' | 'backup' | 'restored' | 'checked';
   amount: number;
+  /** checked: what the mint said is live, of the notes asked about. */
+  live?: number | undefined;
 }
 
 /** A log entry's title in Recent. */
@@ -595,5 +599,11 @@ export function recentTitle(entry: RecentEntry): string {
       return `Kept ${entry.amount} alive`;
     case 'lost':
       return `Lost ${entry.amount}`;
+    case 'backup':
+      return 'Saved a backup';
+    case 'restored':
+      return entry.amount > 0 ? `Restored ${entry.amount}` : 'Restored a backup';
+    case 'checked':
+      return entry.amount > 0 ? `Dropped ${entry.amount} already spent` : `Checked ${entry.live ?? 0} restored`;
   }
 }

@@ -334,7 +334,7 @@ function frame(input: SendInput, paper: Child[], cobalt: Child[], cls = ' flow',
       h(
         'section',
         { class: `band-p${tearing ? ' tearing' : ''}` },
-        h('div', { class: 'wrap' }, tbSub('Send', input.bar.mint, input.bar.name), ...paper),
+        h('div', { class: 'wrap' }, tbSub('Send', input.bar), ...paper),
         tearing ? h('div', { class: 'tear', id: 'tear', 'aria-hidden': 'true' }) : null,
       ),
       h('section', { class: `band-c${tearing ? ' tearing' : ''}` }, h('div', { class: 'wrap' }, ...cobalt)),

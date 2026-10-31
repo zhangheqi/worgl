@@ -31,6 +31,15 @@ describe('what an entry changed', () => {
     assert.equal(effectOf(entry({ kind: 'sent', t: 0, amount: 5, asked: 5, state: 'turned' })), 0);
   });
 
+  test('for a backup, is nothing saved, what a restore changed, and what the mint found spent', () => {
+    assert.equal(effectOf(entry({ kind: 'backup', t: 0, amount: 64 })), 0);
+    assert.equal(effectOf(entry({ kind: 'restored', t: 0, amount: 52 })), 52);
+    // a restore that dropped more than it brought
+    assert.equal(effectOf(entry({ kind: 'restored', t: 0, amount: -4 })), -4);
+    assert.equal(effectOf(entry({ kind: 'checked', t: 0, amount: 12 })), -12);
+    assert.ok(Object.is(effectOf(entry({ kind: 'checked', t: 0, amount: 0, values: [32] })), 0));
+  });
+
   test('for a send, is what it asked while on its way, then what went', () => {
     // the total counts the change on its way and leaves out theirs: a send on its way has taken what it asks
     assert.equal(effectOf(entry({ kind: 'sent', t: 0, amount: 5, asked: 5, state: 'sending' })), -5);
@@ -149,6 +158,30 @@ describe('the register', () => {
 
   test('names a day of another year with its year', () => {
     assert.equal(dayName(new Date(2025, 11, 31, 9).getTime(), NOW), 'Wednesday 31 December 2025');
+  });
+});
+
+describe('the register after a restore', () => {
+  test('counts what faded of it after it, so Held never runs below nothing', () => {
+    // a restore of 36, 4 of which had faded already: the fade the prune logs comes after it
+    const log = [
+      entry({ kind: 'faucet', t: at(21, 9), amount: 64 }),
+      entry({ kind: 'backup', t: at(21, 9, 30), amount: 64, values: [64] }),
+      entry({ kind: 'restored', t: at(21, 10), amount: 36, serials: ['6:1', '6:2'], values: [32, 4] }),
+      entry({ kind: 'faded', t: at(21, 10) + 1, amount: 4, gone: [4], fadeAt: 'after' }),
+      entry({ kind: 'checked', t: at(21, 10, 1), amount: 32, gone: [32] }),
+    ];
+    const rows = register(log, MINT, 64, NOW).flatMap((day) => day.rows);
+    assert.deepEqual(
+      rows.map((row) => [row.entry.kind, row.held]),
+      [
+        ['checked', 64],
+        ['faded', 96],
+        ['restored', 100],
+        ['backup', 64],
+        ['faucet', 64],
+      ],
+    );
   });
 });
 
@@ -414,5 +447,87 @@ describe('a row’s words', () => {
     assert.match(two.detail[1] ?? '', /The mint turned the rest away, and their notes are back with you\.$/);
     // what went not known: no change to show
     assert.equal(rowWords(entry({ kind: 'sent', t: 0, amount: 20, asked: 20, transfers: 2, state: 'partial' }), ctx()).delta, undefined);
+  });
+
+  test('say what a backup saved', () => {
+    const words = rowWords(entry({ kind: 'backup', t: at(21, 9, 15), amount: 69, values: [64, 4, 1] }), ctx());
+    assert.equal(words.title, 'Saved a backup');
+    assert.equal(words.sub, 'Encrypted file · holds 69');
+    assert.equal(words.delta, 0);
+    assert.deepEqual(words.detail, [
+      'A backup holds the notes as they were at 09:15: here, notes of 64, 4 and 1, sealed with your passphrase.',
+      'Notes that move after that get new keys, and the backup no longer covers them.',
+    ]);
+    assert.equal(rowWords(entry({ kind: 'backup', t: at(21, 9, 15), amount: 0 }), ctx()).sub, 'Encrypted file');
+    // a download said saved later: logged then, sealed before
+    const later = rowWords(entry({ kind: 'backup', t: at(21, 9, 40), amount: 64, values: [64], saved: at(21, 9, 15) }), ctx());
+    assert.equal(later.detail[0], 'A backup holds the notes as they were at 09:15: here, one note of 64, sealed with your passphrase.');
+    const nextDay = rowWords(entry({ kind: 'backup', t: at(21, 8), amount: 64, values: [64], saved: at(20, 23, 50) }), ctx());
+    assert.match(nextDay.detail[0] ?? '', /^A backup holds the notes as they were on .*20 Oct/);
+  });
+
+  test('say what a restore brought, dropped and sends again', () => {
+    const words = rowWords(
+      entry({ kind: 'restored', t: at(21, 10), amount: 44, serials: ['6:1', '6:2'], values: [32, 16], gone: [4], transfers: 1, saved: at(20, 18, 40) }),
+      ctx(),
+    );
+    assert.equal(words.title, 'Restored 44');
+    assert.equal(words.sub, 'As 32 + 16 · from a backup');
+    assert.equal(words.delta, 44);
+    assert.deepEqual(words.detail, [
+      'Notes of 32 and 16 from a backup saved on Tue 20 Oct, which this purse did not hold.',
+      'The backup had spent one note of 4 this purse still held, so the purse dropped it.',
+      'It also brought a transfer the mint had not been seen to answer, which the purse sends again.',
+      'The purse asks the mint about each note it brought, and drops those spent since the backup.',
+    ]);
+    const nothing = rowWords(entry({ kind: 'restored', t: at(21, 10), amount: 0, saved: at(21, 9) }), ctx());
+    assert.equal(nothing.title, 'Restored a backup');
+    assert.equal(nothing.sub, 'From a backup');
+    assert.deepEqual(nothing.detail, ['Nothing of this mint from a backup saved at 09:00 was new to this purse.']);
+  });
+
+  test('say what of a restore had faded before it came', () => {
+    const one = rowWords(entry({ kind: 'faded', t: at(21, 10), amount: 64, gone: [64], fadeAt: 'restored' }), ctx());
+    assert.equal(one.title, 'Faded 64');
+    assert.equal(one.sub, 'One note · from a backup');
+    assert.equal(one.delta, -64);
+    assert.deepEqual(one.detail, [
+      'One note of 64 came back with a backup, but the mint had dropped its layer while the backup was kept, so it had faded before it came.',
+    ]);
+    const two = rowWords(entry({ kind: 'faded', t: at(21, 10), amount: 8, gone: [4, 4], fadeAt: 'restored' }), ctx());
+    assert.equal(two.sub, 'As 4 + 4 · from a backup');
+    assert.match(two.detail[0] ?? '', /^Two notes of 4 came back .* their layer .* so they had faded before they came\.$/);
+  });
+
+  test('say what became of a send a restore brought', () => {
+    const lost = rowWords(entry({ kind: 'lost', t: at(21, 10), amount: 59, brought: true }), ctx());
+    assert.equal(lost.title, 'Lost 59');
+    assert.equal(lost.sub, 'A send from a backup');
+    assert.equal(lost.delta, -59);
+    assert.match(lost.detail[0] ?? '', /^A backup brought a send .* so the change it held for this purse is lost\.$/);
+    const back = rowWords(entry({ kind: 'restored', t: at(21, 10), amount: 5, turnedBack: 1 }), ctx());
+    assert.equal(back.title, 'Restored 5');
+    assert.equal(back.sub, 'A send from a backup, turned away');
+    assert.equal(back.delta, 5);
+    assert.deepEqual(back.detail, [
+      'A backup brought a send the mint had not been seen to answer, and the purse sent it again. The mint turned its transfer away, so the note it spent is back here, with the 5 it would have paid.',
+    ]);
+    const both = rowWords(entry({ kind: 'restored', t: at(21, 10), amount: 7, turnedBack: 2 }), ctx());
+    assert.match(both.detail[0] ?? '', /turned its transfers away, so the notes they spent are back here, with the 7 they would have paid\.$/);
+  });
+
+  test('say what the mint said of restored notes', () => {
+    const words = rowWords(entry({ kind: 'checked', t: at(21, 10, 1), amount: 12, gone: [8, 4], values: [32] }), ctx());
+    assert.equal(words.title, 'Dropped 12 already spent');
+    assert.equal(words.sub, 'Checked with the mint · 32 live');
+    assert.equal(words.delta, -12);
+    assert.deepEqual(words.detail, [
+      'The mint says notes of 8 and 4 from the backup were spent after it was saved, by this purse or a copy of it, so the purse dropped them.',
+      'The mint says one note of 32 from the backup is live, so it moves like any other.',
+    ]);
+    const live = rowWords(entry({ kind: 'checked', t: at(21, 10, 1), amount: 0, values: [32, 16] }), ctx());
+    assert.equal(live.title, 'Checked 48 restored');
+    assert.equal(live.sub, 'Live, the mint says');
+    assert.equal(live.delta, 0);
   });
 });

@@ -14,10 +14,15 @@
 // save, so no change waits for the purse's.
 
 import {
+  Backup,
+  type BackupMint,
+  type Checked,
   Client,
   type FaucetInfo,
   type HeldNote,
+  Holder,
   type MintInfo,
+  NO_SPACING,
   PaymentRequest,
   Purse,
   type Refused,
@@ -28,9 +33,11 @@ import {
   type SubmitProgress,
   type Submitted,
   isTransient,
+  isWorglError,
 } from 'worgl';
 import { IndexedDbStore } from 'worgl/browser';
 
+import { passOf } from './cover.ts';
 import { Current } from './current.ts';
 import { noteId } from './holdings.ts';
 import { type Moving, answersOf, movingNotes, spentBy, spentKey } from './keep.ts';
@@ -168,6 +175,8 @@ export interface Read {
   firstExpiry: bigint | undefined;
   /** This mint's notes on their way in refresh transfers, which `notes` no longer lists and `total` still counts. */
   moving: Moving[];
+  /** The notes of `notes` a restore brought that the mint has not been asked about yet, by id: keep-alive leaves them be. */
+  unchecked: ReadonlySet<string>;
 }
 
 /**
@@ -188,7 +197,8 @@ export async function read(server: string, mint: string): Promise<Read> {
   const raw = Number(clock.time) - (sent + clock.back) / 2000;
   const skew = Math.abs(raw) < 2 ? 0 : Math.round(raw);
   const { outgoing, sendInputs } = outgoingOf(purse);
-  return { info, skew, notes, total: balance.total, firstExpiry, moving: movingNotes(outgoing, sendInputs, mint) };
+  const unchecked = new Set(notesOf(purse.unchecked()).flatMap((each) => (each.mint === mint ? [each.id] : [])));
+  return { info, skew, notes, total: balance.total, firstExpiry, moving: movingNotes(outgoing, sendInputs, mint), unchecked };
 }
 
 /** A purse's outgoing transfers, and the notes its sends (the SDK's payments) spend, by `spentKey`. */
@@ -228,7 +238,23 @@ export async function keepServer<R>(
 ): Promise<R> {
   return serverAt(server).purse.change((purse) =>
     work({
-      planRefresh: (mint) => purse.planRefresh(mint),
+      planRefresh: async (mint) => {
+        // a note a restore brought moves once the mint says it is live: a hop of one spent elsewhere would read as lost.
+        // A mint whose only fading notes are such is not due (keep.ts `dueInput`); where others fade with them, the plan
+        // takes every one, so those are taken back. Read before the plan, which takes the notes it moves out of those held.
+        const doubted = doubtedOf(purse);
+        const plan = await purse.planRefresh(mint);
+        const moves: ScheduledTransfer[] = [];
+        for (const each of plan) {
+          if (spentBy(each.request).some((spent) => doubted.has(spentKey(spent)))) {
+            // planned and saved as outgoing: taken back, so the note is held again, still unchecked, and no settle sends it
+            await purse.cancel(each.request);
+          } else {
+            moves.push(each);
+          }
+        }
+        return moves;
+      },
       submit: (transfers, options) => purse.submit(transfers, options),
       settle: async (spacing, options, holdBack) => {
         const what = await settling(purse, holdBack.size === 0 ? 'all' : { holdBack }, spacing, options);
@@ -436,6 +462,8 @@ export interface Kept {
    */
   went: number | undefined;
   back: number | undefined;
+  /** The request's keys: an output to one of them is the receiver's. */
+  holders: string[];
 }
 
 /** The payments `purse` keeps. */
@@ -443,7 +471,8 @@ function kept(purse: Purse): Kept[] {
   const out = new Set(purse.outgoing());
   return purse.payments().map((made) => {
     const transfers = made.payment.transfers.map((transfer) => transfer.request);
-    const split = sentTo(transfers, holdersOf(made.request.json));
+    const holders = holdersOf(made.request.json);
+    const split = sentTo(transfers, holders);
     return {
       id: idOf(made.request),
       mint: made.request.mint,
@@ -453,6 +482,7 @@ function kept(purse: Purse): Kept[] {
       transfers,
       went: split?.theirs,
       back: split?.change,
+      holders,
     };
   });
 }
@@ -489,6 +519,9 @@ export class AlreadySent extends Error {
   }
 }
 
+/** Why a send stopped before anything was signed: see {@link send}. */
+export type Stopped = 'changed' | 'short' | 'already' | 'unchecked';
+
 /** What a send asks of the app on its way. */
 export interface SendHooks {
   /** Under the lock, before anything is signed: plan again from what is held now. */
@@ -501,6 +534,8 @@ export interface SendHooks {
   sendNow: AbortSignal;
   /** Aborted when the person leaves the page. */
   signal: AbortSignal;
+  /** Under the lock, before the plan is checked again: what the mint said of each of this mint's restored notes, asked first. */
+  checked: (results: CheckResult[]) => Promise<void>;
 }
 
 /**
@@ -517,22 +552,35 @@ export interface Sent {
 }
 
 /**
- * Sends to the request `json`: under the lock and in one change, checks
- * again, pays, then submits each transfer at its time. Resolves to what it
- * came to, or to why it stopped before signing. Throws {@link AlreadySent}
- * when the purse keeps a payment to this request already.
+ * Sends to the request `json`: under the lock and in one change, asks the
+ * mint about the mint's restored notes, checks again, pays, then submits
+ * each transfer at its time. Resolves to what it came to, or to why it
+ * stopped before signing: `unchecked` when the mint did not answer about a
+ * restored note, which the SDK might otherwise spend. Throws
+ * {@link AlreadySent} when the purse keeps a payment to this request
+ * already.
  *
  * Once `pay` has run the request counts as paid, so nothing asks the mint
  * anything until `hooks.signed` has logged the send; and once `submit` has
  * the answers, nothing after it can throw for want of the mint.
  */
-export async function send(server: string, json: string, hooks: SendHooks): Promise<Sent | { stopped: 'changed' | 'short' | 'already' }> {
+export async function send(server: string, json: string, hooks: SendHooks): Promise<Sent | { stopped: Stopped }> {
   const done = await locked(() =>
-    serverAt(server).purse.change(async (purse): Promise<Sent | { stopped: 'changed' | 'short' | 'already' }> => {
+    serverAt(server).purse.change(async (purse): Promise<Sent | { stopped: Stopped }> => {
       const request = PaymentRequest.from(json);
       const mint = request.mint;
       if (kept(purse).some((each) => each.id === idOf(request))) {
         throw new AlreadySent();
+      }
+      // the SDK may pick any note held, so none a restore brought goes before the mint has said it is live: read
+      // from the store as saved now, since another tab's restore may be newer than this purse
+      const doubted = (await uncheckedSaved(purse)).filter((each) => each.mint === mint);
+      if (doubted.length > 0) {
+        // each answer is logged as it comes: one saved and not logged would leave History's Held column off for good
+        const results = await checking(purse, doubted, (result) => hooks.checked([result]));
+        if (results.some((result) => result.outcome === 'unanswered')) {
+          return { stopped: 'unchecked' };
+        }
       }
       const fresh = await read(server, mint);
       const verdict = hooks.check(fresh);
@@ -617,6 +665,8 @@ export interface SettledSend {
   refused: Refused[];
   /** Its change that came in this settle: the notes of its own transfers' answers that are not the receiver's. */
   back: Came[];
+  /** The request's keys, as `Kept.holders`: what a refused transfer would have paid the receiver. */
+  holders: string[];
 }
 
 /** What settling a server came to. */
@@ -699,6 +749,7 @@ async function settling(
         kept: now.get(each.id),
         refused: submitted.refused.filter((refusal) => paymentOf(refusal.request) === each.id),
         back: back === undefined ? [] : await placed(purse, each.mint, back),
+        holders: each.holders,
       };
     }),
   );
@@ -716,4 +767,351 @@ export async function retrySettle(server: string, signal: AbortSignal): Promise<
       kept(purse).some((each) => each.outgoing) ? settling(purse, 'sends', SEND_SPACING, { signal }) : Promise.resolve(undefined),
     ),
   ).then((settled) => settled ?? undefined);
+}
+
+// ---------- Backup ----------
+
+/** A note held, with its text: read from the SDK's list of notes. */
+interface Text {
+  note: string;
+  mint: string;
+  id: string;
+  amount: number;
+}
+
+/** The notes `texts` (each a note's text), with what each carries; those that do not read are left out. */
+const notesOf = (texts: readonly string[]): Text[] =>
+  texts.flatMap((note) => {
+    const fields = readNote(note);
+    return fields === undefined ? [] : [{ note, mint: fields.mint, id: fields.id, amount: fields.amount }];
+  });
+
+/** The notes a restore brought that the mint has not been asked about, by `spentKey`. */
+const doubtedOf = (purse: Purse): Set<string> =>
+  new Set(notesOf(purse.unchecked()).map((each) => spentKey({ mint: each.mint, id: each.id, v: 0, generation: 0n })));
+
+/**
+ * The notes a restore brought to `purse`'s store that the mint has not been
+ * asked about, as the store holds them now: read from a purse of its own,
+ * never saved to, since another tab's restore may be newer than `purse`.
+ */
+async function uncheckedSaved(purse: Purse): Promise<Text[]> {
+  const saved = await Purse.open(purse.client, { store: new IndexedDbStore(purse.client.baseUrl) });
+  return notesOf(saved.unchecked());
+}
+
+/** What a backup holds of a mint: its notes' serials and values, in one order. */
+export interface Holds {
+  ids: string[];
+  values: number[];
+}
+
+/** The notes `notes` (texts) by mint, as serials and values. */
+function holdsOf(notes: readonly Text[]): Map<string, Holds> {
+  const holds = new Map<string, Holds>();
+  for (const each of notes) {
+    const at = holds.get(each.mint) ?? { ids: [], values: [] };
+    at.ids.push(each.id);
+    at.values.push(each.amount);
+    holds.set(each.mint, at);
+  }
+  return holds;
+}
+
+/** A mint as a backup lists it: where it is, and what the purse calls it and its tokens, which a restore reads back. */
+export interface Listed {
+  mint: string;
+  server: string;
+  name: string;
+  unit: string;
+}
+
+/**
+ * Seals the purse of every server `mints` names into one backup under
+ * `passphrase`, with `t`, the time it was sealed, in each mint's entry: the
+ * file itself has none, and a copy's own time is when it was copied.
+ * Resolves to the file's text and what it surely holds of each mint: the
+ * notes held both before and after it read the stores, so a note that came
+ * or went meanwhile is never said to be covered, less those whose layer the
+ * mint has dropped, where it answers. Deriving the key holds the thread for
+ * a moment; nothing else runs meanwhile.
+ */
+export async function seal(typed: string, mints: readonly Listed[], t: number): Promise<{ sealed: string; holds: Map<string, Holds> }> {
+  const passphrase = passOf(typed);
+  const servers = [...new Set(mints.map((each) => each.server))];
+  const purses = await Promise.all(servers.map((server) => purseFor(server)));
+  const [first, ...rest] = purses;
+  if (first === undefined) {
+    throw new RangeError('there is no mint to back up');
+  }
+  const before = new Set(purses.flatMap((purse) => purse.notes()));
+  const sealed = await first.backup(passphrase, {
+    purses: rest,
+    mints: mints.map((each) => ({ mint: each.mint, server: each.server, extra: { name: each.name, unit: each.unit, saved: t } })),
+  });
+  // each purse now shows its store as the backup read it
+  const after = notesOf(purses.flatMap((purse) => purse.notes()).filter((note) => before.has(note)));
+  // a note whose layer has gone counts for nothing, though the file holds it until a prune: where the mint answers, left out
+  const faded = new Set<string>();
+  await Promise.all(
+    mints.map(async (each) => {
+      const purse = purses[servers.indexOf(each.server)];
+      const notes = await purse?.notesAt(each.mint).catch(() => undefined);
+      for (const note of notes ?? []) {
+        if (note.state === 'expired') {
+          faded.add(`${each.mint}/${noteId(note.serial)}`);
+        }
+      }
+    }),
+  );
+  return { sealed, holds: holdsOf(after.filter((each) => !faded.has(`${each.mint}/${each.id}`))) };
+}
+
+/** A backup opened: the SDK's, to restore from, the mints it names, and what it holds of each. */
+export interface Opened {
+  backup: Backup;
+  mints: BackupMint[];
+  holds: Map<string, Holds>;
+}
+
+/** Opens a backup's text with `passphrase`. Deriving the key holds the thread for a moment. */
+export async function openBackup(text: string, typed: string): Promise<Opened> {
+  // sealed composed (NFC); then as typed and decomposed, for a file sealed before that, or elsewhere
+  const forms = [...new Set([passOf(typed), typed, typed.normalize('NFD')])];
+  let backup: Backup | undefined;
+  for (const [i, form] of forms.entries()) {
+    try {
+      backup = await Backup.open(text, form);
+      break;
+    } catch (error) {
+      if (i === forms.length - 1 || !(isWorglError(error) && error.code === 'wrong_passphrase')) {
+        throw error;
+      }
+    }
+  }
+  if (backup === undefined) {
+    throw new RangeError('no passphrase was tried');
+  }
+  const holder = Holder.fromJson(backup.toJson());
+  let notes: string[];
+  try {
+    notes = JSON.parse(holder.notes()) as string[];
+  } finally {
+    holder.free();
+  }
+  return { backup, mints: backup.mints, holds: holdsOf(notesOf(notes)) };
+}
+
+/** What a restore came to at one mint. */
+export interface RestoredMint {
+  mint: string;
+  /** What the purse's total changed by. */
+  delta: number;
+  /** The notes it brought, each with whether its layer had gone already, which then counts in nothing. */
+  brought: { id: string; v: number; expired: boolean }[];
+  /** The notes held before that the backup had spent: dropped. */
+  dropped: { id: string; v: number }[];
+  /** Transfers it brought that the mint had not been seen to answer: the next settle sends them. */
+  transfers: number;
+  /** The notes those transfers spend, which come with the restore: a fade of one is never before it. */
+  moved: string[];
+}
+
+/** A holder's total at the mint whose info is `info`. */
+function totalOf(holder: Holder, info: string): bigint {
+  const balance = holder.balance(info);
+  try {
+    return balance.total;
+  } finally {
+    balance.free();
+  }
+}
+
+/** Each note a holder has, by serial, with its state under `info`. */
+function statesOf(holder: Holder, info: string): Map<string, string> {
+  const states = new Map<string, string>();
+  for (const note of holder.notesAt(info)) {
+    states.set(noteId({ generation: note.generation, index: note.index }), note.state);
+    note.free();
+  }
+  return states;
+}
+
+/**
+ * What merging `mints` of `backup` into the holder `json` changes each
+ * mint's total by, under that mint's info as read (`infos`, in the same
+ * order): worked out on copies, so that what another change of the store
+ * adds while the restore runs, such as a take in another tab, is never
+ * counted as the restore's. Its own entry logs it.
+ */
+function mergedDeltas(json: string, backup: Backup, mints: readonly string[], infos: readonly string[]): number[] {
+  const copy = Holder.fromJson(json);
+  const whole = Holder.fromJson(backup.toJson());
+  let part: Holder | undefined;
+  try {
+    part = whole.only(JSON.stringify(mints));
+    const before = infos.map((info) => totalOf(copy, info));
+    copy.merge(part).free();
+    return infos.map((info, i) => Number(totalOf(copy, info) - (before[i] ?? 0n)));
+  } finally {
+    part?.free();
+    whole.free();
+    copy.free();
+  }
+}
+
+/**
+ * Restores `mints` of `backup` into `server`'s purse: under the purse's
+ * lock, so no send, keep-alive pass or check runs meanwhile, and in one
+ * change. Each mint's info is read first, and nothing asks the mint
+ * anything once the merge is saved, so `logged` always writes what it came
+ * to, before the lock goes and before any fade of what it brought.
+ */
+export async function restoreAt(
+  server: string,
+  backup: Backup,
+  mints: readonly string[],
+  logged: (what: RestoredMint[]) => Promise<void>,
+): Promise<RestoredMint[]> {
+  const done = await locked(() =>
+    serverAt(server).purse.change(async (purse) => {
+      // every mint answers before anything changes
+      const infos = await Promise.all(mints.map((mint) => purse.client.infoText(mint)));
+      const deltas = mergedDeltas(purse.toJson(), backup, mints, infos);
+      const restored = await purse.restore(backup, [...mints]);
+      const brought = notesOf(restored.notes);
+      const dropped = notesOf(restored.spent);
+      const merged = Holder.fromJson(purse.toJson());
+      let what: RestoredMint[];
+      try {
+        what = mints.map((mint, i): RestoredMint => {
+          const states = statesOf(merged, infos[i] ?? '');
+          const transfers = restored.outgoing.filter((transfer) => spentBy(transfer).some((spent) => spent.mint === mint));
+          return {
+            mint,
+            delta: deltas[i] ?? 0,
+            brought: brought.filter((each) => each.mint === mint).map((each) => ({ id: each.id, v: each.amount, expired: states.get(each.id) === 'expired' })),
+            dropped: dropped.filter((each) => each.mint === mint).map((each) => ({ id: each.id, v: each.amount })),
+            transfers: transfers.length,
+            moved: [...new Set(transfers.flatMap((transfer) => spentBy(transfer).filter((spent) => spent.mint === mint).map((spent) => spent.id)))],
+          };
+        });
+      } finally {
+        merged.free();
+      }
+      await logged(what);
+      return what;
+    }),
+  );
+  if (done === undefined) {
+    throw new Error('the lock was not granted');
+  }
+  return done;
+}
+
+/**
+ * What the mint said of one restored note: live, spent (dropped), its
+ * layer gone (dropped), or no answer (asked again later); or `gone`, when
+ * another check dropped it first, so this one changed nothing.
+ */
+export interface CheckResult {
+  mint: string;
+  id: string;
+  v: number;
+  generation: bigint;
+  outcome: 'live' | 'spent' | 'expired' | 'gone' | 'unanswered';
+}
+
+/**
+ * Asks the mint about each of `notes`, one at a time with no gap, and
+ * saves each answer as it comes, then hands it to `heard` before the next
+ * question. A note dropped is told apart as spent or faded by the mint's
+ * first layer: one whose layer has gone counted in nothing already, so its
+ * fade is logged as one.
+ */
+async function checking(purse: Purse, notes: readonly Text[], heard: (result: CheckResult) => Promise<void>): Promise<CheckResult[]> {
+  const results: CheckResult[] = [];
+  for (const each of notes) {
+    const checked: Checked = await purse.checkNotes([each.note], NO_SPACING);
+    const generation = BigInt(each.id.split(':')[0] ?? '0');
+    let outcome: CheckResult['outcome'] = 'live';
+    if (checked.unanswered.length > 0) {
+      outcome = 'unanswered';
+    } else if (checked.discarded.length > 0 && checked.value === 0n) {
+      outcome = 'gone';
+    } else if (checked.discarded.length > 0) {
+      const info = await purse.client.info(each.mint).catch(() => undefined);
+      outcome = info !== undefined && generation < info.oldest ? 'expired' : 'spent';
+    }
+    const result: CheckResult = { mint: each.mint, id: each.id, v: each.amount, generation, outcome };
+    results.push(result);
+    await heard(result);
+  }
+  return results;
+}
+
+/**
+ * Asks the mint about the next note a restore brought to `server`'s purse,
+ * leaving out those `skip` names (`mint/serial`, unanswered this run) and
+ * those whose layer has gone, which a prune drops. It holds the purse's
+ * lock, only if no send, keep-alive pass or restore holds it now, so none
+ * of those finds the purse changed under it, and the mint is never asked
+ * about one note twice at once; `heard` logs the answer before it goes.
+ * Resolves to what the mint said and how many are left after it,
+ * `undefined` when none is, or `busy` when the lock is held.
+ */
+export async function checkNext(
+  server: string,
+  skip: ReadonlySet<string>,
+  heard: (result: CheckResult) => Promise<void>,
+): Promise<{ result: CheckResult; left: number } | 'busy' | undefined> {
+  const done = await locked(() => checkOne(server, skip, heard), true);
+  return done === undefined ? 'busy' : done === 'none' ? undefined : done;
+}
+
+async function checkOne(
+  server: string,
+  skip: ReadonlySet<string>,
+  heard: (result: CheckResult) => Promise<void>,
+): Promise<{ result: CheckResult; left: number } | 'none'> {
+  return serverAt(server).purse.change(async (purse) => {
+    const waiting = (await uncheckedSaved(purse)).filter((each) => !skip.has(`${each.mint}/${each.id}`));
+    const gone = new Set<string>();
+    for (const mint of new Set(waiting.map((each) => each.mint))) {
+      for (const note of await purse.notesAt(mint)) {
+        if (note.state === 'expired') {
+          gone.add(`${mint}/${noteId(note.serial)}`);
+        }
+      }
+    }
+    const left = waiting.filter((each) => !gone.has(`${each.mint}/${each.id}`));
+    const next = left[0];
+    if (next === undefined) {
+      return 'none';
+    }
+    const [result] = await checking(purse, [next], heard);
+    return result === undefined ? 'none' : { result, left: left.length - 1 };
+  });
+}
+
+/** How many notes a restore brought to `server`'s store that the mint has not been asked about, the faded left out. */
+export async function uncheckedAt(server: string): Promise<number> {
+  const purse = await purseFor(server);
+  const waiting = await uncheckedSaved(purse);
+  let left = 0;
+  for (const mint of new Set(waiting.map((each) => each.mint))) {
+    const faded = new Set((await purse.notesAt(mint)).filter((note) => note.state === 'expired').map((note) => noteId(note.serial)));
+    left += waiting.filter((each) => each.mint === mint && !faded.has(each.id)).length;
+  }
+  return left;
+}
+
+/** The notes held now at `mint` on `server`, as Backup draws what the last backup covers: serials and values, the faded left out. */
+export async function heldAt(server: string, mint: string): Promise<{ notes: { id: string; v: number }[]; total: number }> {
+  const purse = await purseFor(server);
+  const [notes, balance] = await Promise.all([purse.notesAt(mint), purse.balance(mint)]);
+  return {
+    notes: notes.filter((note) => note.state !== 'expired').map((note) => ({ id: noteId(note.serial), v: Number(note.amount) })),
+    total: Number(balance.total),
+  };
 }

@@ -70,7 +70,7 @@ export function historyView(input: HistoryInput): HTMLElement {
         h(
           'div',
           { class: 'wrap' },
-          tbSub('History', record.mint, record.name),
+          tbSub('History', record),
           h('h1', { class: 'h1 hist-h1', tabindex: -1, 'data-fk': 'h1' }, 'What came and ', h('em', {}, 'went'), '.'),
           h('p', { class: 'lab muted hist-where' }, `${record.name} · kept in this browser only`),
           ...body,
