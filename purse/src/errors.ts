@@ -41,6 +41,8 @@ export interface Context {
   perHour?: number | undefined;
   /** The time now, for when to try again; `Date.now()` if not given. */
   now?: number;
+  /** For a read: whether the mint was named by a server and key typed on Mints, not by a link. */
+  byKey?: boolean;
 }
 
 /** How the purse should go on after an error. */
@@ -68,15 +70,16 @@ export const LOAD_WORDS = 'The purse could not load all of itself. Check the con
 export const UNCHECKED_WORDS =
   'The mint did not answer about a note this purse brought back from a backup, which this send might have spent, so nothing was sent. Try again in a moment.';
 
-/** The words when the server answers, but not with the mint the link names. */
-export const notListed = (host: string): string => `The server at ${host} does not list the mint this link names.`;
+/** The words when the server answers, but not with the mint the link (or the key typed) names. */
+export const notListed = (host: string, byKey = false): string =>
+  `The server at ${host} does not list the mint ${byKey ? 'with this key' : 'this link names'}.`;
 
 /**
  * The words when the mint's server cannot be reached: from a link, check
  * it; from Holdings, which reads the mint again each minute, wait; for a
  * request, a send, a take or a resend, what it means for that.
  */
-function noAnswer(host: string, doing: Doing): string {
+function noAnswer(host: string, doing: Doing, byKey = false): string {
   const first = `The mint at ${host} did not answer.`;
   switch (doing) {
     case 'open':
@@ -94,7 +97,7 @@ function noAnswer(host: string, doing: Doing): string {
     case 'restore':
       return `${first} Nothing of it was restored; try again when it answers.`;
     default:
-      return `${first} Check the link, or try again later.`;
+      return `${first} ${byKey ? 'Check the address' : 'Check the link'}, or try again later.`;
   }
 }
 
@@ -205,7 +208,7 @@ export function say(error: unknown, doing: Doing, context: Context): Said {
       if (doing === 'restore') {
         return { words: `The server at ${host} does not list a mint the backup holds, so nothing of it was restored.` };
       }
-      return { words: doing === 'open' ? `The server at ${host} no longer lists this mint.` : notListed(host) };
+      return { words: doing === 'open' ? `The server at ${host} no longer lists this mint.` : notListed(host, context.byKey) };
     }
     if (code === 'paused') {
       return { words: `The mint at ${host} is paused. Try again later.` };
@@ -216,7 +219,7 @@ export function say(error: unknown, doing: Doing, context: Context): Said {
     if (doing === 'take') {
       return { words: 'The faucet did not answer. Try again in a moment.' };
     }
-    return { words: noAnswer(host, doing) };
+    return { words: noAnswer(host, doing, context.byKey) };
   }
 
   if (name === 'FaucetChanged') {
@@ -229,7 +232,7 @@ export function say(error: unknown, doing: Doing, context: Context): Said {
     return { words: 'This browser refused to save. Nothing changed.' };
   }
   if (name === 'TypeError' || name === 'TimeoutError' || name === 'NetworkError') {
-    return { words: doing === 'take' ? 'The faucet did not answer. Try again in a moment.' : noAnswer(host, doing) };
+    return { words: doing === 'take' ? 'The faucet did not answer. Try again in a moment.' : noAnswer(host, doing, context.byKey) };
   }
   return { words: fallback(doing) };
 }

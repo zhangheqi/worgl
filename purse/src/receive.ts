@@ -113,8 +113,8 @@ export interface ReceiveInput {
   state: ReceiveState;
   /** The mint Receive asks in: the one Holdings shows (none on a take opened by a purse that holds no mint). */
   record: MintRecord | undefined;
-  /** The mint the top bar shows. */
-  bar: { mint: string; name: string };
+  /** The mint the top bar shows, and whether the purse holds it. */
+  bar: { mint: string; name: string; held: boolean };
   denoms: Denoms;
   /** The shown mint's open requests, newest first. */
   asks: readonly AskRecord[];

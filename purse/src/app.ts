@@ -1,7 +1,8 @@
-// The app: its state, its six routes, what the person's actions do, what
+// The app: its state, its seven routes, what the person's actions do, what
 // keeps Holdings current while it is open, and keep-alive's wiring: when
 // the keeper runs, what other tabs hear of it, and how a run shows. The
-// views (first.ts, home.ts, receive.ts, send.ts, history.ts, backup.ts) and
+// views (first.ts, home.ts, receive.ts, send.ts, history.ts, mints.ts,
+// backup.ts) and
 // the field (field.ts) are drawn from the state on every change; the SDK is
 // reached only through purses.ts, which is loaded once the shell has painted.
 
@@ -78,6 +79,8 @@ import { Keeper, type KeptServer, Keeping, type Shown } from './keeper.ts';
 import { withChecksLock, withTransfersLock } from './lock.ts';
 import { type MintLink, hostOf, isMintHash, mintHash, parseMintLink } from './link.ts';
 import { type AskLink, type TakeLink, decode, encodeAsk, encodeTake, linkFor } from './links.ts';
+import { addedWords, heldWords, nameOf, nameProblem, renamedWords, startName, typedKey, typedServer } from './mint-list.ts';
+import { type MintsInput, type MintsState, blankMints, mintsView } from './mints.ts';
 import { holdersOf, readNote, sentTo, serialsSpent, valueOf } from './notes.ts';
 import {
   type Denoms,
@@ -113,8 +116,8 @@ import { keptWords, rotatedWords, rotationWords, tookWords, unreachableFor } fro
 
 type Sdk = typeof import('./purses.ts');
 
-/** The six views. */
-type Route = 'first' | 'home' | 'receive' | 'send' | 'history' | 'backup';
+/** The seven views. */
+type Route = 'first' | 'home' | 'receive' | 'send' | 'history' | 'mints' | 'backup';
 
 /** What Holdings shows and what it is doing. */
 interface HomeState {
@@ -222,6 +225,10 @@ const state = {
   backup: blankBackup() as BackupState,
   /** What Backup last drew, so a read that finds nothing new draws nothing. */
   backupDrawn: undefined as string | undefined,
+  /** Mints: each mint as last read, and a mint being added or renamed. */
+  mintsPage: blankMints() as MintsState,
+  /** What Mints last drew, so a read that finds nothing new draws nothing. */
+  mintsDrawn: undefined as string | undefined,
   /** Each mint's denominations, once its info is read: Receive's sizes of note. */
   policies: new Map<string, Denoms>(),
   /** Each request's link, by its id, once encoded; and the requests whose link could not be written here. */
@@ -376,6 +383,12 @@ function render(): void {
   } else if (state.route === 'history' && record !== undefined) {
     view = historyView(historyInput(record));
     state.history.drawn = historySignature(Date.now());
+  } else if (state.route === 'mints' && record !== undefined) {
+    view = mintsView(mintsInput());
+    state.mintsDrawn = mintsSignature();
+    // an error is announced when it is first drawn, not again on each redraw of the reads
+    const m = state.mintsPage;
+    m.alerted = new Set([...m.errors.values(), m.nameError, m.addError, m.took?.error === true ? m.took.words : undefined].filter((words) => words !== undefined));
   } else if (state.route === 'backup') {
     view = backupView(backupInput());
     state.backupDrawn = backupSignature();
@@ -700,6 +713,9 @@ function routeFor(hash: string): Route {
   if (hash === '#history') {
     return 'history';
   }
+  if (hash === '#mints') {
+    return 'mints';
+  }
   return 'home';
 }
 
@@ -770,6 +786,15 @@ function setRoute(route: Route, options: { focus?: boolean; hash?: string; keep?
       state.backup = { ...blankBackup(), held: b.held, checking: b.checking, persisted: b.persisted, pending: b.pending };
     }
   }
+  if (changed && next === 'mints') {
+    const m = state.mintsPage;
+    // a take, a read of a mint to add, an add or a name being kept keeps the state it writes its end to; anything else
+    // starts afresh, with what the last reads said, until this visit's come back
+    if (m.taking === undefined && !m.reading && !m.adding && !m.renaming) {
+      state.mintsPage = { ...blankMints(), read: m.read, faucets: m.faucets, errors: m.errors };
+    }
+    faucetsAsked.clear();
+  }
   if (changed && next === 'home') {
     state.first = blankFirst();
   }
@@ -812,6 +837,11 @@ function setRoute(route: Route, options: { focus?: boolean; hash?: string; keep?
   }
   if (next === 'backup') {
     void readBackup();
+  }
+  if (next === 'mints') {
+    void readMints();
+  } else {
+    clearTimeout(mintsTimer);
   }
   const record = shown();
   if (next === 'receive' && record !== undefined) {
@@ -973,7 +1003,7 @@ async function saveMint(link: MintLink, about: About): Promise<void> {
   await records.putMint({
     mint: link.mint,
     server: link.server,
-    name: isPlayground(link) ? 'Playground' : hostOf(link.server),
+    name: startName(link.mint, link.server, isPlayground(link), state.mints.map((record) => record.name)),
     unit: 'tokens',
     added: now,
     // nothing is held at a mint just added
@@ -1878,7 +1908,7 @@ const holdingsOf = (read: Read): Holdings =>
 /**
  * The mint whose tokens go first, when it is not the shown one: the date to
  * come back by is the earliest of every mint the purse keeps, and Holdings
- * shows one mint, the one used last, until the Mints screen comes. A mint
+ * shows one mint, the one used last (Mints chooses it, too). A mint
  * this page has not read, since it has not answered yet or does not, counts
  * by what the purse saved of what fades there first.
  */
@@ -2071,7 +2101,10 @@ function receiveInput(): ReceiveInput {
   return {
     state: r,
     record,
-    bar: record !== undefined ? { mint: record.mint, name: record.name } : { mint: take?.link?.mint ?? '', name: take?.host ?? '' },
+    bar:
+      record !== undefined
+        ? { mint: record.mint, name: record.name, held: true }
+        : { mint: take?.link?.mint ?? '', name: take?.host ?? '', held: false },
     denoms: (record === undefined ? undefined : state.policies.get(record.mint)) ?? { kind: 'powers' },
     asks: record === undefined ? [] : openAsks(state.asks, record.mint),
     link: r.ask === undefined ? undefined : state.links.get(r.ask.id),
@@ -3806,10 +3839,10 @@ function sendInput(): SendInput {
     state: s,
     bar:
       held !== undefined
-        ? { mint: held.mint, name: held.name }
+        ? { mint: held.mint, name: held.name, held: true }
         : req !== undefined
-          ? { mint: req.mint, name: host }
-          : { mint: record?.mint ?? '', name: record?.name ?? '' },
+          ? { mint: req.mint, name: host, held: false }
+          : { mint: record?.mint ?? '', name: record?.name ?? '', held: record !== undefined },
     name: held?.name ?? host,
     link: ticket === '' ? undefined : ticket,
     qr: ticketed || s.step === 'handback' ? qrState() : qr,
@@ -3892,6 +3925,423 @@ const sendActions: SendInput['actions'] = {
   },
   retrySettle: () => void retryWaiting(),
 };
+
+// ---------- Mints ----------
+
+function mintsInput(): MintsInput {
+  return {
+    state: state.mintsPage,
+    records: state.mints,
+    shown: shown()?.mint,
+    playground: isPlayground,
+    actions: {
+      show: (mint) => void showMint(mint),
+      take: (mint) => void takeAt(mint),
+      rename: openName,
+      nameChanged: (text) => {
+        state.mintsPage.name = text;
+      },
+      saveName: () => void saveName(),
+      cancelName: () => closeName(true),
+      tab: (tab) => {
+        const m = state.mintsPage;
+        if (m.tab !== tab) {
+          m.tab = tab;
+          m.addError = undefined;
+          m.held = undefined;
+          render();
+        }
+      },
+      typed: (field, text) => {
+        state.mintsPage[field] = text;
+      },
+      find: () => void findMint(),
+      add: () => void addFound(),
+      cancelAdd: () => {
+        const m = state.mintsPage;
+        m.found = undefined;
+        m.addError = undefined;
+        render();
+        focusKey('m-find');
+      },
+    },
+  };
+}
+
+/**
+ * Error words a press just set on Mints: an alert again even where the same
+ * words show already, since the person asked again. A redraw alone (a
+ * read) draws them as a plain line.
+ */
+function anewHere(words: string): string {
+  const alerted = new Set(state.mintsPage.alerted);
+  alerted.delete(words);
+  state.mintsPage.alerted = alerted;
+  return words;
+}
+
+/** What Mints shows that can change between reads: the mints, what each holds and when it rotates, the faucets, the errors, the day. */
+function mintsSignature(): string {
+  const m = state.mintsPage;
+  return JSON.stringify([
+    state.mints.map((record) => [record.mint, record.name, record.server, record.info?.layers, record.info?.periodSecs, record.info?.paused]),
+    shown()?.mint,
+    [...m.read].map(([mint, holdings]) => [mint, holdings.total, holdings.layers, holdings.paused, holdings.schedule?.nextMs, holdings.schedule?.periodMs]),
+    [...m.faucets].map(([mint, faucet]) => [mint, faucet?.amount.toString(), faucet?.perAddressPerHour]),
+    [...m.errors],
+    new Date().toDateString(),
+  ]);
+}
+
+/** Draws Mints again if what it shows changed. */
+function redrawMints(): void {
+  if (state.route === 'mints' && mintsSignature() !== state.mintsDrawn) {
+    render();
+  }
+}
+
+/** Mints' read on its way, and whether another is asked for after it. */
+let mintsReading: Promise<void> | undefined;
+let mintsReadAgain = false;
+/** The mints whose faucet this visit to Mints asked: each is asked once a visit, and again after a take. */
+const faucetsAsked = new Set<string>();
+/** Reads Mints again just after the next rotation of any mint it shows. */
+let mintsTimer: ReturnType<typeof setTimeout> | undefined;
+
+/**
+ * Reads what the purse holds of every mint, and when each rotates; calls
+ * while a read runs ask for one more after it, not one each.
+ */
+function readMints(): Promise<void> {
+  if (mintsReading !== undefined) {
+    mintsReadAgain = true;
+    return mintsReading;
+  }
+  mintsReading = (async () => {
+    try {
+      do {
+        mintsReadAgain = false;
+        await readEveryMint();
+      } while (mintsReadAgain);
+    } finally {
+      mintsReading = undefined;
+    }
+  })();
+  return mintsReading;
+}
+
+async function readEveryMint(): Promise<void> {
+  const records = state.mints;
+  // keep-alive's last read of each mint, until this one comes back: the page is drawn whole at once
+  for (const record of records) {
+    const last = keeping.last(record.mint);
+    if (!state.mintsPage.read.has(record.mint) && last !== undefined) {
+      state.mintsPage.read.set(record.mint, holdingsOf(last));
+    }
+  }
+  redrawMints();
+  let loaded: Sdk;
+  try {
+    loaded = await loadSdk();
+  } catch {
+    for (const record of records) {
+      state.mintsPage.errors.set(record.mint, LOAD_WORDS);
+    }
+    redrawMints();
+    return;
+  }
+  await Promise.all(
+    records.map(async (record) => {
+      if (!faucetsAsked.has(record.mint)) {
+        faucetsAsked.add(record.mint);
+        void askMintFaucet(loaded, record);
+      }
+      await readOneMint(record);
+      redrawMints();
+    }),
+  );
+  planMintsRead();
+}
+
+/** Reads one mint for Mints: what faded is dropped and logged, as Holdings' read does, and keep-alive hears of what is due. */
+async function readOneMint(record: MintRecord): Promise<void> {
+  try {
+    const read = await readPruned(record.server, record.mint);
+    const holdings = holdingsOf(read);
+    state.mintsPage.read.set(record.mint, holdings);
+    state.mintsPage.errors.delete(record.mint);
+    void keepInfo(record, read.info, firstFade(holdings));
+    if (keeping.saw(record.mint, read) === 'due' && finishing === 0) {
+      keeper.poke();
+    }
+  } catch (error) {
+    const said = say(error, 'open', { host: hostOf(record.server) });
+    heed(said);
+    state.mintsPage.errors.set(record.mint, said.words);
+  }
+}
+
+/** Asks the faucet at a mint's server, apart from the read: when it answers for the mint, its card has a Take button. */
+async function askMintFaucet(loaded: Sdk, record: MintRecord): Promise<void> {
+  const faucet = await loaded.faucetAt(record.server, record.mint).catch(() => undefined);
+  state.mintsPage.faucets.set(record.mint, faucet ?? null);
+  redrawMints();
+}
+
+/** Plans Mints' next read just after the next rotation of a mint it shows, so the timetables move on and what faded goes. */
+function planMintsRead(): void {
+  clearTimeout(mintsTimer);
+  if (state.route !== 'mints') {
+    return;
+  }
+  const next = Math.min(...[...state.mintsPage.read.values()].map((holdings) => holdings.schedule?.nextMs ?? Number.POSITIVE_INFINITY));
+  if (!Number.isFinite(next)) {
+    return;
+  }
+  const wait = next - Date.now();
+  mintsTimer = setTimeout(
+    () => {
+      if (state.route === 'mints' && !document.hidden) {
+        void readMints();
+      }
+    },
+    wait > 0 ? Math.min(wait + 1500, 2 ** 31 - 1) : 5000,
+  );
+}
+
+/** Show on Holdings: the mint becomes the one used last, which Holdings shows. */
+async function showMint(mint: string): Promise<void> {
+  await setUsed(mint);
+  tell();
+  setRoute('home');
+}
+
+/** Take from a mint's faucet, from its card: the card says what came, and the mint is the one Holdings shows now. */
+async function takeAt(mint: string): Promise<void> {
+  const m = state.mintsPage;
+  const record = state.mints.find((each) => each.mint === mint);
+  const faucet = m.faucets.get(mint) ?? undefined;
+  if (record === undefined || faucet === undefined || m.taking !== undefined) {
+    return;
+  }
+  m.taking = mint;
+  m.took = undefined;
+  render();
+  let ids: string[];
+  let amount: number;
+  try {
+    await takeInto(record);
+    ids = state.home.took?.ids ?? [];
+    amount = state.home.took?.amount ?? Number(faucet.amount);
+  } catch (error) {
+    const said = say(error, 'take', { host: hostOf(record.server), perHour: faucet.perAddressPerHour });
+    heed(said);
+    m.taking = undefined;
+    m.took = { mint, words: anewHere(said.words), error: true };
+    if (said.noFaucet === true) {
+      m.faucets.set(mint, null);
+    }
+    render();
+    focusKey(`mc-take-${mint}`);
+    return;
+  } finally {
+    // Holdings' words and slide for a take are for a take made there: this one is said here
+    state.home.took = undefined;
+    state.home.arriving = [];
+  }
+  await readOneMint(record);
+  // a faucet counts its taps: ask it again on the next read
+  faucetsAsked.delete(mint);
+  const holdings = m.read.get(mint);
+  const note = holdings?.notes.find((each) => ids.includes(each.id));
+  const words =
+    holdings === undefined ? `Took ${amount} from the faucet.` : tookWords(amount, note === undefined ? undefined : laneOf(note.pos, holdings.layers), holdings, Date.now());
+  m.taking = undefined;
+  m.took = { mint, words, error: false };
+  render();
+  if (document.activeElement === document.body || document.activeElement === null) {
+    focusKey(`mc-take-${mint}`);
+  }
+  announce(words);
+}
+
+/** Opens the field for a mint's name, holding its name as it is. */
+function openName(mint: string): void {
+  const m = state.mintsPage;
+  const record = state.mints.find((each) => each.mint === mint);
+  if (record === undefined || m.renaming) {
+    return;
+  }
+  m.naming = mint;
+  m.name = record.name;
+  m.nameError = undefined;
+  render();
+  const field = $<HTMLInputElement>('#mc-name');
+  field?.focus();
+  field?.select();
+}
+
+/** Closes the name field; from its Cancel or Escape, focus goes back to the mint's Rename. */
+function closeName(refocus: boolean): void {
+  const m = state.mintsPage;
+  const mint = m.naming;
+  if (mint === undefined || m.renaming) {
+    return;
+  }
+  m.naming = undefined;
+  m.nameError = undefined;
+  render();
+  if (refocus) {
+    focusKey(`mc-rename-${mint}`);
+  }
+}
+
+/** Keeps the name typed for a mint: the purse's records, and the other tabs, hear of it. */
+async function saveName(): Promise<void> {
+  const m = state.mintsPage;
+  const mint = m.naming;
+  const records = state.records;
+  if (mint === undefined || m.renaming) {
+    return;
+  }
+  const problem = nameProblem(m.name);
+  if (problem !== undefined) {
+    m.nameError = anewHere(problem);
+    render();
+    $<HTMLInputElement>('#mc-name')?.focus();
+    return;
+  }
+  const name = nameOf(m.name);
+  const record = state.mints.find((each) => each.mint === mint);
+  if (record === undefined || records === undefined || record.name === name) {
+    m.naming = undefined;
+    m.nameError = undefined;
+    render();
+    focusKey(`mc-${mint}`);
+    return;
+  }
+  m.renaming = true;
+  m.nameError = undefined;
+  render();
+  try {
+    await records.updateMint(mint, { name });
+    state.mints = await records.mints();
+  } catch (error) {
+    m.renaming = false;
+    m.nameError = anewHere(say(error, 'open', { host: '' }).words);
+    render();
+    $<HTMLInputElement>('#mc-name')?.focus();
+    return;
+  }
+  m.renaming = false;
+  m.naming = undefined;
+  tell();
+  render();
+  focusKey(`mc-${mint}`);
+  announce(renamedWords(name));
+}
+
+/** Find the mint: what was typed, as a mint and its server, read from that server to show before it is kept. */
+async function findMint(): Promise<void> {
+  const m = state.mintsPage;
+  if (m.reading || m.adding) {
+    return;
+  }
+  m.addError = undefined;
+  m.held = undefined;
+  m.added = undefined;
+  const byKey = m.tab === 'key';
+  let link: MintLink;
+  if (!byKey) {
+    const parsed = parseMintLink(m.link);
+    if (!parsed.ok) {
+      m.addError = anewHere(linkWords(parsed.problem));
+      render();
+      focusKey('m-link');
+      return;
+    }
+    link = parsed.link;
+  } else {
+    const server = typedServer(m.server);
+    if (!server.ok) {
+      m.addError = anewHere(server.words);
+      render();
+      focusKey('m-server');
+      return;
+    }
+    const key = typedKey(m.key);
+    if (!key.ok) {
+      m.addError = anewHere(key.words);
+      render();
+      focusKey('m-key');
+      return;
+    }
+    link = { mint: key.key, server: server.server };
+  }
+  const held = state.mints.find((record) => record.mint === link.mint);
+  if (held !== undefined) {
+    // a mint the purse holds is never read again at another server, nor added twice
+    m.held = { mint: held.mint, words: heldWords(held.name, held.server, link.server) };
+    render();
+    return;
+  }
+  m.reading = true;
+  render();
+  let about: About;
+  try {
+    about = await (await loadSdk()).readMint(link);
+  } catch (error) {
+    m.reading = false;
+    m.addError = anewHere(say(error, 'read', { host: hostOf(link.server), byKey }).words);
+    render();
+    focusKey(byKey ? 'm-server' : 'm-link');
+    return;
+  }
+  m.reading = false;
+  m.found = { link, about, name: startName(link.mint, link.server, isPlayground(link), state.mints.map((record) => record.name)) };
+  render();
+  focusKey('m-add');
+}
+
+/** Add mint: the mint read is kept, and Holdings shows it, as the mint used last. */
+async function addFound(): Promise<void> {
+  const m = state.mintsPage;
+  const found = m.found;
+  if (found === undefined || m.adding) {
+    return;
+  }
+  const held = state.mints.find((record) => record.mint === found.link.mint);
+  if (held !== undefined) {
+    // added meanwhile, in another tab
+    m.found = undefined;
+    m.held = { mint: held.mint, words: heldWords(held.name, held.server, found.link.server) };
+    render();
+    return;
+  }
+  m.adding = true;
+  m.addError = undefined;
+  render();
+  try {
+    await saveMint(found.link, found.about);
+  } catch (error) {
+    m.adding = false;
+    m.addError = anewHere(say(error, 'open', { host: hostOf(found.link.server) }).words);
+    render();
+    focusKey('m-add');
+    return;
+  }
+  const name = state.mints.find((record) => record.mint === found.link.mint)?.name ?? found.name;
+  m.adding = false;
+  m.found = undefined;
+  m.link = '';
+  m.server = '';
+  m.key = '';
+  m.added = addedWords(name);
+  render();
+  focusKey(`mc-${found.link.mint}`);
+  announce(m.added);
+  void readMints();
+}
 
 // ---------- Backup ----------
 
@@ -4393,6 +4843,8 @@ async function keepRestored(
     return;
   }
   const t = Date.now();
+  // the names taken, as each new mint is named: two new mints of one server are told apart
+  const names = state.mints.map((record) => record.name);
   for (const each of what) {
     const plan = planned.find((one) => one.mint === each.mint);
     const record = state.mints.find((one) => one.mint === each.mint);
@@ -4404,10 +4856,12 @@ async function keepRestored(
       if (record === undefined && plan !== undefined) {
         const link = { mint: each.mint, server: plan.server };
         const info = about.get(each.mint)?.info;
+        const name = startName(each.mint, plan.server, isPlayground(link), names);
+        names.push(name);
         await records.putMint({
           mint: each.mint,
           server: plan.server,
-          name: isPlayground(link) ? 'Playground' : hostOf(plan.server),
+          name,
           unit: 'tokens',
           added: t,
           info: info === undefined ? undefined : savedInfo(info, null),
@@ -4773,6 +5227,10 @@ async function heard(data: unknown): Promise<void> {
     void refreshHome();
   } else if (state.route === 'backup') {
     await readBackup();
+  } else if (state.route === 'mints') {
+    // a mint added or named there shows here at once
+    render();
+    await readMints();
   }
   // a restore in that tab brought notes the mint has not been asked about: this tab asks, unless that one is
   void runChecks();
@@ -4804,7 +5262,7 @@ function standalone(): boolean {
   }
 }
 
-/** Escape, in order: the camera, the cancel question, Ask in smaller notes, then the tips. */
+/** Escape, in order: the camera, the cancel question, Ask in smaller notes, a mint's name being typed, then the tips. */
 function escape(): boolean {
   if (state.camera.kind === 'running' || state.camera.kind === 'starting') {
     cameraOff();
@@ -4818,6 +5276,10 @@ function escape(): boolean {
     state.receive.smaller = false;
     render();
     focusKey('ask-smaller');
+    return true;
+  }
+  if (state.route === 'mints' && state.mintsPage.naming !== undefined && !state.mintsPage.renaming) {
+    closeName(true);
     return true;
   }
   return false;
@@ -4900,6 +5362,8 @@ function listen(): void {
       void refreshHome();
     } else if (state.route === 'backup') {
       void readBackup();
+    } else if (state.route === 'mints') {
+      void readMints();
     }
     // on every route: what is held is kept, and what an abort left outgoing, a pass's or a send's, is settled
     keeper.show();
@@ -4953,6 +5417,8 @@ function listen(): void {
       keeper.poke();
       if (state.route === 'backup') {
         void readBackup();
+      } else if (state.route === 'mints') {
+        void readMints();
       }
     }
   }, 60_000);
