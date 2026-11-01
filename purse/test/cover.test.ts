@@ -18,6 +18,8 @@ import {
   restorePlan,
   restoredWords,
   savedWords,
+  HOME_SCREEN,
+  installWords,
   storageWords,
   wantsBackup,
 } from '../src/cover.ts';
@@ -279,13 +281,17 @@ describe('the checks of restored notes', () => {
 });
 
 describe('storage', () => {
-  test('says whether this browser keeps the purse, and how to make Safari keep it', () => {
-    const kept = keep(storageWords(true, true));
-    assert.equal(kept.length, 2);
-    assert.match(kept[0] ?? '', /agreed to keep/);
-    const loose = keep(storageWords(undefined, false));
-    assert.equal(loose.length, 3);
-    assert.match(loose[1] ?? '', /Home Screen/);
+  test('says whether this browser keeps the purse, and what clears it', () => {
+    const kept = keep(storageWords(true));
+    assert.match(kept[0], /agreed to keep/);
+    assert.match(kept[1], /Clearing this site’s data empties the purse/);
+    assert.match(keep(storageWords(undefined))[0], /may clear/);
+  });
+
+  test('says how to make the purse an app: the browser’s offer, or the iPhone’s Home Screen', () => {
+    assert.match(keep(HOME_SCREEN), /Home Screen so Safari keeps it/);
+    assert.equal(keep(installWords(false)), ' to open it in its own window, even offline.');
+    assert.match(keep(installWords(true)), /even offline\. Browsers keep an installed purse’s data more readily\.$/);
   });
 });
 

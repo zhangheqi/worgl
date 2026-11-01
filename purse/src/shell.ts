@@ -2,6 +2,7 @@
 // (with Receive and Send once the purse holds a mint) and the flows' top
 // bar on the phone. The bands themselves are each view's.
 
+import { HOME_SCREEN, installWords } from './cover.ts';
 import { h } from './dom.ts';
 import { backIcon, downIcon, regIcon, upIcon } from './icons.ts';
 import { face, wordmark } from './marks.ts';
@@ -70,4 +71,21 @@ export function tbSub(title: string, mint?: { mint: string; name: string; held?:
           h('span', { class: 'ib face', role: 'img', 'aria-label': `Mint: ${mint.name}` }, face(mint.mint, 4.4, 3.4))
         : h('a', { class: 'ib face', href: '#mints', 'aria-label': `Mints: ${mint.name}`, 'data-fk': 'tb-mints' }, face(mint.mint, 4.4, 3.4)),
   );
+}
+
+/**
+ * How the purse becomes an app: the browser's install offer, while it has
+ * made one, as a button in the line; or else the iPhone's way, which no
+ * page can offer. `storage`, on Backup: what installing does for the
+ * purse's data too.
+ */
+export function appLine(install: (() => void) | undefined, cls: string, storage = false): HTMLElement {
+  return install === undefined
+    ? h('p', { class: cls }, HOME_SCREEN)
+    : h(
+        'p',
+        { class: cls },
+        h('button', { class: 'to-install', type: 'button', 'data-fk': 'install', on: { click: install } }, 'Install the purse'),
+        installWords(storage),
+      );
 }

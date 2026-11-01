@@ -45,6 +45,7 @@ import type { KeepPurse } from './keeper.ts';
 import type { MintLink } from './link.ts';
 import { withTransfersLock } from './lock.ts';
 import { holdersOf, readNote, sentTo, serialsSpent, valueOf } from './notes.ts';
+import { holdsAt, isInfoUrl, offlineNow, skewOf } from './offline.ts';
 import { type Policy, policyFrom } from './plan.ts';
 
 export type { Moving } from './keep.ts';
@@ -56,11 +57,13 @@ const asked = new Map<string, Promise<Response>>();
  * `fetch`, with one request for a mint's info however many ask for it at
  * once. Holdings reads the notes, the balance, the first expiry and the
  * schedule together, and each of those SDK calls GETs the info: shared,
- * they all see the same rotation, and the server sees one request.
+ * they all see the same rotation, and the server sees one request. Each
+ * info answer is kept, for what the purse shows while the mint cannot be
+ * reached (see {@link readSaved}).
  */
 const sharedFetch: typeof fetch = (input, init) => {
   const url = input instanceof Request ? input.url : String(input);
-  if ((init?.method ?? 'GET') !== 'GET' || !url.endsWith('/info')) {
+  if ((init?.method ?? 'GET') !== 'GET' || !isInfoUrl(url)) {
     return fetch(input, init);
   }
   let answer = asked.get(url);
@@ -70,10 +73,152 @@ const sharedFetch: typeof fetch = (input, init) => {
     const done = (): void => {
       asked.delete(url);
     };
-    answer.then(done, done);
+    answer.then((response) => {
+      done();
+      if (response.ok) {
+        void keepAnswer(url, response.clone());
+      }
+    }, done);
   }
   return answer.then((response) => response.clone());
 };
+
+// ---------- what a mint said last, for offline ----------
+
+/** The cache each mint's last info answer is kept in. The service worker leaves it be. */
+const INFO_CACHE = 'purse-info';
+/** The header a kept answer carries: when it came, by this device's clock. */
+const AT = 'x-purse-at';
+
+/** The part of Cache Storage the purse uses; absent on an insecure origin. */
+interface InfoCache {
+  put(url: string, response: Response): Promise<void>;
+  match(url: string): Promise<Response | undefined>;
+}
+
+/** The cache the mints' answers are kept in; it throws where there is no Cache Storage. */
+async function infoCache(): Promise<InfoCache> {
+  const storage = (globalThis as { caches?: { open(name: string): Promise<InfoCache> } }).caches;
+  if (storage === undefined) {
+    throw new TypeError('no Cache Storage here');
+  }
+  return storage.open(INFO_CACHE);
+}
+
+/** A mint's info answer as the purse kept it: its text, when it came, and the mint's clock then, less this device's. */
+interface KeptInfo {
+  text: string;
+  at: number;
+  skewMs: number;
+}
+
+/** Keeps a mint's info answer, with when it came; a newer one replaces it. */
+async function keepAnswer(url: string, response: Response): Promise<void> {
+  try {
+    const text = await response.text();
+    const headers = new Headers({ 'content-type': 'application/json', [AT]: String(Date.now()) });
+    const date = response.headers.get('date');
+    if (date !== null) {
+      headers.set('date', date);
+    }
+    await (await infoCache()).put(url, new Response(text, { headers }));
+  } catch {
+    // no Cache Storage here (an insecure origin, some private windows): offline, the purse has nothing to show
+  }
+}
+
+/** The info answer the purse kept for `url`, if any. */
+async function keptAnswer(url: string): Promise<KeptInfo | undefined> {
+  try {
+    const hit = await (await infoCache()).match(url);
+    if (hit === undefined) {
+      return undefined;
+    }
+    const at = Number(hit.headers.get(AT));
+    return Number.isFinite(at) && at > 0 ? { text: await hit.text(), at, skewMs: skewOf(hit.headers.get('date'), at) } : undefined;
+  } catch {
+    return undefined;
+  }
+}
+
+/**
+ * An SDK purse on `server`'s one store whose client answers the info route
+ * of `url` with `kept`, as the mint answered it then (its `Date` moved on
+ * by the time since), and reaches nothing else: what it reads holds as of
+ * then, and anything that needs the mint fails as a mint that does not
+ * answer would. The server's own purse is not touched.
+ */
+async function keptPurse(server: string, url: string, kept: KeptInfo): Promise<Purse> {
+  const fetchKept: typeof fetch = (input, init) => {
+    const asking = input instanceof Request ? input.url : String(input);
+    if ((init?.method ?? 'GET') === 'GET' && asking === url) {
+      const headers = { 'content-type': 'application/json', date: new Date(Date.now() + kept.skewMs).toUTCString() };
+      return Promise.resolve(new Response(kept.text, { headers }));
+    }
+    return Promise.reject(new TypeError('the purse reaches only what it kept of this mint'));
+  };
+  const { client, store } = serverAt(server);
+  return Purse.open(new Client(client.baseUrl, { fetch: fetchKept }), { store });
+}
+
+/** The URL of `mint`'s info on `server`, as the SDK's Client asks it. */
+const infoUrl = (server: string, mint: string): string => `${serverAt(server).client.baseUrl}/v1/mints/${mint}/info`;
+
+/**
+ * Reads what the purse holds at `mint` by the info it kept of the mint's
+ * last answer, for when the mint cannot be reached: as {@link read} does,
+ * with `keptAt`, when that answer came. Undefined when the purse kept none,
+ * or when the mint has rotated on its schedule since, so the layers that
+ * answer lists are no longer the mint's. Never prunes: only the mint says
+ * a layer went.
+ */
+export async function readSaved(server: string, mint: string): Promise<Read | undefined> {
+  const url = infoUrl(server, mint);
+  const kept = await keptAnswer(url);
+  if (kept === undefined) {
+    return undefined;
+  }
+  const purse = await keptPurse(server, url, kept);
+  const [info, notes, balance, firstExpiry] = await Promise.all([purse.client.info(mint), purse.notesAt(mint), purse.balance(mint), purse.firstExpiry(mint)]);
+  if (!holdsAt(info.rotation, info.paused, Date.now() + kept.skewMs)) {
+    return undefined;
+  }
+  const { outgoing, sendInputs } = outgoingOf(purse);
+  const unchecked = new Set(notesOf(purse.unchecked()).flatMap((each) => (each.mint === mint ? [each.id] : [])));
+  return {
+    info,
+    skew: kept.skewMs / 1000,
+    notes,
+    total: balance.total,
+    firstExpiry,
+    moving: movingNotes(outgoing, sendInputs, mint),
+    unchecked,
+    keptAt: kept.at,
+  };
+}
+
+/**
+ * Runs `live`, which asks the mint; when it cannot be reached (this device
+ * says it is offline, or the request fails as one to a mint that does not
+ * answer), runs `fromKept` on the info the purse kept of the mint's last
+ * answer instead, if it kept one. A refusal from the mint is no reason to.
+ */
+async function orKept<R>(server: string, mint: string, live: () => Promise<R>, fromKept: (kept: KeptInfo) => Promise<R>): Promise<R> {
+  if (offlineNow()) {
+    const kept = await keptAnswer(infoUrl(server, mint));
+    // with nothing kept, the mint is asked all the same, and fails as an offline request does
+    return kept === undefined ? live() : fromKept(kept);
+  }
+  try {
+    return await live();
+  } catch (error) {
+    const kept = isTransient(error) ? await keptAnswer(infoUrl(server, mint)) : undefined;
+    if (kept === undefined) {
+      throw error;
+    }
+    return fromKept(kept);
+  }
+}
 
 /** A server as the purse keeps it: its client, its one store, and its current SDK purse. */
 interface Server {
@@ -177,6 +322,8 @@ export interface Read {
   moving: Moving[];
   /** The notes of `notes` a restore brought that the mint has not been asked about yet, by id: keep-alive leaves them be. */
   unchecked: ReadonlySet<string>;
+  /** When the mint's answer this read was made by came, if the purse kept it from then (see {@link readSaved}); undefined for the mint's answer now. */
+  keptAt?: number;
 }
 
 /**
@@ -406,16 +553,28 @@ const idOf = (request: PaymentRequest): string => request.notes[0]?.holder ?? ''
 /**
  * Asks for `amount` of `mint`: a request with a fresh key for each note,
  * in notes of at most `atMost` when given. The SDK has saved its keys by
- * the time this resolves.
+ * the time this resolves. A request needs only the mint's rules, which
+ * hold across its rotations, so while the mint cannot be reached it is
+ * made by the info the purse kept of its last answer, through a purse on
+ * the same store; the server's own purse reads the store again after.
  */
 export async function ask(server: string, mint: string, amount: number, atMost?: number): Promise<Asked> {
-  return serverAt(server).purse.change(async (purse) => {
-    const request =
-      atMost === undefined
-        ? await purse.request(mint, BigInt(amount))
-        : await purse.requestAtMost(mint, BigInt(amount), BigInt(atMost));
-    return { json: request.json, notes: request.notes.map((note) => Number(note.amount)), id: idOf(request) };
-  });
+  const current = serverAt(server).purse;
+  const made = (purse: Purse): Promise<PaymentRequest> =>
+    atMost === undefined ? purse.request(mint, BigInt(amount)) : purse.requestAtMost(mint, BigInt(amount), BigInt(atMost));
+  const request = await current.change((purse) =>
+    orKept(
+      server,
+      mint,
+      () => made(purse),
+      async (kept) => {
+        // the kept purse saves the request's keys to the store: the server's own reads it again before its next use
+        current.stale();
+        return made(await keptPurse(server, infoUrl(server, mint), kept));
+      },
+    ),
+  );
+  return { json: request.json, notes: request.notes.map((note) => Number(note.amount)), id: idOf(request) };
 }
 
 /** Cancels a request: the SDK drops its keys, so tokens sent to it later are lost. */
@@ -505,10 +664,19 @@ export async function readForSend(server: string, mint: string): Promise<ForSend
   return { read: held, policy, mintLayer, layers: layers || held.info.layers, sends: new Map(kept(purse).map((each) => [each.id, each])) };
 }
 
-/** A mint's policy as its info states it (the SDK's MintInfo leaves it out): for Receive's sizes of note. */
+/**
+ * A mint's policy as its info states it (the SDK's MintInfo leaves it out):
+ * for Receive's sizes of note. A mint's rules hold across its rotations, so
+ * while it cannot be reached, its info as the purse kept it will do.
+ */
 export async function policyAt(server: string, mint: string): Promise<{ policy: Policy; mintLayer: number | undefined; layers: number }> {
-  const purse = await purseFor(server);
-  return policyFrom(JSON.parse(await purse.client.infoText(mint)) as unknown);
+  const text = await orKept(
+    server,
+    mint,
+    async () => (await purseFor(server)).client.infoText(mint),
+    async (kept) => kept.text,
+  );
+  return policyFrom(JSON.parse(text) as unknown);
 }
 
 /** The purse's own refusal to pay a request it has paid already: Send then shows that it did. */

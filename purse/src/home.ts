@@ -19,6 +19,7 @@ import type { Holdings, LaneKey } from './holdings.ts';
 import { type Progress, boxes } from './keep.ts';
 import { shortKey } from './link.ts';
 import { face } from './marks.ts';
+import { asAtWords } from './offline.ts';
 import { postmarkWrap } from './postmark.ts';
 import type { LogEntry, MintRecord } from './records.ts';
 import { brand, deskbar } from './shell.ts';
@@ -45,6 +46,8 @@ export interface HomeData {
   holdings: Holdings;
   /** The faucet at the mint's server, when it answers for this mint. */
   faucet: FaucetInfo | undefined;
+  /** When the mint's answer this was read by came, while the mint cannot be reached and the purse shows what it kept of it. */
+  keptAt?: number;
 }
 
 /** How long the change chip stays, and how long it and a new entry are pink. */
@@ -156,7 +159,7 @@ function paperBand(input: HomeInput): HTMLElement {
         h(
           'div',
           { class: 'hero-l' },
-          h('p', { class: 'lab muted eyebrow' }, `${record.name} · in this browser`),
+          h('p', { class: 'lab muted eyebrow' }, data?.keptAt === undefined ? `${record.name} · in this browser` : asAtWords(record.name, data.keptAt, now)),
           h(
             'h1',
             // a long number shrinks to fit its column (styles.css)

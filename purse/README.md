@@ -74,7 +74,9 @@ Backup and Mints:
   server and key. The face in a flow's top bar leads there, and so do the
   phone's top bar on Holdings and the desktop's bar and mint column.
 
-Not yet: a menu on the phone, and a service worker.
+It installs as an app where the browser allows, and opens with no
+network, showing what each mint said last (below). Not yet: a menu on the
+phone.
 
 ## History
 
@@ -191,6 +193,7 @@ it comes, and sends nothing if the mint did not answer for one.
 
 Below that, Backup says whether the browser agreed to keep the purse's
 data (`navigator.storage.persisted()`), and, outside an installed purse,
+how to install it: the browser's own offer, where it makes one, or else
 that Safari keeps it only once added to the Home Screen.
 
 ## Mints
@@ -223,6 +226,48 @@ kept; "Add mint" keeps it and makes it the one used last. A mint the purse
 holds already is never added again, nor read or moved at another server on
 a link's word, since trust follows the key and not the address: Mints says
 under which name and at which server it is held, and offers to show it.
+
+## Installed and offline
+
+The purse is an installable web app. `public/manifest.webmanifest` names
+it Worgl Purse, standalone, its splash the cobalt, with three icons and an
+Apple touch icon: a paper stamp, perforated, with the favicon's W in bits,
+on the cobalt (`scripts/icons.ts`, `npm run icons`), the maskable one
+small enough for a launcher's circle. Where the browser offers to install
+it (Chromium's `beforeinstallprompt`), the purse holds the offer and shows
+it as "Install the purse" in the first run's notes and in Backup's storage
+section, never as a banner; once installed it asks again to keep its
+storage, which browsers grant an installed app more readily. Elsewhere
+those places keep the iPhone's way: add it to the Home Screen.
+
+A service worker (`sw/sw.ts`, which the build emits as `sw.js` with a
+version and its list of files) keeps the purse's own files in a cache per
+build: every file the build emits but source maps and the `.woff` fonts
+only a browser without `.woff2` asks for, and the files in `public/`. It
+fills the cache whole when it installs, then serves the page and its
+files from it, so the purse opens with no network. It never touches a
+request to a mint. A newer purse installs in the background and waits: it
+takes over only when the page is out of sight and calm (on Holdings,
+History or an untouched first run, with nothing sending, finishing,
+taking from a faucet or kept alive), and the page loads again as the
+newer purse, on the same view. The cache of the build before it stays,
+for a tab of that build still open. A page coming back into sight checks
+for a newer purse at most once an hour (`src/install.ts`).
+
+Offline, the purse shows what it can from what each mint said last. Each
+info answer a mint gives is kept in Cache Storage (`purse-info`), with
+when it came and the mint's clock then. When the mint cannot be reached,
+Holdings and Mints read what the purse holds by that answer, through an
+SDK purse of its own whose client answers that one request and reaches
+nothing else, and Holdings says "as at 14:02" where it says "in this
+browser". The answer counts only until the mint's next scheduled
+rotation, after which its layers are no longer the mint's, and nothing is
+dropped by it: only the mint says a layer went. Receive asks by it too.
+Sending, taking a hand-back in, the faucet and keep-alive need the mint.
+While the browser says the device is offline, each of them that fails
+says "This device is offline" and what waits for the network, and the
+purse reads its mints again, and keep-alive looks again, once the browser
+says it is back online (`src/offline.ts`).
 
 ## Keep-alive
 
@@ -268,8 +313,8 @@ What it does not do:
   step, never in the middle of a transfer, and a closed page stops at
   once; a transfer cut off stays outgoing, and the next open settles it.
   Left closed or hidden, tokens fade at the date on screen, and the copy
-  says "on screen", not "open". There is no service worker, no push and
-  no notification.
+  says "on screen", not "open". The service worker keeps only the purse's
+  files; there is no push and no notification.
 - **It moves only what fades next**, one layer: no lift to the last layers,
   no split, and no other note moves.
 - **No reminders** beyond the date on screen: no calendar entry, no keeper
@@ -341,15 +386,17 @@ under the hosted Content-Security-Policy, with the local mint allowed.
 | `npm run build` | the site, in `dist/` |
 | `npm run preview` | `dist/` on 127.0.0.1:4173, under the policy in `public/_headers` |
 | `npm run check` | `tsc` over the app, and over the tests and scripts |
-| `npm test` | `node --test` over the pure logic in `test/`: mint links, request and hand-back links, deflate, QR codes, words, times, amounts, the planner, open requests, notes and transfers, the field's geometry, errors, which SDK purse is current, keep-alive's spacing and decoding, the keeper's passes with stand-ins, History's register, Backup's words and arithmetic, the grain |
+| `npm test` | `node --test` over the pure logic in `test/`: mint links, request and hand-back links, deflate, QR codes, words, times, amounts, the planner, open requests, notes and transfers, the field's geometry, errors, which SDK purse is current, keep-alive's spacing and decoding, the keeper's passes with stand-ins, History's register, Backup's words and arithmetic, what offline reads hold to, the grain and the app icons |
 | `npm run mint` | the local mint and faucet (`scripts/dev-mint.mjs`) |
 | `npm run screenshots` | `scripts/preview.mjs`: the first run and Holdings, below |
 | `npm run screenshots:send` | `scripts/preview-send.mjs`: Receive and Send between two purses, below |
 | `npm run screenshots:history` | `scripts/preview-history.mjs`: History, from the entries of real sends, takes, keep-alive and a fade |
 | `npm run screenshots:backup` | `scripts/preview-backup.mjs`: Backup: a save, a send after it, a restore in a new browser and the checks |
 | `npm run screenshots:mints` | `scripts/preview-mints.mjs`: Mints: a take, a rename, a second mint added by its link, one typed by its key, two tabs and a server down |
+| `npm run screenshots:offline` | `scripts/preview-offline.mjs`: the install offer, the service worker and the manifest as Chromium reads them, every view offline and a load with no network, back online, and a newer purse taking over only when the page is calm |
 | `npm run plan-check` | `scripts/plan-check.mjs`: the planner's choice of notes, checked against the SDK's own `pay` on a local mint |
 | `npm run grain` | draws `public/grain-*.png` again (`scripts/grain.ts`) |
+| `npm run icons` | draws the app icons in `public/` again (`scripts/icons.ts`) |
 
 `scripts/preview.mjs` starts a mint that rotates every two minutes and a
 faucet on free ports, builds the purse twice (as hosted, and with that mint
@@ -487,8 +534,11 @@ hashed assets a year's cache. The policy allows scripts and styles from the
 site alone, WebAssembly compiled from them, requests to the site and to any
 https server, and requires Trusted Types: the purse builds its DOM with
 `createElement` and `textContent`, never from markup, and sets styles
-through the CSSOM. The fonts are the site's own `@fontsource` packages,
-bundled, and the print grain is two PNGs drawn at build time.
+through the CSSOM. Its one Trusted Types policy, `purse-worker`, passes
+`/sw.js` alone, for registering the service worker. `sw.js` and the
+manifest are served with `Cache-Control: no-cache`, so each load checks for
+a newer purse. The fonts are the site's own `@fontsource` packages,
+bundled, and the print grain and the icons are PNGs drawn ahead of time.
 
 A faucet answers the hosted purse only when it names its origin:
 `FAUCET_ALLOW_ORIGIN=https://purse.worgl.1y.io` on the playground
@@ -517,4 +567,5 @@ A faucet answers the hosted purse only when it names its origin:
 | `src/purses.ts`, `src/current.ts` | everything asked of the SDK, loaded after the first paint, and which SDK purse is current |
 | `src/records.ts` | the purse's own IndexedDB records |
 | `src/link.ts`, `src/errors.ts` | mint links, and every error in plain words |
+| `src/offline.ts`, `src/install.ts`, `sw/sw.ts` | how long a mint's kept answer holds and what offline says; the service worker's registration and updates, and the install offer; the service worker |
 | `src/styles.css` | the approved look, then what the app adds |

@@ -22,7 +22,7 @@ import {
 import { fileIcon } from './icons.ts';
 import { shape, squaresOf } from './layout.ts';
 import { square } from './marks.ts';
-import { deskbar, tbSub } from './shell.ts';
+import { appLine, deskbar, tbSub } from './shell.ts';
 
 /** What Backup shows and what it is doing. The passphrases are never kept here: see app.ts `pass`. */
 export interface BackupState {
@@ -99,6 +99,8 @@ export interface BackupInput {
   state: BackupState;
   records: readonly MintRecord[];
   standalone: boolean;
+  /** Shows the browser's offer to install the purse, while it has made one. */
+  install: (() => void) | undefined;
   now: number;
   actions: BackupActions;
 }
@@ -352,8 +354,11 @@ function restorePart(input: BackupInput): Child[] {
 }
 
 function storagePart(input: BackupInput): Child[] {
+  const [keeps, clearing] = storageWords(input.state.persisted);
   return [
     h('p', { class: 'lab muted mt-26' }, 'Storage'),
-    ...storageWords(input.state.persisted, input.standalone).map((line, i) => h('p', { class: i === 0 ? 'body mt-8' : 'note-line mt-8' }, line)),
+    h('p', { class: 'body mt-8' }, keeps),
+    input.standalone ? null : appLine(input.install, 'note-line mt-8', true),
+    h('p', { class: 'note-line mt-8' }, clearing),
   ];
 }

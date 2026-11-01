@@ -1,8 +1,9 @@
-import { readFileSync } from 'node:fs';
-import { basename } from 'node:path';
+import { createHash } from 'node:crypto';
+import { readFileSync, readdirSync } from 'node:fs';
+import { basename, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 
-import { type Plugin, defineConfig, searchForWorkspaceRoot } from 'vite';
+import { type Plugin, defineConfig, searchForWorkspaceRoot, transformWithOxc } from 'vite';
 
 /** The SDK, linked by `file:`: the dev server serves its wasm/ from here. */
 const sdk = fileURLToPath(new URL('../sdk/typescript/', import.meta.url));
@@ -68,8 +69,60 @@ function preloadFonts(): Plugin {
   };
 }
 
+/**
+ * Whether the service worker keeps a file the build emits: not a source map,
+ * and not a font's .woff, which only a browser without .woff2 asks for, and
+ * such a browser has no service worker.
+ */
+const keeps = (file: string): boolean => !file.endsWith('.map') && !file.endsWith('.woff');
+
+/**
+ * Emits `sw.js`: sw/sw.ts, with the build's version and the files it keeps
+ * before it (sw/build.d.ts). The version is a hash of every one of those
+ * files and of the worker itself, so any change to the purse makes a new
+ * worker, and the browser installs it.
+ */
+function serviceWorker(): Plugin {
+  let publicDir = '';
+  return {
+    name: 'purse:service-worker',
+    apply: 'build',
+    configResolved(config) {
+      publicDir = config.publicDir;
+    },
+    generateBundle: {
+      order: 'post',
+      async handler(_options, bundle) {
+        const source = readFileSync(new URL('sw/sw.ts', import.meta.url), 'utf8');
+        const parts: [string, string | Uint8Array][] = [];
+        for (const [file, output] of Object.entries(bundle)) {
+          if (keeps(file)) {
+            parts.push([file === 'index.html' ? '/' : `/${file}`, output.type === 'chunk' ? output.code : output.source]);
+          }
+        }
+        if (!parts.some(([path]) => path === '/')) {
+          throw new Error('the service worker found no index.html in the bundle');
+        }
+        for (const file of readdirSync(publicDir)) {
+          if (file !== '_headers') {
+            parts.push([`/${file}`, readFileSync(join(publicDir, file))]);
+          }
+        }
+        parts.sort(([a], [b]) => (a < b ? -1 : a > b ? 1 : 0));
+        const hash = createHash('sha256').update(source);
+        for (const [path, content] of parts) {
+          hash.update(`\0${path}\0`).update(content);
+        }
+        const build = { version: hash.digest('hex').slice(0, 16), files: parts.map(([path]) => path) };
+        const { code } = await transformWithOxc(source, 'sw.ts', { lang: 'ts', target: 'es2022' });
+        this.emitFile({ type: 'asset', fileName: 'sw.js', source: `const BUILD = ${JSON.stringify(build)};\n${code}` });
+      },
+    },
+  };
+}
+
 export default defineConfig({
-  plugins: [preloadFonts()],
+  plugins: [preloadFonts(), serviceWorker()],
   // Keep the SDK out of the dependency optimizer: its core finds the wasm
   // relative to its own module (`new URL(..., import.meta.url)`).
   optimizeDeps: { exclude: ['worgl'] },

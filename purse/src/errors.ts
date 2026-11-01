@@ -11,6 +11,7 @@
 
 import { when } from './format.ts';
 import type { LinkProblem } from './link.ts';
+import { offlineNow } from './offline.ts';
 
 /** What the purse was doing when it failed, which decides the words. */
 export type Doing =
@@ -43,6 +44,8 @@ export interface Context {
   now?: number;
   /** For a read: whether the mint was named by a server and key typed on Mints, not by a link. */
   byKey?: boolean;
+  /** Whether this device says it is offline, so a request that never completed says so; the browser's word if not given. */
+  offline?: boolean;
 }
 
 /** How the purse should go on after an error. */
@@ -77,9 +80,14 @@ export const notListed = (host: string, byKey = false): string =>
 /**
  * The words when the mint's server cannot be reached: from a link, check
  * it; from Holdings, which reads the mint again each minute, wait; for a
- * request, a send, a take or a resend, what it means for that.
+ * request, a send, a take or a resend, what it means for that. When this
+ * device says it is offline, that is why, and the time to try again is
+ * once it is back online.
  */
-function noAnswer(host: string, doing: Doing, byKey = false): string {
+function noAnswer(host: string, doing: Doing, byKey = false, offline = false): string {
+  if (offline) {
+    return offlineWords(doing);
+  }
   const first = `The mint at ${host} did not answer.`;
   switch (doing) {
     case 'open':
@@ -98,6 +106,31 @@ function noAnswer(host: string, doing: Doing, byKey = false): string {
       return `${first} Nothing of it was restored; try again when it answers.`;
     default:
       return `${first} ${byKey ? 'Check the address' : 'Check the link'}, or try again later.`;
+  }
+}
+
+/** The words when a request never completed and this device says it is offline: what waits for the network. */
+function offlineWords(doing: Doing): string {
+  const first = 'This device is offline.';
+  switch (doing) {
+    case 'open':
+      return `${first} The purse reaches the mint again once you are back online.`;
+    case 'take':
+      return `${first} The faucet hands out tokens once you are back online.`;
+    case 'ask':
+      return `${first} A request needs the mint’s rules, which the purse has not read yet; try again once you are back online.`;
+    case 'send':
+      return `${first} Sending needs the mint, so nothing was sent; try again once you are back online.`;
+    case 'accept':
+      return `${first} Taking in needs the mint’s keys. The hand-back keeps until its tokens fade, so try again once you are back online.`;
+    case 'settle':
+      return `${first} This purse tries again once you are back online.`;
+    case 'backup':
+      return `${first} Nothing was saved; try again once you are back online.`;
+    case 'restore':
+      return `${first} Nothing of it was restored; try again once you are back online.`;
+    default:
+      return `${first} Try again once you are back online.`;
   }
 }
 
@@ -232,7 +265,8 @@ export function say(error: unknown, doing: Doing, context: Context): Said {
     return { words: 'This browser refused to save. Nothing changed.' };
   }
   if (name === 'TypeError' || name === 'TimeoutError' || name === 'NetworkError') {
-    return { words: doing === 'take' ? 'The faucet did not answer. Try again in a moment.' : noAnswer(host, doing, context.byKey) };
+    const offline = context.offline ?? offlineNow();
+    return { words: doing === 'take' && !offline ? 'The faucet did not answer. Try again in a moment.' : noAnswer(host, doing, context.byKey, offline) };
   }
   return { words: fallback(doing) };
 }

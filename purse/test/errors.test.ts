@@ -36,6 +36,25 @@ describe('errors', () => {
     assert.equal(say(mint(404, 'unknown_mint'), 'open', context).words, 'The server at mint.example.org no longer lists this mint.');
   });
 
+  test('offline, say that this device is, and what waits for the network', () => {
+    const offline = { ...context, offline: true };
+    const failed = new TypeError('Failed to fetch');
+    assert.equal(say(failed, 'open', offline).words, 'This device is offline. The purse reaches the mint again once you are back online.');
+    assert.equal(say(failed, 'take', offline).words, 'This device is offline. The faucet hands out tokens once you are back online.');
+    assert.equal(
+      say(failed, 'send', offline).words,
+      'This device is offline. Sending needs the mint, so nothing was sent; try again once you are back online.',
+    );
+    assert.match(say(failed, 'ask', offline).words, /^This device is offline\. A request needs the mint’s rules/);
+    assert.match(say(failed, 'accept', offline).words, /The hand-back keeps until its tokens fade/);
+    assert.equal(say(failed, 'backup', offline).words, 'This device is offline. Nothing was saved; try again once you are back online.');
+    assert.equal(say(new DOMException('timed out', 'TimeoutError'), 'read', offline).words, 'This device is offline. Try again once you are back online.');
+    // online, a request that never completed is the mint's silence
+    assert.match(say(failed, 'send', { ...context, offline: false }).words, /^The mint at mint\.example\.org did not answer\./);
+    // a mint that answered with an error answered: being offline is not why
+    assert.equal(say(mint(404, 'unknown_mint'), 'open', offline).words, 'The server at mint.example.org no longer lists this mint.');
+  });
+
   test('from the faucet say which limit it reached', () => {
     assert.equal(say(mint(429, 'rate_limited'), 'take', context).words, 'The faucet has given its 10 taps this hour.');
     assert.equal(say(mint(429, 'rate_limited'), 'take', { host: 'x', perHour: 1 }).words, 'The faucet has given its 1 tap this hour.');

@@ -10,7 +10,7 @@ import { hostOf, shortKey } from './link.ts';
 import { bits, face, swatch } from './marks.ts';
 import type { About } from './purses.ts';
 import type { MintRecord } from './records.ts';
-import { brand, deskbar } from './shell.ts';
+import { appLine, brand, deskbar } from './shell.ts';
 import { legend, rotatesQuickly, visitWords } from './words.ts';
 
 /** What the first run is showing in its cobalt band. */
@@ -48,6 +48,8 @@ export interface FirstInput {
   playground: { mint: string; server: string } | undefined;
   /** Whether the purse runs as a Home Screen app, so the hint about it is moot. */
   standalone: boolean;
+  /** Shows the browser's offer to install the purse, while it has made one. */
+  install: (() => void) | undefined;
   actions: FirstActions;
 }
 
@@ -130,7 +132,7 @@ function pasteBlock(input: FirstInput): HTMLElement {
       { class: 'note-line muted' },
       'The key is the mint’s real name. Its face is drawn from the key, so you can compare it with theirs.',
     ),
-    notes(input.standalone),
+    notes(input),
   );
 }
 
@@ -267,17 +269,17 @@ function takeButton(state: FirstState, amount: number, take: () => void): HTMLEl
 
 /** The actions, the error under them and the notes, pinned low in the band; `info`, the stamp's mint. */
 function low(buttons: Child[], input: FirstInput, info?: MintInfo): HTMLElement {
-  return h('div', { class: 'c-low first-acts' }, ...buttons, errorLine(input.state.error), notes(input.standalone, info));
+  return h('div', { class: 'c-low first-acts' }, ...buttons, errorLine(input.state.error), notes(input, info));
 }
 
 const errorLine = (error: string | undefined): HTMLElement | null =>
   error === undefined ? null : h('p', { class: 'err', role: 'alert' }, error);
 
 /**
- * How long a visit keeps a quickly rotating mint's tokens, the Home Screen
- * hint, unless the purse is one already, and what clears the purse.
+ * How long a visit keeps a quickly rotating mint's tokens, the way to make
+ * the purse an app, unless it is one already, and what clears the purse.
  */
-function notes(standalone: boolean, info?: MintInfo): HTMLElement {
+function notes(input: FirstInput, info?: MintInfo): HTMLElement {
   const period = info === undefined || info.paused ? undefined : info.rotation?.periodSecs;
   return h(
     'div',
@@ -285,9 +287,7 @@ function notes(standalone: boolean, info?: MintInfo): HTMLElement {
     period !== undefined && rotatesQuickly(Number(period))
       ? h('p', { class: 'note-line muted' }, visitWords(Number(period)))
       : null,
-    standalone
-      ? null
-      : h('p', { class: 'note-line muted' }, 'On iPhone or iPad, add this purse to your Home Screen so Safari keeps it.'),
+    input.standalone ? null : appLine(input.install, 'note-line muted'),
     h(
       'p',
       { class: 'note-line muted' },
