@@ -1,10 +1,12 @@
 # Headers for Cloudflare Pages. Every response: a policy that runs only the
-# purse's own scripts (and its wasm), loads only its own styles, fonts and
-# images, talks to its own origin and to mints over https, and requires
-# Trusted Types, so no string from a mint or a link can become markup. It may
-# use the camera, for scanning a request or a hand-back on this origin only.
+# purse's own scripts (and its wasm), loads only its own styles, fonts,
+# images, manifest and service worker, talks to its own origin and to mints
+# over https, and requires Trusted Types, so no string from a mint or a link
+# can become markup or a script; its one policy, purse-worker, passes only
+# /sw.js (src/install.ts). It may use the camera, for scanning a request or a
+# hand-back on this origin only.
 /*
-  Content-Security-Policy: default-src 'none'; script-src 'self' 'wasm-unsafe-eval'; style-src 'self'; img-src 'self'; font-src 'self'; connect-src 'self' https:; base-uri 'none'; form-action 'none'; frame-ancestors 'none'; require-trusted-types-for 'script'; trusted-types 'none'
+  Content-Security-Policy: default-src 'none'; script-src 'self' 'wasm-unsafe-eval'; style-src 'self'; img-src 'self'; font-src 'self'; manifest-src 'self'; worker-src 'self'; connect-src 'self' https:; base-uri 'none'; form-action 'none'; frame-ancestors 'none'; require-trusted-types-for 'script'; trusted-types purse-worker
   Cross-Origin-Opener-Policy: same-origin
   Cross-Origin-Resource-Policy: same-origin
   Permissions-Policy: camera=(self), microphone=(), geolocation=(), usb=()
@@ -16,3 +18,10 @@
 # The build names these by their content, so they never change.
 /assets/*
   Cache-Control: public, max-age=31536000, immutable
+
+# The service worker and the manifest are asked for by these names, so each
+# load checks with the server for a newer purse.
+/sw.js
+  Cache-Control: no-cache
+/manifest.webmanifest
+  Cache-Control: no-cache

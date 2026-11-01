@@ -1,0 +1,18 @@
+{
+  "id": "/",
+  "name": "Worgl Purse",
+  "short_name": "Worgl Purse",
+  "description": "A purse for Worgl tokens that lives in this browser. No sign-up.",
+  "lang": "en",
+  "dir": "ltr",
+  "start_url": "/",
+  "scope": "/",
+  "display": "standalone",
+  "background_color": "#1D35D6",
+  "theme_color": "#F3F3EF",
+  "icons": [
+    { "src": "/icon-192.png", "sizes": "192x192", "type": "image/png", "purpose": "any" },
+    { "src": "/icon-512.png", "sizes": "512x512", "type": "image/png", "purpose": "any" },
+    { "src": "/icon-maskable-512.png", "sizes": "512x512", "type": "image/png", "purpose": "maskable" }
+  ]
+}

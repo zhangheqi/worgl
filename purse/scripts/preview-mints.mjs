@@ -21,6 +21,7 @@
 
 import { join } from 'node:path';
 
+import { periodWords } from '../src/format.ts';
 import { chromiumOf, clearPeriod, failingRequests, launch, newContext, options, repo, report, setup, shooter, step, stop } from './preview-kit.mjs';
 
 const { out } = options(join(repo, 'target/purse-preview/mints-shots/'));
@@ -28,7 +29,9 @@ const home = process.env.PREVIEW_HOME ?? join(repo, 'target/purse-preview/mints/
 const chromium = chromiumOf();
 
 // a schedule of about 8 hours, its next rotation well after the walk
-const { mint, builds } = await setup({ home, period: clearPeriod(28_800, 60 * 60_000), perAddress: 1000, mints: 2, serve: ['playground'] });
+// (or a few minutes either side, when 8 hours would rotate during it)
+const period = clearPeriod(28_800, 60 * 60_000);
+const { mint, builds } = await setup({ home, period, perAddress: 1000, mints: 2, serve: ['playground'] });
 const play = builds.playground;
 const [FIRST, SECOND] = mint.issuers;
 const host = new URL(mint.server).host;
@@ -120,7 +123,7 @@ try {
   await A.waitForSelector(`[data-fk="mc-take-${FIRST}"]`, { timeout: 30_000 });
   check((await A.$$('article.mcard')).length === 1, 'one mint');
   check((await A.$$(`${card(FIRST)} .tt li`)).length === 4, 'its next four rotations');
-  check((await text(A, `${card(FIRST)} .tt-h`)).replace(/\s+/g, ' ') === 'Next rotations Every 8 h · 4 layers', 'how often it rotates, over its timetable');
+  check((await text(A, `${card(FIRST)} .tt-h`)).replace(/\s+/g, ' ') === `Next rotations Every ${periodWords(period)} · 4 layers`, 'how often it rotates, over its timetable');
   check(
     await A.$eval(`${card(FIRST)} .mc-key`, (code) => [...code.querySelectorAll('span')].every((span) => span.getClientRects().length === 1)),
     'no pair of groups breaks across a line',

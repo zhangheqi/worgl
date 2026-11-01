@@ -73,6 +73,7 @@ import {
   withChange,
 } from './holdings.ts';
 import { type HistoryInput, historyView } from './history.ts';
+import { canInstall, holdOffer, install, keepOffline } from './install.ts';
 import { type Elsewhere, type HomeData, type HomeInput, type KeepShown, homeView, placeholder, renderBack } from './home.ts';
 import type { Moved } from './keep.ts';
 import { Keeper, type KeptServer, Keeping, type Shown } from './keeper.ts';
@@ -472,6 +473,7 @@ function firstInput(): FirstInput {
     records: state.mints,
     playground: state.playground,
     standalone: state.standalone,
+    install: installAction(),
     actions: {
       take: () => void takeFirst(),
       add: () => void addFirst(),
@@ -1326,6 +1328,9 @@ async function readHome(): Promise<void> {
     const host = hostOf(record.server);
     const said = say(error, 'open', { host });
     heed(said);
+    if (transient(error)) {
+      await showKept(record);
+    }
     // a mint that does not answer: what fades, and when, unless the purse reaches it
     const fades = transient(error) ? unreachableFor(host, state.home.data?.holdings, record.info?.fades, Date.now()) : undefined;
     state.home.error = { words: fades ?? said.words, at: 'read' };
@@ -1410,6 +1415,36 @@ async function readHome(): Promise<void> {
 }
 
 /**
+ * While the shown mint cannot be reached: what the purse holds by the
+ * mint's last answer, which the purse kept, so an open with no network
+ * shows it; Holdings says when that answer came. Once the mint has rotated
+ * on its schedule since, that answer no longer says where the notes sit,
+ * and Holdings shows nothing it would have drawn from it. Nothing is
+ * pruned or kept alive by it: only the mint says what went.
+ */
+async function showKept(record: MintRecord): Promise<void> {
+  let kept: Read | undefined;
+  try {
+    kept = await (await loadSdk()).readSaved(record.server, record.mint);
+  } catch {
+    kept = undefined;
+  }
+  if (shown()?.mint !== record.mint) {
+    return;
+  }
+  if (kept === undefined || kept.keptAt === undefined) {
+    if (state.home.data?.keptAt !== undefined) {
+      state.home.data = undefined;
+    }
+    return;
+  }
+  const holdings = holdingsFrom(kept.info, kept.notes, kept.total, kept.firstExpiry, kept.skew, arrivals(record.mint), kept.moving);
+  keepLanes(holdings);
+  state.home.mint = record.mint;
+  state.home.data = { holdings, faucet: undefined, keptAt: kept.keptAt };
+}
+
+/**
  * What Holdings shows that can change between reads: the notes and their
  * times, the schedule, the faucet, the error, the log, whether the chip
  * shows and the day (for Recent's times). The rest changes only on a step
@@ -1422,6 +1457,7 @@ function shownSignature(now: number): string {
   const keep = keepShown();
   return JSON.stringify([
     state.home.mint,
+    state.home.data?.keptAt,
     holdings?.total,
     holdings?.notes.map((note) => [note.id, note.pos, note.expiresAt, note.readyAt, note.moving]),
     holdings?.schedule?.nextMs,
@@ -4078,6 +4114,11 @@ async function readOneMint(record: MintRecord): Promise<void> {
     const said = say(error, 'open', { host: hostOf(record.server) });
     heed(said);
     state.mintsPage.errors.set(record.mint, said.words);
+    // what the purse holds by the mint's last answer, as Holdings shows it, when nothing newer was read this visit
+    const kept = transient(error) && !state.mintsPage.read.has(record.mint) ? await (await loadSdk()).readSaved(record.server, record.mint).catch(() => undefined) : undefined;
+    if (kept !== undefined) {
+      state.mintsPage.read.set(record.mint, holdingsOf(kept));
+    }
   }
 }
 
@@ -4364,6 +4405,7 @@ function backupInput(): BackupInput {
     state: state.backup,
     records: state.mints,
     standalone: state.standalone,
+    install: installAction(),
     now: Date.now(),
     actions: {
       passChanged: (which, value) => {
@@ -5250,6 +5292,56 @@ function recordsWords(error: unknown): string {
   return 'This browser would not open the purse’s records. Close its other tabs, then reload the page.';
 }
 
+// ---------- the purse as an app ----------
+
+/** Install, while the browser offers it: its prompt, then the view again, without the offer. */
+function installAction(): (() => void) | undefined {
+  if (!canInstall()) {
+    return undefined;
+  }
+  return () => {
+    void install().then(drawOffer);
+    drawOffer();
+  };
+}
+
+/** Whether start() has drawn the first view: an install offer before it waits for it. */
+let drawnFirst = false;
+
+/** The views that show the install offer, drawn again when it comes or goes. */
+function drawOffer(): void {
+  if (drawnFirst && (state.route === 'first' || state.route === 'backup')) {
+    render();
+  }
+}
+
+/** Installed: the browser keeps an app's storage more readily, so the purse asks again, and Backup says what it answered. */
+function installed(): void {
+  state.standalone = standalone();
+  try {
+    void navigator.storage
+      ?.persist?.()
+      .then(() => (state.route === 'backup' ? readBackup() : undefined))
+      .catch(() => undefined);
+  } catch {
+    // the purse works without it
+  }
+}
+
+/**
+ * Whether a newer purse may take over this page now: it is on Holdings,
+ * History or the first run with nothing typed, and nothing is sending,
+ * finishing, taking from a faucet or being kept alive here. src/install.ts
+ * asks only while the page is out of sight.
+ */
+function calm(): boolean {
+  const resting =
+    state.route === 'home' ||
+    state.route === 'history' ||
+    (state.route === 'first' && state.first.paste === '' && state.first.busy === undefined && !state.first.reading);
+  return resting && sendsHere === 0 && finishing === 0 && !keeper.running && !state.home.taking;
+}
+
 /** Whether the purse runs as a Home Screen app. */
 function standalone(): boolean {
   try {
@@ -5405,6 +5497,25 @@ function listen(): void {
     moved = now;
     moveNeedle(host);
   }, 1000);
+  // when the network comes or goes, the view reads again: back online it reaches the mint, and keep-alive looks again;
+  // gone, the read fails at once and says why, showing what the purse kept of the mint's last answer
+  const network = (online: boolean): void => {
+    if (document.hidden) {
+      return;
+    }
+    if (state.route === 'home' || state.route === 'history') {
+      void refreshHome();
+    } else if (state.route === 'mints') {
+      void readMints();
+    } else if (state.route === 'backup') {
+      void readBackup();
+    }
+    if (online) {
+      keeper.poke();
+    }
+  };
+  window.addEventListener('online', () => network(true));
+  window.addEventListener('offline', () => network(false));
   // and the mint is asked again each minute, for a rotation by hand, a pause, or another device's change; on the
   // first run, keep-alive looks again at what it keeps, as Holdings' read would have it do
   setInterval(() => {
@@ -5427,6 +5538,8 @@ function listen(): void {
 /** Opens the records, picks the view and draws it; the SDK loads once that has painted. */
 export async function start(): Promise<void> {
   state.standalone = standalone();
+  // the browser may offer the install while the records open
+  holdOffer(drawOffer, installed);
   const setting = import.meta.env.VITE_PLAYGROUND_LINK;
   if (setting !== undefined && setting !== '') {
     const parsed = parseMintLink(setting);
@@ -5444,6 +5557,7 @@ export async function start(): Promise<void> {
   }
   syncShown();
   listen();
+  keepOffline(calm);
   const hash = location.hash;
   if (flowHash(hash)) {
     // a request or a hand-back opened by its link: its flow, reading it, is the first view drawn
@@ -5461,6 +5575,7 @@ export async function start(): Promise<void> {
     }
     setRoute(route, { focus: false });
   }
+  drawnFirst = true;
   requestAnimationFrame(() => {
     void loadSdk().then(
       async () => {

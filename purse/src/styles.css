@@ -878,6 +878,9 @@ span.ib.face:hover { background: none; }
 .mintc .to-bk:hover { text-decoration: underline; text-underline-offset: .3em; }
 /* the first run's way to a backup */
 .first-notes .to-restore { color: inherit; text-decoration: underline; text-decoration-thickness: 1px; text-underline-offset: .24em; }
+/* the browser's install offer, a link in its line: in the first run's notes and in Backup's storage */
+.to-install { display: inline; text-decoration: underline; text-decoration-thickness: 1px; text-underline-offset: .24em; }
+.to-install:hover { text-decoration-thickness: 2px; }
 @media (min-width: 1100px) {
   .v-bk .h1 { font-size: 72px; }
   .big-when { font-size: 56px; }

@@ -338,13 +338,19 @@ export function checkingWords(c: Checking): string {
 
 // ---------- Storage ----------
 
-/** What Backup says of how this browser keeps the purse. */
-export function storageWords(persisted: boolean | undefined, standalone: boolean): string[] {
+/** What Backup says of how this browser keeps the purse, and of what clears it; the way to make it an app goes between. */
+export function storageWords(persisted: boolean | undefined): [string, string] {
   return [
     persisted === true
       ? 'This browser has agreed to keep the purse’s data until you clear it.'
       : 'This browser may clear the purse’s data when it runs short of space.',
-    ...(standalone ? [] : ['On iPhone or iPad, add this purse to your Home Screen so Safari keeps it.']),
     'Clearing this site’s data empties the purse, and a private window forgets it when it closes. A backup brings back the notes it covers.',
   ];
 }
+
+/** The iPhone’s way to make the purse an app, which no page can offer: the hint, where the browser makes no offer of its own. */
+export const HOME_SCREEN = 'On iPhone or iPad, add this purse to your Home Screen so Safari keeps it.';
+
+/** What follows the install button: what installing does, and on Backup, what it does for the purse’s storage. */
+export const installWords = (storage: boolean): string =>
+  ` to open it in its own window, even offline.${storage ? ' Browsers keep an installed purse’s data more readily.' : ''}`;

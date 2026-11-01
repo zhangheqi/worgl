@@ -20,6 +20,7 @@ import {
   values,
 } from './holdings.ts';
 import { type Progress, stepOf } from './keep.ts';
+import { offlineNow } from './offline.ts';
 
 /**
  * Whether the purse keeps tokens alive while it is on screen: the SDK's
@@ -455,27 +456,34 @@ function notesFade({ values: vals, pos, holdings, now }: Stuck): { notes: string
   return { notes: notesWords(sorted), they: `${sorted.length === 1 ? 'it fades' : 'they fade'} at ${rotationWords(holdings, pos, now)}` };
 }
 
-/** How the failure words end: the purse tries again only while it can run. */
-const AGAIN = 'The purse asks again each minute while it is on screen.';
+/** How the failure words end: the purse tries again only while it can run, and, offline, once it is back online. */
+const again = (offline: boolean): string =>
+  offline ? 'The purse asks again once this device is back online.' : 'The purse asks again each minute while it is on screen.';
 
-/** The mint did not answer the hops: what fades, and when, unless the purse reaches it. */
-export function unreachableWords(host: string, stuck: Stuck): string {
+/** Why the mint could not be reached: this device is offline, or the mint did not answer. */
+const unreached = (host: string, offline: boolean): string => (offline ? 'This device is offline' : `The mint at ${host} did not answer`);
+
+/** The mint offline: named, since "it" would be the device. */
+const reachIt = (offline: boolean): string => (offline ? 'the mint' : 'it');
+
+/** The mint did not answer the hops, or this device is offline: what fades, and when, unless the purse reaches it. */
+export function unreachableWords(host: string, stuck: Stuck, offline = offlineNow()): string {
   const { n, they } = tokensFade(stuck);
-  return `The mint at ${host} did not answer, so ${n} could not move. ${they} unless the purse reaches it before then. ${AGAIN}`;
+  return `${unreached(host, offline)}, so ${n} could not move. ${they} unless the purse reaches ${reachIt(offline)} before then. ${again(offline)}`;
 }
 
 /**
  * The mint did not answer, with nothing of the purse's on its way or
  * fading: what goes first, and when, as the purse last saw it.
  */
-export function unreachableFirstWords(host: string, first: LastFade, now: number): string {
+export function unreachableFirstWords(host: string, first: LastFade, now: number, offline = offlineNow()): string {
   const fade = first.amount === 1 ? 'fades' : 'fade';
-  return `The mint at ${host} did not answer. As the purse last saw them, ${toks(first.amount)} ${fade} at ${when(first.at, now)} unless the purse reaches it before then. ${AGAIN}`;
+  return `${unreached(host, offline)}. As the purse last saw them, ${toks(first.amount)} ${fade} at ${when(first.at, now)} unless the purse reaches ${reachIt(offline)} before then. ${again(offline)}`;
 }
 
 /** The mint did not answer, and the purse has not read it since this version kept what fades first. */
-export const unreachableUnknownWords = (host: string): string =>
-  `The mint at ${host} did not answer, so the purse cannot tell yet when its tokens there fade. ${AGAIN}`;
+export const unreachableUnknownWords = (host: string, offline = offlineNow()): string =>
+  `${unreached(host, offline)}, so the purse cannot tell yet when its tokens there fade. ${again(offline)}`;
 
 /**
  * What the purse says when a mint does not answer, from the newest holdings
@@ -488,25 +496,26 @@ export function unreachableFor(
   holdings: Holdings | undefined,
   last: LastFade | null | undefined,
   now: number,
+  offline = offlineNow(),
 ): string | undefined {
   let first = last;
   if (holdings !== undefined) {
     const fading = holdings.notes.filter((note) => note.pos === 0);
     if (fading.length > 0) {
-      return unreachableWords(host, { values: values(fading), pos: 0, holdings, now });
+      return unreachableWords(host, { values: values(fading), pos: 0, holdings, now }, offline);
     }
     first = firstFade(holdings);
   }
   if (first === undefined) {
-    return unreachableUnknownWords(host);
+    return unreachableUnknownWords(host, offline);
   }
-  return first === null || first.at <= now ? undefined : unreachableFirstWords(host, first, now);
+  return first === null || first.at <= now ? undefined : unreachableFirstWords(host, first, now, offline);
 }
 
 /** The mint's answer to a hop did not check out, so the purse kept none of it. */
 export function uncheckedWords(host: string, stuck: Stuck): string {
   const { n, they } = tokensFade(stuck);
-  return `The answer from ${host} did not check out, so ${n} could not move. ${they} unless a later answer checks out before then. ${AGAIN}`;
+  return `The answer from ${host} did not check out, so ${n} could not move. ${they} unless a later answer checks out before then. ${again(false)}`;
 }
 
 /** The mint was paused when the hops went: nothing fades while it is. */

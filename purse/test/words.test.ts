@@ -689,6 +689,26 @@ describe('when the mint does not answer', () => {
   });
 });
 
+describe('when this device is offline', () => {
+  const host = 'playground.worgl.1y.io';
+
+  test('says so, not that the mint did not answer, and that the purse asks again once back online', () => {
+    const fading = holdings([note(64, 1), ...FADING()]);
+    assert.equal(
+      unreachableFor(host, fading, undefined, NOW, true),
+      'This device is offline, so 5 tokens could not move. They fade at 16:00 unless the purse reaches the mint before then. The purse asks again once this device is back online.',
+    );
+    assert.equal(
+      unreachableFor(host, undefined, { at: NEXT, amount: 1 }, NOW, true),
+      'This device is offline. As the purse last saw them, 1 token fades at 16:00 unless the purse reaches the mint before then. The purse asks again once this device is back online.',
+    );
+    assert.equal(
+      unreachableFor(host, undefined, undefined, NOW, true),
+      'This device is offline, so the purse cannot tell yet when its tokens there fade. The purse asks again once this device is back online.',
+    );
+  });
+});
+
 describe('another mint’s tokens going first', () => {
   test('the come-back row and column name the mint they are for', () => {
     const h = holdings([note(64, 1), note(4, 2)]);
