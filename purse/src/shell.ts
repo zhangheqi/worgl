@@ -20,7 +20,7 @@ export function brand(link: boolean, key = 'brand'): HTMLElement {
 }
 
 /** Where the desktop bar is drawn: the first run (the brand alone), or one of the views it leads to. */
-export type Bar = 'first' | 'home' | 'receive' | 'send' | 'history' | 'backup';
+export type Bar = 'first' | 'home' | 'receive' | 'send' | 'history' | 'mints' | 'backup';
 
 /**
  * The desktop bar, from 1100 px: the brand, and past the first run the
@@ -37,6 +37,7 @@ export function deskbar(link: boolean, current: Bar = 'first'): HTMLElement {
     { 'aria-label': 'Purse sections' },
     h('a', { href: '#home', 'aria-current': page('home'), 'data-fk': 'db-home' }, 'Purse'),
     h('a', { href: '#history', 'aria-current': page('history'), 'data-fk': 'db-history' }, 'History'),
+    h('a', { href: '#mints', 'aria-current': page('mints'), 'data-fk': 'db-mints' }, 'Mints'),
     h('a', { href: '#backup', 'aria-current': page('backup'), 'data-fk': 'db-backup' }, 'Backup'),
   );
   const acts = h(
@@ -50,11 +51,11 @@ export function deskbar(link: boolean, current: Bar = 'first'): HTMLElement {
 
 /**
  * A flow's top bar on the phone: back to the purse, the flow's name on a
- * rule, and the mint's face, a mark until the Mints screen comes. Backup,
- * which covers every mint, shows no face; with no mint yet, there is no
- * purse to go back to.
+ * rule, and the mint's face, which leads to Mints (a mint the purse does
+ * not hold, a request's, is only its face). Backup and Mints, which cover
+ * every mint, show no face; with no mint yet, there is no purse to go back to.
  */
-export function tbSub(title: string, mint?: { mint: string; name: string }, back = true): HTMLElement {
+export function tbSub(title: string, mint?: { mint: string; name: string; held?: boolean }, back = true): HTMLElement {
   return h(
     'header',
     { class: 'tb' },
@@ -64,6 +65,9 @@ export function tbSub(title: string, mint?: { mint: string; name: string }, back
     h('div', { class: 'subhead' }, h('span', { class: 'lab' }, title), h('span', { class: 'rule' }), regIcon()),
     mint === undefined
       ? h('span', { class: 'ib face', 'aria-hidden': 'true' })
-      : h('span', { class: 'ib face', role: 'img', 'aria-label': `Mint: ${mint.name}` }, face(mint.mint, 4.4, 3.4)),
+      : mint.held === false
+        ? // a request's or a hand-back's mint the purse does not hold: Mints does not list it
+          h('span', { class: 'ib face', role: 'img', 'aria-label': `Mint: ${mint.name}` }, face(mint.mint, 4.4, 3.4))
+        : h('a', { class: 'ib face', href: '#mints', 'aria-label': `Mints: ${mint.name}`, 'data-fk': 'tb-mints' }, face(mint.mint, 4.4, 3.4)),
   );
 }

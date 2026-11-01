@@ -267,8 +267,8 @@ export interface SendActions {
 /** Everything Send draws from. */
 export interface SendInput {
   state: SendState;
-  /** The mint the top bar shows: the request's when it is held, else the one Holdings shows. */
-  bar: { mint: string; name: string };
+  /** The mint the top bar shows: the request's (held or not), else the one Holdings shows. */
+  bar: { mint: string; name: string; held: boolean };
   /** The request's mint, as the ticket names it: its name, or its host when it is not held. */
   name: string;
   /** The request's link, for the ticket's code. */

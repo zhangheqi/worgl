@@ -141,7 +141,15 @@ function paperBand(input: HomeInput): HTMLElement {
     h(
       'div',
       { class: 'wrap' },
-      h('header', { class: 'tb' }, brand(true), h('span', { class: 'sp' }), backupLink(input)),
+      h(
+        'header',
+        { class: 'tb' },
+        brand(true),
+        h('span', { class: 'sp' }),
+        backupLink(input),
+        // the mint's face, at the right as on every phone top bar: the way to Mints
+        h('a', { class: 'ib face', href: '#mints', 'aria-label': `Mints: ${record.name}`, 'data-fk': 'to-mints' }, face(record.mint, 4.4, 3.4)),
+      ),
       h(
         'div',
         { class: `hero${input.received !== undefined ? ' has-pm' : ''}` },
@@ -464,7 +472,7 @@ function breakable(name: string): Child[] {
   return name.split('.').flatMap((part, i, parts): Child[] => (i < parts.length - 1 ? [`${part}.`, h('wbr')] : [part]));
 }
 
-/** The desktop's mint column: its face, name, rotation and key. */
+/** The desktop's mint column: its face, name, rotation and key, and the way to Mints. */
 function mintColumn(input: HomeInput): HTMLElement {
   const { record, data } = input;
   const holdings = data?.holdings;
@@ -488,7 +496,12 @@ function mintColumn(input: HomeInput): HTMLElement {
   return h(
     'div',
     { class: 'col-mint desk-only' },
-    h('div', { class: 'col-h' }, h('h2', { class: 'lab' }, 'Mint')),
+    h(
+      'div',
+      { class: 'col-h mint-h' },
+      h('h2', { class: 'lab' }, 'Mint'),
+      h('a', { class: 'lab to-mints', href: '#mints', 'data-fk': 'to-mints-d' }, 'Mints', arrowIcon()),
+    ),
     h(
       'div',
       { class: 'mintc' },

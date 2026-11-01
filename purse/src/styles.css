@@ -892,3 +892,75 @@ span.ib.face:hover { background: none; }
   .reg-cols, .hrow > button { grid-template-columns: 60px minmax(0, 1fr) 72px 60px; gap: 12px; }
   .hrow .det { padding-left: 72px; }
 }
+/* ---------- Mints ---------- */
+.mints-h1 { margin-top: 10px; }
+.mints-lede { text-wrap: pretty; }
+/* each mint a stamp on the page, its perforation bitten out of the paper; the column leaves room for the bite */
+.mcards { display: flex; flex-direction: column; gap: 28px; margin-top: 26px; padding-inline: 5px; }
+.mcard { --bite: var(--paper); position: relative; background: var(--paper-2); padding: 16px 16px 6px; }
+.mcard.footless { padding-bottom: 14px; }
+.mcard::before { content: ""; position: absolute; inset: -5px; pointer-events: none;
+  background:
+    radial-gradient(circle, var(--bite) 4.2px, transparent 4.8px) 0 0 / 14px 10px repeat-x,
+    radial-gradient(circle, var(--bite) 4.2px, transparent 4.8px) 0 100% / 14px 10px repeat-x,
+    radial-gradient(circle, var(--bite) 4.2px, transparent 4.8px) 0 0 / 10px 14px repeat-y,
+    radial-gradient(circle, var(--bite) 4.2px, transparent 4.8px) 100% 0 / 10px 14px repeat-y; }
+.mc-top { display: grid; grid-template-columns: auto minmax(0, 1fr) auto; gap: 14px; align-items: center; }
+.mc-top .face { color: var(--sq); }
+.mc-name { font-family: var(--f-serif); font-size: 32px; line-height: 1; letter-spacing: -.01em; overflow-wrap: anywhere; }
+.mc-who .lab { margin-top: 5px; }
+.mc-held { text-align: right; }
+.mc-held b { display: block; font-family: var(--f-serif); font-weight: 400; font-size: 40px; line-height: .9; letter-spacing: -.02em; }
+.mc-held small { display: block; margin-top: 5px; font-size: 11px; color: var(--muted); }
+.mc-rename { margin-top: 14px; }
+.mc-rename .btn-row { gap: 10px; }
+/* the next four rotations, as a timetable under how often they come: the next underlined */
+.tt-h { display: flex; flex-wrap: wrap; justify-content: space-between; align-items: baseline; gap: 4px 12px; margin-top: 16px; padding-top: 10px; border-top: 1px solid var(--rule-strong); }
+.tt-h .lab { font-size: 11px; }
+.tt { display: grid; grid-template-columns: repeat(4, minmax(0, 1fr)); margin-top: 2px; }
+.tt li { padding: 10px 8px 8px 0; border-right: 1px solid var(--rule); min-width: 0; }
+.tt li + li { padding-left: 10px; }
+.tt li:last-child { border-right: 0; }
+.tt time { display: flex; flex-direction: column; gap: 4px; }
+.tt b { font-family: var(--f-serif); font-weight: 400; font-size: 27px; line-height: 1; letter-spacing: -.01em; }
+.tt .lab { font-size: 11px; color: var(--muted); }
+.tt li.next b { text-decoration: underline; text-decoration-thickness: 1.5px; text-underline-offset: .14em; }
+.mc-clock { margin-top: 6px; }
+.mcard dl { display: grid; grid-template-columns: auto minmax(0, 1fr); margin-top: 12px; border-top: 1px solid var(--rule); }
+.mcard dt, .mcard dd { min-height: 46px; padding: 9px 0; border-bottom: 1px solid var(--rule); display: flex; align-items: center; }
+.mcard dt { color: var(--muted); font-size: 14.5px; }
+.mcard dd { justify-content: flex-end; flex-wrap: wrap; gap: 6px 12px; padding-left: 12px; text-align: right; font-size: 15px; min-width: 0; overflow-wrap: anywhere; }
+/* the whole key, under the rows: four groups to a line, two on a narrow phone, never one alone */
+.mc-whole { display: flex; flex-direction: column; gap: 6px; padding: 10px 0 4px; }
+.mc-key { max-width: 36.5ch; font-family: var(--f-mono); font-size: 12px; font-stretch: 87.5%; letter-spacing: .02em; line-height: 1.6; }
+.mc-key span { display: inline-block; white-space: nowrap; }
+.mc-err, .mc-took { margin-top: 10px; }
+.mc-foot { display: flex; align-items: center; flex-wrap: wrap; gap: 8px 12px; min-height: 54px; padding-top: 4px; }
+.mc-foot .mc-rn { margin-left: auto; }
+.mc-tag { display: inline-flex; align-items: center; gap: 8px; min-height: 44px; color: var(--ink); }
+.mc-tag::before { content: ""; width: 9px; height: 9px; background: var(--sq); }
+/* on a phone the faucet's button goes under its row, which keeps to the top beside its label */
+@media (max-width: 559px) {
+  .mcard dt.mc-ft { align-items: flex-start; }
+  .mcard dd.mc-faucet { flex-direction: column; align-items: flex-end; }
+}
+/* adding a mint, on the cobalt */
+.tabs { display: grid; grid-template-columns: 1fr 1fr; margin-top: 12px; border: 1.5px solid var(--on-cobalt); }
+.tabs button { min-height: 48px; padding: 0 8px; font-family: var(--f-mono); font-size: 11.5px; letter-spacing: .08em; text-transform: uppercase; font-stretch: 87.5%; font-weight: 600; }
+.tabs button:hover { background: var(--hover-cobalt); }
+.tabs button[aria-pressed="true"] { background: var(--on-cobalt); color: var(--cobalt); }
+.mints-add .form { margin-top: 14px; }
+.mints-add .body, .mints-add .note-line { max-width: 34em; }
+.mc-found { margin-top: 14px; padding: 5px; }
+.band-c .mc-whole { padding-top: 14px; }
+.band-c .mc-key { color: var(--on-cobalt); }
+.mc-held-note { display: flex; flex-direction: column; align-items: flex-start; gap: 12px; margin-top: 14px; }
+/* Holdings' ways to Mints: the desktop's mint column, beside its heading */
+.mint-h .to-mints { color: var(--on-cobalt); min-height: 44px; display: inline-flex; align-items: center; gap: 8px; text-decoration: none; }
+.mint-h .to-mints:hover { text-decoration: underline; text-underline-offset: .4em; }
+@media (min-width: 1100px) {
+  .v-mints .h1 { font-size: 72px; }
+  .mc-name { font-size: 38px; }
+  .mc-held b { font-size: 48px; }
+  .tt b { font-size: 30px; }
+}

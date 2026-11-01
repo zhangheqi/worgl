@@ -6,7 +6,8 @@ at `purse.worgl.1y.io` on Cloudflare Pages, built with Vite and TypeScript
 and no UI framework, on the [TypeScript SDK](../sdk/typescript/README.md),
 which runs the Rust core as WebAssembly.
 
-This version is the shell, Holdings, keep-alive, Receive, Send and History:
+This version is the shell, Holdings, keep-alive, Receive, Send, History,
+Backup and Mints:
 
 - **The first run** (`#first`): what the purse is and how its field reads,
   then a way in. A mint link (`#mint=<issuer key hex>&at=<server URL>`)
@@ -66,8 +67,14 @@ This version is the shell, Holdings, keep-alive, Receive, Send and History:
   is held, and the desktop's mint panel has a Backup row. With no mint yet
   it is the first run's way to restore ("Have a backup file? Restore it").
 
-Not yet: the Mints screen (Holdings shows the mint used last), a menu on
-the phone, and a service worker.
+- **Mints** (`#mints`): every mint the purse holds, each as a stamp: its
+  face, name and key, what is held of it, its next four rotations, its
+  server and faucet, and its whole key. A mint is renamed there, taken from,
+  and shown on Holdings; below them a mint is added by its link, or by its
+  server and key. The face in a flow's top bar leads there, and so do the
+  phone's top bar on Holdings and the desktop's bar and mint column.
+
+Not yet: a menu on the phone, and a service worker.
 
 ## History
 
@@ -185,6 +192,37 @@ it comes, and sends nothing if the mint did not answer for one.
 Below that, Backup says whether the browser agreed to keep the purse's
 data (`navigator.storage.persisted()`), and, outside an installed purse,
 that Safari keeps it only once added to the Home Screen.
+
+## Mints
+
+Each card is drawn at once from keep-alive's last read of its mint, then
+read again (the same read as Holdings', so what faded is dropped and
+logged), on each visit to Mints, every minute while it is on screen, and
+just after the next rotation of any mint it shows. Its timetable is the
+next four rotations by this device's clock, from the mint's schedule; a
+mint its operator rotates by hand, or has paused, has none, and its card
+says why. A mint's faucet is asked once a visit, and again after a take,
+apart from the read: when it answers for the mint, its card has "Take 64",
+which takes as the first run's does and says what came and when it rests.
+A read that fails says so on the card, with what was read last.
+
+With more than one mint, Holdings shows the one used last, and each other
+card has "Show on Holdings", which makes it the one used last and goes
+there. A name is the person's own: at most 40 characters, composed (NFC),
+its spaces run together; the unit stays "tokens". A mint the purse adds
+starts with the playground's name or its server's host, with the key's
+first eight digits after it when another mint has that name already, as a
+restore's new mints do. A rename is told to the other tabs.
+
+Adding a mint takes a mint link, or a server and a key typed by hand: the
+server with `https://` put before it when it names no scheme, and the key's
+64 hex digits in either case, with spaces or line breaks between them. The
+mint is read from that server and shown, its stamp and its whole key, with
+the words to compare them with the ones its people give, before it is
+kept; "Add mint" keeps it and makes it the one used last. A mint the purse
+holds already is never added again, nor read or moved at another server on
+a link's word, since trust follows the key and not the address: Mints says
+under which name and at which server it is held, and offers to show it.
 
 ## Keep-alive
 
@@ -309,6 +347,7 @@ under the hosted Content-Security-Policy, with the local mint allowed.
 | `npm run screenshots:send` | `scripts/preview-send.mjs`: Receive and Send between two purses, below |
 | `npm run screenshots:history` | `scripts/preview-history.mjs`: History, from the entries of real sends, takes, keep-alive and a fade |
 | `npm run screenshots:backup` | `scripts/preview-backup.mjs`: Backup: a save, a send after it, a restore in a new browser and the checks |
+| `npm run screenshots:mints` | `scripts/preview-mints.mjs`: Mints: a take, a rename, a second mint added by its link, one typed by its key, two tabs and a server down |
 | `npm run plan-check` | `scripts/plan-check.mjs`: the planner's choice of notes, checked against the SDK's own `pay` on a local mint |
 | `npm run grain` | draws `public/grain-*.png` again (`scripts/grain.ts`) |
 
@@ -464,8 +503,9 @@ A faucet answers the hosted purse only when it names its origin:
 | `src/keep.ts` | keep-alive's pure logic: the time budget and spacing, which note a transfer spends, moving and kept notes, when a mint is due, the step count and boxes |
 | `src/keeper.ts` | keep-alive's runner: when passes run and stop (`Keeper`), and one pass over a server (`Keeping`), every browser and SDK dependency injected |
 | `src/lock.ts` | the one Web Lock that keep-alive passes, sends, settles and restores take, and the one the checks of restored notes take |
-| `src/first.ts`, `src/home.ts`, `src/receive.ts`, `src/send.ts`, `src/history.ts`, `src/backup.ts`, `src/shell.ts` | the views, and the bars and brand they share |
+| `src/first.ts`, `src/home.ts`, `src/receive.ts`, `src/send.ts`, `src/history.ts`, `src/backup.ts`, `src/mints.ts`, `src/shell.ts` | the views, and the bars and brand they share |
 | `src/register.ts` | History's register: the rows by day, what was held after each, and what each row says |
+| `src/mint-list.ts` | Mints' words: each mint's timetable, clock and faucet, its whole key, the name a new mint starts with, and what a typed name, server or key lacks |
 | `src/cover.ts` | Backup's words and arithmetic: the passphrase, the file, what a backup covers, where a restore puts each mint, and what a restore and the checks came to |
 | `src/flow.ts`, `src/flow-words.ts`, `src/slice.ts`, `src/postmark.ts`, `src/icons.ts` | what Receive and Send draw: the stamps, codes, ticket and scanner, their words, the slice of the field a send takes from, the postmark of what came in |
 | `src/plan.ts`, `src/amount.ts`, `src/asks.ts`, `src/entries.ts` | which notes a send takes, the amount typed, the open requests, and the log's sends and receipts |
