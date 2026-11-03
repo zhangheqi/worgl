@@ -6,7 +6,7 @@ import { randInt } from './motion';
 
 const FIELDS = [
   { k: 'ver', name: 'Version', from: 0, to: 1, d: 'The format version, so the layout can change later.' },
-  { k: 'iss', name: 'Mint key', from: 1, to: 33, d: 'The issuer key of the mint that made it. A note names its mint, so it finds its own way back.' },
+  { k: 'iss', name: 'Mint key', from: 1, to: 33, d: 'The issuer key of the mint that made it. The server finds a note’s mint from this.' },
   { k: 'gen', name: 'Generation', from: 33, to: 41, d: 'Which rotation’s layer it was issued in. A generation is never reused.' },
   { k: 'idx', name: 'Index', from: 41, to: 45, d: 'The note’s bit, run through a keyed permutation, so serials don’t reveal order.' },
   { k: 'amt', name: 'Amount', from: 45, to: 53, d: 'What the note is worth, in the token’s smallest unit.' },
