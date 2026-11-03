@@ -1,5 +1,12 @@
 # Worgl
 
+[![CI](https://img.shields.io/github/actions/workflow/status/zhangheqi/worgl/ci.yml?branch=main&label=CI)](https://github.com/zhangheqi/worgl/actions/workflows/ci.yml)
+[![crates.io](https://img.shields.io/crates/v/worgl)](https://crates.io/crates/worgl)
+[![docs.rs](https://img.shields.io/docsrs/worgl)](https://docs.rs/worgl)
+[![MSRV](https://img.shields.io/crates/msrv/worgl)](Cargo.toml)
+[![License](https://img.shields.io/crates/l/worgl)](#license)
+[![Website](https://img.shields.io/badge/website-zhangheqi.github.io%2Fworgl-1D35D6)](https://zhangheqi.github.io/worgl/)
+
 Worgl is an open-source issuer for tokens that cost one bit to track, need
 no accounts, and expire if they sit still. It is meant for the credits,
 quotas and points that services and agents hand each other. Identity checks
@@ -20,8 +27,9 @@ answer it lost.
 The name comes from Wörgl, the Austrian town whose 1932 stamp scrip cost its
 holders 1% a month to keep valid.
 
-> **Status:** 0.1. The design and code have not had an independent security
-> review. Do not use it to hold anything you cannot afford to lose.
+> [!IMPORTANT]
+> The design and code have not had an independent security review. Do not use
+> Worgl to hold anything you cannot afford to lose.
 
 ## Try it
 
@@ -32,35 +40,19 @@ cargo build --release
 ./target/release/worgl-server serve       --state ./server --listen 127.0.0.1:8080
 ```
 
-The [quickstart](site/src/content/docs/docs/quickstart.md) continues from
-there with the `worgl` command: two purses, a mint, a payment and a rotation.
+The [quickstart](https://zhangheqi.github.io/worgl/docs/quickstart/)
+continues from there with the `worgl` command: two purses, a mint, a payment
+and a rotation.
 
 ## Documentation
 
-The documentation is published at <https://zhangheqi.github.io/worgl/docs/>.
-Its source is in [`site/src/content/docs/docs`](site/src/content/docs/docs),
-and the links below point there.
-
-- **Start:** [Quickstart](site/src/content/docs/docs/quickstart.md) ·
-  [Concepts](site/src/content/docs/docs/concepts.md) ·
-  [Choosing a period and layer count](site/src/content/docs/docs/choosing-a-period.md)
-- **Build:** [Rust SDK](site/src/content/docs/docs/rust-sdk.mdx) ·
-  [TypeScript SDK](site/src/content/docs/docs/typescript-sdk.md) ·
-  [The worgl command](site/src/content/docs/docs/command-line.md) ·
-  [Embedding the library](site/src/content/docs/docs/embedding.mdx)
-- **Operate:** [Running a server](site/src/content/docs/docs/running-a-server.md) ·
-  [Running a cluster](site/src/content/docs/docs/running-a-cluster.md) ·
-  [Running a faucet](site/src/content/docs/docs/running-a-faucet.md) ·
-  [Mint authorities and keys](site/src/content/docs/docs/keys.md) ·
-  [Pausing a mint](site/src/content/docs/docs/pausing.md) ·
-  [Backups](site/src/content/docs/docs/backups.md) ·
-  [Exporting a log for audit](site/src/content/docs/docs/audit.md)
-- **Reference:** [HTTP API](site/src/content/docs/docs/http-api.md) ·
-  [Error codes](site/src/content/docs/docs/error-codes.md) ·
-  [Note format](site/src/content/docs/docs/note-format.md) ·
-  [Policy fields](site/src/content/docs/docs/policy.md) ·
-  [Privacy model](site/src/content/docs/docs/privacy.md) ·
-  [Changelog](CHANGELOG.md)
+The documentation is on the website, **[zhangheqi.github.io/worgl](https://zhangheqi.github.io/worgl/)**.
+Start with the [quickstart](https://zhangheqi.github.io/worgl/docs/quickstart/), or read
+[How it works](https://zhangheqi.github.io/worgl/how-it-works/) for the model first. The
+[docs](https://zhangheqi.github.io/worgl/docs/) cover the Rust and TypeScript SDKs, running servers and
+clusters, and the HTTP API. API reference for each crate is on
+[docs.rs](https://docs.rs/worgl), and changes are in the
+[changelog](CHANGELOG.md).
 
 ## The workspace
 
@@ -110,8 +102,8 @@ stronger than any account system. Blind signatures do not fit this design,
 because the issuer must choose each note's serial: the serial names the
 note's bit.
 
-The [privacy model](site/src/content/docs/docs/privacy.md) describes what
-each party to a payment sees.
+The [privacy model](https://zhangheqi.github.io/worgl/docs/privacy/) describes what each party to a
+payment sees.
 
 ## Efficiency
 
@@ -171,9 +163,9 @@ the members, built on [`worgl-raft`](crates/worgl-raft).
   its own files, and the member leading the mint applies its own, so change
   them the same way on every member while the mint is paused.
 
-[Running a cluster](site/src/content/docs/docs/running-a-cluster.md) covers
-starting a cluster, keeping it private, pointing clients at it, creating
-mints, changing their rules, and its limits.
+[Running a cluster](https://zhangheqi.github.io/worgl/docs/running-a-cluster/)
+covers starting a cluster, keeping it private, pointing clients at it,
+creating mints, changing their rules, and its limits.
 
 ## Limitations
 

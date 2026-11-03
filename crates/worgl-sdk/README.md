@@ -23,8 +23,9 @@ cargo add worgl worgl-sdk
 - [Privacy model](https://zhangheqi.github.io/worgl/docs/privacy/)
 - [API reference](https://docs.rs/worgl-sdk)
 
-> **Status:** 0.1. The design and code have not had an independent security
-> review. Do not use it to hold anything you cannot afford to lose.
+> [!IMPORTANT]
+> The design and code have not had an independent security review. Do not use
+> Worgl to hold anything you cannot afford to lose.
 
 ## License
 

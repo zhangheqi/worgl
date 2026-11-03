@@ -11,8 +11,9 @@ which uses this crate to run as a cluster.
 - [Running a cluster](https://zhangheqi.github.io/worgl/docs/running-a-cluster/)
 - [API reference](https://docs.rs/worgl-raft)
 
-> **Status:** 0.1. The design and code have not had an independent security
-> review. Do not use it to hold anything you cannot afford to lose.
+> [!IMPORTANT]
+> The design and code have not had an independent security review. Do not use
+> Worgl to hold anything you cannot afford to lose.
 
 ## License
 
