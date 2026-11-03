@@ -1,10 +1,10 @@
 ---
 import Page from '../layouts/Page.astro';
 import SectionHead from '../components/SectionHead.astro';
-import { DISCUSSIONS, REPO } from '../lib/links';
+import { DISCUSSIONS, page } from '../lib/links';
 import '../styles/pages.css';
 
-const RUN_SERVER = `${REPO}#running-the-server`;
+const RUN_SERVER = page('docs/running-a-server/');
 ---
 <Page title="Worgl Cloud" description="Worgl Cloud will run your mints for you, on the same open-source server you can run yourself. It is not available yet.">
   <section class="band paper cloud-hero edge edge-cobalt" data-tone="paper">
@@ -17,8 +17,8 @@ const RUN_SERVER = `${REPO}#running-the-server`;
           <span class="label na tag">Not available yet</span>
           <p class="intro">Worgl Cloud will run your mints for you. You create a mint for each kind of token, mint to your own systems with your own authority key, and your holders use the SDKs. It runs the same open-source server you can run yourself.</p>
           <div class="act">
-            <p>There is no waitlist and no form. Questions and ideas go to GitHub Discussions, in public.</p>
-            <div class="ctas"><a class="btn btn-solid-paper" href={DISCUSSIONS}>Tell us what you'd build</a></div>
+            <p>There is no waitlist or sign-up form. Ask questions and share ideas in GitHub Discussions.</p>
+            <div class="ctas"><a class="btn btn-solid-paper" href={DISCUSSIONS}>Discuss it on GitHub</a></div>
           </div>
         </div>
       </div>
@@ -30,7 +30,7 @@ const RUN_SERVER = `${REPO}#running-the-server`;
       <SectionHead num="01" name="Promises" />
       <div class="grid">
         <h2 class="h2">What it will <em>promise.</em></h2>
-        <p class="body sec-aside">Four commitments, made before the service exists, so you can hold it to them.</p>
+        <p class="body sec-aside">Four commitments, written down before the service exists.</p>
         <ol class="promise-list">
           <li><h3>Worgl never mints</h3><p>Worgl never mints, holds or redeems value. Only your authority key can mint.</p></li>
           <li><h3>One note per transfer</h3><p>Every hosted mint takes one note per transfer, so no transfer reveals that two notes share an owner.</p></li>
@@ -46,7 +46,7 @@ const RUN_SERVER = `${REPO}#running-the-server`;
       <SectionHead num="02" name="Where it stands" />
       <div class="grid">
         <h2 class="h2 sec-intro">Three steps, no <em>dates.</em></h2>
-        <p class="body muted sec-aside">Each step starts when the one before it has done what it says, not on a calendar.</p>
+        <p class="body muted sec-aside">Each step starts when the one before it has met its goal.</p>
         <ol class="stage-row">
           <li class="now">
             <span class="stage-box" aria-hidden="true">1</span>
@@ -68,8 +68,8 @@ const RUN_SERVER = `${REPO}#running-the-server`;
           </li>
         </ol>
         <div class="self-host">
-          <p class="lede">Until then, the server Worgl Cloud will run is yours to run today, alone or as a three-member cluster.</p>
-          <div class="ctas"><a class="btn btn-solid" href={RUN_SERVER}>Run the server</a><a class="btn" href={DISCUSSIONS}>Tell us what you'd build</a></div>
+          <p class="lede">Until then, you can run the same server yourself, alone or as a three-member cluster.</p>
+          <div class="ctas"><a class="btn btn-solid" href={RUN_SERVER}>Run the server</a><a class="btn" href={DISCUSSIONS}>Discuss it on GitHub</a></div>
         </div>
       </div>
     </div>

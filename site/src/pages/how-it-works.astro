@@ -13,7 +13,7 @@ const LIFECYCLE = `${REPO}/blob/main/crates/worgl/examples/lifecycle.rs`;
     <div class="wrap grid">
       <p class="eyebrow label"><span>How it works</span><span>v0.1</span></p>
       <h1 class="display">How Worgl <em>works.</em></h1>
-      <p class="lede">A mint issues signed notes and remembers one bit for each. Everything else follows from three rules:</p>
+      <p class="lede">A mint issues signed notes and keeps one bit for each. Notes move and expire by three rules:</p>
       <ol class="three">
         <li><span class="num" aria-hidden="true">I</span><p>A transfer moves value one layer on.</p></li>
         <li><span class="num" aria-hidden="true">II</span><p>The last layer cannot move until the next rotation.</p></li>
@@ -51,7 +51,7 @@ const LIFECYCLE = `${REPO}/blob/main/crates/worgl/examples/lifecycle.rs`;
               <span>· can make <span class="k">n − 1 − k</span> more hops now</span>
               <span>· dies in rotation <span class="k">k + 1</span> from now if left alone</span>
             </div>
-            <p>So one setting, the rotation period, sets both limits. With 4 layers rotated daily, a note moves at most once a day once it reaches the last layer, and a note left alone dies within 4 days. Three example settings:</p>
+            <p>The rotation period sets both limits. With 4 layers rotated daily, a note moves at most once a day once it reaches the last layer, and a note left alone dies within 4 days. Three example settings:</p>
             <div class="tbl-wrap">
               <table>
                 <thead><tr><th class="label" scope="col">Use</th><th class="label" scope="col">Period</th><th class="label" scope="col">Layers</th><th class="label" scope="col">Idle tokens die after</th></tr></thead>
@@ -83,9 +83,9 @@ const LIFECYCLE = `${REPO}/blob/main/crates/worgl/examples/lifecycle.rs`;
 
   <section class="band cobalt hiw-privacy edge edge-paper" id="privacy" data-tone="cobalt">
     <div class="wrap">
-      <SectionHead num="05" name="Privacy, precisely" />
+      <SectionHead num="05" name="Privacy" />
       <div class="grid">
-        <h2 class="h2">Privacy, <em>precisely.</em></h2>
+        <h2 class="h2">What the mint <em>sees.</em></h2>
         <p class="lede intro">The mint sees every transfer's input die and its outputs appear, so it can follow each note's lineage, along with amounts and timing. It never learns who holds a note, and it cannot tell that two unrelated notes share an owner, as long as holders keep three rules. The SDKs keep them by default:</p>
         <figure class="lineage">
           <div class="lineage-frame"><svg data-lineage aria-hidden="true"></svg></div>
@@ -94,7 +94,7 @@ const LIFECYCLE = `${REPO}/blob/main/crates/worgl/examples/lifecycle.rs`;
         <ol class="rules">
           <li><h3>A fresh one-time key for every note received</h3></li>
           <li><h3>One note per transfer, never two spent together</h3><p>Spending two at once would tell the mint they had one owner, the way blockchain analysis links addresses.</p></li>
-          <li><h3>Transfers spread out in time</h3><p>So a burst does not read as one payment.</p></li>
+          <li><h3>Transfers spread out in time</h3><p>A burst of transfers would read as one payment.</p></li>
         </ol>
         <p class="compare">This is weaker than blind-signature schemes such as Chaum's, Cashu or GNU Taler, where the issuer cannot link a note to the one it replaced, and stronger than any account system. Blind signatures cannot work here, because the mint must choose each serial: the serial names the bit. <a class="fig-link" href={README.privacy}>README</a></p>
       </div>

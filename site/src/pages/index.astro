@@ -18,14 +18,14 @@ const expire = [...'expire.'];
       <p class="eyebrow label"><span>Open source</span><span>Rust and TypeScript</span><span>v0.1</span></p>
       <h1 class="display">One bit per token.<br />No accounts.<br />Idle tokens <em class="expire"><span class="sr-only">expire.</span><span aria-hidden="true">{expire.map((ch, i) => <span class="l" style={`--i:${i}`}>{ch}</span>)}</span></em></h1>
       <div class="hero-side">
-        <p class="lede">Worgl is an open-source issuer for the credits, quotas and points that services and agents hand each other. It keeps one bit per token. Tokens change hands with no accounts, under a fresh key every time, and a token that sits still expires.</p>
+        <p class="lede">Worgl is an open-source issuer for the credits, quotas and points that services and agents hand each other. Holders keep their own tokens, each under a fresh key, and the issuer keeps one bit per token.</p>
         <div class="ctas">
           <a class="btn btn-solid-paper" href={REPO}>Read the code</a>
           <a class="btn" href={page('how-it-works/')}>How it works</a>
         </div>
       </div>
     </div>
-    <LiveField>A simulated mint running in this page, with a rotation every 12 seconds. Brighter notes are worth more. Hover a bit to read its note and click a lit one to spend it. Then stop moving for a few seconds and watch what happens to idle notes.</LiveField>
+    <LiveField>A simulated mint running in this page, rotating every 12 seconds. Brighter notes are worth more. Hover over a bit to read its note, and click a lit one to spend it. If you stop moving for a few seconds, transfers stop but rotations go on, and idle notes expire.</LiveField>
   </section>
 
   <section class="band paper storage edge edge-cobalt" id="storage" data-tone="paper">
@@ -34,7 +34,7 @@ const expire = [...'expire.'];
       <div class="grid">
         <h2 class="h2">You hold 149 bytes.<br />The mint keeps <em>one bit</em><span class="big-bit-glyph" aria-hidden="true"></span></h2>
         <NoteBytes>
-          <p class="body">The holder keeps the note: the mint's key, a serial, an amount, the holder's one-time key and the mint's signature. The mint keeps none of it. It keeps one bit per note, 1 while the note is live and 0 once it is spent, so checking a note is a signature check and one bit read.</p>
+          <p class="body">The holder keeps the note: the mint's key, a serial, an amount, the holder's one-time key and the mint's signature. The mint keeps only one bit per note, 1 while the note is live and 0 once it is spent, so checking a note takes a signature check and one bit read.</p>
         </NoteBytes>
         <div class="stats3">
           <div><b>512 KiB</b><span>Four layers of 2<sup>20</sup> bits, holding over four million notes in flight. <a class="fig-link" href={README.efficiency}>README</a></span></div>
@@ -49,11 +49,11 @@ const expire = [...'expire.'];
     <div class="wrap">
       <SectionHead num="02" name="Privacy" />
       <div class="grid">
-        <h2 class="h2">The mint sees every hop.<br />It never sees <em>who.</em></h2>
-        <p class="lede intro muted">There are no accounts to look anyone up in. Every note is bound to a fresh one-time key, so the mint can follow how value moves without knowing whose it is.</p>
+        <h2 class="h2">The mint never learns<br />who holds a <em>note.</em></h2>
+        <p class="lede intro muted">There are no accounts. Every note is bound to a fresh one-time key, so the mint can follow each note from transfer to transfer without knowing whose it is.</p>
         <figure class="lineage">
           <div class="lineage-frame"><svg data-lineage aria-hidden="true"></svg></div>
-          <figcaption>Every box is a note under its own one-time key. The mint can draw these lines. It can't say which boxes belong to the same holder.</figcaption>
+          <figcaption>Each box is a note under its own one-time key. The mint can draw these lines, but it can't tell which boxes belong to the same holder.</figcaption>
         </figure>
         <ol class="rules">
           <li><h3>A fresh key for every note</h3><p>Each note is bound to a one-time key of whoever receives it. No key is used twice, so no key names an owner.</p></li>
@@ -67,7 +67,7 @@ const expire = [...'expire.'];
             <div><h3>Worgl</h3><p>Sees each note's lineage, never its holder. While holders keep the three rules, it can't tell that two unrelated notes share an owner.</p></div>
             <div><h3>Blind signatures</h3><p>Chaum, Cashu, GNU Taler. The issuer can't even link a note to the one it replaced.</p></div>
           </div>
-          <p class="timing">Blind signatures don't fit this design: the mint has to choose each note's serial, because the serial names the note's bit. Timing still shows, too. Three notes sent to one payee in the same second invite a guess, which is why the SDKs space them out. <a class="fig-link" href={README.privacy}>README</a></p>
+          <p class="timing">Blind signatures don't fit this design, because the mint has to choose each note's serial: the serial names the note's bit. Timing also shows. Three notes sent to one payee in the same second suggest one payment, so the SDKs space them out. <a class="fig-link" href={README.privacy}>README</a></p>
         </div>
       </div>
     </div>
@@ -81,14 +81,14 @@ const expire = [...'expire.'];
         <p class="intro body muted">The bits are split into layers, oldest first. New notes land in the second-to-last layer, and a transfer issues its outputs one layer on. The last layer is frozen until the next rotation, which drops the oldest layer and every note still in it.</p>
         <StampLab />
         <div class="presets">
-          <div class="built"><h3 class="h3">Built for</h3><p class="body muted">One setting, the rotation period, sets both how fast tokens can move and how long they can sit still. Three uses, with a setting each:</p></div>
+          <div class="built"><h3 class="h3">Built for</h3><p class="body muted">The rotation period sets both how fast tokens can move and how long they can sit still. Three example settings:</p></div>
           <div class="tbl-wrap">
             <table>
               <thead><tr><th class="label" scope="col">Use</th><th class="label" scope="col">Rotation</th><th class="label" scope="col">Layers</th><th class="label" scope="col">Idle tokens die within</th></tr></thead>
               <tbody>
                 <tr><td>API quotas<span class="sub">Sell quota as tokens a customer splits across its systems. Quota nobody uses lapses.</span></td><td class="n">1 minute</td><td class="n">60</td><td>an hour</td></tr>
                 <tr><td>Agent credits<span class="sub">Agents and services that pay per call, with no account per agent.</span></td><td class="n">1 hour</td><td class="n">168</td><td>a week</td></tr>
-                <tr><td>Points that circulate<span class="sub">Rewards worth more moving than hoarded, because idle points expire.</span></td><td class="n">1 day</td><td class="n">30</td><td>a month</td></tr>
+                <tr><td>Points that circulate<span class="sub">Rewards that expire unless they keep moving.</span></td><td class="n">1 day</td><td class="n">30</td><td>a month</td></tr>
               </tbody>
             </table>
           </div>
@@ -103,15 +103,15 @@ const expire = [...'expire.'];
       <div class="grid">
         <h2>Wörgl, <em>1932.</em></h2>
         <div class="story">
-          <p>In the summer of 1932, deep in the Depression, the Austrian town of Wörgl began paying for public works with notes of its own.</p>
-          <p>The notes carried a cost borrowed from the economist Silvio Gesell. Each month the holder had to buy a stamp worth 1% of the note and stick it on, or the note stopped being valid. Holding one cost money, so nobody held them for long.</p>
-          <p>The notes kept moving. Mayor Michael Unterguggenberger's experiment ran until Austria's central bank ended it in September 1933.</p>
+          <p>In the summer of 1932, during the Depression, the Austrian town of Wörgl began paying for public works with notes of its own.</p>
+          <p>The idea came from the economist Silvio Gesell. Each month the holder had to buy a stamp worth 1% of the note and stick it on, or the note stopped being valid. Holding one cost money, so people spent them quickly.</p>
+          <p>The experiment, run by mayor Michael Unterguggenberger, lasted until Austria's central bank ended it in September 1933.</p>
         </div>
         <div class="strip-wrap">
           <div class="strip" data-strip></div>
           <p class="strip-cap">One stamp a month. An illustration, not a replica of the note.</p>
         </div>
-        <p class="closing">Wörgl stamped its notes every month. Worgl drops a layer <em>every rotation.</em></p>
+        <p class="closing">Instead of a monthly stamp, Worgl drops a layer <em>every rotation.</em></p>
         <div class="origin-foot">
           <p class="sources">Sources: <a href="https://en.wikipedia.org/wiki/W%C3%B6rgl">Wörgl on Wikipedia</a> and <a href="https://wiki.p2pfoundation.net/Worgl_Shillings">Wörgl Shillings on the P2P Foundation wiki</a>. They differ on the exact day in September 1933.</p>
           <a class="btn btn-sm" href={page('why-worgl/')}>Why Worgl</a>
@@ -124,7 +124,7 @@ const expire = [...'expire.'];
     <div class="wrap">
       <SectionHead num="05" name="Build" />
       <div class="grid">
-        <h2 class="h2">Built in the <em>open.</em></h2>
+        <h2 class="h2">Build with <em>Worgl.</em></h2>
         <div class="intro">
           <p class="body muted">A Rust workspace with a TypeScript SDK, dual-licensed MIT or Apache-2.0. Its libraries, server and command are on crates.io; the example runs from the repository.</p>
           <div class="term-box">
@@ -209,8 +209,8 @@ worgl refresh $MINT                                     <span class="c"># once p
           <h2>Your mints, run for you.</h2>
         </div>
         <div class="stamp-r">
-          <p>Worgl Cloud will run your mints for you, replicated across three zones, on the same open server. It is not available yet. Tell us what you'd build.</p>
-          <div class="ctas"><a class="btn btn-solid-paper" href={DISCUSSIONS}>Tell us on GitHub</a><a class="btn" href={page('cloud/')}>What it will promise</a></div>
+          <p>Worgl Cloud will run your mints for you on the same open-source server, replicated across three zones. It is not available yet.</p>
+          <div class="ctas"><a class="btn btn-solid-paper" href={DISCUSSIONS}>Discuss it on GitHub</a><a class="btn" href={page('cloud/')}>What it will promise</a></div>
         </div>
       </div>
     </div>

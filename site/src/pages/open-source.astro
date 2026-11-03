@@ -14,7 +14,7 @@ const parts = [
   { name: 'worgl-server', path: 'crates/worgl-server', lang: 'Rust', d: 'An HTTP server that hosts many mints side by side, alone or as a three-member cluster.' },
   { name: 'worgl-raft', path: 'crates/worgl-raft', lang: 'Rust', d: "Raft replication for each mint, plus a registry of the cluster's mints." },
   { name: 'worgl-sdk', path: 'crates/worgl-sdk', lang: 'Rust', d: "The holder's side: requests, pays, receives and refreshes notes while keeping the privacy rules." },
-  { name: 'worgl-client', path: 'crates/worgl-client', lang: 'Rust', d: 'Typed calls for every route, and a purse that saves itself.' },
+  { name: 'worgl-client', path: 'crates/worgl-client', lang: 'Rust', d: 'Typed calls for every route, and a purse that saves after every change.' },
   { name: 'worgl-cli', path: 'crates/worgl-cli', lang: 'Rust', d: '`worgl`, a command-line purse in a passphrase-encrypted file.' },
   { name: 'worgl-faucet', path: 'crates/worgl-faucet', lang: 'Rust', d: 'Hands out notes of a playground mint to anyone who asks, within limits per address and per day.' },
   { name: 'worgl-wasm', path: 'crates/worgl-wasm', lang: 'Rust', d: '`worgl-sdk` compiled to WebAssembly.' },
@@ -37,9 +37,9 @@ const checks = ['rustfmt', 'clippy', 'tests on Linux', 'tests on macOS', 'Rust 1
   <section class="band cobalt page-hero edge edge-paper" data-tone="cobalt">
     <div class="wrap grid">
       <p class="eyebrow label"><span>Open source</span><span>MIT or Apache-2.0</span><span>v0.1</span></p>
-      <h1 class="display">Everything that touches a token is <em>public.</em></h1>
+      <h1 class="display">All the code that handles tokens is open <em>source.</em></h1>
       <div class="side">
-        <p class="lede">The ledger, the server, replication, the SDKs and the command line live in one repository, under MIT or Apache-2.0 at your option.</p>
+        <p class="lede">The ledger, server, replication, SDKs and command line are in one repository, under MIT or Apache-2.0 at your option.</p>
         <div class="ctas">
           <a class="btn btn-solid-paper" href={REPO}>Read the code</a>
           <a class="btn" href={page('docs/')}>Docs</a>
@@ -133,7 +133,7 @@ const checks = ['rustfmt', 'clippy', 'tests on Linux', 'tests on macOS', 'Rust 1
         <div class="ci">
           <div class="ci-head">
             <h3 class="h3">Contributing</h3>
-            <p>CI runs rustfmt, clippy, the tests on Linux and macOS, the minimum Rust version (1.89), the docs, the lifecycle example, the TypeScript SDK against a real server and the playground deploy on every pull request. Commit messages follow Conventional Commits. <a class="fig-link" href={CI}>CI workflow</a></p>
+            <p>CI runs these checks on every pull request, including the TypeScript SDK's tests against a real server. Commit messages follow Conventional Commits. <a class="fig-link" href={CI}>CI workflow</a></p>
           </div>
           <ul class="checks" aria-label="What CI checks on every pull request">
             {checks.map((c) => <li>{c}</li>)}
