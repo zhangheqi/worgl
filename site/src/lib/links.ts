@@ -3,7 +3,7 @@ export const REPO = 'https://github.com/zhangheqi/worgl';
 export const README = {
   efficiency: `${REPO}#efficiency`,
   cluster: `${REPO}#running-a-cluster`,
-  privacy: `${REPO}#privacy-precisely`,
+  privacy: `${REPO}#privacy`,
 };
 export const DISCUSSIONS = `${REPO}/discussions`;
 export const TS_SDK = `${REPO}/tree/main/sdk/typescript`;

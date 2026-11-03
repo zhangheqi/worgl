@@ -1,77 +1,35 @@
 # Worgl
 
+[![CI](https://img.shields.io/github/actions/workflow/status/zhangheqi/worgl/ci.yml?branch=main&label=CI)](https://github.com/zhangheqi/worgl/actions/workflows/ci.yml)
+[![crates.io](https://img.shields.io/crates/v/worgl)](https://crates.io/crates/worgl)
+[![docs.rs](https://img.shields.io/docsrs/worgl)](https://docs.rs/worgl)
+[![MSRV](https://img.shields.io/crates/msrv/worgl)](Cargo.toml)
+[![License](https://img.shields.io/crates/l/worgl)](#license)
+[![Website](https://img.shields.io/badge/website-zhangheqi.github.io%2Fworgl-1D35D6)](https://zhangheqi.github.io/worgl/)
+
 Worgl is an open-source issuer for tokens that cost one bit to track, need
-no accounts, and expire if they sit still.
+no accounts, and expire if they sit still. It is meant for the credits,
+quotas and points that services and agents hand each other. Identity checks
+and regulation are out of scope.
+
+An issuer signs notes with Ed25519 and keeps one bit per note in a layered
+bit array: 1 while the note is live, 0 once it is spent. A transfer clears
+the bits of the notes it spends and issues new notes to the receivers, so no
+note can be spent twice. There are no accounts: each note is bound to a fresh
+one-time key of whoever receives it. At every rotation the issuer drops its
+oldest layer, and a note nobody moves dies within as many rotations as there
+are layers.
+
+The issuer stores no notes. It keeps the bits, a few counters, and a bounded
+list of recent transfers so that a client can safely resend a request whose
+answer it lost.
 
 The name comes from Wörgl, the Austrian town whose 1932 stamp scrip cost its
-holders 1% a month to keep valid, so nobody sat on it. Notes here likewise
-expire if they sit still.
+holders 1% a month to keep valid.
 
-An issuer signs notes with Ed25519 and keeps a single bit per note in a
-layered bit array: 1 while the note is live, 0 once it is spent. A transfer
-clears the input notes' bits and issues new notes to the receivers, so no note
-can be spent twice. There are no accounts. Each note is bound to a fresh
-one-time key of whoever receives it. The issuer stores no notes: only the
-bits, a few counters, and a bounded list of recent transfers so that a client
-can safely resend a request whose answer it lost.
-
-It is for the credits, quotas and points that services and agents hand each
-other. Identity checks and regulation are out of scope.
-
-> **Status:** 0.1. The design and code have not had an independent security
-> review. Do not use it to hold anything you cannot afford to lose.
-
-## Documentation
-
-The docs live in [`site/src/content/docs/docs`](site/src/content/docs/docs),
-the source of the website's docs pages.
-
-- **Start:** [Quickstart](site/src/content/docs/docs/quickstart.md) ·
-  [Concepts](site/src/content/docs/docs/concepts.md) ·
-  [Choosing a period and layer count](site/src/content/docs/docs/choosing-a-period.md)
-- **Build:** [Rust SDK](site/src/content/docs/docs/rust-sdk.mdx) ·
-  [TypeScript SDK](site/src/content/docs/docs/typescript-sdk.md) ·
-  [The worgl command](site/src/content/docs/docs/command-line.md) ·
-  [Embedding the library](site/src/content/docs/docs/embedding.mdx)
-- **Operate:** [Running a server](site/src/content/docs/docs/running-a-server.md) ·
-  [Running a cluster](site/src/content/docs/docs/running-a-cluster.md) ·
-  [Running a faucet](site/src/content/docs/docs/running-a-faucet.md) ·
-  [Mint authorities and keys](site/src/content/docs/docs/keys.md) ·
-  [Pausing a mint](site/src/content/docs/docs/pausing.md) ·
-  [Backups](site/src/content/docs/docs/backups.md) ·
-  [Exporting a log for audit](site/src/content/docs/docs/audit.md)
-- **Reference:** [HTTP API](site/src/content/docs/docs/http-api.md) ·
-  [Error codes](site/src/content/docs/docs/error-codes.md) ·
-  [Note format](site/src/content/docs/docs/note-format.md) ·
-  [Policy fields](site/src/content/docs/docs/policy.md) ·
-  [Changelog](CHANGELOG.md)
-- [Privacy model](site/src/content/docs/docs/privacy.md)
-
-## The workspace
-
-Eight crates and a TypeScript package. All the crates but `worgl-faucet` and
-`worgl-wasm` are on crates.io; the TypeScript package is not on npm yet.
-
-- [`worgl`](crates/worgl): the library. Ledger, note format, transfer
-  protocol, policy, issuer state machine and crash-safe storage.
-- [`worgl-server`](crates/worgl-server): an HTTP server built on it that
-  hosts many issuers, called mints, side by side.
-- [`worgl-raft`](crates/worgl-raft): Raft replication for one mint, so a
-  group of replicas keeps its log and any of them can take over as leader,
-  and a registry group that lists a cluster's mints. The server runs on it
-  as a cluster.
-- [`worgl-sdk`](crates/worgl-sdk): the holder's side. A note store that
-  requests, pays, receives and refreshes notes while keeping the privacy
-  rules, with no networking of its own.
-- [`worgl-client`](crates/worgl-client): talks to the server. Typed calls
-  for every route, and a purse that runs a holder over HTTP and saves it.
-- [`worgl-cli`](crates/worgl-cli): `worgl`, a command line purse on
-  `worgl-client`, kept in a passphrase-encrypted file.
-- [`worgl-faucet`](crates/worgl-faucet): hands out notes of a playground
-  mint to anyone who asks, within limits per address and per day.
-- [`worgl-wasm`](crates/worgl-wasm): `worgl-sdk` compiled to WebAssembly.
-- [`sdk/typescript`](sdk/typescript): the TypeScript SDK, a client and purse
-  like `worgl-client`'s on top of `worgl-wasm`, for Node and browsers.
+> [!IMPORTANT]
+> The design and code have not had an independent security review. Do not use
+> Worgl to hold anything you cannot afford to lose.
 
 ## Try it
 
@@ -82,57 +40,88 @@ cargo build --release
 ./target/release/worgl-server serve       --state ./server --listen 127.0.0.1:8080
 ```
 
-The [quickstart](site/src/content/docs/docs/quickstart.md) goes on from
-there: two purses, a mint, a payment and a rotation, with the `worgl`
-command.
+The [quickstart](https://zhangheqi.github.io/worgl/docs/quickstart/)
+continues from there with the `worgl` command: two purses, a mint, a payment
+and a rotation.
 
-## Privacy, precisely
+## Documentation
+
+The documentation is on the [Worgl website](https://zhangheqi.github.io/worgl/docs/).
+
+## The workspace
+
+Eight crates and a TypeScript package. All crates except `worgl-faucet` and
+`worgl-wasm` are on crates.io. The TypeScript package is not on npm yet.
+
+- [`worgl`](crates/worgl): the library. Ledger, note format, transfer
+  protocol, policy, issuer state machine and crash-safe storage.
+- [`worgl-server`](crates/worgl-server): an HTTP server that hosts many
+  issuers, called mints, side by side.
+- [`worgl-raft`](crates/worgl-raft): Raft replication. A group of replicas
+  keeps each mint's log, and any of them can take over as leader; a registry
+  group lists the cluster's mints. `worgl-server` uses it to run as a
+  cluster.
+- [`worgl-sdk`](crates/worgl-sdk): the holder's side. A note store that
+  requests, pays, receives and refreshes notes and follows the privacy rules.
+  It does no networking itself.
+- [`worgl-client`](crates/worgl-client): an HTTP client for the server, with
+  a typed call for every route and a purse that runs a holder over HTTP and
+  saves it.
+- [`worgl-cli`](crates/worgl-cli): the `worgl` command, a command-line purse
+  built on `worgl-client` and stored in a passphrase-encrypted file.
+- [`worgl-faucet`](crates/worgl-faucet): gives out notes from a playground
+  mint to anyone who asks, with limits per address and per day.
+- [`worgl-wasm`](crates/worgl-wasm): `worgl-sdk` compiled to WebAssembly.
+- [`sdk/typescript`](sdk/typescript): the TypeScript SDK for Node and
+  browsers, a client and purse like `worgl-client`'s built on `worgl-wasm`.
+
+## Privacy
 
 The issuer learns no identities and keeps no accounts. It does see each
-transfer's inputs die and its outputs appear, so it can follow the lineage of
-every note. What it cannot do is:
+transfer's inputs die and its outputs appear, so it can follow every note's
+lineage. It cannot tell who holds a note, or that two unrelated lineages
+share an owner, as long as holders follow two rules:
 
-- tell who holds a note, or
-- tell that two unrelated lineages share an owner,
+- Use a fresh key for every note received.
+- Never spend two notes in one transfer, since that tells the issuer they had
+  one owner. The default policy enforces this rule.
 
-provided holders use a fresh key for every note they receive and never spend
-two notes in one transfer. The default policy enforces the second rule.
-Spending several notes together would tell the issuer they had one owner.
+Timing is still visible. A payer who sends three notes to one payee in the
+same second invites the guess that they are one payment. Spacing or batching
+transfers makes this harder.
 
-What remains visible is timing: a payer who sends three notes to one payee in
-the same second invites the guess that they are one payment. Spacing or
-batching transfers blurs this.
+This is weaker than blind-signature schemes such as Chaum's, Cashu and GNU
+Taler, where the issuer cannot link a note to the one it replaced, and
+stronger than any account system. Blind signatures do not fit this design,
+because the issuer must choose each note's serial: the serial names the
+note's bit.
 
-This is weaker than blind-signature schemes (Chaum's, Cashu, GNU Taler),
-where the issuer cannot link a note to the one it replaced, and stronger than
-any account system. Blind signatures do not fit this design: the issuer must
-choose each note's serial, because the serial names the note's bit.
-
-What each party to a payment sees is in the
-[privacy model](site/src/content/docs/docs/privacy.md).
+The [privacy model](https://zhangheqi.github.io/worgl/docs/privacy/) describes what each party to a
+payment sees.
 
 ## Efficiency
 
 - **Storage:** one bit per note. Four layers of 2²⁰ bits take 512 KiB and
   hold over four million notes in flight.
-- **Status reads and writes:** O(1). A serial maps straight to its bit: the
+- **Status reads and writes:** O(1). A serial maps directly to its bit: the
   layer's slot is `generation mod layers`, its position is
   `generation − oldest generation`, and the bit is the index run back through
-  a ten-round keyed permutation, about 0.65 µs in a release build.
+  a ten-round keyed permutation. This takes about 0.65 µs in a release build.
 - **Rotation:** one word write per 64 bits the dropped layer used.
 - **Per transfer:** two signature checks per input (issuer and holder) and one
   signature per output.
 - **Durability:** one flush per batch of changes, not per change. On a 4-core
-  cloud VM the server went from about 4,000 transfers/s, whatever the
-  number of clients, to about 8,800 with 8 concurrent clients and 17,000
-  with 64, where signature checks become the limit. The library alone
-  commits about 41,000 transfers/s in batches of 256. Sustained, one mint
-  takes at most `receipt_capacity / receipt_min_age_secs` transfers and
-  burns a second, about 8,192 at the defaults, since it keeps each answer
-  for a resend for at least 128 seconds. A burst of up to 1,048,576 is not
-  held back, except for up to 128 seconds after a restart if the mint
-  already holds that many answers, and mints on one server are not capped
-  together.
+  cloud VM this took the server from about 4,000 transfers/s, whatever the
+  number of clients, to about 8,800 with 8 concurrent clients and 17,000 with
+  64, where signature checks become the limit. The library alone commits
+  about 41,000 transfers/s in batches of 256.
+- **Rate per mint:** a mint keeps each answer for at least 128 seconds so
+  that clients can resend, so it sustains at most
+  `receipt_capacity / receipt_min_age_secs` transfers and burns a second,
+  about 8,192 at the defaults. Bursts of up to 1,048,576 are not held back,
+  except for up to 128 seconds after a restart if the mint already holds that
+  many answers. The limit applies to each mint on its own, not to a server's
+  mints together.
 
 ## How the design maps onto the code
 
@@ -149,36 +138,41 @@ What each party to a payment sees is in the
 
 ## Running a cluster
 
-Three servers can run as a cluster that keeps every mint on all three, so each
-mint carries on when one server fails. Each mint is a Raft group of the
-members, built on [`worgl-raft`](crates/worgl-raft), and a change is answered
-once two of the three hold it on disk. When a leader fails, the others elect
-a new one within a few seconds; until then, requests are answered
-`503 no_leader`, and sending the same request again is safe. A leader cut off
-from the other members stops taking requests after two seconds without
-hearing from them, and a member that cannot reach the leader says so within a
-few seconds. Clients need one address that covers all three, such as a proxy
-in front of them. The members talk to each other in plain HTTP, tokens
-included, so they need a private network between them. A mint's policy and
-rotation period are not replicated: each member reads its own files, and the
-member leading the mint applies its own, so change them identically on every
-member with the mint paused.
+Three servers can run as a cluster that keeps every mint on all three, so
+each mint keeps working when one server fails. Each mint is a Raft group of
+the members, built on [`worgl-raft`](crates/worgl-raft).
 
-How to start one, keep it private, point clients at it, create mints on it,
-change their rules and what its limits are:
-[Running a cluster](site/src/content/docs/docs/running-a-cluster.md).
+- A change is answered once two of the three members hold it on disk.
+- When a leader fails, the others elect a new one within a few seconds. Until
+  then, requests are answered `503 no_leader`, and sending the same request
+  again is safe.
+- A leader cut off from the other members stops taking requests after two
+  seconds without hearing from them. A member that cannot reach the leader
+  says so within a few seconds.
+- Clients need one address that covers all three members, such as a proxy in
+  front of them.
+- Members talk to each other in plain HTTP, tokens included, so they need a
+  private network between them.
+- A mint's policy and rotation period are not replicated. Each member reads
+  its own files, and the member leading the mint applies its own, so change
+  them the same way on every member while the mint is paused.
 
-## Not covered yet
+[Running a cluster](https://zhangheqi.github.io/worgl/docs/running-a-cluster/)
+covers starting a cluster, keeping it private, pointing clients at it,
+creating mints, changing their rules, and its limits.
 
-- **The issuer sees lineage.** Inherent to the design; see above.
-- **No backing.** A mint authority decides what to mint; there is no deposit
-  or redemption into anything else.
-- **Clusters are fixed and their members talk in the clear.** Members cannot
-  be added or removed, and they send each other Raft's messages and clients'
-  requests, tokens included, without TLS. The issuer key itself never
-  rotates: a new one is a new mint.
-- **No SDK for other languages yet.** Rust and TypeScript have one, and
-  the `worgl` command covers scripts; others call the HTTP API directly.
+## Limitations
+
+- **The issuer sees lineage.** This follows from the design; see
+  [Privacy](#privacy).
+- **No backing.** A mint authority decides what to mint. Notes cannot be
+  deposited for, or redeemed into, anything else.
+- **Clusters are fixed and unencrypted.** Members cannot be added or removed,
+  and they send each other Raft messages and client requests, tokens
+  included, without TLS.
+- **Issuer keys do not rotate.** A new issuer key means a new mint.
+- **SDKs for Rust and TypeScript only.** Scripts can use the `worgl` command;
+  other languages call the HTTP API directly.
 
 ## Development
 
@@ -190,14 +184,14 @@ cargo fmt --all --check
 
 `cargo test -p worgl-raft --test simulation` runs a mint's three-replica group
 through seeded faults on a simulated clock: replicas cut off, split apart,
-crashed and restarted, messages lost and delayed. Afterwards it checks that
-the replicas agree, that every answered change is there, that no note was
-spent twice and that supply balances. It runs 32 seeds by default; set
-`WORGL_SIM_SEEDS=1000` for more, or `WORGL_SIM_SEED=<n>` to repeat one.
+crashed and restarted, and messages lost and delayed. It then checks that the
+replicas agree, that every answered change is there, that no note was spent
+twice and that supply balances. It runs 32 seeds by default. Set
+`WORGL_SIM_SEEDS=1000` to run more, or `WORGL_SIM_SEED=<n>` to repeat one.
 
-The minimum supported Rust version is 1.89. CI runs all of the above plus the
-docs and the example on every push and pull request, and the TypeScript SDK's
-tests against a real server:
+The minimum supported Rust version is 1.89. On every push and pull request,
+CI runs all of the above, builds the docs, runs the example, and runs the
+TypeScript SDK's tests against a real server. To run those tests locally:
 
 ```sh
 rustup target add wasm32-unknown-unknown
@@ -206,8 +200,17 @@ cargo build -p worgl-server -p worgl-faucet -p worgl-cli
 cd sdk/typescript && npm ci && npm run build && npm run check && npm test
 ```
 
-The website, docs included, is in [`site`](site); see its
+The website, including the docs, is in [`site`](site); see its
 [README](site/README.md).
+
+## Contributing
+
+Commit messages and pull request titles follow
+[Conventional Commits](https://www.conventionalcommits.org/).
+
+Please report security issues privately through
+[GitHub](https://github.com/zhangheqi/worgl/security/advisories/new), not in a
+public issue.
 
 ## License
 
