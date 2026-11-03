@@ -46,13 +46,7 @@ and a rotation.
 
 ## Documentation
 
-The documentation is on the website, **[zhangheqi.github.io/worgl](https://zhangheqi.github.io/worgl/)**.
-Start with the [quickstart](https://zhangheqi.github.io/worgl/docs/quickstart/), or read
-[How it works](https://zhangheqi.github.io/worgl/how-it-works/) for the model first. The
-[docs](https://zhangheqi.github.io/worgl/docs/) cover the Rust and TypeScript SDKs, running servers and
-clusters, and the HTTP API. API reference for each crate is on
-[docs.rs](https://docs.rs/worgl), and changes are in the
-[changelog](CHANGELOG.md).
+The documentation is on the [Worgl website](https://zhangheqi.github.io/worgl/docs/).
 
 ## The workspace
 
